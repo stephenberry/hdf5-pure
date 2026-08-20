@@ -246,3 +246,57 @@ fn persisting_session_seeds_reusable_free_on_open() {
     assert!(!acct.reusable_free_space.is_empty());
     assert_internally_consistent(&acct);
 }
+
+/// A relocating overwrite vacates two adjacent things — the dataset's old object
+/// header and its old chunk storage — and both are reclaimed, so they coalesce
+/// into a single reusable region rather than leaving the header stranded between
+/// the freed chunks (issue #317's refactor carries the old header address on the
+/// write plan; before that it was re-derived by a second path lookup).
+///
+/// The single region is the assertion that bites: leaving the header unreclaimed
+/// still reports free space, just less of it and in two pieces.
+#[test]
+fn a_relocating_overwrite_reclaims_the_old_header_with_its_storage() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("relocate.h5");
+
+    let mut b = FileBuilder::new();
+    // Zeros compress to almost nothing, so the replacement below cannot fit back
+    // into the chunk slots and the dataset is rebuilt elsewhere.
+    b.create_dataset("d")
+        .with_i32_data(&vec![0i32; 64])
+        .with_shape(&[64])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[16])
+        .with_deflate(6);
+    b.write(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    let incompressible: Vec<i32> = (0..64)
+        .map(|i: i32| i.wrapping_mul(0x9E37_79B1u32 as i32))
+        .collect();
+    session
+        .dataset("d")
+        .unwrap()
+        .write_staged(|b| {
+            b.with_i32_data(&incompressible);
+        })
+        .unwrap();
+    session.commit().unwrap();
+
+    let acct = session.space_accounting().unwrap();
+    assert_internally_consistent(&acct);
+    assert_eq!(
+        acct.reusable_free_space.len(),
+        1,
+        "the vacated header and chunk storage are adjacent and must coalesce: {:?}",
+        acct.reusable_free_space
+    );
+
+    drop(session);
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("d").unwrap().read_i32().unwrap(),
+        incompressible
+    );
+}

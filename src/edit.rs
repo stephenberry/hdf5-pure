@@ -271,12 +271,14 @@ const REFERENCE_INTO_RECLAIMED_SPACE: &str = "a reference this commit writes hol
 /// The refusal for the other half of [`InvalidatedAddresses`]: the object is
 /// still there, but not at that address any more.
 ///
-/// It names the way out, which the removal refusal cannot: the target still
-/// exists, so naming it by path gets the address it lands on rather than the one
-/// it is leaving.
+/// It can offer a way out, which the removal refusal cannot: the target still
+/// exists, so a path names it. Whether the path resolves depends on where the
+/// commit has got to — [`WriteEngine::resolve_reference_target`] resolves it once
+/// this commit has placed the target and reports "still writing" until then — so
+/// the message names separate commits as well, rather than promising the first.
 const REFERENCE_TO_A_MOVED_OBJECT: &str = "a reference this commit writes holds the pre-commit address of an object this commit \
-     rewrites elsewhere; name the target by path (`with_path_references`), which resolves to \
-     where it lands";
+     rewrites elsewhere; name the target by path (`with_path_references`) so it resolves to \
+     where the object lands, or use separate commits";
 
 /// Maximum number of compact attributes; beyond this HDF5 switches a dataset to
 /// dense (fractal-heap) attribute storage, which this engine does not emit.
@@ -3309,14 +3311,8 @@ impl WriteEngine {
         // compact rewrite relocates the header and is staged against its parent
         // group so the commit below rebuilds it and patches the link. ---
         let mut inplace_writes: Vec<(usize, Vec<u8>)> = Vec::new();
-        let mut moving_writes: Vec<(PathKey, String, MovingWrite)> = Vec::new();
+        let mut moving_writes: Vec<(PathKey, String, u64, MovingWrite)> = Vec::new();
         let mut write_targets: Vec<PathKey> = Vec::new();
-        // Pre-commit object-header addresses this commit rewrites elsewhere, for
-        // `InvalidatedAddresses` below: a reference naming one of these keeps an
-        // address the commit is vacating (issue #317). Recorded here rather than
-        // re-derived, since each site has just resolved the address and knows
-        // from its own plan whether the header actually moves.
-        let mut moved_headers: Vec<u64> = Vec::new();
         // The file-wide hard-link count, computed lazily the first time a write
         // relocates a header: such a write moves the dataset's object header and
         // patches only the one parent link that names it, so a dataset reachable
@@ -3369,10 +3365,9 @@ impl WriteEngine {
                             ));
                         }
                     }
-                    moved_headers.push(addr as u64);
                     let leaf = full.last().unwrap().clone();
                     let parent = full[..full.len() - 1].to_vec();
-                    moving_writes.push((parent, leaf, mw));
+                    moving_writes.push((parent, leaf, addr as u64, mw));
                 }
             }
             write_targets.push(full.clone());
@@ -3425,10 +3420,9 @@ impl WriteEngine {
                     ));
                 }
             }
-            moved_headers.push(addr as u64);
             let leaf = full.last().unwrap().clone();
             let parent = full[..full.len() - 1].to_vec();
-            moving_writes.push((parent, leaf, mw));
+            moving_writes.push((parent, leaf, addr as u64, mw));
             write_targets.push(full.clone());
         }
 
@@ -3491,7 +3485,6 @@ impl WriteEngine {
                         ));
                     }
                 }
-                moved_headers.push(addr as u64);
                 let region = Self::gather_oh_messages(&self.image(), addr as u64, base)?;
                 let (region, pending_vl_attrs) = apply_group_attr_ops(&region, &ops)?;
                 let leaf = full.last().unwrap().clone();
@@ -3499,6 +3492,7 @@ impl WriteEngine {
                 moving_writes.push((
                     parent,
                     leaf,
+                    addr as u64,
                     MovingWrite::AttrEdit {
                         region,
                         pending_vl_attrs,
@@ -3507,6 +3501,14 @@ impl WriteEngine {
                 write_targets.push(full);
             }
         }
+
+        // Pre-commit object-header addresses this commit rewrites elsewhere, for
+        // `InvalidatedAddresses` below: a reference naming one of these keeps an
+        // address the commit is vacating (issue #317). Read off the one list every
+        // relocating write is staged on, so a write added later cannot be left out
+        // of the screen without failing to compile.
+        let mut moved_headers: Vec<u64> =
+            moving_writes.iter().map(|&(_, _, addr, _)| addr).collect();
 
         // Fast path: when the only staged edits are same-length in-place
         // overwrites, apply them straight to their data blocks and return without
@@ -3589,9 +3591,13 @@ impl WriteEngine {
         // Attach relocating value overwrites (resized contiguous or compact) to
         // their parent group nodes: the new header is written below and the
         // parent's existing link patched to it, like an existing child group.
-        for (parent, leaf, mw) in moving_writes {
+        for (parent, leaf, old_oh, mw) in moving_writes {
             ensure_ancestors(&mut nodes, &parent);
-            nodes.entry(parent).or_default().writes.push((leaf, mw));
+            nodes
+                .entry(parent)
+                .or_default()
+                .writes
+                .push((leaf, old_oh, mw));
         }
 
         // Stage group attribute edits against their target groups. A target may
@@ -3909,8 +3915,8 @@ impl WriteEngine {
         // reclaimed (a safe leak) — and none is screened either, which is sound
         // in the same direction: nothing is freed, so no reference dangles.
         // Superseded group headers and relocated dataset headers are vacated too,
-        // and are screened separately: `moved_headers` holds them, gathered as
-        // each write's plan was made, and they are addresses rather than spans.
+        // and are screened separately: `moved_headers` holds them, and they are
+        // addresses rather than spans.
         let mut deleted_free: Vec<(u64, u64, PageType)> = Vec::new();
         deleted_addrs.sort_unstable();
         deleted_addrs.dedup();
@@ -3921,32 +3927,29 @@ impl WriteEngine {
                 }
             }
         }
-        // The page types the walk records are for the allocator, not for this.
-        let supplied = InvalidatedAddresses {
-            removed: deleted_free
-                .iter()
-                .map(|&(off, len, _)| (off, len))
-                .collect(),
-            moved: moved_headers,
-            base: self.superblock.base_address,
-        };
-
         // An in-file copy re-emits its source's element bytes verbatim, so a
         // copied object reference keeps naming whatever it named in the source —
-        // including an object this same commit is removing (issue #317).
+        // including an object this same commit is removing (issue #317). The page
+        // types the walk records are for the allocator, not for this.
         //
         // Removals only, and this is the one place the two halves part company. A
         // *supplied* address is a fresh claim about the file, and a commit that
         // moves the object falsifies it. A *copied* one repeats a claim the file
-        // already made: if the target moves, the reference it was copied from
-        // breaks whether or not the copy happens, so refusing the copy would
-        // rescue nothing and would take with it every copy in every commit —
-        // a commit rebuilds the root group, so `moved` is rarely empty. That
-        // wider breakage is [#324](https://github.com/stephenberry/hdf5-pure/issues/324).
-        let copied = InvalidatedAddresses {
-            removed: supplied.removed.clone(),
+        // already made: if the target moves, the reference the copy was taken from
+        // breaks whether or not the copy happens, so refusing the copy would not
+        // make that one valid. It would also cost what it cannot buy: every commit
+        // that reaches here rebuilds its root group, so `moved` is never empty, and
+        // a chunked object-reference dataset is refused on a non-empty screen alone
+        // rather than on a matching address — so every such copy would be refused,
+        // in every commit. That wider breakage is
+        // [#324](https://github.com/stephenberry/hdf5-pure/issues/324).
+        let for_copied = InvalidatedAddresses {
+            removed: deleted_free
+                .iter()
+                .map(|&(off, len, _)| (off, len))
+                .collect(),
             moved: Vec::new(),
-            base: supplied.base,
+            base: self.superblock.base_address,
         };
         {
             // Framed at the base address: a shared-message address is stored
@@ -3959,10 +3962,17 @@ impl WriteEngine {
             };
             for key in &keys {
                 for (_, tree) in &nodes[key].copies {
-                    screen_copied_references(tree, &copied, &framed)?;
+                    screen_copied_references(tree, &for_copied, &framed)?;
                 }
             }
         }
+
+        // The same screen the copies just got, plus the half a supplied address
+        // earns and a copied one does not.
+        let for_supplied = InvalidatedAddresses {
+            moved: moved_headers,
+            ..for_copied
+        };
 
         // References a builder already resolved to addresses never reach
         // `resolve_reference_target`, so they are screened out of the element
@@ -3975,7 +3985,7 @@ impl WriteEngine {
         // `reject_foreign_addresses` refuses a reference datatype outright on
         // that path.
         for (_, fd) in staged.datasets.iter().chain(&staged.writes) {
-            screen_resolved_references(&fd.dt, &fd.raw, &supplied)?;
+            screen_resolved_references(&fd.dt, &fd.raw, &for_supplied)?;
         }
 
         // Prove every object-reference target resolves before any write (see
@@ -3990,7 +4000,7 @@ impl WriteEngine {
             &add_targets,
             &write_targets,
             delete_targets,
-            &supplied,
+            &for_supplied,
             &self.image(),
             &self.superblock,
         )?;
@@ -4051,7 +4061,7 @@ impl WriteEngine {
         // The single-hard-link guard in the write preflight makes freeing the old
         // header safe (no surviving link still points at it).
         for key in &keys {
-            for (leaf, mw) in &nodes[key].writes {
+            for (_leaf, old_oh, mw) in &nodes[key].writes {
                 match mw {
                     MovingWrite::Contiguous {
                         old_extent: Some(extent),
@@ -4110,18 +4120,9 @@ impl WriteEngine {
                     _ => {}
                 }
                 // The relocated dataset's old header chunks are dead too.
-                let mut full = key.clone();
-                full.push(leaf.clone());
-                let path_str = full.join("/");
-                if let Ok(addr) = crate::group_v2::resolve_path_any_from_source(
-                    &self.image(),
-                    &self.superblock,
-                    &path_str,
-                ) {
-                    if let Ok(a) = usize::try_from(addr) {
-                        if let Ok(spans) = self.oh_chunk_spans(a) {
-                            to_free.extend(spans.into_iter().map(|(a, l)| (a, l, PageType::Meta)));
-                        }
+                if let Ok(a) = usize::try_from(*old_oh) {
+                    if let Ok(spans) = self.oh_chunk_spans(a) {
+                        to_free.extend(spans.into_iter().map(|(a, l)| (a, l, PageType::Meta)));
                     }
                 }
             }
@@ -4220,7 +4221,7 @@ impl WriteEngine {
                             &add_targets,
                             &write_targets,
                             &delete_targets,
-                            &supplied,
+                            &for_supplied,
                             &self.image(),
                             &self.superblock,
                         )?;
@@ -4277,7 +4278,7 @@ impl WriteEngine {
             // link target is stored relative to the base address (`- base`); on a
             // userblock file only the chunked variant reaches here (contiguous and
             // compact resizes are refused in the write preflight).
-            for (leaf, mw) in &writes {
+            for (leaf, _old_oh, mw) in &writes {
                 let new_oh = self.write_moving(mw)?;
                 patch_link_target(&mut region, leaf, new_oh - base)?;
             }
@@ -7039,9 +7040,17 @@ impl WriteEngine {
     /// against something this same commit places. [`resolve_reference_target`]
     /// classifies a target purely from *whether* a `PathKey` has been placed
     /// yet (`path_addr.get`), never from the address *value*, so replaying the
-    /// apply loop's placement order here with placeholder addresses (`0`)
-    /// standing in for "already placed" reproduces the exact same verdict the
-    /// apply loop's own calls will reach later, without writing anything. If
+    /// apply loop's placement order here with a placeholder address standing in
+    /// for "already placed" reproduces the exact same verdict the apply loop's
+    /// own calls will reach later, without writing anything.
+    ///
+    /// The placeholder is the file's **base address**, not zero. Any value
+    /// reproduces the verdict, but it is also handed to the same `addr - base`
+    /// that converts a real address into its stored form: a zero placeholder
+    /// underflows that on every file with a userblock, panicking in a debug
+    /// build on an otherwise legal edit. At the base address it converts to a
+    /// stored `0`, which is exactly the "placed, real address not known yet"
+    /// this stands for. If
     /// this preflight pass returns `Ok`, none of the apply loop's own
     /// `resolve_reference_target` calls can fail, so a reference-resolution
     /// error can no longer leave earlier-processed groups' real writes
@@ -7087,10 +7096,10 @@ impl WriteEngine {
                     }
                     let mut full = key.clone();
                     full.push(fd.name.clone());
-                    sim_addr.insert(full, 0);
+                    sim_addr.insert(full, superblock.base_address);
                 }
             }
-            sim_addr.insert(key.clone(), 0);
+            sim_addr.insert(key.clone(), superblock.base_address);
         }
         Ok(())
     }
@@ -7554,11 +7563,14 @@ struct Node {
     /// point of no return.
     cross_copies: Vec<String>,
     /// Value overwrites whose dataset header relocates (a resize or compact
-    /// rewrite by `write_dataset`), as (child link name, the relocation plan). On
+    /// rewrite by `write_dataset`, a staged append, an attribute edit), as (child
+    /// link name, the pre-commit object-header address, the relocation plan). On
     /// apply, the new data and header are written and this group's existing link
     /// to the moved header is patched to its new address — exactly like an
-    /// existing child group's link.
-    writes: Vec<(String, MovingWrite)>,
+    /// existing child group's link. The old address is carried rather than
+    /// re-resolved: the screen above and the reclaim below both need it, and one
+    /// derivation cannot disagree with itself.
+    writes: Vec<(String, u64, MovingWrite)>,
     base_region: Vec<u8>,
     existing_links: Vec<String>,
     /// Variable-length group/root attributes staged by [`apply_group_attr_ops`],
@@ -7692,11 +7704,13 @@ enum CopyTree {
 /// a relocating dataset write are both rebuilt at a fresh address, and the old
 /// header is freed once the superblock is repointed.
 ///
-/// Both are screened here because both are refused on the *path* side — a deleted
-/// path by name, a dirty group or a write target as "still writing"
-/// ([`WriteEngine::resolve_reference_target`]). An address that skipped either
-/// check would make the answer depend on how the caller named the target, which
-/// is the shape of the defect this exists to close.
+/// Both are screened here because on the *path* side neither can come out as a
+/// pre-commit address: [`WriteEngine::resolve_reference_target`] refuses a deleted
+/// path by name, and a dirty group or a write target it either refuses as "still
+/// writing" or — once this commit has placed the target — resolves to the address
+/// it lands on. An address that skipped either check would be the one form that
+/// writes the value the commit is vacating, which is the shape of the defect this
+/// exists to close.
 ///
 /// The removal spans are the very ones the commit hands to the free-space
 /// manager, taken from one walk rather than two, so the screen and the reclaimer
@@ -7708,9 +7722,10 @@ struct InvalidatedAddresses {
     /// Absolute pre-commit object-header addresses this commit rewrites
     /// elsewhere: every existing group it dirties, and every dataset write that
     /// relocates (a resizing or compact overwrite, a staged append, an attribute
-    /// edit). An in-place overwrite does not relocate and is not here — the path
-    /// side refuses it anyway, for want of a cheap way to tell them apart, but
-    /// here the write plan already has.
+    /// edit). An in-place overwrite does not relocate and is not here. The path
+    /// side refuses it anyway, deliberately conservatively — `write_targets`
+    /// records that a dataset is written, not which plan it got — while this list
+    /// is filled from the plans themselves.
     moved: Vec<u64>,
     /// The superblock base address. A stored object reference is *base-relative*
     /// and both lists above are absolute, so the comparison needs it; it is zero
@@ -7720,7 +7735,9 @@ struct InvalidatedAddresses {
 
 impl InvalidatedAddresses {
     /// Whether this commit invalidates anything at all, so a caller with nothing
-    /// cheap to check can skip its own work.
+    /// cheap to check can skip its own work. Worth testing on the copy screen,
+    /// whose `moved` is empty by construction; the supplied screen's never is,
+    /// since every commit that builds one rebuilds its root group.
     fn is_empty(&self) -> bool {
         self.removed.is_empty() && self.moved.is_empty()
     }
@@ -9740,7 +9757,7 @@ fn datatype_copies_foreign_address(dt: &crate::datatype::Datatype) -> bool {
 /// existed it was written straight through to disk.
 ///
 /// Element bytes still carrying placeholders are unaffected: an unresolved slot
-/// holds zero, which [`InvalidatedAddresses::covers`] never screens, and the target
+/// holds zero, which [`InvalidatedAddresses::refusal`] passes, and the target
 /// that replaces it is screened by `resolve_reference_target` instead — by name
 /// for a path, by address for a raw one. So this runs over every staged
 /// dataset's `raw` without asking which builder filled it: the rule is about the
@@ -9763,30 +9780,24 @@ fn screen_resolved_references(
     // one this crate builds; refuse rather than write references past a screen
     // that could not see them.
     let Some(slots) = embedded_reference_slots(dt).filter(|slots| !slots.is_empty()) else {
-        // A *blanket* refusal, so it asks a different question from the
-        // per-address checks below and answers to a different set. `moved` is
-        // never empty — a commit always rebuilds the root group — so gating this
-        // on it would refuse the datatype in every commit rather than in the
-        // ones where something is actually going away, which is a ban rather
-        // than a screen. `removed` is empty whenever the commit deletes nothing,
-        // which is what keeps the refusal (and its wording) honest.
+        // Unconditional, unlike the per-address checks below. Those refuse an
+        // address that lands somewhere this commit vacates; this one cannot read
+        // the addresses at all, so there is nothing to compare and no commit it
+        // could be safe in — `moved` is never empty, since a commit always
+        // rebuilds the root group. An in-file copy reaches this only beside a
+        // deletion, because it is screened against `for_copied`, whose `moved`
+        // is empty by construction.
         //
         // The `filter` is belt-and-braces: `embedded_reference_slots` already
         // reports an unaddressable reference as `None` rather than as an empty
         // list, and reading an empty list as "nothing to check" is exactly the
-        // hole that cost this screen a defect.
-        return if invalidated.removed.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::EditUnsupported(
-                "an object reference this commit writes could not be located in its datatype, \
-                 so it cannot be screened against the objects this commit deletes",
-            ))
-        };
+        // hole this screen was found to have.
+        return Err(Error::EditUnsupported(
+            "an object reference this commit writes could not be located in its datatype, so it \
+             cannot be screened against what this commit vacates; supply an 8-byte object \
+             reference (`with_reference_data`)",
+        ));
     };
-    if invalidated.is_empty() {
-        return Ok(());
-    }
     // Non-empty slots mean the datatype has room for at least one 8-byte
     // address, so the element size is at least 8 and `chunks_exact` is safe.
     let element_size = dt.type_size() as usize;
@@ -10193,14 +10204,16 @@ mod tests {
             "got: {err}"
         );
 
-        // A commit that reclaims nothing has nothing to screen it against, so
-        // the datatype alone is not a refusal.
+        // Unconditional: a screen holding nothing still refuses, because the
+        // refusal is about addresses that cannot be read rather than about what
+        // the commit is vacating. `moved` is never empty in a real commit, so
+        // there is no case this could have been made conditional on.
         let nothing = InvalidatedAddresses {
             removed: Vec::new(),
             moved: Vec::new(),
             base: 0,
         };
-        assert!(screen_resolved_references(&dt, &raw, &nothing).is_ok());
+        assert!(screen_resolved_references(&dt, &raw, &nothing).is_err());
     }
 
     /// A variable-length *of object references* is refused rather than skipped:
@@ -10274,13 +10287,14 @@ mod tests {
         let err = screen_resolved_references(&dt, &raw, &invalidated).unwrap_err();
         assert!(err.to_string().contains("cannot be screened"), "got: {err}");
 
-        // Still nothing to screen against when the commit reclaims nothing.
+        // Unconditional, for the reason
+        // `a_datatype_whose_reference_slots_do_not_fit_is_refused` states.
         let nothing = InvalidatedAddresses {
             removed: Vec::new(),
             moved: Vec::new(),
             base: 0,
         };
-        assert!(screen_resolved_references(&dt, &raw, &nothing).is_ok());
+        assert!(screen_resolved_references(&dt, &raw, &nothing).is_err());
     }
 
     /// A reference target supplied as a *raw address* is screened exactly as one

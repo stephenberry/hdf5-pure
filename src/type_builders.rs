@@ -1815,7 +1815,8 @@ impl DatasetBuilder {
     /// [`File::open_rw`](crate::File::open_rw) session the addresses are checked
     /// at `commit` against the objects that commit deletes and the headers it
     /// rewrites elsewhere, so an address the commit is about to vacate is
-    /// refused rather than written.
+    /// refused rather than written, with a message naming
+    /// [`with_path_references`](Self::with_path_references) as the alternative.
     pub fn with_reference_data(&mut self, addresses: &[u64]) -> &mut Self {
         self.datatype = Some(make_object_reference_type());
         let mut b = Vec::with_capacity(addresses.len() * 8);

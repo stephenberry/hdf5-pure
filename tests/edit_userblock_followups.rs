@@ -439,3 +439,52 @@ fn userblock_reference_into_deleted_space_is_refused() {
     assert_userblock_unchanged(&path, &userblock);
     std::fs::remove_file(&path).ok();
 }
+
+/// A path reference to an object the *same commit* places, on a userblock file.
+///
+/// The commit preflight replays the apply loop's placement order against
+/// placeholder addresses, and those placeholders go through the same
+/// `address - base` that converts a real address to its stored, base-relative
+/// form. A zero placeholder underflows that on any file with a userblock, so
+/// this edit — legal, and fine on a base-0 file — panicked in a debug build.
+#[test]
+fn userblock_reference_to_an_object_the_same_commit_places() {
+    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_ref_same_commit.h5");
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB as u64);
+    b.create_dataset("alpha").with_f64_data(&[1.0, 2.0]);
+    let mut bytes = b.finish().unwrap();
+    let userblock = stamp_userblock(&mut bytes);
+    std::fs::write(&path, &bytes).unwrap();
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().create_group("g").unwrap();
+        s.root()
+            .create_dataset("g/inner", |b| {
+                b.with_i32_data(&[7, 8, 9]);
+            })
+            .unwrap();
+        s.root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["g/inner"]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    // The stored value is base-relative, and it resolves to the object this
+    // same commit placed.
+    let raw = file.dataset("refs").unwrap().read_raw().unwrap();
+    let stored = u64::from_le_bytes(raw[..8].try_into().unwrap());
+    assert!(stored > 0 && stored < UB as u64, "base-relative: {stored}");
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    match &targets[0] {
+        hdf5_pure::Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![7, 8, 9]),
+        other => panic!("expected a dataset reference, got {other:?}"),
+    }
+    drop(file);
+    assert_userblock_unchanged(&path, &userblock);
+    std::fs::remove_file(&path).ok();
+}

@@ -2,8 +2,8 @@
 //! add, delete, and copy datasets and groups at any path.
 
 use hdf5_pure::{
-    AttrValue, CharacterSet, DType, Datatype, Error, File, FileBuilder, FormatError, Object,
-    ReferenceType, ScaleOffset, StringPadding,
+    AttrValue, CharacterSet, CompoundTypeBuilder, DType, Datatype, Error, File, FileBuilder,
+    FormatError, Object, ReferenceType, ScaleOffset, StringPadding,
 };
 
 /// Write a starter file with one dataset, returning its path.
@@ -4015,8 +4015,9 @@ fn a_copy_of_a_reference_dataset_is_allowed_beside_an_unrelated_delete() {
 /// old one, so a reference supplied as `g`'s pre-commit address is stale the
 /// moment the commit lands — and, once something reuses the span, reads as
 /// whatever went there. The same target named as a **path** resolves to the new
-/// address instead, which is why the refusal can point at `with_path_references`
-/// rather than at separate commits.
+/// address instead — placed already, because `commit` writes the deepest groups
+/// first — which is what the refusal points at. It does not always work, and the
+/// relocated-dataset test below pins the case where it does not.
 #[test]
 fn a_reference_address_to_a_group_this_commit_rewrites_is_refused() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_moved_group.h5");
@@ -4123,18 +4124,193 @@ fn a_reference_address_to_a_relocated_dataset_is_refused() {
         assert!(err.to_string().contains("rewrites elsewhere"), "got: {err}");
     }
 
+    // The refusal's first suggestion does not reach this one: a written dataset
+    // is a `write_targets` entry, which the path side refuses outright rather
+    // than resolving. That is why the message names separate commits as well.
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_path_references(&["d"]);
+            })
+            .unwrap();
+        session
+            .dataset("d")
+            .unwrap()
+            .set_attr("tag", AttrValue::I32(1))
+            .unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("still writing"), "got: {err}");
+    }
+
     assert_eq!(std::fs::read(&path).unwrap(), before);
     std::fs::remove_file(&path).ok();
+}
+
+/// A datatype mixing an object reference this crate can locate with one it
+/// cannot is refused, not screened half-way (issue #317).
+///
+/// This is the shape that defeats a screen keyed on "did the walker find any
+/// slots": the 8-byte member yields one, so the list is non-empty, and a screen
+/// that took that for "this type is walkable" would write the other member's
+/// address unexamined. `embedded_reference_slots` reports the whole datatype as
+/// unaddressable instead, which is what its fall-through arm asks
+/// `datatype_holds_object_reference` in order to know.
+///
+/// Both members are reachable from a plain C-written file through `copy`, and
+/// from `with_raw_data` here, which takes whatever `Datatype` it is given.
+#[test]
+fn a_datatype_mixing_locatable_and_unlocatable_references_is_refused() {
+    let object_ref = || Datatype::Reference {
+        size: 8,
+        ref_type: ReferenceType::Object,
+    };
+    let unlocatable = [
+        (
+            "wider than eight bytes",
+            Datatype::Reference {
+                size: 16,
+                ref_type: ReferenceType::Object,
+            },
+        ),
+        (
+            "a variable length of them",
+            Datatype::VariableLength {
+                is_string: false,
+                padding: None,
+                charset: None,
+                base_type: Box::new(object_ref()),
+            },
+        ),
+    ];
+
+    for (tag, second) in unlocatable {
+        let path = std::env::temp_dir().join("hdf5_pure_edit_ref_mixed.h5");
+        let inner = write_reference_fixture(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        let dt = CompoundTypeBuilder::with_size(24)
+            .field("locatable", 0, object_ref())
+            .field("other", 8, second)
+            .build()
+            .unwrap();
+        // The hazardous address goes in the member the walker cannot reach; the
+        // one it can reach is left null, so only the unreachable half can refuse.
+        let mut element = vec![0u8; 24];
+        element[8..16].copy_from_slice(&inner.to_le_bytes());
+
+        {
+            let session = File::open_rw(&path).unwrap();
+            session
+                .root()
+                .create_dataset("added", |b| {
+                    b.with_raw_data(dt.clone(), element.clone(), 1);
+                })
+                .unwrap();
+            session.root().delete("g").unwrap();
+            let err = session.commit().unwrap_err();
+            assert!(
+                err.to_string().contains("could not be located"),
+                "{tag}: got {err}"
+            );
+        }
+
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{tag}");
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+/// The relocating-write half of `moved`, through the two doors an attribute
+/// edit does not cover: a **resizing overwrite** and a **staged append**, each
+/// of which rewrites the dataset's header at a fresh address (issue #317).
+///
+/// Both reach `moved` from the write plan rather than from the path, so a
+/// reference supplied as the target's pre-commit address is refused where the
+/// same commit relocates it.
+#[test]
+fn a_reference_address_to_a_dataset_a_write_relocates_is_refused() {
+    for (tag, relocate) in [
+        (
+            // A filtered chunk whose replacement compresses worse than what it
+            // replaces no longer fits its slot, so the dataset is rebuilt
+            // elsewhere and its old header vacated.
+            "refiltered",
+            (|session: &File| {
+                let incompressible: Vec<i32> = (0..64)
+                    .map(|i: i32| i.wrapping_mul(0x9E37_79B1u32 as i32))
+                    .collect();
+                session
+                    .dataset("d")
+                    .unwrap()
+                    .write_staged(|b| {
+                        b.with_i32_data(&incompressible);
+                    })
+                    .unwrap();
+            }) as fn(&File),
+        ),
+        (
+            "append",
+            (|session: &File| {
+                session
+                    .dataset("d")
+                    .unwrap()
+                    .append_staged(|a| {
+                        a.append_i32(&[9]);
+                    })
+                    .unwrap();
+            }) as fn(&File),
+        ),
+    ] {
+        let path = std::env::temp_dir().join(format!("hdf5_pure_edit_ref_moved_{tag}.h5"));
+        let mut b = FileBuilder::new();
+        // Zeros so every chunk compresses to almost nothing, leaving slots the
+        // replacement below cannot fit back into.
+        b.create_dataset("d")
+            .with_i32_data(&vec![0i32; 64])
+            .with_shape(&[64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[16])
+            .with_deflate(6);
+        b.create_dataset("refs").with_path_references(&["d"]);
+        b.write(&path).unwrap();
+
+        let d_addr = {
+            let file = File::open(&path).unwrap();
+            let raw = file.dataset("refs").unwrap().read_raw().unwrap();
+            u64::from_le_bytes(raw[..8].try_into().unwrap())
+        };
+        let before = std::fs::read(&path).unwrap();
+
+        {
+            let session = File::open_rw(&path).unwrap();
+            session
+                .root()
+                .create_dataset("added", |b| {
+                    b.with_reference_data(&[d_addr]);
+                })
+                .unwrap();
+            relocate(&session);
+            let err = session.commit().unwrap_err();
+            assert!(
+                err.to_string().contains("rewrites elsewhere"),
+                "{tag}: got {err}"
+            );
+        }
+
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{tag}");
+        std::fs::remove_file(&path).ok();
+    }
 }
 
 /// An address naming an object the commit leaves alone still commits, even
 /// though the commit rewrites *something* — it rebuilds the root group, as every
 /// commit does (issue #317).
 ///
-/// This is what keeps the moved-header half a screen rather than a ban: the
-/// list of rewritten headers is non-empty on essentially every commit, so a
-/// gate on "does this commit rewrite anything" would refuse every supplied
-/// address there is.
+/// This is what keeps the moved-header half a screen rather than a ban: every
+/// commit that reaches the screen has rebuilt its root group, so the list of
+/// rewritten headers is never empty, and a gate on "does this commit rewrite
+/// anything" would refuse every supplied address there is.
 #[test]
 fn a_reference_address_to_an_object_this_commit_leaves_alone_is_accepted() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_untouched.h5");
