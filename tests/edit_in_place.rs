@@ -2632,12 +2632,13 @@ fn write_dataset_overwrites_filtered_extensible_fits_with_slack() {
 #[test]
 fn write_dataset_rejects_filtered_request() {
     // A builder that itself requests chunking/filtering is refused as "not a
-    // value overwrite" before the on-disk dataset is even consulted.
+    // value overwrite" before the on-disk dataset is even consulted — which is
+    // why the refusal arrives from `write_staged` and not from the commit.
     let path = std::env::temp_dir().join("hdf5_pure_write_filtered_request.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
-        session
+        let err = session
             .dataset("original")
             .unwrap()
             .write_staged(|b| {
@@ -2645,11 +2646,14 @@ fn write_dataset_rejects_filtered_request() {
                     .with_shape(&[4])
                     .with_chunks(&[2]);
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(
             err.to_string().contains("overwrites values only"),
             "expected value-only refusal, got: {err}"
+        );
+        assert!(
+            !session.has_staged_edits(),
+            "a refused overwrite must not be left staged"
         );
     }
     std::fs::remove_file(&path).ok();
@@ -2664,18 +2668,21 @@ fn write_dataset_rejects_staged_attributes() {
     let before = std::fs::read(&path).unwrap();
     {
         let session = File::open_rw(&path).unwrap();
-        session
+        let err = session
             .dataset("original")
             .unwrap()
             .write_staged(|b| {
                 b.with_f64_data(&[5.0, 6.0, 7.0, 8.0]) // same size, valid overwrite
                     .set_attr("units", AttrValue::String("m/s".into()));
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(
             err.to_string().contains("cannot set attributes"),
             "expected attribute refusal, got: {err}"
+        );
+        assert!(
+            !session.has_staged_edits(),
+            "a refused overwrite must not be left staged"
         );
     }
     assert_eq!(
@@ -3832,17 +3839,20 @@ fn write_dataset_rejects_vlen_strings_without_writing() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session
+        let err = session
             .dataset("labels")
             .unwrap()
             .write_staged(|b| {
                 b.with_vlen_strings(&["x", "y"]);
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(
             err.to_string().contains("variable-length-string"),
             "got: {err}"
+        );
+        assert!(
+            !session.has_staged_edits(),
+            "a refused overwrite must not be left staged"
         );
     }
 
@@ -3854,6 +3864,120 @@ fn write_dataset_rejects_vlen_strings_without_writing() {
         file.dataset("labels").unwrap().read_string().unwrap(),
         vec!["a".to_string(), "b".to_string()]
     );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The object-reference counterpart of
+/// [`write_dataset_rejects_vlen_strings_without_writing`], and the regression
+/// test for issue #318: both builders stage placeholder element bytes that only
+/// the add path resolves, so both are refused as the overwrite is staged.
+///
+/// Before the refusal existed, this same sequence returned `Ok` from
+/// `write_staged` **and** from `commit`, having written eight zero bytes over a
+/// working reference dataset. The file-content and `dereference` assertions are
+/// what make this a test about that rather than about an error message; no
+/// mutation of the code as it stands reaches them, since the refusal precedes
+/// every write, and they are here for a version of this code where it does not.
+#[test]
+fn write_dataset_rejects_object_references_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_write_object_ref_rejected.h5");
+    std::fs::remove_file(&path).ok();
+    let mut b = FileBuilder::new();
+    b.create_dataset("a").with_i32_data(&[1]);
+    b.create_dataset("bb").with_i32_data(&[2]);
+    b.create_dataset("refs").with_path_references(&["a"]);
+    b.write(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let err = session
+            .dataset("refs")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_path_references(&["bb"]);
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("object-reference"),
+            "expected an object-reference refusal, got: {err}"
+        );
+        assert!(
+            !session.has_staged_edits(),
+            "a refused overwrite must not be left staged"
+        );
+    }
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "file modified on refusal"
+    );
+    let file = File::open(&path).unwrap();
+    // Still a live reference to `a`, not the address-zero placeholder the
+    // unrefused write left behind.
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    assert_eq!(targets.len(), 1);
+    match &targets[0] {
+        Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![1]),
+        other => panic!("expected a dataset reference, got {other:?}"),
+    }
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The boundary of the refusal above: what it rejects is an *unresolved* target,
+/// not the object-reference datatype. `with_reference_data` supplies the stored
+/// addresses itself, so there is nothing for the commit to resolve and the
+/// overwrite is applied.
+///
+/// This is the other half of issue #318's fix. Widening the refusal to "any
+/// reference dataset" would take a working capability away, and the whole suite
+/// would still pass.
+///
+/// It pins that the write *applies*, not that the addresses are sound. Nothing
+/// screens them: an address into a subtree the same commit deletes is stored
+/// as-is, where the same target named as a path is refused (issue #317's family,
+/// which this refusal neither creates nor closes).
+#[test]
+fn write_dataset_accepts_resolved_reference_addresses() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_write_resolved_refs.h5");
+    std::fs::remove_file(&path).ok();
+    let mut b = FileBuilder::new();
+    b.create_dataset("a").with_i32_data(&[1]);
+    b.create_dataset("bb").with_i32_data(&[2]);
+    b.create_dataset("refs").with_path_references(&["a"]);
+    // A second reference dataset is how the test learns `bb`'s address without
+    // reaching into the file format itself.
+    b.create_dataset("refs_to_bb").with_path_references(&["bb"]);
+    b.write(&path).unwrap();
+
+    let addr_bb = {
+        let file = File::open(&path).unwrap();
+        let raw = file.dataset("refs_to_bb").unwrap().read_raw().unwrap();
+        u64::from_le_bytes(raw[..8].try_into().unwrap())
+    };
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("refs")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_reference_data(&[addr_bb]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    assert_eq!(targets.len(), 1);
+    match &targets[0] {
+        Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![2]),
+        other => panic!("expected a dataset reference, got {other:?}"),
+    }
+    drop(file);
     std::fs::remove_file(&path).ok();
 }
 

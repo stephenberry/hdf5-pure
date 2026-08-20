@@ -2023,10 +2023,13 @@ impl WriteEngine {
     /// `commit` reports [`Error::EditUnsupported`]. Contiguous, compact, and
     /// chunked (including filtered) datasets are all supported; the dataset's
     /// existing chunk geometry, filter pipeline, and chunk index are taken from the
-    /// on-disk header (a builder that itself requests chunking/filtering is refused
-    /// as "not a value overwrite"). A chunk index this engine cannot enumerate (a
-    /// version-2 B-tree) is refused. Partial / sub-region writes are out of scope —
-    /// the whole dataset is replaced.
+    /// on-disk header. A chunk index this engine cannot enumerate (a version-2
+    /// B-tree) is refused. Partial / sub-region writes are out of scope — the
+    /// whole dataset is replaced.
+    ///
+    /// What the builder alone can rule out —
+    /// [`refuse_unsupported_overwrite`](Self::refuse_unsupported_overwrite) —
+    /// is refused *here* rather than at `commit`.
     ///
     /// When the new data is the same length as the existing contiguous data block
     /// (the common case), the bytes are written straight into that block: no
@@ -2057,7 +2060,9 @@ impl WriteEngine {
             return Err(Error::EditUnsupported("cannot overwrite the root group"));
         };
         builder.name = leaf.clone();
-        self.staged.writes.push((comps, flatten_dataset(builder)?));
+        let fd = flatten_dataset(builder)?;
+        Self::refuse_unsupported_overwrite(&fd)?;
+        self.staged.writes.push((comps, fd));
         Ok(())
     }
 
@@ -5075,25 +5080,15 @@ impl WriteEngine {
         Ok(GroupInfo { region, link_names })
     }
 
-    /// Preflight a staged value overwrite (`write_dataset`): resolve the dataset
-    /// at `addr`, validate that the staged `fd` matches it byte-exactly in
-    /// datatype and shape, and classify how the bytes will be applied. No file
-    /// bytes are written here — this is part of the all-or-nothing preflight, so a
-    /// rejected write leaves the commit unapplied.
+    /// The refusals a staged value overwrite (`write_dataset`) makes from the
+    /// staged builder alone, with no on-disk header involved.
     ///
-    /// Contiguous, compact, and chunked (including filtered) datasets are all
-    /// supported; the chunk geometry, filter pipeline, and chunk index come from
-    /// the on-disk header (a staged builder that itself requests chunking/filters/an
-    /// extensible shape is refused as "not a value overwrite", and a chunk index
-    /// this engine cannot enumerate — a version-2 B-tree — is refused too). A
-    /// datatype or shape that differs from the on-disk dataset's is likewise
-    /// refused — this is a value overwrite, not a reshape or retype.
-    fn prepare_write<S: Source + ?Sized>(
-        src: &S,
-        addr: u64,
-        fd: &FlatDataset,
-        base: u64,
-    ) -> Result<WritePlan, Error> {
+    /// [`stage_dataset_write`](Self::stage_dataset_write) applies these as the
+    /// write is staged, so the call that configured the builder is the one that
+    /// reports the mistake. A refusal that reads only `fd` belongs here; one that
+    /// needs the target's header belongs in
+    /// [`prepare_write`](Self::prepare_write).
+    fn refuse_unsupported_overwrite(fd: &FlatDataset) -> Result<(), Error> {
         // A value overwrite never introduces chunking, filters, or an extensible
         // shape: those would change the storage layout, not just the bytes.
         if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
@@ -5129,20 +5124,67 @@ impl WriteEngine {
         }
 
         // `with_vlen_strings` stages placeholder element references that only the
-        // add path's apply loop knows how to resolve (place the global heap
-        // collection, then patch the placeholders once its address is known,
-        // before the data block itself is written). `prepare_write` runs during
-        // preflight, before any bytes are written and without `&mut self`
-        // access to place a heap collection, and its result can be flushed by
-        // the same-length fast path with no apply loop at all — so refuse
-        // rather than write unpatched (heap address 0) placeholders as if they
-        // were final.
+        // add path knows how to resolve: place the global heap collection, then
+        // patch the placeholders once its address is known, before the data block
+        // itself is written. The overwrite path has no such step, and a
+        // same-length overwrite is flushed straight over the existing data block
+        // with no apply loop at all — so refuse rather than write unpatched (heap
+        // address 0) placeholders as if they were final.
         if fd.vl_string_staging.is_some() {
             return Err(Error::EditUnsupported(
                 "write_dataset cannot overwrite a variable-length-string dataset's \
                  data in place yet",
             ));
         }
+
+        // `reference_targets` holds elements only the add path resolves, in
+        // `preflight_reference_targets` and the apply loop after it; the
+        // overwrite path never reads the field. Checked on the field rather than
+        // on `with_path_references`, since every producer stages elements that
+        // are equally unresolved. Left unrefused, a staged overwrite writes
+        // address-zero placeholders over a working reference dataset and
+        // `commit` reports `Ok` (issue #318). `with_reference_data` supplies
+        // resolved addresses and overwrites like any other value.
+        if fd.reference_targets.is_some() {
+            return Err(Error::EditUnsupported(
+                "write_dataset cannot overwrite an object-reference dataset's \
+                 data in place yet",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Preflight a staged value overwrite (`write_dataset`): resolve the dataset
+    /// at `addr`, validate that the staged `fd` matches it byte-exactly in
+    /// datatype and shape, and classify how the bytes will be applied. No file
+    /// bytes are written here — this is part of the all-or-nothing preflight, so a
+    /// rejected write leaves the commit unapplied.
+    ///
+    /// Contiguous, compact, and chunked (including filtered) datasets are all
+    /// supported; the chunk geometry, filter pipeline, and chunk index come from
+    /// the on-disk header (a chunk index this engine cannot enumerate — a
+    /// version-2 B-tree — is refused). A datatype or shape that differs from the
+    /// on-disk dataset's is likewise refused — this is a value overwrite, not a
+    /// reshape or retype.
+    ///
+    /// Every refusal `fd` can decide on its own has been made by then, where the
+    /// write is staged.
+    fn prepare_write<S: Source + ?Sized>(
+        src: &S,
+        addr: u64,
+        fd: &FlatDataset,
+        base: u64,
+    ) -> Result<WritePlan, Error> {
+        // Enforced by construction: `staged.writes` has one producer, and it
+        // refuses there. Asserted rather than re-refused because a second caller
+        // that skipped it would not fail here — a chunked builder would fall
+        // through and be written as a plain contiguous overwrite, with
+        // `chunk_options` silently dropped.
+        debug_assert!(
+            Self::refuse_unsupported_overwrite(fd).is_ok(),
+            "a staged write reached prepare_write without refuse_unsupported_overwrite"
+        );
 
         let region = Self::gather_oh_messages(src, addr, base)?;
 
