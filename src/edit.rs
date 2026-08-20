@@ -6620,17 +6620,38 @@ impl WriteEngine {
     /// refused with a clear [`Error::EditUnsupported`] rather than resolved to
     /// a stale or wrong address — the one case this engine cannot resolve
     /// without the whole-file writer's two-pass dummy/real-address scheme.
-    /// "Touched" also covers a path this same commit deletes (`pending_deletes`):
-    /// without that check the deleted object's pre-commit address would still
-    /// resolve via step 2, and the reference would end up pointing at storage
-    /// this same commit is about to reclaim and hand out to something else.
+    ///
+    /// A path this same commit *deletes* (`delete_targets`) is refused for a
+    /// different reason, and so carries its own message: the address step 2
+    /// would resolve is not stale but doomed, and the next commit to reuse the
+    /// span leaves a reference that dereferenced cleanly reading whatever
+    /// landed there. The test is by **prefix**, because a deletion takes the
+    /// whole subtree with it (`collect_free_spans` walks it): a reference to a
+    /// child of a deleted group dangles exactly as a reference to the group
+    /// itself does (issue #314).
+    ///
+    /// It is a conservative test in the same sense `write_targets` is. A child
+    /// whose object survives the delete through another hard link keeps its
+    /// address — `collect_free_spans` reclaims nothing when the incoming count
+    /// is not 1 — and is refused here anyway, so the message states what the
+    /// commit does rather than what the allocator will conclude.
+    ///
+    /// The delete test runs *after* the other three so that a replacement this
+    /// commit has merely not placed yet — a sibling group later in the same
+    /// depth band — is reported as an ordering problem rather than as a
+    /// deletion. That ordering is a better default, not a partition: because
+    /// `add_targets` claims a replaced path's whole subtree by prefix, a child
+    /// the replacement does *not* recreate is genuinely doomed and still
+    /// reports "still writing". Distinguishing it would mean enumerating what
+    /// a replacement actually rebuilds, which neither list holds. A path the
+    /// commit puts back is resolved by step 1 before either test is reached.
     fn resolve_reference_target(
         target: &ObjectRefTarget,
         path_addr: &BTreeMap<PathKey, u64>,
         nodes: &BTreeMap<PathKey, Node>,
         add_targets: &[PathKey],
         write_targets: &[PathKey],
-        pending_deletes: &[PathKey],
+        delete_targets: &[PathKey],
         src: &(impl Source + ?Sized),
         superblock: &Superblock,
     ) -> Result<u64, Error> {
@@ -6646,11 +6667,19 @@ impl WriteEngine {
         if nodes.contains_key(&key)
             || add_targets.iter().any(|t| is_prefix(t, &key))
             || write_targets.contains(&key)
-            || pending_deletes.contains(&key)
         {
             return Err(Error::EditUnsupported(
                 "an object-reference dataset targets a path this commit is still writing; \
                  use separate commits",
+            ));
+        }
+        // After the three above; see this function's doc for why, and for what
+        // that ordering does and does not buy.
+        if delete_targets.iter().any(|d| is_prefix(d, &key)) {
+            return Err(Error::EditUnsupported(
+                "an object-reference dataset targets an object this commit deletes, or one \
+                 under it; the reference would be left pointing at storage the delete can \
+                 reclaim",
             ));
         }
         match crate::group_v2::resolve_path_any_from_source(src, superblock, path) {
@@ -6679,7 +6708,7 @@ impl WriteEngine {
         nodes: &BTreeMap<PathKey, Node>,
         add_targets: &[PathKey],
         write_targets: &[PathKey],
-        pending_deletes: &[PathKey],
+        delete_targets: &[PathKey],
         src: &(impl Source + ?Sized),
         superblock: &Superblock,
     ) -> Result<(), Error> {
@@ -6703,7 +6732,7 @@ impl WriteEngine {
                                 nodes,
                                 add_targets,
                                 write_targets,
-                                pending_deletes,
+                                delete_targets,
                                 src,
                                 superblock,
                             )?;

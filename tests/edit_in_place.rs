@@ -3452,11 +3452,11 @@ fn add_zero_element_reference_dataset_via_edit_session() {
 
 /// Regression test: a reference targeting an object **deleted in the same
 /// commit** must not resolve to that object's soon-to-be-freed pre-commit
-/// address — `resolve_reference_target`'s "still writing" guard must check
-/// `pending_deletes`, not just `nodes`/`add_targets`/`write_targets`. A
-/// nested group/dataset is staged first so it would already be durably
-/// written (deepest-first apply order) before the root-level delete is even
-/// reached; the whole commit must still leave the file untouched.
+/// address — `resolve_reference_target` must check `pending_deletes`, not
+/// just `nodes`/`add_targets`/`write_targets`. A nested group/dataset is
+/// staged first so it would already be durably written (deepest-first apply
+/// order) before the root-level delete is even reached; the whole commit must
+/// still leave the file untouched.
 #[test]
 fn add_reference_dataset_targeting_same_commit_delete_is_rejected_without_writing() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_deleted_target.h5");
@@ -3480,10 +3480,209 @@ fn add_reference_dataset_targeting_same_commit_delete_is_rejected_without_writin
             })
             .unwrap();
         let err = session.commit().unwrap_err();
-        assert!(err.to_string().contains("still writing"), "got: {err}");
+        assert!(
+            err.to_string().contains("this commit deletes"),
+            "got: {err}"
+        );
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A deletion takes the whole subtree with it, so a reference to a *child* of
+/// a deleted group dangles exactly as a reference to the group itself does —
+/// and that one was refused while the child's was not, because the guard
+/// matched the deleted path exactly instead of by prefix (issue #314).
+///
+/// The committed reference pointed at the freed header: measured on the
+/// commit before the fix, the stored address landed inside a span the same
+/// commit reported as reusable free space, and one later commit that reused
+/// it turned a clean `dereference` into `InvalidObjectHeaderVersion(170)` —
+/// the filler byte, read as an object header.
+///
+/// Both depths are checked. A direct child catches the exact-match guard the
+/// bug shipped; a grandchild catches a fix that only descends one level.
+#[test]
+fn add_reference_dataset_targeting_a_child_of_a_same_commit_delete_is_rejected() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_deleted_child.h5");
+    let mut b = FileBuilder::new();
+    let mut doomed = b.create_group("doomed");
+    doomed.create_dataset("inner").with_i32_data(&[7, 7, 7]);
+    let mut sub = doomed.create_group("sub");
+    sub.create_dataset("deep").with_i32_data(&[8]);
+    doomed.add_group(sub.finish());
+    b.add_group(doomed.finish());
+    b.write(&path).unwrap();
+    // One fixture for both depths: each refusal is asserted to leave the file
+    // byte-identical, so the second pass runs against a file that has already
+    // survived a failed commit.
+    let before = std::fs::read(&path).unwrap();
+
+    for target in ["doomed/inner", "doomed/sub/deep"] {
+        {
+            let session = File::open_rw(&path).unwrap();
+            session.root().delete("doomed").unwrap();
+            session
+                .root()
+                .create_dataset("refs", |b| {
+                    b.with_path_references(&[target]);
+                })
+                .unwrap();
+            let err = session.commit().unwrap_err();
+            // Assert the delete guard's own message: every other guard in
+            // `resolve_reference_target` reports "still writing", so a test
+            // that only asserted `is_err` would pass on any of them.
+            assert!(
+                err.to_string().contains("this commit deletes"),
+                "{target}: got: {err}"
+            );
+        }
+
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{target}");
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// The floor under the guard above: a delete in the commit must not stop an
+/// unrelated reference from resolving. Without this, a guard that refused
+/// whenever *any* deletion was staged would pass every other reference test
+/// in this file — none of them combines a delete with a reference that is
+/// supposed to succeed.
+#[test]
+fn a_delete_elsewhere_does_not_block_an_unrelated_reference() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_delete_elsewhere.h5");
+    let mut b = FileBuilder::new();
+    let mut doomed = b.create_group("doomed");
+    doomed.create_dataset("inner").with_i32_data(&[7]);
+    b.add_group(doomed.finish());
+    let mut keep = b.create_group("keep");
+    keep.create_dataset("survivor").with_i32_data(&[4, 5, 6]);
+    b.add_group(keep.finish());
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("doomed").unwrap();
+        session
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["keep/survivor"]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    assert_eq!(targets.len(), 1);
+    match &targets[0] {
+        Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![4, 5, 6]),
+        other => panic!("expected a dataset reference, got {other:?}"),
+    }
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The interaction with issue #305: when the commit puts the deleted path
+/// *back*, a reference to the replacement's child resolves to the **new**
+/// object. The deepest-first apply order places `g/inner` before the root
+/// group that references it, so step 1 (`path_addr`) answers and no guard is
+/// consulted.
+///
+/// That is also this test's limitation, and it is worth stating rather than
+/// discovering: because the guard is never reached, no mutation of the delete
+/// test makes this fail. It backs the documented positive claim and asserts
+/// the resolved *value* — the replacement, not the object removed — which no
+/// other test here does. It is not evidence that the guard is correct.
+#[test]
+fn a_reference_to_a_replaced_paths_new_child_resolves_to_the_replacement() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_replaced_child.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("g");
+    g.create_dataset("inner").with_i32_data(&[7, 7, 7]);
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("g").unwrap();
+        session.root().create_group("g").unwrap();
+        session
+            .root()
+            .create_dataset("g/inner", |b| {
+                b.with_i32_data(&[9, 9]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["g/inner"]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    assert_eq!(targets.len(), 1);
+    match &targets[0] {
+        // The replacement, not the [7, 7, 7] the commit removed.
+        Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![9, 9]),
+        other => panic!("expected a dataset reference, got {other:?}"),
+    }
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The delete guard runs *after* the three "still writing" ones, so a
+/// replacement the apply loop has merely not reached yet is reported as the
+/// ordering problem it is rather than as a deletion. `a` and `b` are both at
+/// depth 1 and `a` sorts first, so `a/refs` resolves `b/inner` before `b` is
+/// placed — even though `b` is deleted and recreated in this same commit, the
+/// object being referenced is one the commit *writes*, and saying it is being
+/// deleted would send a reader looking for the wrong thing.
+///
+/// Both orderings refuse, so this pins a diagnostic rather than a correctness
+/// property. It is here because the ordering is a deliberate choice that
+/// nothing else in the suite would notice being undone.
+///
+/// The ordering is a better default, not a partition. A child of a replaced
+/// path that the replacement does *not* recreate is genuinely doomed and also
+/// reports "still writing", because `add_targets` claims the whole replaced
+/// subtree by prefix. That case is deliberately left untested: the message it
+/// gets is the wrong one, and a test asserting it would make the imprecision
+/// harder to fix rather than easier.
+#[test]
+fn a_reference_to_an_unplaced_replacement_reports_the_ordering_not_the_delete() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_unplaced_replacement.h5");
+    let mut b = FileBuilder::new();
+    let mut a = b.create_group("a");
+    a.create_dataset("seed").with_i32_data(&[0]);
+    b.add_group(a.finish());
+    let mut later = b.create_group("b");
+    later.create_dataset("inner").with_i32_data(&[7]);
+    b.add_group(later.finish());
+    b.write(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    session.root().delete("b").unwrap();
+    session.root().create_group("b").unwrap();
+    session
+        .root()
+        .create_dataset("b/inner", |b| {
+            b.with_i32_data(&[9]);
+        })
+        .unwrap();
+    session
+        .root()
+        .create_dataset("a/refs", |b| {
+            b.with_path_references(&["b/inner"]);
+        })
+        .unwrap();
+    let err = session.commit().unwrap_err();
+    assert!(err.to_string().contains("still writing"), "got: {err}");
+    drop(session);
     std::fs::remove_file(&path).ok();
 }
 

@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- An object reference to a child of a group the same commit deletes is refused rather than written pointing into the space that delete reclaims; the deleted path itself was already refused ([#314](https://github.com/stephenberry/hdf5-pure/issues/314)).
 - **Breaking:** Extensible-Array and Fixed-Array chunk indexes have their checksums validated, matching the reference C library, so a torn or bit-rotted index is refused rather than decoded as sound — on reading it and on reclaiming its space when the dataset is deleted. A file with an already-corrupt index that this crate used to read now reports `ChecksumMismatch` ([#312](https://github.com/stephenberry/hdf5-pure/issues/312)).
 - Appending in place to a dataset whose Extensible Array header names an element wider than the fields it holds is refused rather than panicking. Only a corrupt or crafted file reaches it; the whole-file read path already refused the same header ([#307](https://github.com/stephenberry/hdf5-pure/issues/307)).
 - An interrupted in-place append no longer leaves a dataset unreadable. A value and the checksum covering it are published in one write, where they were two that only became atomic when they shared a file-space page — so a dataset whose object header exceeded one page, such as a compound type with many members or a few string attributes, tore on every append ([#307](https://github.com/stephenberry/hdf5-pure/issues/307)).
