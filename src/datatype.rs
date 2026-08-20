@@ -1124,6 +1124,160 @@ impl Datatype {
     }
 }
 
+/// Whether `dt` reaches an **object address** anywhere in its structure — an
+/// object or dataset-region reference, directly or through a compound member,
+/// array entry, enumeration base, or the contents of a variable-length
+/// sequence.
+///
+/// The paired half of [`embedded_reference_slots`], which locates the ones it
+/// can address. This one recognises an object reference of any width and in any
+/// position; that one maps only the 8-byte form reachable through compound
+/// members and array entries. The gap between them is not an oversight but the
+/// point: a datatype this accepts and that cannot map is one whose addresses
+/// cannot be read, which callers must refuse rather than pass over. Their fall-
+/// through arm consults this function so the two cannot drift apart.
+///
+/// A variable-length datatype counts only when what it *holds* is an object
+/// reference. The heap itself is not at risk — a deletion frees object headers
+/// and dataset storage and never a global heap collection, so a variable-length
+/// string keeps pointing at data that is still there — but a `H5T_VLEN` of
+/// `H5T_STD_REF_OBJ`, which the reference library writes, keeps its addresses in
+/// the heap *contents*, where the element bytes hold only a heap id.
+pub(crate) fn datatype_holds_object_address(dt: &Datatype) -> bool {
+    match dt {
+        // Both reference kinds name an object. An object reference *is* the
+        // header address; a dataset-region reference is a global-heap id whose
+        // heap object holds the address and a selection, so the address is one
+        // indirection further out — out of reach of a screen that reads element
+        // bytes, which is what makes it unmappable rather than absent.
+        Datatype::Reference { .. } => true,
+        Datatype::Compound { members, .. } => members
+            .iter()
+            .any(|m| datatype_holds_object_address(&m.datatype)),
+        Datatype::Array { base_type, .. }
+        | Datatype::Enumeration { base_type, .. }
+        | Datatype::VariableLength { base_type, .. } => datatype_holds_object_address(base_type),
+        _ => false,
+    }
+}
+
+/// Every 8-byte object reference `datatype` reaches through a compound member or
+/// array entry, as byte offsets within one element, in declaration order.
+///
+/// Mirrors [`embedded_vlen_slots`](crate::vl_data::embedded_vlen_slots) for the
+/// other kind of address a rewrite invalidates. A datatype that *is* an object
+/// reference yields the single slot at offset 0, so callers handling that case
+/// separately should test for it first.
+///
+/// Returns `None` when the element bytes cannot be walked safely: the offsets
+/// found do not fit the datatype's declared element size, or the type reaches an
+/// object reference this walker cannot address (see
+/// [`datatype_holds_object_address`]). Both mean the same thing to a caller —
+/// the addresses are not readable from here — so neither is reported as an empty
+/// slot list, which would read as "this type holds none".
+pub(crate) fn embedded_reference_slots(datatype: &Datatype) -> Option<Vec<usize>> {
+    /// Returns `false` when the datatype cannot be walked on this target, for the
+    /// reasons [`embedded_vlen_slots`]' walker documents.
+    fn collect(datatype: &Datatype, base: usize, capacity: usize, out: &mut Vec<usize>) -> bool {
+        if out.len() > capacity {
+            return true;
+        }
+        match datatype {
+            Datatype::Reference {
+                ref_type: ReferenceType::Object,
+                size: 8,
+            } => {
+                out.push(base);
+                true
+            }
+            Datatype::Compound { members, .. } => {
+                for m in members {
+                    let Some(at) = usize::try_from(m.byte_offset)
+                        .ok()
+                        .and_then(|off| base.checked_add(off))
+                    else {
+                        return false;
+                    };
+                    if !collect(&m.datatype, at, capacity, out) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Datatype::Array {
+                base_type,
+                dimensions,
+            } => {
+                // As in `embedded_vlen_slots`: probe once so that entries which can
+                // never contribute do not drive a walk over huge declared
+                // dimensions, and so every iteration below pushes at least one slot.
+                // Walked once and translated per entry, for the reason
+                // `embedded_vlen_slots` documents: re-walking is exponential in
+                // nesting depth.
+                let mut probe = Vec::new();
+                if !collect(base_type, 0, capacity, &mut probe) {
+                    return false;
+                }
+                if probe.is_empty() {
+                    return true;
+                }
+                let count = dimensions
+                    .iter()
+                    .copied()
+                    .fold(1u64, |a, b| a.saturating_mul(u64::from(b)));
+                // As in `embedded_vlen_slots`: more entries than the element has
+                // room for cannot fit, so reject without walking them.
+                if count > capacity as u64 {
+                    return false;
+                }
+                let entries = usize::try_from(count).unwrap_or(usize::MAX);
+                let stride = base_type.type_size() as usize;
+                for i in 0..entries {
+                    let Some(at) = i.checked_mul(stride).and_then(|off| base.checked_add(off))
+                    else {
+                        return false;
+                    };
+                    for &slot in &probe {
+                        let Some(off) = at.checked_add(slot) else {
+                            return false;
+                        };
+                        out.push(off);
+                        if out.len() > capacity {
+                            return true;
+                        }
+                    }
+                }
+                true
+            }
+            // Anything this walker does not map. A type that nonetheless
+            // reaches an object reference — a width other than 8, an
+            // enumeration over one, a variable-length sequence *of* them — is
+            // one whose addresses cannot be located in the element bytes, so
+            // say so rather than report "no slots here" and let a caller read
+            // that as "nothing to check". Asking the predicate rather than
+            // restating its arms is what keeps the pair honest as either grows.
+            _ => !datatype_holds_object_address(datatype),
+        }
+    }
+
+    let element_size = datatype.type_size() as usize;
+    let capacity = element_size / 8;
+    let mut slots = Vec::new();
+    if !collect(datatype, 0, capacity, &mut slots) {
+        return None;
+    }
+    // `checked_add`: an offset near the top of the address space would otherwise
+    // wrap here and read as "fits".
+    if slots.len() > capacity
+        || slots
+            .iter()
+            .any(|&s| s.checked_add(8).is_none_or(|end| end > element_size))
+    {
+        return None;
+    }
+    Some(slots)
+}
+
 /// Build a datatype header (8 bytes) for testing.
 #[cfg(test)]
 fn build_dt_header(class: u8, version: u8, bf: [u8; 3], size: u32) -> Vec<u8> {

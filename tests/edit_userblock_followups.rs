@@ -378,3 +378,120 @@ fn userblock_cross_file_copy_into_userblock_dest() {
     std::fs::remove_file(&dst_path).ok();
     std::fs::remove_file(&src_path).ok();
 }
+
+// ---- reference screening (issue #317) ----
+
+/// An object reference this commit writes is screened against the space the
+/// same commit reclaims, and on a userblock file the two are in different
+/// coordinates: a stored reference is relative to the base address, while the
+/// reclaimed spans are absolute file offsets. A screen that compared them
+/// directly would miss every hazard on a `.mat`-shaped file and catch a
+/// harmless address 512 bytes further on.
+///
+/// `refs` names `grp/inner`, `grp` is what goes away, and the address reaches
+/// the commit as an address rather than as a path — the form that skips
+/// `resolve_reference_target` entirely (issue #317).
+#[test]
+fn userblock_reference_into_deleted_space_is_refused() {
+    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_ref_delete.h5");
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB as u64);
+    b.create_dataset("alpha").with_f64_data(&[1.0, 2.0]);
+    let mut g = b.create_group("grp");
+    g.create_dataset("inner").with_f64_data(&[7.5, 8.5]);
+    b.add_group(g.finish());
+    b.create_dataset("refs")
+        .with_path_references(&["grp/inner"]);
+    let mut bytes = b.finish().unwrap();
+    let userblock = stamp_userblock(&mut bytes);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let stored = {
+        let file = File::open(&path).unwrap();
+        let raw = file.dataset("refs").unwrap().read_raw().unwrap();
+        u64::from_le_bytes(raw[..8].try_into().unwrap())
+    };
+    // Base-relative: the object is past the 512-byte userblock, and the value
+    // stored for it is not.
+    assert!(
+        stored < UB as u64,
+        "expected a base-relative address, got {stored}"
+    );
+
+    let before = std::fs::read(&path).unwrap();
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("added", |b| {
+                b.with_reference_data(&[stored]);
+            })
+            .unwrap();
+        s.root().delete("grp").unwrap();
+        let err = s.commit().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds the address of an object this commit deletes"),
+            "got: {err}"
+        );
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_userblock_unchanged(&path, &userblock);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A path reference to an object the *same commit* places, on a userblock file.
+///
+/// The commit preflight replays the apply loop's placement order against
+/// placeholder addresses, and those placeholders go through the same
+/// `address - base` that converts a real address to its stored, base-relative
+/// form. A zero placeholder underflows that on any file with a userblock, so
+/// this edit — legal, and fine on a base-0 file — panicked in a debug build.
+#[test]
+fn userblock_reference_to_an_object_the_same_commit_places() {
+    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_ref_same_commit.h5");
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB as u64);
+    b.create_dataset("alpha").with_f64_data(&[1.0, 2.0]);
+    let mut bytes = b.finish().unwrap();
+    let userblock = stamp_userblock(&mut bytes);
+    std::fs::write(&path, &bytes).unwrap();
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().create_group("g").unwrap();
+        s.root()
+            .create_dataset("g/inner", |b| {
+                b.with_i32_data(&[7, 8, 9]);
+            })
+            .unwrap();
+        s.root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["g/inner"]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    // The stored value is base-relative, and it resolves to the object this
+    // same commit placed.
+    let raw = file.dataset("refs").unwrap().read_raw().unwrap();
+    let stored = u64::from_le_bytes(raw[..8].try_into().unwrap());
+    // Base-relative, so it is smaller than the absolute offset the object sits
+    // at. (It is under `UB` here only because this fixture is small; the
+    // dereference below is what proves the value is the right one.)
+    let absolute = stored + UB as u64;
+    assert!(
+        stored > 0 && absolute > UB as u64,
+        "base-relative: {stored}"
+    );
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    match &targets[0] {
+        hdf5_pure::Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![7, 8, 9]),
+        other => panic!("expected a dataset reference, got {other:?}"),
+    }
+    drop(file);
+    assert_userblock_unchanged(&path, &userblock);
+    std::fs::remove_file(&path).ok();
+}
