@@ -1801,8 +1801,12 @@ impl DatasetBuilder {
         self
     }
 
-    /// Write an object reference dataset. Each address is an 8-byte absolute
-    /// address pointing to an object header in the file.
+    /// Write an object reference dataset. Each address is an 8-byte object-header
+    /// address *relative to the file's base address*, which is the form HDF5
+    /// stores and the form a reference read back out of a file carries. The two
+    /// coincide on a file with no userblock; on one with a userblock — every
+    /// MATLAB v7.3 `.mat` — an absolute offset here would be wrong by the
+    /// userblock's size.
     ///
     /// The addresses are written as given — nothing here resolves them, and
     /// nothing checks that they name anything. Use

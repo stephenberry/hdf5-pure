@@ -257,13 +257,13 @@ const UNDEF: u64 = u64::MAX;
 /// The refusal both address-side reference screens report: an object reference
 /// this commit writes names an object the same commit removes.
 ///
-/// One constant because the two screens differ only in where the address came
-/// from — [`WriteEngine::resolve_reference_target`] takes it from a builder's
+/// One constant because the screens differ only in where the address came from
+/// — [`WriteEngine::resolve_reference_target`] takes it from a builder's
 /// [`ObjectRefTarget::Raw`], [`screen_resolved_references`] reads it out of a
-/// dataset's element bytes — and a caller must not be able to tell them apart
-/// by the message. It is the address-side twin of the by-name refusal
+/// dataset's or an attribute's element bytes — and a caller must not be able to
+/// tell them apart by the message. It is the address-side twin of the by-name refusal
 /// `resolve_reference_target` reports for a path, and shares its second clause.
-const REFERENCE_INTO_RECLAIMED_SPACE: &str = "an object-reference dataset holds the address of an object this commit deletes, or of \
+const REFERENCE_INTO_RECLAIMED_SPACE: &str = "a reference this commit writes holds the address of an object this commit deletes, or of \
      one under it; the reference would be left pointing at storage the delete can reclaim";
 
 /// Maximum number of compact attributes; beyond this HDF5 switches a dataset to
@@ -3901,7 +3901,14 @@ impl WriteEngine {
                 }
             }
         }
-        let reclaimed = ReclaimedSpace::new(&deleted_free, self.superblock.base_address);
+        // The page types the walk records are for the allocator, not for this.
+        let reclaimed = ReclaimedSpace {
+            spans: deleted_free
+                .iter()
+                .map(|&(off, len, _)| (off, len))
+                .collect(),
+            base: self.superblock.base_address,
+        };
 
         // An in-file copy re-emits its source's element bytes verbatim, so a
         // copied object reference keeps naming whatever it named in the source —
@@ -3922,15 +3929,17 @@ impl WriteEngine {
             }
         }
 
-        // A value overwrite never reaches `preflight_reference_targets` — it
-        // replaces an existing dataset's bytes rather than placing a new object —
-        // so its elements are screened here. Resolved addresses are the only
-        // references an overwrite can carry: `refuse_unsupported_overwrite`
-        // refuses one whose builder staged unresolved `reference_targets`
-        // (issue #318). Cross-file copies need no screen for the opposite
-        // reason — `reject_foreign_addresses` refuses a reference datatype
-        // outright on that path.
-        for (_, fd) in &staged.writes {
+        // References a builder already resolved to addresses never reach
+        // `resolve_reference_target`, so they are screened out of the element
+        // bytes instead — additions and value overwrites alike, since neither
+        // form's bytes are touched again before they are written. A slot still
+        // holding a placeholder screens as the zero it is, and is screened for
+        // real by `resolve_reference_target` when it resolves.
+        //
+        // Cross-file copies need no screen for the opposite reason:
+        // `reject_foreign_addresses` refuses a reference datatype outright on
+        // that path.
+        for (_, fd) in staged.datasets.iter().chain(&staged.writes) {
             screen_resolved_references(&fd.dt, &fd.raw, &reclaimed)?;
         }
 
@@ -3982,11 +3991,10 @@ impl WriteEngine {
         // best-effort — `collect_free_spans` simply omits anything it cannot
         // account for exhaustively, so the worst case is unreclaimed dead bytes,
         // never a freed-but-live region.
-        let mut to_free: Vec<(u64, u64, PageType)> = Vec::new();
+        // It starts as the deleted objects' blocks, enumerated above the preflight
+        // because a refusal there screens against them.
+        let mut to_free: Vec<(u64, u64, PageType)> = deleted_free;
 
-        // The deleted objects' blocks, enumerated before the preflight because a
-        // refusal there depends on them (`deleted_free`).
-        to_free.extend_from_slice(&deleted_free);
         // A superseded group header is dead once the root is repointed. Its chunk
         // spans are enumerated base-aware (`oh_chunk_spans` shifts continuation
         // addresses by the userblock base and returns absolute file offsets), as is
@@ -7042,12 +7050,6 @@ impl WriteEngine {
                             )?;
                         }
                     }
-                    // References a builder already resolved to addresses never
-                    // reach `resolve_reference_target`, so they are screened out
-                    // of the element bytes instead. This is the only pass over
-                    // them: the apply loop patches unresolved slots and re-reads
-                    // none of what it did not write.
-                    screen_resolved_references(&fd.dt, &fd.raw, reclaimed)?;
                     let mut full = key.clone();
                     full.push(fd.name.clone());
                     sim_addr.insert(full, 0);
@@ -7667,15 +7669,6 @@ struct ReclaimedSpace {
 }
 
 impl ReclaimedSpace {
-    /// Build the screen from one delete walk's output. The page types the walk
-    /// records are for the allocator, not for this.
-    fn new(freed: &[(u64, u64, PageType)], base: u64) -> Self {
-        Self {
-            spans: freed.iter().map(|&(off, len, _)| (off, len)).collect(),
-            base,
-        }
-    }
-
     /// Whether this commit reclaims anything at all. A commit that deletes
     /// nothing — or whose deletes reclaim nothing, because the objects keep a
     /// surviving hard link — screens no reference, so every caller can skip its
@@ -9730,19 +9723,21 @@ fn screen_resolved_references(
     if reclaimed.is_empty() || !datatype_holds_object_reference(dt) {
         return Ok(());
     }
-    // A datatype that declares a reference but whose slots do not fit its own
-    // element size cannot be walked, so its addresses cannot be screened. That
-    // is a datatype this crate would not itself build; refuse rather than write
-    // references past a screen that could not read them.
-    let Some(slots) = embedded_reference_slots(dt) else {
+    // The datatype declares an object reference, so the walker must find one.
+    // Two ways it does not: slots that do not fit the element size (`None`), and
+    // a reference `embedded_reference_slots` does not map — it locates the
+    // 8-byte object reference only, and reports any other width as no slots at
+    // all. Both mean the addresses cannot be read, and an empty list taken for
+    // "nothing to check" would wave through exactly the datatype
+    // `datatype_holds_object_reference` had just recognised. Neither shape is
+    // one this crate builds; refuse rather than write references past a screen
+    // that could not see them.
+    let Some(slots) = embedded_reference_slots(dt).filter(|slots| !slots.is_empty()) else {
         return Err(Error::EditUnsupported(
-            "a staged dataset's object-reference slots do not fit its datatype, so they \
-             cannot be screened against this commit's deletions",
+            "an object reference this commit writes could not be located in its datatype, so \
+             it cannot be screened against this commit's deletions",
         ));
     };
-    if slots.is_empty() {
-        return Ok(());
-    }
     // Non-empty slots mean the datatype has room for at least one 8-byte
     // address, so the element size is at least 8 and `chunks_exact` is safe.
     let element_size = dt.type_size() as usize;
@@ -9907,6 +9902,11 @@ fn screen_copied_references(
             }
             _ => {}
         },
+        // No Datatype message means no declared reference, here and in the
+        // chunked arm below: such a header is not a dataset any reader can
+        // interpret, so there is nothing in it to dangle. That is why only the
+        // compact arm above refuses on a missing piece — there the datatype is
+        // present and says a reference is in bytes it could not reach.
         CopyTree::DatasetContiguous { data, .. } => {
             if let Some(dt) = &element_dt {
                 screen_resolved_references(dt, data, reclaimed)?;
@@ -10138,12 +10138,51 @@ mod tests {
         };
         let err = screen_resolved_references(&dt, &raw, &reclaimed).unwrap_err();
         assert!(
-            err.to_string().contains("do not fit its datatype"),
+            err.to_string().contains("could not be located"),
             "got: {err}"
         );
 
         // A commit that reclaims nothing has nothing to screen it against, so
         // the datatype alone is not a refusal.
+        let nothing = ReclaimedSpace {
+            spans: Vec::new(),
+            base: 0,
+        };
+        assert!(screen_resolved_references(&dt, &raw, &nothing).is_ok());
+    }
+
+    /// An object reference wider than the 8 bytes the slot walker maps is
+    /// refused, not skipped (issue #317).
+    ///
+    /// [`datatype_holds_object_reference`] answers for an object reference of
+    /// *any* width, while [`embedded_reference_slots`] locates only the 8-byte
+    /// one and reports every other as "no slots here". A screen that read an
+    /// empty slot list as "nothing to check" would wave through exactly the
+    /// datatype it had just recognised — and `Dataset::dereference` reads such
+    /// an element, taking the address from its first eight bytes, so the
+    /// reference is live.
+    #[test]
+    fn an_object_reference_wider_than_eight_bytes_is_refused() {
+        use crate::datatype::ReferenceType;
+        let dt = Datatype::Reference {
+            size: 16,
+            ref_type: ReferenceType::Object,
+        };
+        assert!(
+            embedded_reference_slots(&dt).is_some_and(|s| s.is_empty()),
+            "the fixture must be one the walker maps no slot for"
+        );
+
+        let mut raw = vec![0u8; 16];
+        raw[..8].copy_from_slice(&300u64.to_le_bytes());
+        let reclaimed = ReclaimedSpace {
+            spans: vec![(248, 71)],
+            base: 0,
+        };
+        let err = screen_resolved_references(&dt, &raw, &reclaimed).unwrap_err();
+        assert!(err.to_string().contains("cannot be screened"), "got: {err}");
+
+        // Still nothing to screen against when the commit reclaims nothing.
         let nothing = ReclaimedSpace {
             spans: Vec::new(),
             base: 0,
