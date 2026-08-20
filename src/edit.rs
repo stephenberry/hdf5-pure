@@ -3883,6 +3883,14 @@ impl WriteEngine {
         // the link graph cannot be walked in full, no deleted object is
         // reclaimed (a safe leak) — and none is screened either, which is sound
         // in the same direction: nothing is freed, so no reference dangles.
+        // Superseded group headers — always dead once the root is repointed —
+        // are reclaimed regardless, and are gathered below rather than here.
+        // They are deliberately outside this screen: a rewritten group is the
+        // same object at the same path, so a reference *named as a path*
+        // resolves to its new address, while every reference already stored in
+        // the file still holds the old one. That second half is a defect of its
+        // own and a wider one, since it breaks references this commit never
+        // touched, and refusing more here would not fix it.
         let mut deleted_free: Vec<(u64, u64, PageType)> = Vec::new();
         deleted_addrs.sort_unstable();
         deleted_addrs.dedup();
@@ -6936,9 +6944,15 @@ impl WriteEngine {
     ) -> Result<u64, Error> {
         let path = match target {
             // An address carries no name to test, so the delete check the path
-            // arm reaches by prefix is made here on the address itself: whoever
-            // staged this resolved it against the pre-commit file, and this
-            // commit may be about to take that object away (issue #317).
+            // arm makes by prefix is made here on the address itself.
+            //
+            // It fires on nothing today: every `Raw` this crate stages is a
+            // sentinel, because `repack`'s faithful re-emit resolves a real
+            // target to a `Path` and leaves only the null and undefined
+            // references raw. It is here because the variant carries an
+            // arbitrary address, and a producer that staged a real one would
+            // otherwise write it past the screen its `Path` twin gets — which
+            // is the shape of this bug in the first place (issue #317).
             ObjectRefTarget::Raw(addr) => {
                 if reclaimed.covers(*addr) {
                     return Err(Error::EditUnsupported(REFERENCE_INTO_RECLAIMED_SPACE));
@@ -9703,10 +9717,11 @@ fn datatype_holds_object_reference(dt: &Datatype) -> bool {
 /// existed it was written straight through to disk.
 ///
 /// Element bytes still carrying placeholders are unaffected: an unresolved slot
-/// holds zero, which [`ReclaimedSpace::covers`] never screens, and the address
-/// that replaces it is screened by `resolve_reference_target` when it resolves.
-/// So this runs over every staged dataset's `raw` without asking which builder
-/// filled it — the rule is about the bytes, not the door they came through.
+/// holds zero, which [`ReclaimedSpace::covers`] never screens, and the target
+/// that replaces it is screened by `resolve_reference_target` instead — by name
+/// for a path, by address for a raw one. So this runs over every staged
+/// dataset's `raw` without asking which builder filled it: the rule is about the
+/// bytes, not the door they came through.
 fn screen_resolved_references(
     dt: &Datatype,
     raw: &[u8],
@@ -10140,12 +10155,13 @@ mod tests {
     /// supplied as a path (issue #317), and the address it would have resolved
     /// to is returned unchanged when it names space this commit keeps.
     ///
-    /// Driven directly because no session API stages one: `ObjectRefTarget::Raw`
-    /// is what [`crate::repack`]'s faithful re-emit builds, through
-    /// `with_embedded_object_references`, and a builder reachable from a session
-    /// produces only [`ObjectRefTarget::Path`]. The arm is here so the two ways
-    /// a target can name an object answer to the same rule rather than to
-    /// whichever one a caller happened to use.
+    /// Driven directly because nothing stages a `Raw` target carrying a real
+    /// address: a builder reachable from a session produces only
+    /// [`ObjectRefTarget::Path`], and [`crate::repack`]'s faithful re-emit
+    /// resolves every real target to a `Path`, leaving `Raw` for the null and
+    /// undefined references alone. The arm exists so that the two ways a target
+    /// can name an object answer to the same rule rather than to whichever one
+    /// a caller happened to use, and this is what holds it to that.
     #[test]
     fn a_raw_reference_target_is_screened_like_a_path_one() {
         use tempfile::tempdir;
