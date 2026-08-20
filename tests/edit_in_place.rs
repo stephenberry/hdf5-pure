@@ -3506,20 +3506,20 @@ fn add_reference_dataset_targeting_same_commit_delete_is_rejected_without_writin
 #[test]
 fn add_reference_dataset_targeting_a_child_of_a_same_commit_delete_is_rejected() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_deleted_child.h5");
+    let mut b = FileBuilder::new();
+    let mut doomed = b.create_group("doomed");
+    doomed.create_dataset("inner").with_i32_data(&[7, 7, 7]);
+    let mut sub = doomed.create_group("sub");
+    sub.create_dataset("deep").with_i32_data(&[8]);
+    doomed.add_group(sub.finish());
+    b.add_group(doomed.finish());
+    b.write(&path).unwrap();
+    // One fixture for both depths: each refusal is asserted to leave the file
+    // byte-identical, so the second pass runs against a file that has already
+    // survived a failed commit.
+    let before = std::fs::read(&path).unwrap();
 
     for target in ["doomed/inner", "doomed/sub/deep"] {
-        let mut b = FileBuilder::new();
-        b.create_dataset("original")
-            .with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
-        let mut doomed = b.create_group("doomed");
-        doomed.create_dataset("inner").with_i32_data(&[7, 7, 7]);
-        let mut sub = doomed.create_group("sub");
-        sub.create_dataset("deep").with_i32_data(&[8]);
-        doomed.add_group(sub.finish());
-        b.add_group(doomed.finish());
-        b.write(&path).unwrap();
-        let before = std::fs::read(&path).unwrap();
-
         {
             let session = File::open_rw(&path).unwrap();
             session.root().delete("doomed").unwrap();
@@ -3553,8 +3553,6 @@ fn add_reference_dataset_targeting_a_child_of_a_same_commit_delete_is_rejected()
 fn a_delete_elsewhere_does_not_block_an_unrelated_reference() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_delete_elsewhere.h5");
     let mut b = FileBuilder::new();
-    b.create_dataset("original")
-        .with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
     let mut doomed = b.create_group("doomed");
     doomed.create_dataset("inner").with_i32_data(&[7]);
     b.add_group(doomed.finish());
@@ -3586,12 +3584,17 @@ fn a_delete_elsewhere_does_not_block_an_unrelated_reference() {
     std::fs::remove_file(&path).ok();
 }
 
-/// The other floor, and the interaction with issue #305: when the commit puts
-/// the deleted path *back*, a reference to the replacement's child resolves to
-/// the **new** object rather than being caught by the delete guard. The
-/// deepest-first apply order places `g/inner` before the root group that
-/// references it, so step 1 (`path_addr`) answers and the guard is never
+/// The interaction with issue #305: when the commit puts the deleted path
+/// *back*, a reference to the replacement's child resolves to the **new**
+/// object. The deepest-first apply order places `g/inner` before the root
+/// group that references it, so step 1 (`path_addr`) answers and no guard is
 /// consulted.
+///
+/// That is also this test's limitation, and it is worth stating rather than
+/// discovering: because the guard is never reached, no mutation of the delete
+/// test makes this fail. It backs the documented positive claim and asserts
+/// the resolved *value* — the replacement, not the object removed — which no
+/// other test here does. It is not evidence that the guard is correct.
 #[test]
 fn a_reference_to_a_replaced_paths_new_child_resolves_to_the_replacement() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_replaced_child.h5");
@@ -3643,6 +3646,13 @@ fn a_reference_to_a_replaced_paths_new_child_resolves_to_the_replacement() {
 /// Both orderings refuse, so this pins a diagnostic rather than a correctness
 /// property. It is here because the ordering is a deliberate choice that
 /// nothing else in the suite would notice being undone.
+///
+/// The ordering is a better default, not a partition. A child of a replaced
+/// path that the replacement does *not* recreate is genuinely doomed and also
+/// reports "still writing", because `add_targets` claims the whole replaced
+/// subtree by prefix. That case is deliberately left untested: the message it
+/// gets is the wrong one, and a test asserting it would make the imprecision
+/// harder to fix rather than easier.
 #[test]
 fn a_reference_to_an_unplaced_replacement_reports_the_ordering_not_the_delete() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_unplaced_replacement.h5");
