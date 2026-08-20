@@ -10016,14 +10016,124 @@ mod tests {
         attr
     }
 
-    /// Wrap one attribute in the object-header message record a header region
-    /// holds it in: type, body size, flags, body.
+    /// Wrap a message body in the object-header record a header region holds it
+    /// in: type, body size, flags, body.
+    fn message_record(msg_type: MessageType, body: &[u8]) -> Vec<u8> {
+        let mut record = vec![msg_type.to_u16() as u8, 0, 0, 0];
+        record[1..3].copy_from_slice(&(body.len() as u16).to_le_bytes());
+        record.extend_from_slice(body);
+        record
+    }
+
+    /// A header region holding one attribute inline.
     fn inline_attr_region(attr: &crate::attribute::AttributeMessage) -> Vec<u8> {
-        let body = attr.serialize_v3(LENGTH_SIZE);
-        let mut region = vec![0x0C, 0, 0, 0];
-        region[1..3].copy_from_slice(&(body.len() as u16).to_le_bytes());
-        region.extend_from_slice(&body);
+        message_record(MessageType::Attribute, &attr.serialize_v3(LENGTH_SIZE))
+    }
+
+    /// The header region of a one-element *compact* object-reference dataset:
+    /// its datatype, and a version 3 compact data-layout message carrying the
+    /// element inline (version, class 0, a 2-byte inline size, then the data).
+    fn compact_reference_region(address: u64) -> Vec<u8> {
+        let mut region = message_record(
+            MessageType::Datatype,
+            &crate::type_builders::make_object_reference_type().serialize(),
+        );
+        let mut layout = vec![3u8, 0];
+        layout.extend_from_slice(&8u16.to_le_bytes());
+        layout.extend_from_slice(&address.to_le_bytes());
+        region.extend_from_slice(&message_record(MessageType::DataLayout, &layout));
         region
+    }
+
+    /// A *compact* dataset keeps its elements inside the data-layout message
+    /// rather than in a data block, so the copy screen reads them straight out
+    /// of the header region (issue #317).
+    ///
+    /// Driven from a hand-built region because no writer in this crate emits a
+    /// compact layout — the files that carry one come from the reference C
+    /// library, which is also why the userblock suite notes that its
+    /// compact-layout fixtures have to come from there.
+    #[test]
+    fn a_copied_compact_reference_dataset_is_screened() {
+        let empty = BytesSource::new(Vec::new());
+        let reclaimed = ReclaimedSpace {
+            spans: vec![(248, 71)],
+            base: 0,
+        };
+        for (address, refused) in [(248u64, true), (318, true), (319, false)] {
+            let tree = CopyTree::DatasetVerbatim {
+                region: compact_reference_region(address),
+                dense_attrs: Vec::new(),
+            };
+            let got = screen_copied_references(&tree, &reclaimed, &empty);
+            assert_eq!(got.is_err(), refused, "compact element {address}: {got:?}");
+        }
+
+        // A region whose layout message yields no inline data leaves a reference
+        // datatype unscreened, so it is refused rather than waved through.
+        // `read_object` builds this variant only from a compact layout, so this
+        // is a header that did not parse as one — malformed input, not a shape
+        // the copy path produces.
+        let no_layout = CopyTree::DatasetVerbatim {
+            region: message_record(
+                MessageType::Datatype,
+                &crate::type_builders::make_object_reference_type().serialize(),
+            ),
+            dense_attrs: Vec::new(),
+        };
+        let err = screen_copied_references(&no_layout, &reclaimed, &empty).unwrap_err();
+        assert!(
+            err.to_string().contains("could not be read to screen"),
+            "got: {err}"
+        );
+    }
+
+    /// A datatype that declares an object reference the element bytes have no
+    /// room for cannot be walked, so its addresses cannot be screened — and a
+    /// commit that reclaims space refuses it rather than writing references past
+    /// a screen that could not read them (issue #317).
+    ///
+    /// Reachable only from a malformed source header: every datatype this crate
+    /// builds sizes its element to its members. Driven directly for that reason.
+    #[test]
+    fn a_datatype_whose_reference_slots_do_not_fit_is_refused() {
+        use crate::datatype::{CompoundMember, ReferenceType};
+        // An 8-byte compound declaring an 8-byte reference at offset 4: the slot
+        // runs four bytes past the element.
+        let dt = Datatype::Compound {
+            size: 8,
+            members: vec![CompoundMember {
+                name: "r".to_string(),
+                byte_offset: 4,
+                datatype: Datatype::Reference {
+                    size: 8,
+                    ref_type: ReferenceType::Object,
+                },
+            }],
+        };
+        assert!(
+            embedded_reference_slots(&dt).is_none(),
+            "the fixture must be one the walker cannot map"
+        );
+
+        let raw = [0u8; 8];
+        let reclaimed = ReclaimedSpace {
+            spans: vec![(248, 71)],
+            base: 0,
+        };
+        let err = screen_resolved_references(&dt, &raw, &reclaimed).unwrap_err();
+        assert!(
+            err.to_string().contains("do not fit its datatype"),
+            "got: {err}"
+        );
+
+        // A commit that reclaims nothing has nothing to screen it against, so
+        // the datatype alone is not a refusal.
+        let nothing = ReclaimedSpace {
+            spans: Vec::new(),
+            base: 0,
+        };
+        assert!(screen_resolved_references(&dt, &raw, &nothing).is_ok());
     }
 
     /// A reference target supplied as a *raw address* is screened exactly as one

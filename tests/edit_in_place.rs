@@ -4008,18 +4008,16 @@ fn a_copy_of_a_reference_dataset_is_allowed_beside_an_unrelated_delete() {
     std::fs::remove_file(&path).ok();
 }
 
-/// A copy of a *chunked* object-reference dataset is refused beside a delete
-/// even though the address it holds is fine, because this path cannot tell:
-/// the copy carries `chunk_bytes` exactly as the source stored them, filters
-/// and all, and never decodes them (issue #317).
+/// Build a file with a *chunked* object-reference dataset `crefs` holding two
+/// references to `keep/survivor`, alongside the `probe` path-reference dataset
+/// the address is read back from and a deletable group `g`. Returns the address
+/// `keep/survivor` sits at.
 ///
-/// The address below is deliberately one no delete touches, so the refusal can
-/// only be coming from the datatype. It is the one place the screen is
-/// conservative, and it is the same limit that makes `repack` refuse a chunked
-/// object-reference dataset outright.
-#[test]
-fn a_chunked_reference_copy_beside_a_delete_is_refused() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_chunked.h5");
+/// Two passes because the address is only known once the layout is final: the
+/// second writes the same objects in the same order and changes eight data
+/// bytes per element, so it must not move anything, and the caller asserts that
+/// it did not.
+fn write_chunked_reference_file(path: &std::path::Path, stored: u64) -> u64 {
     let mut b = FileBuilder::new();
     let mut g = b.create_group("g");
     g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
@@ -4029,26 +4027,34 @@ fn a_chunked_reference_copy_beside_a_delete_is_refused() {
     b.add_group(keep.finish());
     b.create_dataset("probe")
         .with_path_references(&["keep/survivor"]);
-    b.write(&path).unwrap();
-
-    let survivor = {
-        let file = File::open(&path).unwrap();
-        let raw = file.dataset("probe").unwrap().read_raw().unwrap();
-        u64::from_le_bytes(raw[..8].try_into().unwrap())
-    };
-
-    // Rebuild with a chunked reference dataset naming the *surviving* object.
-    let mut b = FileBuilder::new();
-    let mut g = b.create_group("g");
-    g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
-    b.add_group(g.finish());
-    let mut keep = b.create_group("keep");
-    keep.create_dataset("survivor").with_i32_data(&[4, 5, 6]);
-    b.add_group(keep.finish());
     b.create_dataset("crefs")
-        .with_reference_data(&[survivor, survivor])
+        .with_reference_data(&[stored, stored])
         .with_chunks(&[1]);
-    b.write(&path).unwrap();
+    b.write(path).unwrap();
+
+    let file = File::open(path).unwrap();
+    let raw = file.dataset("probe").unwrap().read_raw().unwrap();
+    u64::from_le_bytes(raw[..8].try_into().unwrap())
+}
+
+/// A copy of a *chunked* object-reference dataset is refused beside a delete
+/// even though the address it holds is fine, because this path cannot tell:
+/// the copy carries `chunk_bytes` exactly as the source stored them, filters
+/// and all, and never decodes them (issue #317).
+///
+/// `crefs` names `keep/survivor` and the delete takes `g`, so the refusal can
+/// only be coming from the datatype. This is the one place the screen is
+/// conservative, and it is the same limit that makes `repack` refuse a chunked
+/// object-reference dataset outright.
+#[test]
+fn a_chunked_reference_copy_beside_a_delete_is_refused() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_chunked.h5");
+    let survivor = write_chunked_reference_file(&path, 0);
+    assert_eq!(
+        write_chunked_reference_file(&path, survivor),
+        survivor,
+        "the second pass must not move keep/survivor"
+    );
     let before = std::fs::read(&path).unwrap();
 
     {
@@ -4063,6 +4069,37 @@ fn a_chunked_reference_copy_beside_a_delete_is_refused() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The chunked refusal above is gated on the commit reclaiming something: with
+/// nothing deleted, a chunked object-reference dataset copies like any other
+/// and both copies still dereference (issue #317).
+///
+/// Without that gate the screen would take a capability away from every commit
+/// rather than from the ones where an address could have gone stale.
+#[test]
+fn a_chunked_reference_copy_without_a_delete_still_works() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_chunked_ok.h5");
+    let survivor = write_chunked_reference_file(&path, 0);
+    assert_eq!(write_chunked_reference_file(&path, survivor), survivor);
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("crefs", "dup").unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    for name in ["crefs", "dup"] {
+        let targets = file.dataset(name).unwrap().dereference().unwrap();
+        assert_eq!(targets.len(), 2, "{name}");
+        match &targets[0] {
+            Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![4, 5, 6], "{name}"),
+            other => panic!("{name}: expected a dataset reference, got {other:?}"),
+        }
+    }
+    drop(file);
     std::fs::remove_file(&path).ok();
 }
 
