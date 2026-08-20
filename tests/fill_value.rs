@@ -250,12 +250,13 @@ fn edit_session_fill_size_mismatch_is_refused() {
         fb.write(&p).unwrap();
     }
     let s = File::open_rw(&p).unwrap();
-    s.root()
+    // 2-byte fill on a 4-byte element
+    let err = s
+        .root()
         .create_dataset("added", |b| {
             b.with_i32_data(&[1, 2, 3]).with_fill_value(1_u16);
         })
-        .unwrap(); // 2-byte fill on a 4-byte element
-    let err = s.commit().unwrap_err();
+        .unwrap_err();
     assert!(
         matches!(
             err,

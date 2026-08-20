@@ -2037,8 +2037,7 @@ fn malformed_chunked_requests_are_rejected_without_writing() {
         let before = std::fs::read(&path).unwrap();
         {
             let session = File::open_rw(&path).unwrap();
-            session.root().create_dataset("bad", configure).unwrap();
-            let err = session.commit().unwrap_err();
+            let err = session.root().create_dataset("bad", configure).unwrap_err();
             let text = err.to_string();
             assert!(
                 text.contains("in-place edit"),
@@ -2048,8 +2047,9 @@ fn malformed_chunked_requests_are_rejected_without_writing() {
                 text.contains(expected),
                 "[{label}] refusal must name {expected:?}, got: {err}"
             );
+            session.commit().unwrap();
         }
-        // The guard runs before any write, so the file is untouched.
+        // The guard runs as the dataset is staged, so the file is untouched.
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
@@ -2809,14 +2809,14 @@ fn add_empty_dataset_with_mismatched_data_is_rejected_without_writing() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session
+        let err = session
             .root()
             .create_dataset("bogus", |b| {
                 b.with_f64_data(&[9.0, 9.0, 9.0]).with_shape(&[0, 3]);
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(err.to_string().contains("shape"), "got: {err}");
+        session.commit().unwrap();
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -2969,7 +2969,7 @@ fn add_provenance_dataset_over_attr_budget_is_rejected_without_writing() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session
+        let err = session
             .root()
             .create_dataset("sensor_over_budget", |ds| {
                 ds.with_f64_data(&[1.0, 2.0]);
@@ -2979,9 +2979,9 @@ fn add_provenance_dataset_over_attr_budget_is_rejected_without_writing() {
                 }
                 ds.with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(err.to_string().contains("dense"), "got: {err}");
+        session.commit().unwrap();
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -3087,15 +3087,15 @@ fn add_dataset_with_oversized_variable_length_attribute_is_rejected_without_writ
         // reference; 5000 of them (80000 bytes) comfortably overflows the
         // object header's 2-byte (`u16::MAX` = 65535) message-size field.
         let strings: Vec<String> = (0..5000).map(|i| i.to_string()).collect();
-        session
+        let err = session
             .root()
             .create_dataset("oversized", |b| {
                 b.with_i32_data(&[1])
                     .set_attr("tags", AttrValue::VarLenAsciiArray(strings));
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(err.to_string().contains("too large"), "got: {err}");
+        session.commit().unwrap();
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -3146,17 +3146,17 @@ fn add_chunked_vlen_string_dataset_is_rejected_without_writing() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session
+        let err = session
             .root()
             .create_dataset("labels", |b| {
                 b.with_vlen_strings(&["a", "b", "c"]).with_chunks(&[2]);
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(
             err.to_string().contains("variable-length-string"),
             "got: {err}"
         );
+        session.commit().unwrap();
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -3325,14 +3325,14 @@ fn add_chunked_reference_dataset_is_rejected_without_writing() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session
+        let err = session
             .root()
             .create_dataset("refs", |b| {
                 b.with_path_references(&["original"]).with_chunks(&[1]);
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(err.to_string().contains("object-reference"), "got: {err}");
+        session.commit().unwrap();
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -3772,18 +3772,18 @@ fn add_extensible_vlen_string_dataset_is_rejected_without_writing() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session
+        let err = session
             .root()
             .create_dataset("labels", |b| {
                 b.with_vlen_strings(&["a", "b", "c"])
                     .with_maxshape(&[u64::MAX]);
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(
             err.to_string().contains("variable-length-string"),
             "got: {err}"
         );
+        session.commit().unwrap();
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -3870,7 +3870,7 @@ fn a_zero_width_element_type_is_refused_by_a_staged_write() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session
+        let err = session
             .root()
             .create_dataset("zero_width", |b| {
                 // Empty element bytes on purpose: four elements of zero width
@@ -3889,14 +3889,15 @@ fn a_zero_width_element_type_is_refused_by_a_staged_write() {
                 )
                 .with_chunks(&[2]);
             })
-            .unwrap();
-        match session.commit() {
-            Err(Error::Format(FormatError::ZeroSizedDatatype { class: 3 })) => {}
+            .unwrap_err();
+        match err {
+            Error::Format(FormatError::ZeroSizedDatatype { class: 3 }) => {}
             other => panic!("expected ZeroSizedDatatype for class 3, got {other:?}"),
         }
+        session.commit().unwrap();
     }
 
-    // A refused commit leaves the file exactly as it was.
+    // A refused addition leaves the file exactly as it was.
     assert_eq!(std::fs::read(&path).unwrap(), before);
     let file = File::open(&path).unwrap();
     assert_eq!(
@@ -4549,4 +4550,414 @@ fn a_copy_reading_from_a_replaced_path_is_refused() {
     assert!(file.dataset("slot").is_err());
     drop(file);
     std::fs::remove_file(&path).ok();
+}
+
+/// A commit refused partway through its preflight must leave the staged set
+/// exactly as it found it (issue #316).
+///
+/// Three of the four edits staged here are ones the commit never objects to;
+/// the deletion/addition pair is the one it refuses. The refusal fires in the
+/// delete-staging loop, which runs after the other pending vectors have been
+/// drained, so before the fix `commit()` returned `Err` having destroyed three
+/// valid edits and left `has_staged_edits()` answering `false`.
+#[test]
+fn a_refused_commit_leaves_its_other_staged_edits_alone() {
+    let path = std::env::temp_dir().join("hdf5_pure_refused_keeps_staged.h5");
+    {
+        let mut b = FileBuilder::new();
+        let mut g = b.create_group("g");
+        g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+        b.add_group(g.finish());
+        b.write(&path).unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    session
+        .root()
+        .create_dataset("added_a", |b| {
+            b.with_i32_data(&[10]);
+        })
+        .unwrap();
+    session.root().create_group("newgrp").unwrap();
+    session
+        .root()
+        .set_attr("label", AttrValue::String("v1".into()))
+        .unwrap();
+    // The refused pair: a deletion that overlaps an addition under it.
+    session.root().delete("g").unwrap();
+    session
+        .root()
+        .create_dataset("g/x", |b| {
+            b.with_i32_data(&[1]);
+        })
+        .unwrap();
+
+    let err = session.commit().unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("deletion overlaps an addition")),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        session.has_staged_edits(),
+        "the refusal discarded the staged set"
+    );
+
+    // The batch is still whole, so committing it again refuses identically
+    // rather than applying the three edits the refusal was not about.
+    let again = session.commit().unwrap_err();
+    assert_eq!(format!("{err:?}"), format!("{again:?}"));
+
+    drop(session);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a refused commit wrote to the file"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A commit refused in its *first* preflight loop must not leave the rest of
+/// the batch staged for a later `commit()` to apply on its own (issue #316).
+///
+/// The overwrite below is refused by the write preflight, which runs before
+/// anything else. Before the fix only `pending_writes` had been drained, so the
+/// caller was told the commit failed atomically and a later `commit()` — for
+/// unrelated work, perhaps much later — silently applied the surviving half of
+/// the batch it had been told was rejected.
+#[test]
+fn a_refused_commit_does_not_apply_its_survivors_later() {
+    let path = std::env::temp_dir().join("hdf5_pure_refused_no_partial_apply.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+        b.write(&path).unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    session
+        .root()
+        .create_dataset("added_a", |b| {
+            b.with_i32_data(&[10]);
+        })
+        .unwrap();
+    // Refused at commit: a value overwrite is not a reshape.
+    session
+        .dataset("keep")
+        .unwrap()
+        .write_staged(|b| {
+            b.with_i32_data(&[1, 2, 3, 4, 5]);
+        })
+        .unwrap();
+
+    let err = session.commit().unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("shape does not match")),
+        "unexpected error: {err:?}"
+    );
+    let again = session.commit().unwrap_err();
+    assert_eq!(
+        format!("{err:?}"),
+        format!("{again:?}"),
+        "the second commit applied the refused batch's survivors"
+    );
+
+    drop(session);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a refused commit wrote to the file"
+    );
+    let file = File::open(&path).unwrap();
+    assert!(
+        file.dataset("added_a").is_err(),
+        "an edit from a refused batch reached the file"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// The restore a refused commit performs covers *every* kind of staged edit,
+/// not the ones that happen to be drained late (issue #316).
+///
+/// Each case below stages exactly one edit of one kind, plus the deletion it
+/// conflicts with, so the commit's refusal depends on that edit still being
+/// there. A second `commit()` therefore discriminates: with the staged set put
+/// back whole it refuses identically, and with that one kind dropped it would
+/// see a lone deletion and *succeed*, taking `g` with it.
+#[test]
+fn a_refused_commit_restores_every_kind_of_staged_edit() {
+    /// Stages the one edit this case is about, against a session whose batch
+    /// already holds `delete("g")`.
+    type Stage = fn(&File, &File);
+
+    let cases: &[(&str, Stage)] = &[
+        ("dataset addition", |s, _| {
+            s.root()
+                .create_dataset("g/added", |b| {
+                    b.with_i32_data(&[1]);
+                })
+                .unwrap();
+        }),
+        ("group creation", |s, _| {
+            s.root().create_group("g/sub").unwrap();
+        }),
+        ("group attribute", |s, _| {
+            s.group("g")
+                .unwrap()
+                .set_attr("tag", AttrValue::I32(1))
+                .unwrap();
+        }),
+        ("in-file copy", |s, _| {
+            s.copy("original", "g/copied").unwrap();
+        }),
+        ("cross-file copy", |s, other| {
+            s.copy_from(other, "donor", "g/from_other").unwrap();
+        }),
+        ("value overwrite", |s, _| {
+            s.dataset("g/inner")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_i32_data(&[9, 9, 9, 9]);
+                })
+                .unwrap();
+        }),
+        ("dataset attribute", |s, _| {
+            s.dataset("g/inner")
+                .unwrap()
+                .set_attr("tag", AttrValue::I32(1))
+                .unwrap();
+        }),
+        ("append", |s, _| {
+            s.dataset("g/inner")
+                .unwrap()
+                .append_staged(|b| {
+                    b.append_i32(&[5, 6]);
+                })
+                .unwrap();
+        }),
+        ("second deletion", |s, _| {
+            s.root().delete("g/inner").unwrap();
+        }),
+    ];
+
+    let donor_path = std::env::temp_dir().join("hdf5_pure_restore_kinds_donor.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("donor").with_i32_data(&[7]);
+        b.write(&donor_path).unwrap();
+    }
+
+    for (what, stage) in cases {
+        let path =
+            std::env::temp_dir().join(format!("hdf5_pure_restore_{}.h5", what.replace(' ', "_")));
+        {
+            let mut b = FileBuilder::new();
+            b.create_dataset("original").with_i32_data(&[0]);
+            let mut g = b.create_group("g");
+            g.create_dataset("inner")
+                .with_i32_data(&[1, 2, 3, 4])
+                .with_chunks(&[2])
+                .with_maxshape(&[u64::MAX]);
+            b.add_group(g.finish());
+            b.write(&path).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+
+        {
+            let donor = File::open(&donor_path).unwrap();
+            let session = File::open_rw(&path).unwrap();
+            session.root().delete("g").unwrap();
+            stage(&session, &donor);
+
+            let Err(first) = session.commit() else {
+                panic!("[{what}] the commit was expected to refuse");
+            };
+            assert!(
+                matches!(
+                    &first,
+                    Error::EditUnsupported(_) | Error::AppendUnsupported(_)
+                ),
+                "[{what}] unexpected error: {first:?}"
+            );
+            let Err(second) = session.commit() else {
+                panic!("[{what}] the second commit applied the batch the first refused");
+            };
+            assert_eq!(
+                format!("{first:?}"),
+                format!("{second:?}"),
+                "[{what}] the refusal did not put this edit back"
+            );
+        }
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "[{what}] a refused commit wrote to the file"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+    std::fs::remove_file(&donor_path).ok();
+}
+
+/// A staging call that refuses stages nothing, even when it carries a batch.
+///
+/// `create_group_with` records a group, its attributes and its whole subtree in
+/// one call, and each dataset is validated as it is staged — so the refusal
+/// below arrives with three edits already recorded. They are dropped with it
+/// (issue #316), leaving the session as the call found it.
+#[test]
+fn a_refused_staging_call_stages_none_of_its_batch() {
+    let path = std::env::temp_dir().join("hdf5_pure_refused_staging_batch.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        // One edit staged beforehand: the rewind must not reach past the call
+        // that failed.
+        session
+            .root()
+            .create_dataset("kept", |b| {
+                b.with_i32_data(&[1]);
+            })
+            .unwrap();
+
+        let err = session
+            .root()
+            .create_group_with("batch", |g| {
+                g.set_attr("tag", AttrValue::I32(1));
+                g.create_dataset("good", |b| {
+                    b.with_i32_data(&[1, 2]);
+                });
+                // Data that does not match the shape: refused as it is staged.
+                g.create_dataset("bad", |b| {
+                    b.with_f64_data(&[9.0, 9.0, 9.0]).with_shape(&[7]);
+                });
+            })
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::EditUnsupported(m) if m.contains("shape")),
+            "unexpected error: {err:?}"
+        );
+
+        session.commit().unwrap();
+    }
+
+    // Only the edit staged before the refused call reached the file.
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("kept").unwrap().read_i32().unwrap(), vec![1]);
+    assert!(file.group("batch").is_err(), "the refused group was staged");
+    assert!(
+        file.dataset("batch/good").is_err(),
+        "a dataset from the refused call was staged"
+    );
+    drop(file);
+    assert_ne!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A group's added datasets are placed in staging order, which is the order
+/// `preflight_reference_targets` replays.
+///
+/// Two *reference* datasets in one group sort together (`sort_by_key` is
+/// stable), so staging order alone decides which is placed first and therefore
+/// whether the second can resolve the first. That makes the agreement between
+/// the preflight's replay and the apply loop's own placement observable: if
+/// they disagreed, this commit would pass every guard and then fail with
+/// "still writing" having already written part of itself.
+#[test]
+fn a_reference_datasets_placement_order_is_the_order_the_preflight_proved() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_placement_order.h5");
+    write_starter(&path);
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("first", |b| {
+                b.with_path_references(&["original"]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("second", |b| {
+                b.with_path_references(&["first"]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let via_second = file.dataset("second").unwrap().dereference().unwrap();
+    assert_eq!(via_second.len(), 1);
+    match &via_second[0] {
+        Object::Dataset(ds) => {
+            let via_first = ds.dereference().unwrap();
+            assert_eq!(via_first.len(), 1);
+            match &via_first[0] {
+                Object::Dataset(d) => {
+                    assert_eq!(d.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+                }
+                other => panic!("expected a dataset reference, got {other:?}"),
+            }
+        }
+        other => panic!("expected a dataset reference, got {other:?}"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// A group gains its new links in the order the commit places them: copied
+/// objects first — in-file copies, then cross-file ones — and then the
+/// datasets added to it.
+///
+/// The names are chosen so that order is not the alphabetical one, and not the
+/// reverse of it either, so the assertion cannot pass by coincidence. It is
+/// pinned because the commit's cross-file copies join their group's other
+/// copies at the point of no return rather than while the plan is built, and
+/// nothing else observes where in the sequence they land.
+#[test]
+fn a_group_gains_its_new_links_in_placement_order() {
+    let donor_path = std::env::temp_dir().join("hdf5_pure_link_order_donor.h5");
+    let path = std::env::temp_dir().join("hdf5_pure_link_order.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("donated").with_i32_data(&[3]);
+        b.write(&donor_path).unwrap();
+    }
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("source").with_i32_data(&[1]);
+        b.write(&path).unwrap();
+    }
+
+    {
+        let donor = File::open(&donor_path).unwrap();
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("g").unwrap();
+        session
+            .root()
+            .create_dataset("g/z_added", |b| {
+                b.with_i32_data(&[2]);
+            })
+            .unwrap();
+        session.copy("source", "g/m_copied").unwrap();
+        session
+            .copy_from(&donor, "donated", "g/a_from_other")
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.group("g").unwrap().datasets().unwrap(),
+        vec![
+            "m_copied".to_string(),
+            "a_from_other".to_string(),
+            "z_added".to_string()
+        ]
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&donor_path).ok();
 }

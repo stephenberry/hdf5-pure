@@ -1033,11 +1033,9 @@ fn an_in_place_edit_refuses_a_committed_datatype() {
         ),
     ] {
         let file = File::open_rw(&path).expect("open for editing");
-        file.root()
-            .create_dataset("added", |db| configure(db))
-            .expect("staging is where the builder is recorded, not where it is written");
         let message = file
-            .commit()
+            .root()
+            .create_dataset("added", |db| configure(db))
             .expect_err("naming a committed type in place must fail")
             .to_string();
         assert!(

@@ -330,3 +330,61 @@ fn combined_mixed_edits_c_readable() {
     // Pure reader agrees on the grown dataset.
     assert_eq!(read_pure(&path, "log"), (0..10).collect::<Vec<_>>());
 }
+
+/// A refused realignment must not leave its own append staged (issue #316).
+///
+/// `BufferedAppender` is the one caller that stages *on the session's behalf*:
+/// a filtered dataset sitting on a partial trailing chunk is realigned by an
+/// internal `append_staged` plus `commit`. When that commit refuses — here
+/// because the C library gave the dataset a second hard link, which the append
+/// preflight will not relocate a header for — restoring the staged set would
+/// hand the caller an append they never made. It would also be permanent: every
+/// later `commit` re-runs the same refusal, including the one `close` makes, so
+/// the session could never be sealed and its free-space managers never rehomed.
+#[test]
+fn a_refused_realignment_leaves_nothing_staged() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wedge.h5");
+    {
+        let mut b = hdf5_pure::FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..10).collect::<Vec<i32>>())
+            .with_shape(&[10])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[8])
+            .with_deflate(1);
+        b.write(&path).unwrap();
+    }
+    {
+        let file = hdf5::File::open_rw(&path).unwrap();
+        file.link_hard("d", "alias").unwrap();
+        file.close().unwrap();
+    }
+
+    let session = File::open_rw(&path).unwrap();
+    {
+        let mut ds = session.dataset("d").unwrap();
+        let mut app = ds.buffered_appender().unwrap();
+        let err = app
+            .append(&(10..30i32).collect::<Vec<_>>())
+            .expect_err("a two-hard-link dataset cannot have its header relocated");
+        assert!(
+            err.to_string().contains("single hard link"),
+            "unexpected error: {err}"
+        );
+        drop(app);
+    }
+    assert!(
+        !session.has_staged_edits(),
+        "the refused realignment left its own append staged"
+    );
+    session
+        .commit()
+        .expect("a session that staged nothing must commit cleanly");
+    session
+        .close()
+        .expect("the session must still be sealable after a refused realignment");
+
+    // The dataset is as it was: the refusal wrote nothing.
+    assert_eq!(read_pure(&path, "d"), (0..10).collect::<Vec<i32>>());
+}
