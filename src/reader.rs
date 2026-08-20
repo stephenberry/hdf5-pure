@@ -1987,6 +1987,10 @@ impl File {
     /// `delete`/`set_attr`/`remove_attr`, and [`copy`](Self::copy)/
     /// [`copy_from`](Self::copy_from). Immediate [`Dataset::append`]s are never
     /// staged and do not count. Always `false` for a read-only file.
+    ///
+    /// A `commit` that refuses puts the staged set back untouched, so this still
+    /// answers `true` afterwards and the same batch can be committed again — to
+    /// the same refusal, until the session is dropped.
     pub fn has_staged_edits(&self) -> bool {
         match &self.inner.backend {
             Backend::Edit(m) => {
@@ -2963,10 +2967,15 @@ impl Group {
             return Err(Error::ReadOnly);
         };
         let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for op in ops {
-            op.apply(&mut session)?;
-        }
-        Ok(())
+        // All or nothing: one call can carry a whole subtree, and each op is
+        // validated as it is staged, so a refusal partway must not leave the
+        // ops before it recorded.
+        session.stage_atomically(|s| {
+            for op in ops {
+                op.apply(s)?;
+            }
+            Ok(())
+        })
     }
 
     /// Run `f` with the writable session and this group's *own* root-relative
@@ -3295,9 +3304,18 @@ impl Dataset {
             }
             // Suspend this appender's own claim: it is the reason no other
             // edit may be staged, and it must not refuse its own realignment.
+            //
+            // Staged atomically because this is the one place that stages on the
+            // caller's behalf: a refusal from the commit below puts the staged
+            // set back (issue #316), and an append the *caller* never staged is
+            // not one to hand them. Left behind it would also be permanent —
+            // every later `commit` re-runs the same refusal, including the one
+            // `close` makes, so the session could never be sealed.
             engine.within_appender_commit(|e| {
-                e.stage_dataset_append(&path, b)?;
-                e.commit()
+                e.stage_atomically(|s| {
+                    s.stage_dataset_append(&path, b)?;
+                    s.commit()
+                })
             })?;
         }
         // A commit rewrites and *relocates* object headers, so unlike every other

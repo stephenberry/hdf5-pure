@@ -279,6 +279,10 @@ The appended data is `fsync`ed before the root is repointed, so the "repoint las
 !!! warning "All-or-nothing safety"
     Every check runs before the first byte is written. On any `Error::EditUnsupported`, the file on disk is left untouched. This makes editing safe to attempt: an unsupported edit fails cleanly rather than producing a partially modified or corrupt file.
 
+A refusal costs the session nothing it had staged, so nothing is lost by attempting a commit. A refused `commit()` puts the staged set back whole — `has_staged_edits()` still answers `true`, and committing again gives the same refusal rather than applying the part of the batch the refusal was not about. A staging call that refuses stages nothing, including a `create_group_with` whose closure had already recorded several edits before the refused one.
+
+Which errors arrive where follows from that: a dataset is validated as it is staged, so a bad shape, a missing datatype or an unsupported combination is reported by `create_dataset` itself, while anything that has to read the file — a value overwrite that is not the on-disk shape, a deletion that overlaps another edit, a target that does not exist — is reported by `commit()`.
+
 ## Choosing the fsync cadence
 
 Those barriers are `fsync`s, and by default there is one at every durability point: five per append *batch* (a `Dataset::append` larger than about a megabyte is applied in several), two or three per commit, one at `close`. That is a strong guarantee and a real cost, and an application that wants durability at its own cadence instead sets `SyncPolicy` on the fapl.

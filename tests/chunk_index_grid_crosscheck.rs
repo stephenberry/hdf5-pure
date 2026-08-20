@@ -299,9 +299,8 @@ fn two_unlimited_dimensions_are_refused() {
 /// The refusal covers the in-place session path too, not only the whole-file
 /// writer.
 ///
-/// A session validates a dataset's geometry when it builds the dataset, which is
-/// at `commit` rather than at `create_dataset` — so the refusal arrives there,
-/// with the file left as it was.
+/// A session validates a dataset's geometry as it stages it, so the refusal
+/// arrives from `create_dataset` itself and nothing is ever staged to commit.
 #[test]
 fn two_unlimited_dimensions_are_refused_in_a_session_too() {
     let dir = tempdir().unwrap();
@@ -314,7 +313,7 @@ fn two_unlimited_dimensions_are_refused_in_a_session_too() {
     // the file below.
     {
         let session = hdf5_pure::File::open_rw(&path).unwrap();
-        session
+        let err = session
             .root()
             .create_dataset("d", |b| {
                 b.with_u32_data(&values(&[3, 3]))
@@ -322,13 +321,17 @@ fn two_unlimited_dimensions_are_refused_in_a_session_too() {
                     .with_maxshape(&[U, U])
                     .with_chunks(&[2, 2]);
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(format!("{err}").contains("at most one dimension"), "{err}");
+        assert!(
+            !session.has_staged_edits(),
+            "a refused addition must not be left staged"
+        );
+        session.commit().unwrap();
     }
 
-    // The refused commit wrote nothing: the file still holds what it did, and
-    // not a half-written dataset the reference library would choke on.
+    // Nothing was written: the file still holds what it did, and not a
+    // half-written dataset the reference library would choke on.
     assert_eq!(
         c_read_named(&path, "seed"),
         vec![1, 2, 3],
