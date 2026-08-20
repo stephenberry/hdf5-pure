@@ -6620,10 +6620,24 @@ impl WriteEngine {
     /// refused with a clear [`Error::EditUnsupported`] rather than resolved to
     /// a stale or wrong address — the one case this engine cannot resolve
     /// without the whole-file writer's two-pass dummy/real-address scheme.
-    /// "Touched" also covers a path this same commit deletes (`pending_deletes`):
-    /// without that check the deleted object's pre-commit address would still
-    /// resolve via step 2, and the reference would end up pointing at storage
-    /// this same commit is about to reclaim and hand out to something else.
+    ///
+    /// A path this same commit *deletes* (`pending_deletes`) is refused for a
+    /// different reason, and so carries its own message: the address step 2
+    /// would resolve is not stale but doomed. Deleting an object reclaims its
+    /// header and its owned blocks, so the reference would name storage this
+    /// commit hands back to the allocator, and the next commit that reuses the
+    /// span turns a reference that dereferenced cleanly into one that reads
+    /// whatever landed there. The test is by **prefix**, because a deletion
+    /// takes the whole subtree with it (`collect_free_spans` walks it): a
+    /// reference to a child of a deleted group dangles exactly as a reference
+    /// to the group itself does (issue #314). A path under a deleted one that
+    /// this commit puts back (a replacement, issue #305) never reaches here —
+    /// step 1 resolves it to the new object, since the deepest-first apply
+    /// order places a replacement's contents before any shallower group that
+    /// could reference them. The delete test runs *after* the other three so
+    /// that a replacement this commit has merely not placed yet — a sibling
+    /// group later in the same depth band — is still reported as an ordering
+    /// problem rather than as a deletion.
     fn resolve_reference_target(
         target: &ObjectRefTarget,
         path_addr: &BTreeMap<PathKey, u64>,
@@ -6646,11 +6660,18 @@ impl WriteEngine {
         if nodes.contains_key(&key)
             || add_targets.iter().any(|t| is_prefix(t, &key))
             || write_targets.contains(&key)
-            || pending_deletes.contains(&key)
         {
             return Err(Error::EditUnsupported(
                 "an object-reference dataset targets a path this commit is still writing; \
                  use separate commits",
+            ));
+        }
+        // Last, so it names only what nothing else claims: a path this commit
+        // removes and does not put back.
+        if pending_deletes.iter().any(|d| is_prefix(d, &key)) {
+            return Err(Error::EditUnsupported(
+                "an object-reference dataset targets an object this commit deletes, or one \
+                 under it; the stored reference would point into reclaimed space",
             ));
         }
         match crate::group_v2::resolve_path_any_from_source(src, superblock, path) {
