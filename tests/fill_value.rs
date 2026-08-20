@@ -282,16 +282,20 @@ fn write_dataset_refuses_a_fill_value() {
         fb.write(&p).unwrap();
     }
     let s = File::open_rw(&p).unwrap();
-    s.dataset("d")
+    let err = s
+        .dataset("d")
         .unwrap()
         .write_staged(|b| {
             b.with_i32_data(&[4, 5, 6]).with_fill_value(-1_i32);
         })
-        .unwrap();
-    let err = s.commit().unwrap_err();
+        .unwrap_err();
     assert!(
         matches!(&err, Error::EditUnsupported(m) if m.contains("fill value")),
         "expected a fill-value refusal, got {err:?}"
+    );
+    assert!(
+        !s.has_staged_edits(),
+        "a refused overwrite must not be left staged"
     );
 }
 
