@@ -414,3 +414,68 @@ fn a_reference_dataset_through_a_committed_datatype_is_repointed() {
         other => panic!("expected the group, got {other:?}"),
     }
 }
+
+/// The reference C library's **default** output format — earliest library
+/// bounds, so every object header is version 1 — is reached too.
+///
+/// This is not a legacy corner. `H5Fcreate` without `H5Pset_libver_bounds` uses
+/// the earliest format that can express each object, and h5py's default is the
+/// same, so a file that was never told otherwise carries version 1 headers
+/// throughout. Those headers are read by a different parser here, and until they
+/// were, #324 was fixed for files in the latest format and unfixed for the
+/// format most files are actually in.
+///
+/// What that parser reaches is narrower — a contiguous dataset's elements, which
+/// live outside the header — so an attribute's value in a version 1 header is
+/// still left alone.
+#[test]
+fn an_earliest_format_reference_dataset_is_repointed() {
+    let _c = c_lib_guard();
+    use hdf5::{ObjectReference, ObjectReference1, ReferencedObject};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("earliest.h5");
+    {
+        let file = hdf5::FileBuilder::new()
+            .with_fapl(|p| p.libver_earliest())
+            .create(&path)
+            .unwrap();
+        let g = file.create_group("g").unwrap();
+        g.new_dataset::<i32>()
+            .shape((3,))
+            .create("inner")
+            .unwrap()
+            .write(&[1i32, 2, 3])
+            .unwrap();
+        file.new_dataset::<ObjectReference1>()
+            .shape((1,))
+            .create("refs")
+            .unwrap()
+            .write(&[ObjectReference1::create(&file, "g").unwrap()])
+            .unwrap();
+        file.close().unwrap();
+    }
+    // The premise, asserted rather than assumed: a version 2 header carries an
+    // `OHDR` signature and a version 1 header carries none, so a file with no
+    // `OHDR` anywhere is one this walk reaches only through the other parser.
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        bytes.windows(4).filter(|w| *w == b"OHDR").count(),
+        0,
+        "the fixture must actually be in the earliest format, or this test is \
+         about nothing"
+    );
+
+    move_the_group_and_churn(&path);
+
+    let c = hdf5::File::open(&path).unwrap();
+    let values = c
+        .dataset("refs")
+        .unwrap()
+        .read_raw::<ObjectReference1>()
+        .unwrap();
+    match values[0].dereference(&c).unwrap() {
+        ReferencedObject::Group(g) => assert_resolves_to_the_moved_group(&g),
+        other => panic!("expected the group, got {other:?}"),
+    }
+}

@@ -45,11 +45,14 @@
 //! - **Dense (fractal-heap) attributes**, whose values are not in the header,
 //!   and an attribute held as a **shared (SOHM) record**, which is not stored in
 //!   the header either.
-//! - **Version 1 object headers**, and version 2 headers that track message
-//!   creation order — what [`read_oh_chunks`] declines on a well-formed file; it
-//!   declines a malformed one too. Such an object is still descended through,
-//!   since [`ObjectHeader::parse_from_source`] reads both, so neither hides the
-//!   objects below it from the walk.
+//! - An **attribute's value** in a **version 1 object header**, or in a version
+//!   2 header that tracks message creation order — the two [`read_oh_chunks`]
+//!   declines on a well-formed file (it declines a malformed one too). Such an
+//!   object's *element data* is still reached, through the parsed form that
+//!   reads both versions ([`scan_parsed_header`]); what that form does not hand
+//!   back is the file offset an attribute inside the header would have to be
+//!   written at. Nor does it hide the objects below it: it is descended through
+//!   either way.
 //!
 //! And by datatype, every form `embedded_reference_slots` answers `None` for: an
 //! object reference **wider than 8 bytes**, a **dataset-region** reference, a
@@ -57,13 +60,10 @@
 //! `DIMENSION_LIST` uses, whose addresses sit in a global heap collection), an
 //! **enumeration** over one, and any compound or array reaching one of those.
 //!
-//! A file whose objects all carry version 1 headers — what the reference C
-//! library writes under its default, earliest-format bounds — is therefore
-//! walked in full on every commit and patched nowhere, and can never be proved
-//! free of references either. Measured at about 15% of a commit over 4,700
-//! objects. Reaching those headers is what would remove it; skipping the walk on
-//! them cannot, since a later commit may add a version 2 object holding a
-//! reference.
+//! A file whose objects all carry version 1 headers — the reference C library's
+//! default, and h5py's — can never be *proved* free of references, since an
+//! attribute in one of those headers is never read. Such a file is therefore
+//! walked on every commit rather than on the first.
 //!
 //! Deliberately, none of these is a *refusal*. Every commit rebuilds at least
 //! its root group, so there is always a relocation in hand, and refusing on an
@@ -325,6 +325,14 @@ pub(crate) fn plan<S: Source + ?Sized>(
             complete = false;
             continue;
         };
+        // A header the chunk reader declined is reached through this parse
+        // instead, which reads version 1 and creation-order headers alike. It
+        // gives message *bodies* rather than their file offsets, so it reaches
+        // element data — which lives outside the header — and not an attribute's
+        // value, which does not.
+        if !outcome.header_located {
+            saw_reference |= scan_parsed_header(src, &header, base, relocations, &mut plan);
+        }
         let Ok(entries) = resolve_group_entries_from_source(src, &header, os, ls, base) else {
             complete = false;
             continue;
@@ -337,6 +345,114 @@ pub(crate) fn plan<S: Source + ?Sized>(
     }
     plan.proved_free_of_references = complete && !saw_reference;
     Ok(plan)
+}
+
+/// Collect the byte edits owed by an object whose header [`read_oh_chunks`]
+/// would not read — a version 1 header, or a version 2 one tracking message
+/// creation order — from the parsed form that reads both.
+///
+/// Version 1 is not a museum piece: it is what the reference C library writes
+/// under its default, earliest-format bounds, so a file that was never told to
+/// use the latest format carries these throughout. Leaving them out left #324
+/// unfixed for exactly those files.
+///
+/// What it reaches is narrower than the chunk walk's, and the reason is the same
+/// one that makes it cheap. [`ObjectHeader`] hands back message *bodies*, not
+/// the offsets they were read from, so this can address only what lives outside
+/// the header: a **contiguous** dataset's data block. A compact dataset's
+/// elements and an attribute's value are inside the header, and rewriting either
+/// needs an offset this does not have. There is no checksum to reseal either
+/// way — a version 1 header has none, and a data block never did.
+///
+/// Returns whether the object holds a reference-bearing datatype at all, which
+/// is what stops a file of these being *proved* free of them.
+fn scan_parsed_header<S: Source + ?Sized>(
+    src: &S,
+    header: &ObjectHeader,
+    base: u64,
+    relocations: &BTreeMap<u64, u64>,
+    plan: &mut Plan,
+) -> bool {
+    use crate::shared_message::SharedResolver as _;
+    let mut element_dt = None;
+    let mut layout = None;
+    for message in &header.messages {
+        match message.msg_type {
+            // A committed (shared) datatype's body names the type rather than
+            // encoding it, so it is followed first — the flag is on the message,
+            // which this form does keep. Reading the class byte off an
+            // unresolved body would be reading a shared-message header as a
+            // datatype class, which is not an error, just an answer about the
+            // wrong bytes.
+            MessageType::Datatype => {
+                let resolved;
+                let encoded = if message.flags & crate::edit::MSG_FLAG_SHARED != 0 {
+                    let framed = crate::source::BaseOffsetSource { inner: src, base };
+                    let resolver = crate::shared_message::SourceResolver::new(
+                        &framed,
+                        crate::file_writer::OFFSET_SIZE,
+                        crate::file_writer::LENGTH_SIZE,
+                    );
+                    match resolver.resolve(&message.data, MessageType::Datatype) {
+                        Ok(bytes) => {
+                            resolved = bytes;
+                            &resolved[..]
+                        }
+                        Err(_) => continue,
+                    }
+                } else {
+                    &message.data[..]
+                };
+                if encoded
+                    .first()
+                    .is_some_and(|&b| crate::datatype::class_may_hold_object_address(b))
+                {
+                    if let Ok((dt, _)) = Datatype::parse(encoded) {
+                        element_dt = Some(dt);
+                    }
+                }
+            }
+            MessageType::DataLayout => {
+                layout = DataLayout::parse(
+                    &message.data,
+                    crate::file_writer::OFFSET_SIZE,
+                    crate::file_writer::LENGTH_SIZE,
+                )
+                .ok();
+            }
+            _ => {}
+        }
+    }
+    let Some(dt) = element_dt else {
+        return false;
+    };
+    let holds = datatype_holds_object_address(&dt);
+    let (
+        Some(slots),
+        Some(DataLayout::Contiguous {
+            address: Some(a),
+            size,
+        }),
+    ) = (element_slots(&dt), layout)
+    else {
+        return holds;
+    };
+    let (Some(at), Ok(want)) = (a.checked_add(base), usize::try_from(size)) else {
+        return holds;
+    };
+    let Ok(raw) = src.read_exact_at(at, want) else {
+        return holds;
+    };
+    collect_slots(
+        &dt,
+        &slots,
+        &raw,
+        at,
+        base,
+        relocations,
+        &mut plan.data_writes,
+    );
+    holds
 }
 
 /// What one object contributed to the walk beyond its byte edits.
@@ -357,6 +473,11 @@ struct Scanned {
     /// The object's header was read in full. False leaves the file's
     /// reference-free claim unproven, since what was not read might hold one.
     fully_read: bool,
+    /// [`read_oh_chunks`] read this header, so its messages were located *in the
+    /// file* and an attribute inside it can be edited. False for a version 1
+    /// header and for one tracking message creation order, whose elements are
+    /// reached the other way — see [`scan_parsed_header`].
+    header_located: bool,
 }
 
 /// Collect the byte edits owed by the single object whose header is at `addr`:
@@ -383,6 +504,7 @@ fn scan_object<S: Source + ?Sized>(
             descend: true,
             holds_a_reference: false,
             fully_read: false,
+            header_located: false,
         });
     };
     use crate::shared_message::SharedResolver as _;
@@ -409,6 +531,7 @@ fn scan_object<S: Source + ?Sized>(
         descend: false,
         holds_a_reference: false,
         fully_read: true,
+        header_located: true,
     };
 
     // Resolved committed-datatype bodies, kept alive for the borrows the message
