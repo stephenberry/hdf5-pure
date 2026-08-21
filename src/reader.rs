@@ -3528,18 +3528,39 @@ impl Dataset {
     }
 
     /// Gate a staged edit on this dataset *without* taking the session lock:
-    /// the file must accept staged edits, and this handle must have a resolvable
-    /// path.
+    /// the file must accept staged edits, this handle must have a resolvable
+    /// path, and this dataset's elements must be ones the engine owns.
     ///
     /// The path check belongs here rather than only in
     /// [`with_session_mut`](Self::with_session_mut) so that every reason to
     /// refuse is reported *before* a user closure runs, not after. A handle
     /// reached by object reference ([`dereference`](Self::dereference)) has no
     /// path, and would otherwise have its closure run and its result discarded.
+    ///
+    /// This is the one gate every data-writing entry point shares — `write`,
+    /// `write_staged`, `append_staged`, and the staged rewrite behind
+    /// [`BufferedAppender`] — which is why the external-storage refusal is here
+    /// and not on any one of them. Attribute edits do not come through here, and
+    /// are unaffected: they change the object header, not the elements.
     fn check_staged_edit(&self) -> Result<(), Error> {
         self.file.check_staged_writable()?;
         if self.path.is_none() {
             return Err(Error::ReadOnly);
+        }
+        // The elements of an externally stored dataset are not in this file, and
+        // the engine writes only this file. Its contiguous layout message records
+        // no address, so a write took it for never-allocated storage, appended the
+        // new bytes and pointed the layout at them — leaving the file with two
+        // contradictory records of where the data lives, and the reference
+        // library still reading the external files it had not touched. See
+        // [`has_external_storage`](Self::has_external_storage).
+        if self.has_external_storage() {
+            return Err(Error::EditUnsupported(
+                "this dataset's elements live in external files (H5Pset_external), which this \
+engine does not write; writing them into the HDF5 file would leave it disagreeing with \
+the external files about where the data is. Delete the dataset and create it again in \
+the same commit to replace it",
+            ));
         }
         Ok(())
     }
@@ -3897,7 +3918,7 @@ impl Dataset {
     {
         let dt = self.datatype()?;
         let ds = self.dataspace()?;
-        let dl = self.data_layout()?;
+        let dl = self.read_layout()?;
         let pipeline = self.filter_pipeline_parsed();
         // See `read_raw`: an unparseable fill value message is carried into the
         // read rather than failing it up front.
@@ -4417,13 +4438,32 @@ impl Dataset {
     /// is undefined — the same encoding a never-written dataset uses — so a
     /// caller that reads "no address" as "no storage" would call a dataset full
     /// of data empty. This crate does not follow the external files, so the only
-    /// safe answer is to refuse the dataset rather than reproduce it without its
-    /// data.
+    /// safe answer is to refuse: [`read_layout`](Self::read_layout) refuses a
+    /// read of one rather than answering its fill value, and `repack` refuses to
+    /// reproduce it without its data.
     pub(crate) fn has_external_storage(&self) -> bool {
         self.header
             .messages
             .iter()
-            .any(|m| m.msg_type == MessageType::Unknown(0x0007))
+            .any(|m| m.msg_type == MessageType::ExternalDataFiles)
+    }
+
+    /// The data layout to read element bytes through, as opposed to the one
+    /// [`layout`](Self::layout) reports.
+    ///
+    /// [`data_layout`](Self::data_layout) answers what the message records;
+    /// this answers whether those bytes are reachable at all. The two differ for
+    /// exactly one kind of dataset: an externally stored one, whose contiguous layout
+    /// with no address is also what a never-written dataset carries, so reading
+    /// it would answer the fill value for every element it holds. Introspection
+    /// keeps answering — the address-less layout is the evidence a caller needs
+    /// — while every path that turns a layout into bytes comes through here and
+    /// refuses.
+    fn read_layout(&self) -> Result<DataLayout, Error> {
+        if self.has_external_storage() {
+            return Err(FormatError::UnsupportedExternalStorage.into());
+        }
+        self.data_layout()
     }
 
     /// The raw, still-compressed on-disk bytes of every allocated chunk of this
@@ -4527,10 +4567,16 @@ impl Dataset {
     ///
     /// For compound datasets this preserves all file padding and uses the
     /// offsets reported by [`datatype`](Self::datatype).
+    ///
+    /// A dataset whose elements live in external files (`H5Pset_external`) is
+    /// refused with `FormatError::UnsupportedExternalStorage` rather than read as
+    /// unallocated storage, which is what its layout message alone says. This
+    /// applies to every read here; its shape, datatype, and
+    /// [`layout`](Self::layout) still read.
     pub fn read_raw(&self) -> Result<Vec<u8>, Error> {
         let dt = self.datatype()?;
         let ds = self.dataspace()?;
-        let dl = self.data_layout()?;
+        let dl = self.read_layout()?;
         // The data layout's on-disk addresses are left base-relative here;
         // `read_dataset_raw` applies the base address centrally (for both
         // contiguous and chunked layouts) by reading from a base-relative view of
@@ -4577,7 +4623,7 @@ impl Dataset {
     pub fn read_raw_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<u8>, Error> {
         let dt = self.datatype()?;
         let ds = self.dataspace()?;
-        let dl = self.data_layout()?;
+        let dl = self.read_layout()?;
 
         let n0 = ds.dimensions.first().copied().unwrap_or(1);
         let start = start_row.min(n0);

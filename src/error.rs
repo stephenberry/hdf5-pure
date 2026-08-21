@@ -209,6 +209,14 @@ pub enum FormatError {
     /// yet resolve virtual mappings, so such a dataset is refused rather than
     /// read as empty or wrong.
     UnsupportedVirtualLayout,
+    /// A dataset's element bytes live in files outside this one
+    /// (`H5Pset_external`, the External Data Files header message). Its layout
+    /// message is contiguous with the data address undefined — the same encoding
+    /// a never-written dataset carries — so reading the layout alone would answer
+    /// the fill value for every element of a dataset that holds data. This reader
+    /// does not follow the external files, so such a dataset is refused rather
+    /// than read as empty.
+    UnsupportedExternalStorage,
     /// Invalid attribute message version.
     InvalidAttributeVersion(u8),
     /// Invalid Attribute Info message version.
@@ -728,6 +736,13 @@ impl fmt::Display for FormatError {
             }
             FormatError::UnsupportedVirtualLayout => {
                 write!(f, "virtual (VDS) data layout is not supported")
+            }
+            FormatError::UnsupportedExternalStorage => {
+                write!(
+                    f,
+                    "dataset stores its elements in external files (H5Pset_external), \
+                     which this reader does not follow"
+                )
             }
             FormatError::InvalidAttributeVersion(v) => {
                 write!(f, "invalid attribute message version: {v}")

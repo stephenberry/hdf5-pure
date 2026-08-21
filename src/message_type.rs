@@ -12,6 +12,11 @@ pub enum MessageType {
     FillValueOld,
     FillValue,
     Link,
+    /// External Data Files: the dataset's elements live in files outside this
+    /// one (`H5Pset_external`). The message names them; this crate does not
+    /// follow them, and refuses to read such a dataset rather than answering the
+    /// fill value its address-less contiguous layout would otherwise imply.
+    ExternalDataFiles,
     DataLayout,
     GroupInfo,
     FilterPipeline,
@@ -39,6 +44,7 @@ impl MessageType {
             0x0004 => MessageType::FillValueOld,
             0x0005 => MessageType::FillValue,
             0x0006 => MessageType::Link,
+            0x0007 => MessageType::ExternalDataFiles,
             0x0008 => MessageType::DataLayout,
             0x000A => MessageType::GroupInfo,
             0x000B => MessageType::FilterPipeline,
@@ -65,6 +71,7 @@ impl MessageType {
             MessageType::FillValueOld => 0x0004,
             MessageType::FillValue => 0x0005,
             MessageType::Link => 0x0006,
+            MessageType::ExternalDataFiles => 0x0007,
             MessageType::DataLayout => 0x0008,
             MessageType::GroupInfo => 0x000A,
             MessageType::FilterPipeline => 0x000B,
@@ -93,6 +100,7 @@ impl fmt::Display for MessageType {
             Self::FillValueOld => "fill value (old)",
             Self::FillValue => "fill value",
             Self::Link => "link",
+            Self::ExternalDataFiles => "external data files",
             Self::DataLayout => "data layout",
             Self::GroupInfo => "group info",
             Self::FilterPipeline => "filter pipeline",
@@ -128,6 +136,7 @@ mod tests {
             (0x0004, MessageType::FillValueOld),
             (0x0005, MessageType::FillValue),
             (0x0006, MessageType::Link),
+            (0x0007, MessageType::ExternalDataFiles),
             (0x0008, MessageType::DataLayout),
             (0x000A, MessageType::GroupInfo),
             (0x000B, MessageType::FilterPipeline),
@@ -155,11 +164,30 @@ mod tests {
         assert_eq!(mt.to_u16(), 0x00FF);
     }
 
+    /// 0x0009 is the specification's Bogus message — "For testing only; should
+    /// never be stored in a valid file" — so it stays unnamed on purpose, and a
+    /// file carrying one is a file worth refusing. Being unnamed is not itself a
+    /// claim that a type is undefined: 0x000D (object comment), 0x000E (old
+    /// object modification time) and 0x0014 (driver info) are all defined and
+    /// unnamed here, for the ordinary reason that nothing in this crate reads
+    /// them.
+    ///
+    /// This test used to assert the same of 0x0007 under a comment reading
+    /// "0x0007 is not a defined type". It is External Data Files, which the C
+    /// library writes for every dataset created with `H5Pset_external`, and that
+    /// comment is the mistaken basis on which the message went unnamed and so
+    /// silently ignored (issue #331).
     #[test]
-    fn unknown_type_zero_gap() {
-        // 0x0007 is not a defined type
+    fn the_specifications_testing_only_type_stays_unknown() {
+        let mt = MessageType::from_u16(0x0009);
+        assert_eq!(mt, MessageType::Unknown(0x0009));
+    }
+
+    #[test]
+    fn external_data_files_is_a_named_type() {
         let mt = MessageType::from_u16(0x0007);
-        assert_eq!(mt, MessageType::Unknown(0x0007));
+        assert_eq!(mt, MessageType::ExternalDataFiles);
+        assert_eq!(mt.to_u16(), 0x0007);
     }
 }
 

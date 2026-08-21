@@ -7,15 +7,30 @@
 //! byte-for-byte the encoding a never-written dataset uses — and an External Data
 //! Files message (header type 7) beside it names where the bytes actually are.
 //! This crate does not follow those files, so "undefined address" must not be
-//! read as "stores nothing": a rewrite that did would emit a schema-only dataset
-//! in place of one holding data, and report success.
+//! read as "stores nothing": a reader that did would answer the fill value for
+//! every element of a dataset that holds data, and a rewrite that did would emit
+//! a schema-only dataset in place of it — both reporting success.
 
 use std::ffi::{CString, c_char, c_int};
+use std::sync::{Mutex, MutexGuard};
 
 use hdf5_pure::{File, RepackOptions, repack};
 use tempfile::tempdir;
 
 const DEFAULT: i64 = 0;
+
+// libhdf5 is not built thread-safe here. `hdf5-metno` serializes its own calls
+// through a private global lock, but the raw `H5P…` / `H5D…` FFI below bypasses
+// it, so a raw call can race an `hdf5-metno` operation on another test thread and
+// abort the C library. EVERY test here takes this guard as its first line and
+// holds it for the whole body, so no two run C-library code at once (matching
+// `bounded_append_crosscheck` and `file_space_crosscheck`). Poisoning is ignored
+// so one test's panic does not cascade.
+static C_LIB: Mutex<()> = Mutex::new(());
+
+fn c_lib_guard() -> MutexGuard<'static, ()> {
+    C_LIB.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 unsafe extern "C" {
     fn H5Screate_simple(rank: c_int, dims: *const u64, maxdims: *const u64) -> i64;
@@ -99,14 +114,17 @@ fn write_external_fixture(path: &std::path::Path, payload: &str) {
 /// the file, so a rewrite has nothing to copy; the only honest answer is to
 /// refuse. Before this was checked, `repack` returned `Ok` and the destination
 /// answered the fill value for every element — the failure mode a
-/// values-round-trip assertion cannot see, since the source's *reader* here
-/// returns the same zeros.
+/// values-round-trip assertion could not see, because the source's *reader*
+/// answered the same zeros. It refuses now, as of #331; repack's own refusal
+/// still fires first, so this test does not rest on that.
 #[test]
 fn repack_refuses_external_data_storage() {
+    let _c = c_lib_guard();
     let dir = tempdir().unwrap();
     let src = dir.path().join("external.h5");
     let dst = dir.path().join("external_repacked.h5");
-    write_external_fixture(&src, "external_payload.bin");
+    let payload = dir.path().join("repack_payload.bin");
+    write_external_fixture(&src, payload.to_str().unwrap());
 
     // Ground truth: the C library follows the external file and finds the data.
     {
@@ -142,6 +160,227 @@ fn repack_refuses_external_data_storage() {
         other => panic!("expected RepackUnsupported, got {other:?}"),
     }
     assert!(!dst.exists(), "dst must not be created when repack refuses");
+}
 
-    std::fs::remove_file("external_payload.bin").ok();
+/// Every read path refuses an externally stored dataset rather than answering
+/// the fill value for data it never looked at.
+///
+/// The layout message records a contiguous layout, an extent of 64 bytes, and an
+/// **undefined** data address — and a never-written dataset of this shape and
+/// type records those same eighteen bytes. Nothing in it says where the elements
+/// are, so the External Data Files message beside it is the only thing telling
+/// the two apart, and a read that consults the layout alone reports a dataset
+/// holding 1..=16 as sixteen zeros, with `Ok` (issue #331).
+///
+/// The three calls below are the three places that build a read of that layout:
+/// `read_raw`, the whole-dataset typed reads, and the windowed reads. Reverting
+/// any one of them to the introspection accessor fails this test at that call.
+/// The streaming repeat is not a fourth: it pins the refusal *above* the backend
+/// dispatch, where one written into the buffered arm alone would pass every
+/// assertion before it.
+#[test]
+fn every_read_path_refuses_external_data_storage() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("external.h5");
+    let payload = dir.path().join("read_payload.bin");
+    write_external_fixture(&src, payload.to_str().unwrap());
+
+    // Ground truth: the data exists, and the C library reads it.
+    {
+        let c = hdf5::File::open(&src).unwrap();
+        assert_eq!(
+            c.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            (1..=N as i32).collect::<Vec<i32>>(),
+        );
+        c.close().unwrap();
+    }
+
+    let refusal = |what: &str, err: hdf5_pure::Error| match err {
+        hdf5_pure::Error::Format(hdf5_pure::FormatError::UnsupportedExternalStorage) => {}
+        other => panic!("{what}: expected UnsupportedExternalStorage, got {other:?}"),
+    };
+
+    let f = File::open(&src).unwrap();
+    let d = f.dataset("d").unwrap();
+    refusal("read_raw", d.read_raw().unwrap_err());
+    refusal("read_i32", d.read_i32().unwrap_err());
+    refusal("read_raw_rows", d.read_raw_rows(0, 4).unwrap_err());
+    drop(f);
+
+    // A streaming file reads through a different backend, and the issue measured
+    // it answering the same zeros.
+    let s = File::open_streaming(&src).unwrap();
+    refusal(
+        "streaming read_i32",
+        s.dataset("d").unwrap().read_i32().unwrap_err(),
+    );
+}
+
+/// The refusal is scoped to the data: everything the header records about an
+/// externally stored dataset still reads.
+///
+/// Refusing the metadata too would make the dataset invisible rather than
+/// unreadable, and a caller cannot then see *why* it was refused — the layout
+/// with no address is the evidence.
+#[test]
+fn external_data_storage_still_reports_its_metadata() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("external.h5");
+    let payload = dir.path().join("meta_payload.bin");
+    write_external_fixture(&src, payload.to_str().unwrap());
+
+    let f = File::open(&src).unwrap();
+    let d = f.dataset("d").unwrap();
+    assert_eq!(d.shape().unwrap(), vec![N as u64]);
+    assert!(matches!(
+        d.layout().unwrap(),
+        hdf5_pure::Layout::Contiguous {
+            address: None,
+            size: 64
+        }
+    ));
+    assert_eq!(d.datatype().unwrap().type_size(), 4);
+}
+
+/// No write reaches an externally stored dataset's elements either.
+///
+/// The elements are not in this file and the edit engine writes only this file,
+/// but the layout message it consults records no address — so a staged write
+/// took the dataset for never-allocated storage, appended the new bytes to the
+/// HDF5 file and pointed the layout at them, reporting `Ok`. That left the file
+/// holding two contradictory records of where its data lives: this crate read
+/// the new bytes, while the reference library went on reading the external files
+/// it had never touched, so the caller's write was visible to neither reader
+/// once #331 made the read refuse.
+///
+/// Attribute edits are deliberately unaffected — they rewrite the object header,
+/// not the elements — and replacing the dataset outright still works, which is
+/// the way to stop a file depending on external files.
+#[test]
+fn no_write_reaches_an_external_dataset() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("external.h5");
+    let payload = dir.path().join("write_payload.bin");
+    write_external_fixture(&src, payload.to_str().unwrap());
+    let before = std::fs::metadata(&src).unwrap().len();
+
+    let refusal = |what: &str, err: hdf5_pure::Error| match err {
+        hdf5_pure::Error::EditUnsupported(msg) => assert!(
+            msg.contains("external files"),
+            "{what}: the refusal must name external storage: {msg}"
+        ),
+        other => panic!("{what}: expected EditUnsupported, got {other:?}"),
+    };
+
+    let f = File::open_rw(&src).unwrap();
+    refusal(
+        "write",
+        f.dataset("d").unwrap().write(&[100i32; N]).unwrap_err(),
+    );
+    refusal(
+        "write_staged",
+        f.dataset("d")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[100i32; N]);
+            })
+            .unwrap_err(),
+    );
+    refusal(
+        "append_staged",
+        f.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_i32(&[100]);
+            })
+            .unwrap_err(),
+    );
+    drop(f);
+
+    // Nothing was staged, so nothing was written: a refusal that had already
+    // appended the bytes would show here.
+    assert_eq!(
+        std::fs::metadata(&src).unwrap().len(),
+        before,
+        "a refused write must not have grown the file"
+    );
+
+    // An attribute is a header edit, not a data write, and still commits. It
+    // rewrites the header elsewhere, so the file does grow — what must survive
+    // is the address-less layout and the External Data Files message with it.
+    let f = File::open_rw(&src).unwrap();
+    f.dataset("d")
+        .unwrap()
+        .set_attr("tag", hdf5_pure::AttrValue::I64(1))
+        .unwrap();
+    f.commit().unwrap();
+    drop(f);
+    {
+        let r = File::open(&src).unwrap();
+        let d = r.dataset("d").unwrap();
+        assert_eq!(
+            d.attrs().unwrap().get("tag"),
+            Some(&hdf5_pure::AttrValue::I64(1))
+        );
+        assert!(matches!(
+            d.layout().unwrap(),
+            hdf5_pure::Layout::Contiguous { address: None, .. }
+        ));
+    }
+    let c = hdf5::File::open(&src).unwrap();
+    assert_eq!(
+        c.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+        (1..=N as i32).collect::<Vec<i32>>(),
+        "the external files still hold the data, untouched"
+    );
+    c.close().unwrap();
+
+    // Replacing the dataset is the supported way out: the removal drops the
+    // External Data Files message with the rest of the old header.
+    let f = File::open_rw(&src).unwrap();
+    f.root().delete("d").unwrap();
+    f.root()
+        .create_dataset("d", |b| {
+            b.with_i32_data(&[7i32; N]);
+        })
+        .unwrap();
+    f.commit().unwrap();
+    drop(f);
+    let r = File::open(&src).unwrap();
+    assert_eq!(r.dataset("d").unwrap().read_i32().unwrap(), vec![7i32; N]);
+}
+
+/// `File::copy` must never reproduce an externally stored dataset.
+///
+/// It refuses today, but only by accident: the copy planner reads the undefined
+/// data address as a real one and fails a bounds check, which is the same
+/// refusal a *never-written* contiguous dataset gets — a dataset that is
+/// perfectly valid and ought to copy. Teaching `copy` to carry unallocated
+/// storage, as `repack` learned in #293, would silently turn this into an `Ok`
+/// that writes a schema-only copy of a dataset holding data. This test is the
+/// tripwire for that; when it is addressed, the refusal here should stay a
+/// refusal and start naming external storage.
+#[test]
+fn copy_does_not_reproduce_an_external_dataset() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("external.h5");
+    let payload = dir.path().join("copy_payload.bin");
+    write_external_fixture(&src, payload.to_str().unwrap());
+
+    let f = File::open_rw(&src).unwrap();
+    f.copy("d", "d_copy").unwrap();
+    let err = f.commit().unwrap_err();
+    drop(f);
+    assert!(
+        matches!(err, hdf5_pure::Error::EditUnsupported(_)),
+        "expected the copy to be refused, got {err:?}"
+    );
+    assert!(
+        File::open(&src).unwrap().dataset("d_copy").is_err(),
+        "a refused copy must leave no dataset behind"
+    );
 }
