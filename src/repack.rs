@@ -543,6 +543,35 @@ fn emit_dataset(
         )));
     }
 
+    // Storage the source never allocated is reproduced as storage, not as the
+    // values reading it answers with. The reference library allocates a chunked
+    // dataset late, so one created and never written holds nothing at all; since
+    // #292 reading it answers the fill value for every element, and re-writing
+    // those values would turn a schema-only file into a fully materialized one
+    // of the size its shape declares (issue #293).
+    //
+    // Placed after every refusal the datatype and layout share and before the
+    // paths that move element bytes, all of which exist to rebuild an address
+    // this dataset does not store: there is no data to carry, so each of them
+    // would be reproducing the fill value it read rather than anything the
+    // source held. `check_pipeline` still runs, so a filter this crate could not
+    // re-apply is refused here exactly as it is on the re-encode path below —
+    // the filters are reproduced through the same `carry_shape_and_pipeline`.
+    if storage_is_unallocated(ds, &layout)? {
+        check_pipeline(pipeline.as_ref(), path)?;
+        db.fill = fill;
+        db.with_unallocated_storage(datatype, &dims);
+        carry_shape_and_pipeline(
+            db,
+            &dims,
+            dataspace.max_dimensions.as_deref(),
+            &layout,
+            &pipeline,
+        );
+        copy_dataset_attrs(db, ds, path, drop, addr_map)?;
+        return Ok(());
+    }
+
     // Variable-length string datasets take a dedicated path: their element
     // references point into the global heap, so they are re-emitted by reading
     // each element's exact heap bytes and re-staging them, not by copying raw
@@ -1588,6 +1617,27 @@ fn resolve_reference_address(
 
 /// Reject data layouts that cannot be read and re-emitted (virtual datasets;
 /// contiguous/chunked with an undefined address are allowed — they are empty).
+/// Whether `ds` stores nothing at all: no chunk, no contiguous data region.
+///
+/// Read from the file's own statement of where its data is rather than from the
+/// values a read answers with, which cannot tell the two apart — a dataset that
+/// stores a grid of fill values reads exactly like one that stores nothing.
+///
+/// A contiguous dataset says so with the undefined data address. A chunked one
+/// is asked for its chunks rather than for its index address, because the two
+/// can disagree: an index that exists and holds no chunk is still a dataset with
+/// nothing in it, and it is the chunks that a rewrite would materialize.
+///
+/// Compact data is inline in the layout message, so it is always allocated;
+/// virtual layouts are refused by [`check_layout`] before this is asked.
+fn storage_is_unallocated(ds: &Dataset, layout: &DataLayout) -> Result<bool, Error> {
+    Ok(match layout {
+        DataLayout::Contiguous { address, .. } => address.is_none(),
+        DataLayout::Chunked { .. } => ds.raw_chunks()?.is_empty(),
+        DataLayout::Compact { .. } | DataLayout::Virtual { .. } => false,
+    })
+}
+
 fn check_layout(layout: &DataLayout, path: &str) -> Result<(), Error> {
     match layout {
         DataLayout::Compact { .. } | DataLayout::Contiguous { .. } | DataLayout::Chunked { .. } => {

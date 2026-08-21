@@ -1115,6 +1115,31 @@ pub(crate) fn fixed_array_len(
 ///
 /// The variant names match [`layout_info::ChunkIndex`](crate::layout_info::ChunkIndex),
 /// which classifies the same three shapes on the read side.
+/// Whether a dataset's storage is allocated at all.
+///
+/// The reference library's default allocation time is *late*: a dataset created
+/// and never written holds no chunks over a non-empty dataspace, and its layout
+/// message carries the undefined address rather than naming an index. A
+/// contiguous dataset created the same way is the same story without an index in
+/// it.
+///
+/// This has to be said rather than derived, because the element count cannot
+/// tell the two apart: a shape of 1,000 means "ten chunks of fill value" for one
+/// dataset and "nothing stored" for the other, and reading the second answers the
+/// fill value for every element exactly as the first does (issue #292). Deriving
+/// it from the staged bytes would be worse still, since "no bytes" is also what a
+/// caller who simply forgot the data looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum StorageAllocation {
+    /// Storage covers the dataspace: a chunk in every grid slot the shape
+    /// implies, or a contiguous run of every element's bytes.
+    #[default]
+    Allocated,
+    /// No storage: no chunks, no index, and no data region. The layout message
+    /// carries the undefined address.
+    Unallocated,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ChunkIndexKind {
     /// No index structure and no chunk address: a fixed-shape dataset with no
@@ -2253,6 +2278,7 @@ pub(crate) fn compress_chunks(
     options: &ChunkOptions,
     maxshape: Option<&[u64]>,
     fill: FillPattern<'_>,
+    allocation: StorageAllocation,
 ) -> Result<CompressedChunkSet, FormatError> {
     let chunk_dims = ctx.chunk_dims;
     let element_size = nonzero_usize_from(ctx.element_size)?;
@@ -2270,9 +2296,19 @@ pub(crate) fn compress_chunks(
         maxshape,
         full_chunk_bytes(chunk_dims.iter().copied(), element_size),
         pipeline.is_some(),
+        allocation,
     )?;
 
-    let chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size, fill)?;
+    // An unallocated dataset is not split: the splitter pads every slot the
+    // shape implies with the fill value, which is precisely the materialization
+    // this case exists to avoid. `plan_index_slots` already answered for the
+    // same `allocation`, so the assertion below still pairs the two.
+    let chunks = match allocation {
+        StorageAllocation::Allocated => {
+            split_into_chunks(raw_data, shape, chunk_dims, element_size, fill)?
+        }
+        StorageAllocation::Unallocated => Vec::new(),
+    };
     let num_chunks = chunks.len();
     let has_filters = pipeline.is_some();
     debug_assert_eq!(slot_of_chunk.len(), num_chunks);
@@ -2319,12 +2355,18 @@ pub(crate) fn compress_chunks(
 /// are numbered over is the same grid whose size picks between a single-chunk
 /// layout and a Fixed Array, and a caller that derived them separately could
 /// number chunks for one index while declaring another.
+///
+/// `allocation` says whether the dataset stores anything at all. Every other
+/// input describes the *dataspace*, which an unallocated dataset declares in
+/// full; only this distinguishes a grid of chunks from none, and a fixed-shape
+/// dataset that stores none is the [`ChunkIndexKind::Unallocated`] layout.
 pub(crate) fn plan_index_slots(
     shape: &[u64],
     chunk_dims: &[u64],
     maxshape: Option<&[u64]>,
     chunk_bytes: u64,
     has_filters: bool,
+    allocation: StorageAllocation,
 ) -> Result<(ChunkIndexKind, Vec<u64>, u64), FormatError> {
     let grid = index_grid(shape, chunk_dims, maxshape)?;
     let counts: Vec<u64> = shape
@@ -2332,7 +2374,14 @@ pub(crate) fn plan_index_slots(
         .zip(chunk_dims)
         .map(|(d, c)| d.div_ceil(*c))
         .collect();
-    let num_chunks = counts.iter().product::<u64>().to_usize()?;
+    // The grid the shape implies, or none of it. The maximum-shape refusals
+    // below still run for an unallocated dataset: it is allowed to grow, and a
+    // maximum shape this writer could not index once it did is refused when the
+    // dataset is written rather than when the first chunk arrives.
+    let num_chunks = match allocation {
+        StorageAllocation::Allocated => counts.iter().product::<u64>().to_usize()?,
+        StorageAllocation::Unallocated => 0,
+    };
     let kind = chunk_index_kind(&grid, num_chunks);
 
     let mut slot_of_chunk = Vec::with_capacity(num_chunks);
@@ -2751,7 +2800,15 @@ pub fn build_chunked_data_at_ext(
     maxshape: Option<&[u64]>,
     fill: FillPattern<'_>,
 ) -> Result<ChunkedDataResult, FormatError> {
-    let set = compress_chunks(raw_data, shape, ctx, options, maxshape, fill)?;
+    let set = compress_chunks(
+        raw_data,
+        shape,
+        ctx,
+        options,
+        maxshape,
+        fill,
+        StorageAllocation::Allocated,
+    )?;
     assemble_chunked_at(&set, base_address)
 }
 
@@ -2930,6 +2987,10 @@ pub(crate) fn plan_chunked_data_verbatim(
         maxshape,
         full_chunk_bytes(chunk_dims.iter().copied(), element_size),
         has_filters,
+        // A verbatim payload is the chunks the source held. Its own count is
+        // checked against the plan's just below, so an empty one is reported
+        // rather than quietly re-planned as an unallocated dataset.
+        StorageAllocation::Allocated,
     )?;
     if slot_of_chunk.len() != num_chunks {
         return Err(FormatError::ChunkedReadError(format!(
@@ -3218,6 +3279,127 @@ mod tests {
         }
     }
 
+    /// A dataset that stores nothing is planned as storing nothing, whatever
+    /// its shape says (issue #293).
+    ///
+    /// The shape is the only thing the planner otherwise has to count chunks
+    /// from, so this is the one input that can tell "ten chunks of the fill
+    /// value" from "no chunks at all" — the two states a read cannot
+    /// distinguish. Both answers are taken from the same geometry here, so the
+    /// only difference between them is the allocation.
+    #[test]
+    fn an_unallocated_dataset_plans_no_chunks_over_the_shape_it_declares() {
+        let shape = [1000u64];
+        let chunk = [100u64];
+
+        let (kind, slots, span) = plan_index_slots(
+            &shape,
+            &chunk,
+            None,
+            400,
+            false,
+            StorageAllocation::Allocated,
+        )
+        .expect("a dense fixed-shape plan");
+        assert!(matches!(kind, ChunkIndexKind::FixedArray));
+        assert_eq!(slots.len(), 10, "ten chunks cover the shape");
+        assert_eq!(span, 10);
+
+        let (kind, slots, span) = plan_index_slots(
+            &shape,
+            &chunk,
+            None,
+            400,
+            false,
+            StorageAllocation::Unallocated,
+        )
+        .expect("an unallocated plan");
+        assert!(
+            matches!(kind, ChunkIndexKind::Unallocated),
+            "a fixed-shape dataset that stores nothing carries the undefined \
+             address, not an index over an empty grid: {kind:?}"
+        );
+        assert!(slots.is_empty(), "no chunk has a slot");
+        assert_eq!(span, 0, "and the index spans none");
+
+        // A dataset that is allowed to grow keeps the growable index either
+        // way, which is the same choice an empty resizable dataset gets: the
+        // in-place append path needs the index to exist before the first chunk
+        // arrives, so "stores nothing" does not mean "indexes nothing" here.
+        let (kind, slots, _) = plan_index_slots(
+            &shape,
+            &chunk,
+            Some(&[u64::MAX]),
+            400,
+            false,
+            StorageAllocation::Unallocated,
+        )
+        .expect("an unallocated resizable plan");
+        assert!(matches!(kind, ChunkIndexKind::ExtensibleArray), "{kind:?}");
+        assert!(slots.is_empty());
+    }
+
+    /// The encoder does not split an unallocated dataset into chunks.
+    ///
+    /// Compressing one is not merely wasted work: [`split_into_chunks`] pads
+    /// every slot the shape implies with the fill value, so a set built from it
+    /// would carry the whole materialized grid — the exact bytes issue #293 is
+    /// about — and would do it while `raw_data` is empty, which is what the
+    /// dataset staging this actually hands over.
+    #[test]
+    fn an_unallocated_dataset_encodes_no_chunk_bytes() {
+        let shape = [1000u64];
+        let chunk = [100u64];
+        let fill = [7u8, 0, 0, 0];
+        let elem = NonZeroUsize::new(4).unwrap();
+
+        let set = compress_chunks(
+            &[],
+            &shape,
+            ChunkContext::basic(&chunk, 4),
+            &ChunkOptions::default(),
+            None,
+            FillPattern::new(Some(&fill), elem),
+            StorageAllocation::Unallocated,
+        )
+        .expect("an unallocated set");
+        assert_eq!(set.compressed.len(), 0, "no chunk was encoded");
+        assert_eq!(
+            chunked_data_len(&set).unwrap(),
+            0,
+            "and the dataset occupies no data region"
+        );
+
+        let assembled = assemble_chunked_at(&set, 0x1000).unwrap();
+        assert!(assembled.data_bytes.is_empty(), "nothing to write out");
+        // The layout message names no index. `HADDR_UNDEF` is all ones, and it
+        // is the field the reference library reads to decide the dataset has no
+        // storage at all.
+        assert!(
+            assembled
+                .layout_message
+                .windows(8)
+                .any(|w| w == u64::MAX.to_le_bytes()),
+            "the layout message must carry the undefined address: {:?}",
+            assembled.layout_message
+        );
+
+        // The same geometry with its storage allocated is the grid this avoids.
+        let raw = vec![0u8; 1000 * 4];
+        let dense = compress_chunks(
+            &raw,
+            &shape,
+            ChunkContext::basic(&chunk, 4),
+            &ChunkOptions::default(),
+            None,
+            FillPattern::new(Some(&fill), elem),
+            StorageAllocation::Allocated,
+        )
+        .expect("a dense set");
+        assert_eq!(dense.compressed.len(), 10);
+        assert!(chunked_data_len(&dense).unwrap() >= 4000);
+    }
+
     /// The index-size bound counts the bytes that describe no chunk.
     ///
     /// Two things follow, and neither did from the slot count this replaced. A
@@ -3234,8 +3416,15 @@ mod tests {
         // A dense index is never bounded, however large: every slot holds a
         // chunk, so none of its bytes describe nothing.
         let many = (MAX_UNUSED_INDEX_BYTES / 8 + 1) as usize;
-        let (kind, slots, span) = plan_index_slots(&[many as u64], &[1], None, 8, false)
-            .expect("a dense index is not bounded");
+        let (kind, slots, span) = plan_index_slots(
+            &[many as u64],
+            &[1],
+            None,
+            8,
+            false,
+            StorageAllocation::Allocated,
+        )
+        .expect("a dense index is not bounded");
         assert!(matches!(kind, ChunkIndexKind::FixedArray));
         assert_eq!(slots.len(), many);
         assert_eq!(span, many as u64);
@@ -3252,10 +3441,24 @@ mod tests {
                     as u32,
             );
             let widest = MAX_UNUSED_INDEX_BYTES / elem + 1;
-            plan_index_slots(&[1], &[1], Some(&[widest]), chunk_bytes, has_filters)
-                .expect("an index exactly at the budget is written");
-            let err = plan_index_slots(&[1], &[1], Some(&[widest + 1]), chunk_bytes, has_filters)
-                .unwrap_err();
+            plan_index_slots(
+                &[1],
+                &[1],
+                Some(&[widest]),
+                chunk_bytes,
+                has_filters,
+                StorageAllocation::Allocated,
+            )
+            .expect("an index exactly at the budget is written");
+            let err = plan_index_slots(
+                &[1],
+                &[1],
+                Some(&[widest + 1]),
+                chunk_bytes,
+                has_filters,
+                StorageAllocation::Allocated,
+            )
+            .unwrap_err();
             assert!(
                 format!("{err}").contains("describe no chunk"),
                 "filtered={has_filters}: {err}"
@@ -3264,8 +3467,15 @@ mod tests {
 
         // Room to grow along the dimension the dataset grows in costs no unused
         // slots however far it reaches, so it stays accepted.
-        plan_index_slots(&[8, 8], &[4, 4], Some(&[u64::MAX, 8]), 64, false)
-            .expect("growth along the indexed dimension leaves no gaps");
+        plan_index_slots(
+            &[8, 8],
+            &[4, 4],
+            Some(&[u64::MAX, 8]),
+            64,
+            false,
+            StorageAllocation::Allocated,
+        )
+        .expect("growth along the indexed dimension leaves no gaps");
     }
 
     /// An Extensible Array can address only as many slots as its blocks cover.
@@ -3286,8 +3496,16 @@ mod tests {
         );
 
         // Two chunks a stride apart: the second sits at slot `stride`.
-        let at =
-            |stride: u64| plan_index_slots(&[2, 1], &[1, 1], Some(&[u64::MAX, stride]), 4, false);
+        let at = |stride: u64| {
+            plan_index_slots(
+                &[2, 1],
+                &[1, 1],
+                Some(&[u64::MAX, stride]),
+                4,
+                false,
+                StorageAllocation::Allocated,
+            )
+        };
         at(capacity - 1).expect("the last addressable slot is written");
         let err = at(capacity).unwrap_err();
         assert!(format!("{err}").contains("can address"), "{err}");
@@ -3381,6 +3599,7 @@ mod tests {
                 &ChunkOptions::default(),
                 maxshape,
                 FillPattern::ZERO,
+                StorageAllocation::Allocated,
             )
             .unwrap();
 
@@ -4343,6 +4562,7 @@ mod tests {
                         &options,
                         maxshape.as_ref().map(<[u64; 1]>::as_slice),
                         FillPattern::ZERO,
+                        StorageAllocation::Allocated,
                     )
                     .unwrap();
 

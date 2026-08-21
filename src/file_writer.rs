@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use crate::attribute::AttributeMessage;
 use crate::btree_v2_write::{self, BTreeV2Plan};
 use crate::chunked_write::{
-    ByteSink, ChunkOptions, ChunkProvider, ChunkedMeasure, CompressedChunkSet, VerbatimLayout,
-    VerbatimPlan, assemble_chunked_at, compress_chunks, emit_chunked_data_verbatim,
+    ByteSink, ChunkOptions, ChunkProvider, ChunkedMeasure, CompressedChunkSet, StorageAllocation,
+    VerbatimLayout, VerbatimPlan, assemble_chunked_at, compress_chunks, emit_chunked_data_verbatim,
     measure_chunked_at, plan_chunked_data_verbatim,
 };
 use crate::convert::TryToUsize;
@@ -1360,6 +1360,10 @@ impl FileWriter {
             /// When set, this contiguous dataset's element bytes are produced at
             /// write time rather than held in `raw`, which stays empty.
             produced: Option<crate::type_builders::ProducedPayload>,
+            /// Whether this dataset allocates storage at all. An unallocated one
+            /// declares its shape and stores nothing: `raw` is empty over a
+            /// dataspace that is not, which no other dataset here is.
+            allocation: StorageAllocation,
         }
 
         impl DsFlat {
@@ -1370,6 +1374,40 @@ impl FileWriter {
                 match &self.produced {
                     Some(p) => p.total_bytes,
                     None => self.raw.len() as u64,
+                }
+            }
+
+            /// The byte length the contiguous data-layout message records for a
+            /// data region of `region_len` bytes.
+            ///
+            /// The two are the same number for every dataset that allocates its
+            /// storage. An unallocated one has no region, and the reference
+            /// library still records the extent the dataset *would* occupy
+            /// beside the undefined address — so a reader asking how big this
+            /// dataset is gets the same answer from either writer, and
+            /// [`Layout::Contiguous`](crate::Layout::Contiguous)'s promise that
+            /// `size` is "the extent that would be written" holds for a file
+            /// this crate produced (issue #293).
+            ///
+            /// One function rather than a rule restated at the sizing pass and
+            /// again at the emit pass, which reach the region's length by
+            /// different routes and could otherwise disagree about it.
+            fn declared_contiguous_len(&self, region_len: u64) -> Result<u64, FormatError> {
+                match self.allocation {
+                    StorageAllocation::Allocated => Ok(region_len),
+                    StorageAllocation::Unallocated => {
+                        // Saturating for the same reason `flatten_dataset`'s
+                        // shape check saturates: an absurd shape must not panic
+                        // a debug build in `product`.
+                        let elements = self
+                            .ds
+                            .dimensions
+                            .iter()
+                            .copied()
+                            .try_fold(1u64, |acc, d| acc.checked_mul(d))
+                            .unwrap_or(u64::MAX);
+                        Ok(elements.saturating_mul(self.dt.element_size_usize()?.get() as u64))
+                    }
                 }
             }
 
@@ -1646,9 +1684,14 @@ impl FileWriter {
             // A produced dataset owns no flat bytes either: its region is a run
             // of `total_bytes` filled by its provider during emission.
             let produced = db.produced;
+            // And an unallocated one owns none because it stores nothing at all
+            // — the one case here where an empty `raw` sits under a dataspace
+            // that is not empty (issue #293).
+            let allocation = db.allocation;
+            let unallocated = allocation == StorageAllocation::Unallocated;
             // Allow empty data for zero-element datasets (e.g. shape [0, 0]).
             let is_empty = shape.contains(&0);
-            let raw = if is_empty || raw_chunks.is_some() || produced.is_some() {
+            let raw = if is_empty || unallocated || raw_chunks.is_some() || produced.is_some() {
                 db.data.unwrap_or_default()
             } else {
                 db.data.ok_or(FormatError::DatasetMissingData)?
@@ -1672,7 +1715,9 @@ impl FileWriter {
             // produce a file that fails to read back. `saturating_mul` keeps an
             // absurd shape from overflowing into a false match.
             let elem_bytes = elem_size.get() as u64;
-            if !is_empty && raw_chunks.is_none() {
+            // An unallocated dataset stages no bytes to disagree with its shape;
+            // the whole point is that the two do not have to match.
+            if !is_empty && !unallocated && raw_chunks.is_none() {
                 // A produced region is checked against the same invariant as a
                 // materialized one — its size is declared rather than measured,
                 // and a declaration that disagrees with the shape would produce a
@@ -1777,6 +1822,7 @@ impl FileWriter {
                 reference_targets: db.reference_targets,
                 vl_string_staging: db.vl_string_staging,
                 fill: db.fill,
+                allocation,
             });
             ds_vl.push(patches);
             Ok(idx)
@@ -2229,6 +2275,7 @@ impl FileWriter {
                         &d.chunk_options,
                         d.maxshape.as_deref(),
                         fill,
+                        d.allocation,
                     )?))
                 } else {
                     Ok(None)
@@ -2433,7 +2480,7 @@ impl FileWriter {
                     &d.dt_location,
                     &d.ds,
                     0,
-                    d.contiguous_len(),
+                    d.declared_contiguous_len(d.contiguous_len())?,
                     &d.attrs,
                     dense_attr_info.as_deref(),
                     d.fill.as_deref(),
@@ -2669,7 +2716,7 @@ impl FileWriter {
                         &d.dt_location,
                         &d.ds,
                         layout.data_addr,
-                        layout.data.len(),
+                        d.declared_contiguous_len(layout.data.len())?,
                         &d.attrs,
                         ds_dense_blobs[i]
                             .as_ref()
