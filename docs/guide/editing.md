@@ -357,6 +357,18 @@ Rather than silently degrade a file, the editor refuses anything it cannot repro
 
 See [`Error::EditUnsupported`](../reference/data-types.md) for the full set of refusals.
 
+## Object references the file already stores
+
+An object reference is an object-header address stored as data — in a dataset's elements, or in an attribute's value. A commit rebuilds every dirty object's header at a fresh address and repoints the *link* that names it, which leaves those stored addresses naming a header the same commit frees. So a commit's last act, after the superblock repoint that publishes it, is to walk the tree it just published and rewrite every stored address that names something it moved. Nothing about this is opt-in and no API reports it; the point is that a reference keeps naming its object.
+
+Two things decide what it reaches. **Where the bytes are**: a contiguous or compact dataset's elements, and an attribute held in the object header — but not a chunked dataset's chunks, not a dense (fractal-heap) attribute, and not one held as a shared (SOHM) record. A version 1 object header, or a version 2 one tracking message creation order, is read by a different parser that reaches element data but not an attribute's value; version 1 is the format the reference C library and h5py write by default, so this is the common case rather than a legacy corner. And **what the datatype is**: an 8-byte object reference, an array of them, a compound holding one, and any nesting of those two — but not an object reference wider than 8 bytes, not a dataset-region reference, not a variable-length reference (how the dimension-scale attribute `DIMENSION_LIST` is encoded), and not an enumeration over one.
+
+Everything outside that is left exactly as it was rather than refused — refusing would ban editing such a file at all, since every commit rebuilds its root group — which is where all of it stood before ([#324](https://github.com/stephenberry/hdf5-pure/issues/324)).
+
+A reference whose target the commit **deletes** is left alone too, and for a different reason: the object is gone, and HDF5 has no rule that turns a reference to it into something else. The reference C library behaves the same way.
+
+The cost is one pass over the file's objects per commit, so it scales with the object count rather than with the file's size. A session that proves a file holds no reference at all skips the pass on every later commit, until it stages something that could introduce one.
+
 ## Space reuse and truncation
 
 Within a session, the space a deletion frees is reused for later writes, so add/delete churn stays bounded instead of only ever growing the file. If a freed run reaches the end of the file, the file is truncated.

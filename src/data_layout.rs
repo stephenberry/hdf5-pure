@@ -43,6 +43,16 @@ pub enum DataLayout {
     },
 }
 
+/// Byte offset of a compact layout's inline data within the layout message
+/// body: version(1) + layout class(1) + data size(2). Version 3 and version 4
+/// encode the compact class identically, so one constant covers both.
+///
+/// Exported because the data is addressed in the *file* as well as parsed out of
+/// it — repointing a stored object reference writes over these bytes in place
+/// (issue #324) — and a second derivation of the same offset would be free to
+/// drift from the parser's.
+pub(crate) const COMPACT_DATA_OFFSET: usize = 4;
+
 impl DataLayout {
     /// Parse a data layout message from raw message bytes.
     ///
@@ -71,8 +81,8 @@ impl DataLayout {
                 // Compact
                 ensure_len(data, pos, 2)?;
                 let data_size = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                ensure_len(data, pos + 2, data_size)?;
-                let raw = data[pos + 2..pos + 2 + data_size].to_vec();
+                ensure_len(data, COMPACT_DATA_OFFSET, data_size)?;
+                let raw = data[COMPACT_DATA_OFFSET..COMPACT_DATA_OFFSET + data_size].to_vec();
                 Ok(DataLayout::Compact { data: raw })
             }
             1 => {
@@ -127,8 +137,8 @@ impl DataLayout {
                 // Compact — same as v3
                 ensure_len(data, pos, 2)?;
                 let data_size = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
-                ensure_len(data, pos + 2, data_size)?;
-                let raw = data[pos + 2..pos + 2 + data_size].to_vec();
+                ensure_len(data, COMPACT_DATA_OFFSET, data_size)?;
+                let raw = data[COMPACT_DATA_OFFSET..COMPACT_DATA_OFFSET + data_size].to_vec();
                 Ok(DataLayout::Compact { data: raw })
             }
             1 => {
