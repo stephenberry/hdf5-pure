@@ -41,7 +41,9 @@ A dataset created with `H5Pset_external` keeps its elements in one or more files
 
 Writing is refused for the same reason, with `Error::EditUnsupported`: `Dataset::write`, `write_staged`, and `append_staged` would otherwise take the address-less layout for never-allocated storage, append the new elements to the HDF5 file and point the layout at them, leaving the file disagreeing with the external files about where its data lives. Delete the dataset and create it again in the same commit to replace it.
 
-What still works is everything that does not touch the elements: the shape, the datatype, and the address-less layout all read, since that layout is the evidence a caller needs, and attributes can be set and removed. Following the external files is a separate feature rather than a gap here — it means resolving each named file against the reading process's own filesystem, which is outside what a self-contained HDF5 file describes.
+Copying is refused too, by name: `File::copy` and `File::copy_from` reproduce a dataset whose storage was never allocated as the empty storage it is, and an externally stored dataset carries that same address-less layout over data that exists — so a copy that treated the two alike would report success having written the schema and none of the elements ([#336](https://github.com/stephenberry/hdf5-pure/issues/336)).
+
+What still works is reading the metadata — the shape, the datatype, and the address-less layout, since that layout is the evidence a caller needs — and setting and removing attributes. Following the external files is a separate feature rather than a gap here — it means resolving each named file against the reading process's own filesystem, which is outside what a self-contained HDF5 file describes.
 
 ### Repack faithfulness
 

@@ -1984,3 +1984,243 @@ fn editing_a_group_is_refused_when_the_links_cannot_be_walked() {
         "a refused commit must leave the file byte-identical"
     );
 }
+
+/// A dataset the reference library created and never wrote is copied as the
+/// storage it has — none — rather than refused (issue #336).
+///
+/// The C library does not allocate a contiguous dataset's data until something
+/// is written to it, so one created and never written stores no data block at
+/// all and its layout message carries the undefined address. Reading it answers
+/// the fill value for every element (#284), which is exactly what makes a copy
+/// that reproduced what it *read* look correct: a destination storing a grid of
+/// fill values reads identically to one storing nothing. So the copy is checked
+/// for what it **stores** — no data address, and a file too small to hold the
+/// elements — as well as for what it reads. `repack` learned the same lesson in
+/// #293.
+///
+/// The fill value is deliberately not zero: a copy that lost it would still read
+/// as a plausible run of zeros.
+#[test]
+fn a_never_written_dataset_is_copied_as_the_storage_it_never_had() {
+    const N: usize = 100_000;
+    const FILL: i32 = -12_345;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("never_written_copy.h5");
+    {
+        // The copy path needs a version 2 object header, so the format is named
+        // rather than left to the linked library's default (which has moved).
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape((N,))
+            .fill_value(FILL)
+            .create("d")
+            .unwrap();
+        ds.new_attr::<i32>()
+            .shape(())
+            .create("tag")
+            .unwrap()
+            .write_scalar(&99i32)
+            .unwrap();
+        // A group holding another one, to copy the same shape recursively.
+        let g = file.create_group("g").unwrap();
+        g.new_dataset::<f64>()
+            .shape((4, 5))
+            .create("inner")
+            .unwrap();
+        file.close().unwrap();
+    }
+    // The source stores no data block: this is the shape under test, not an
+    // assumption about it.
+    {
+        let before = File::open(&path).unwrap();
+        assert!(
+            matches!(
+                before.dataset("d").unwrap().layout().unwrap(),
+                hdf5_pure::Layout::Contiguous { address: None, .. }
+            ),
+            "the fixture is meant to be a never-written dataset"
+        );
+    }
+
+    let session = File::open_rw(&path).unwrap();
+    session.copy("d", "d_copy").unwrap();
+    session.copy("g", "g_copy").unwrap();
+    session.commit().unwrap();
+    drop(session);
+
+    let f = File::open(&path).unwrap();
+    for name in ["d_copy", "g_copy/inner"] {
+        let ds = f.dataset(name).unwrap();
+        assert!(
+            matches!(
+                ds.layout().unwrap(),
+                hdf5_pure::Layout::Contiguous { address: None, .. }
+            ),
+            "{name}: the copy materialized storage the source never had: {:?}",
+            ds.layout().unwrap()
+        );
+    }
+    let copied = f.dataset("d_copy").unwrap();
+    assert_eq!(copied.read_i32().unwrap(), vec![FILL; N], "values match");
+    assert_eq!(
+        copied.fill_value::<i32>().unwrap(),
+        Some(FILL),
+        "the fill value carried across"
+    );
+    assert_eq!(copied.shape().unwrap(), vec![N as u64], "shape carried");
+    assert_eq!(
+        copied.attrs().unwrap().get("tag"),
+        Some(&AttrValue::I64(99)),
+        "the attribute carried across"
+    );
+    assert_eq!(
+        f.dataset("g_copy/inner").unwrap().read_f64().unwrap(),
+        vec![0.0; 20],
+        "the group's never-written child copied too"
+    );
+    drop(f);
+
+    // The elements are absent rather than merely small: the whole file is
+    // smaller than the run of bytes one copy of them would occupy. Stated as a
+    // rule against the dataset's own size so it holds whatever the surrounding
+    // metadata costs.
+    let materialized = (N * core::mem::size_of::<i32>()) as u64;
+    let len = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        len < materialized,
+        "the file ({len} B) carries the {materialized} B of elements neither the \
+         source nor its copy ever stored"
+    );
+
+    // The reference library reads its own convention back out of the copy.
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("d_copy").unwrap().read_raw::<i32>().unwrap(),
+        vec![FILL; N],
+        "the C library reads the copy as its fill value"
+    );
+    assert_eq!(
+        c.dataset("g_copy/inner")
+            .unwrap()
+            .read_raw::<f64>()
+            .unwrap(),
+        vec![0.0; 20]
+    );
+    c.close().unwrap();
+
+    // The cross-file path reads the source at staging time and screens each
+    // copied header for addresses that would dangle in another file, so it
+    // reaches the same dataset through a different set of checks.
+    let dst = dir.path().join("cross.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+        b.write(&dst).unwrap();
+    }
+    let source = File::open(&path).unwrap();
+    let session = File::open_rw(&dst).unwrap();
+    session.copy_from(&source, "d", "d_copy").unwrap();
+    session.commit().unwrap();
+    drop(session);
+    drop(source);
+
+    let f = File::open(&dst).unwrap();
+    let ds = f.dataset("d_copy").unwrap();
+    assert!(
+        matches!(
+            ds.layout().unwrap(),
+            hdf5_pure::Layout::Contiguous { address: None, .. }
+        ),
+        "the cross-file copy materialized storage the source never had: {:?}",
+        ds.layout().unwrap()
+    );
+    assert_eq!(ds.read_i32().unwrap(), vec![FILL; N]);
+    drop(f);
+    let len = std::fs::metadata(&dst).unwrap().len();
+    assert!(
+        len < materialized,
+        "the cross-file destination ({len} B) carries the {materialized} B of \
+         elements the source never stored"
+    );
+}
+
+/// A never-written dataset whose *datatype* declares an object reference stores
+/// no address at all, so copying it beside a delete has nothing that could point
+/// into the space the delete reclaims (issues #317, #336).
+///
+/// The screen that enforces #317 reads a copied dataset's element bytes and
+/// refuses any address landing in a vacated span. A dataset with no storage has
+/// no element bytes to read, so it has to be skipped rather than screened as an
+/// empty run — because when that screen cannot *map* a datatype's addresses it
+/// refuses unconditionally, before reading a byte, and an empty run does not
+/// save it.
+///
+/// Which is why all three unmappable shapes are here and not just the one this
+/// crate can write. A dataset-region reference and a variable length of object
+/// references are exactly the datatypes that refusal names, and an
+/// object-reference dataset — the only one with mappable addresses — passes for
+/// a reason that tells you nothing about the other two. Before #336 the whole
+/// combination was unreachable: the copy was refused before any screen ran.
+#[test]
+fn a_never_written_reference_dataset_copies_beside_a_delete() {
+    use hdf5::types::{Reference, TypeDescriptor};
+
+    for (label, desc) in [
+        ("object", TypeDescriptor::Reference(Reference::Object)),
+        ("region", TypeDescriptor::Reference(Reference::Region)),
+        (
+            "vlen-of-object",
+            TypeDescriptor::VarLenArray(Box::new(TypeDescriptor::Reference(Reference::Object))),
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("never_written_refs.h5");
+        {
+            // As above: the copy path needs a version 2 object header.
+            let file = hdf5::File::with_options()
+                .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+                .create(&path)
+                .unwrap();
+            file.new_dataset_builder()
+                .empty_as(&desc)
+                .shape((4,))
+                .create("refs")
+                .unwrap();
+            file.new_dataset::<i32>()
+                .shape((3,))
+                .create("doomed")
+                .unwrap()
+                .write(&[1i32, 2, 3])
+                .unwrap();
+            file.close().unwrap();
+        }
+
+        let session = File::open_rw(&path).unwrap();
+        session.copy("refs", "refs_copy").unwrap();
+        session.root().delete("doomed").unwrap();
+        session
+            .commit()
+            .unwrap_or_else(|e| panic!("{label}: a dataset storing no reference was refused: {e}"));
+        drop(session);
+
+        let f = File::open(&path).unwrap();
+        let ds = f.dataset("refs_copy").unwrap();
+        assert!(
+            matches!(
+                ds.layout().unwrap(),
+                hdf5_pure::Layout::Contiguous { address: None, .. }
+            ),
+            "{label}: the copy materialized storage the source never had: {:?}",
+            ds.layout().unwrap()
+        );
+        assert!(
+            f.dataset("doomed").is_err(),
+            "{label}: the delete went through"
+        );
+    }
+}
