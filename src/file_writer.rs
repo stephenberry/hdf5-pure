@@ -1732,11 +1732,27 @@ impl FileWriter {
             let declared_contiguous_len = if unallocated { extent } else { region_len };
             // Guard against a shape that disagrees with the supplied data:
             // without this, a mismatch (data for 3 elements with shape `[2, 2]`)
-            // would produce a file that fails to read back. A verbatim-chunk
+            // would produce a file that fails to read back. A zero-element shape
+            // is held to that rule rather than exempted from it (issue #332): its
+            // extent is 0, so bytes staged beside it disagree with it like any
+            // other mismatch, and exempting them wrote a file the reference
+            // library refuses to open — twelve bytes of elements at a defined
+            // address under a dataspace declaring none, which our own reader
+            // answers `Ok([])` for without ever looking at the region. A chunked
+            // dataset of that shape had the milder version of the same fault: an
+            // empty chunk grid, so the staged bytes went nowhere and the caller
+            // was told `Ok`. The in-place writer refuses both already
+            // (`edit::flatten_dataset`, which shares this function's name and
+            // holds the same invariant with its own error type), and this is the
+            // same refusal on the whole-file path.
+            //
+            // Staging *no* data for a zero-element shape stays legal, which is
+            // what the `is_empty` bypass above is for: `region_len` and `extent`
+            // are both 0 there, so this comparison passes. A verbatim-chunk
             // dataset has no flat region to compare, and an unallocated one
             // stages no bytes to disagree with its shape — the whole point is
             // that the two do not have to match.
-            if !is_empty && !unallocated && raw_chunks.is_none() && region_len != extent {
+            if !unallocated && raw_chunks.is_none() && region_len != extent {
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "byte counts reported in a shape-mismatch error; display-only"

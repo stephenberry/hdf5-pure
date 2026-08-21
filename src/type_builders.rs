@@ -2320,6 +2320,14 @@ impl DatasetBuilder {
         self
     }
 
+    /// Declare the dataset's dimensions.
+    ///
+    /// The shape and the staged element data have to agree on the element
+    /// count, or the write is refused with
+    /// [`FormatError::ShapeDataMismatch`](crate::FormatError::ShapeDataMismatch).
+    /// A shape holding a zero dimension declares no elements and is held to that
+    /// same rule: stage an empty slice, or no data at all beside a
+    /// [`with_dtype`](Self::with_dtype), rather than data with nowhere to go.
     pub fn with_shape(&mut self, shape: &[u64]) -> &mut Self {
         self.shape = Some(shape.to_vec());
         self

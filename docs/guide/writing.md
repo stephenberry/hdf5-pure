@@ -176,6 +176,8 @@ builder
 
 `with_chunks` is required here rather than optional: auto-chunking derives the chunk from the shape, and a zero-element shape has nothing to derive from. Leaving it out is refused with `FormatError::InvalidChunkGeometry`.
 
+A zero-element shape and staged element data are refused together, with `FormatError::ShapeDataMismatch`: the shape declares nowhere for the data to go. Pass an empty slice or leave the data out entirely, as both examples above do.
+
 ## Serializing: `finish()` vs `write(path)`
 
 When the file is fully assembled, choose how to materialize it:
