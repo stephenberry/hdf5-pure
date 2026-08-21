@@ -25,6 +25,14 @@
 #                                                        (implies --push)
 #   --publish      `cargo publish` to crates.io          (implies --commit)
 #
+# The public-API delta report is not opt-in. CI stops checking once the manifest
+# carries a bump, so this is the one run that sees a whole cycle's delta, and a
+# `cargo-semver-checks` that is missing or cannot run stops the release rather
+# than being reported as nothing to see. That is worth an override for the window
+# after a rustc release, when no published version of the tool may yet parse the
+# new rustdoc format:
+#   --skip-api-delta  release without checking the public-API delta
+#
 # Usage:
 #   scripts/release.sh 0.21.0 --summary-file notes.md
 #   scripts/release.sh 0.21.0 --summary "One-paragraph summary." --push --gh-release
@@ -46,9 +54,14 @@ DO_COMMIT=0
 DO_PUSH=0
 DO_GH=0
 DO_PUBLISH=0
+SKIP_API_DELTA=0
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '\033[1m==>\033[0m %s\n' "$*"; }
+# For the things a release can proceed without but nobody should discover later.
+# On stderr, like `die` and unlike `note`, so redirecting the run to a log leaves
+# the warnings on the terminal rather than in the part nobody reads.
+warn() { printf '\n\033[33m!\033[0m %s\n' "$*" >&2; }
 
 usage() {
   # The leading comment block, minus the shebang and the `#` markers. Ends at
@@ -66,6 +79,7 @@ while [ $# -gt 0 ]; do
     --push)        DO_PUSH=1; shift ;;
     --gh-release)  DO_GH=1; shift ;;
     --publish)     DO_PUBLISH=1; shift ;;
+    --skip-api-delta) SKIP_API_DELTA=1; shift ;;
     -*)            die "unknown option: $1 (see --help)" ;;
     *)
       [ -z "$NEW_VERSION" ] || die "unexpected extra argument: $1"
@@ -187,7 +201,68 @@ fi
 TODAY="$(date +%Y-%m-%d)"
 
 # ---------------------------------------------------------------------------
-# 1. Bump the version in Cargo.toml and Cargo.lock
+# 1. Report the cycle's public-API delta
+# ---------------------------------------------------------------------------
+# CI's semver-checks job derives what to check from the version already in the
+# manifest, so once a breaking PR has bumped it the job reports "no semver update
+# required" and skips every check for the rest of the cycle. `--release-type
+# minor` overrides that derivation and forces the full run, which is worth having
+# exactly once, here, where the accumulated delta can be read against the
+# [Unreleased] section about to be promoted.
+#
+# Informational: a listed break is expected under a 0.x minor bump, and an empty
+# report on a cycle whose changelog claims a breaking change is the real signal.
+# Reading a report that way takes for granted that there is one to read, which is
+# what the guards below establish before anything is read into it (issue #337).
+#
+# Placed ahead of the bump and the promotion so that stopping here leaves a clean
+# tree to re-run in. Nothing those steps produce is an input: `--release-type`
+# sets the release type instead of deriving it from the manifest version, and the
+# baseline comes from the tag.
+if [ "$SKIP_API_DELTA" -eq 1 ]; then
+  warn "Skipping the public-API delta report (--skip-api-delta); nothing will have checked this cycle's accumulated public-API delta"
+else
+  SEMVER_FEATURES="serde,zfp,provenance,ndarray,num-complex"
+  command -v cargo-semver-checks >/dev/null 2>&1 \
+    || die "cargo-semver-checks is not installed, and this is the one run that checks a whole cycle's public-API delta (CI stops checking once the manifest carries a bump); install it (\`cargo install cargo-semver-checks --locked\`) or pass --skip-api-delta"
+
+  # The feature list is deliberate rather than derived — it names the features
+  # whose public API is worth checking, not every feature that exists, so the
+  # test-only ones stay out. That makes it drift when a feature is renamed or
+  # removed, and swallowing the failure would hide cargo's "feature does not
+  # exist" error behind an empty report that reads exactly like a clean one.
+  # Check the names against the manifest first, so the drift stops the release
+  # and says so before the build cost is paid.
+  for feat in $(printf '%s' "$SEMVER_FEATURES" | tr ',' ' '); do
+    awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[a-zA-Z0-9_-]+ = /{print $1}' \
+      "$CARGO_TOML" | grep -qx -- "$feat" \
+      || die "release.sh checks feature '$feat', which $CARGO_TOML no longer defines; update SEMVER_FEATURES"
+  done
+
+  note "Public API delta since ${PREV_VERSION} (informational)"
+  SEMVER_OUT="$(mktemp)"; TMP_FILES="$TMP_FILES $SEMVER_OUT"
+  # The exit status cannot be the test, because what it means changed under this
+  # script: 0.48.0 exits 1 both for a run that found breaks and for one that died
+  # before checking anything, where 0.50.0 splits those into 100 and 101. A rule
+  # written on either is a rule about one version window. `|| true` therefore
+  # still says "a break is the expected outcome here", not "any outcome is fine".
+  #
+  # What both versions do is print a `Summary` line once they reach a verdict —
+  # "no semver update required", or the bump the findings require — and a run
+  # that never reached its checks has none to print. Asserted as present rather
+  # than by looking for error text, so the release stops on a verdict this does
+  # not recognize instead of on only the failures it has already met.
+  # `--color always` because the pipe would otherwise strip the red and green
+  # that make the verdict scannable.
+  cargo semver-checks --baseline-version "$PREV_VERSION" --release-type minor \
+    --default-features --features "$SEMVER_FEATURES" --color always 2>&1 \
+    | tee "$SEMVER_OUT" || true
+  grep -q 'Summary' "$SEMVER_OUT" \
+    || die "cargo-semver-checks printed no verdict above, so the public-API delta since ${PREV_VERSION} went unchecked; its own error says why. A toolchain newer than the installed version supports is the common cause, and \`cargo install cargo-semver-checks --locked\` refreshes it. Pass --skip-api-delta to release without the check"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Bump the version in Cargo.toml and Cargo.lock
 # ---------------------------------------------------------------------------
 # Rewrite the first `version =` line that follows the hdf5-pure package header.
 # The same state machine works for Cargo.toml ([package]) and Cargo.lock
@@ -216,7 +291,7 @@ bump_version "$CARGO_TOML"
 bump_version "$CARGO_LOCK"
 
 # ---------------------------------------------------------------------------
-# 2. Promote [Unreleased] into a dated section and refresh the compare links
+# 3. Promote [Unreleased] into a dated section and refresh the compare links
 # ---------------------------------------------------------------------------
 note "Updating $CHANGELOG"
 CL_TMP="$(mktemp)"; TMP_FILES="$TMP_FILES $CL_TMP"
@@ -251,39 +326,6 @@ grep -q "^## \[${NEW_VERSION}\] - ${TODAY}\$" "$CHANGELOG" \
   || die "failed to promote [Unreleased] into a [$NEW_VERSION] section"
 
 # ---------------------------------------------------------------------------
-# 3. Report the cycle's public-API delta
-# ---------------------------------------------------------------------------
-# CI's semver-checks job derives what to check from the version already in the
-# manifest, so once a breaking PR has bumped it the job reports "no semver update
-# required" and skips every check for the rest of the cycle. `--release-type
-# minor` overrides that derivation and forces the full run, which is worth having
-# exactly once, here, where the accumulated delta can be read against the
-# [Unreleased] section about to be promoted.
-#
-# Informational: a listed break is expected under a 0.x minor bump, and an empty
-# report on a cycle whose changelog claims a breaking change is the real signal.
-#
-# The feature list is deliberate rather than derived — it names the features
-# whose public API is worth checking, not every feature that exists, so the
-# test-only ones stay out. That makes it drift when a feature is renamed or
-# removed, and `|| true` would then hide cargo's "feature does not exist" error
-# behind an empty report that reads exactly like a clean one. Check the names
-# against the manifest first, so the drift stops the release and says so.
-SEMVER_FEATURES="serde,zfp,provenance,ndarray,num-complex"
-if command -v cargo-semver-checks >/dev/null 2>&1; then
-  for feat in $(printf '%s' "$SEMVER_FEATURES" | tr ',' ' '); do
-    awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[a-zA-Z0-9_-]+ = /{print $1}' \
-      "$CARGO_TOML" | grep -qx -- "$feat" \
-      || die "release.sh checks feature '$feat', which $CARGO_TOML no longer defines; update SEMVER_FEATURES"
-  done
-  note "Public API delta since ${PREV_VERSION} (informational)"
-  cargo semver-checks --baseline-version "$PREV_VERSION" --release-type minor \
-    --default-features --features "$SEMVER_FEATURES" || true
-else
-  note "Skipping the API delta report (cargo-semver-checks not installed)"
-fi
-
-# ---------------------------------------------------------------------------
 # 4. Verify the crate still packages cleanly with the new version
 # ---------------------------------------------------------------------------
 note "Verifying with cargo publish --dry-run"
@@ -296,7 +338,11 @@ if [ "$DO_COMMIT" -eq 0 ]; then
   note "Prepared release files (not committed)."
   git --no-pager diff --stat -- "$CARGO_TOML" "$CARGO_LOCK" "$CHANGELOG"
   [ "$SUMMARY_IS_TODO" -eq 1 ] && \
-    printf '\n\033[33m!\033[0m Fill in the TODO summary in %s before committing.\n' "$CHANGELOG"
+    warn "Fill in the TODO summary in $CHANGELOG before committing."
+  # Repeated here because the skip happened before a build and a package check,
+  # far enough up that it is no longer on screen.
+  [ "$SKIP_API_DELTA" -eq 1 ] && \
+    warn "This release's public-API delta was never checked (--skip-api-delta)."
   cat <<EOF
 
 Next steps:
@@ -353,3 +399,10 @@ if [ "$DO_PUBLISH" -eq 1 ]; then
 fi
 
 note "Done: $TAG"
+
+# Last, so it is the line still on screen. An `if` rather than the `&&` form the
+# earlier reminders use: as the final command of the script, a false test would
+# be the script's own exit status.
+if [ "$SKIP_API_DELTA" -eq 1 ]; then
+  warn "$TAG went out without its public-API delta being checked (--skip-api-delta)."
+fi
