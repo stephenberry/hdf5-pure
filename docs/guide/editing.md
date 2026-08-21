@@ -352,6 +352,7 @@ Rather than silently degrade a file, the editor refuses anything it cannot repro
 
 - A file whose superblock is not located at its base address — a relocated or malformed userblock layout. (A canonical userblock, such as a MATLAB v7.3 `.mat` file's 512-byte userblock, is supported: addresses are read and written relative to the base and the userblock bytes are preserved.)
 - Dense-storage headers on the edited path.
+- Editing a **group with more than one hard link**, or one whose link count cannot be established because the file's links cannot be walked. A commit rebuilds a dirty group's object header at a fresh address and repoints the link it resolved the group through; every other link would be left naming the old header, which the same commit frees. The refusal reaches an edit *below* such a group too, since every ancestor on the edited path is rebuilt. The same rule already governs a relocating dataset write, append, or attribute edit; the root group is exempt, being named by the superblock rather than by a link. Deleting a link is unaffected — it relocates nothing.
 - Copying an existing version-1 object.
 - Across files (`copy_from`): variable-length or reference datasets and attributes, any shared (committed/SOHM) header message, and a streaming source file — none of which can be reproduced verbatim in another file.
 
