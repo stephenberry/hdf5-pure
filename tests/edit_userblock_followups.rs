@@ -13,7 +13,12 @@
 
 use hdf5_pure::{AttrValue, File, FileBuilder};
 
+#[path = "common/temp_fixture.rs"]
+mod temp_fixture;
+use temp_fixture::temp_path;
+
 const UB: usize = 512;
+
 const MARKER: &[u8] = b"USERBLOCK-FOLLOWUP-104";
 
 /// Stamp a recognizable marker across the userblock region of `bytes` and return
@@ -53,7 +58,7 @@ fn build_userblock_file(path: &std::path::Path) -> Vec<u8> {
 
 #[test]
 fn userblock_delete_dataset_roundtrip() {
-    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_delete_ds.h5");
+    let path = temp_path("hdf5_pure_ub_fu_delete_ds.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -77,8 +82,6 @@ fn userblock_delete_dataset_roundtrip() {
     datasets.sort();
     assert_eq!(datasets, vec!["beta".to_string()]);
     assert_userblock_unchanged(&path, &userblock);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -86,7 +89,7 @@ fn userblock_delete_group_subtree_roundtrip() {
     // Deleting a group reclaims its whole subtree (its header plus the nested
     // dataset's header and data). On a userblock file every child link and data
     // address is base-relative, so the subtree walk must re-absolutize them.
-    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_delete_grp.h5");
+    let path = temp_path("hdf5_pure_ub_fu_delete_grp.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -104,15 +107,13 @@ fn userblock_delete_group_subtree_roundtrip() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     assert_userblock_unchanged(&path, &userblock);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn userblock_delete_chunked_dataset_roundtrip() {
     // Deleting a chunked/filtered dataset reclaims its chunk index and chunk data
     // blocks via the base-aware `chunked_storage_spans`.
-    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_delete_chunk.h5");
+    let path = temp_path("hdf5_pure_ub_fu_delete_chunk.h5");
     let mut b = FileBuilder::new();
     b.with_userblock(UB as u64);
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
@@ -139,8 +140,6 @@ fn userblock_delete_chunked_dataset_roundtrip() {
         vec![1, 2, 3]
     );
     assert_userblock_unchanged(&path, &userblock);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -150,7 +149,7 @@ fn userblock_delete_then_reuse_freed_space() {
     // than only appending. The reused write lands at the freed *absolute* offset,
     // so a base mistake in `collect_free_spans` would either leak (no reuse) or, far
     // worse, free a still-live region the reuse then corrupts.
-    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_delete_reuse.h5");
+    let path = temp_path("hdf5_pure_ub_fu_delete_reuse.h5");
     let mut b = FileBuilder::new();
     b.with_userblock(UB as u64);
     let big: Vec<f64> = (0..256).map(|i| i as f64).collect();
@@ -188,15 +187,13 @@ fn userblock_delete_then_reuse_freed_space() {
         vec![7, 8, 9]
     );
     assert_userblock_unchanged(&path, &userblock);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn userblock_delete_one_of_several_then_read_attr() {
     // A delete rewrites the parent group's header (relinking survivors) and frees
     // the removed object. A sibling group's compact attribute must remain readable.
-    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_delete_attr.h5");
+    let path = temp_path("hdf5_pure_ub_fu_delete_attr.h5");
     let mut b = FileBuilder::new();
     b.with_userblock(UB as u64);
     b.create_dataset("doomed").with_f64_data(&[1.0, 2.0]);
@@ -226,8 +223,6 @@ fn userblock_delete_one_of_several_then_read_attr() {
         Some(&AttrValue::AsciiString("kept".into()))
     );
     assert_userblock_unchanged(&path, &userblock);
-
-    std::fs::remove_file(&path).ok();
 }
 
 // ---- copy (in-file) ----
@@ -237,7 +232,7 @@ fn userblock_copy_dataset_roundtrip() {
     // Copying a contiguous dataset writes a fresh data block and header; on a
     // userblock file the new data address and the parent link to the copy must both
     // be stored base-relative.
-    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_copy_ds.h5");
+    let path = temp_path("hdf5_pure_ub_fu_copy_ds.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -262,15 +257,13 @@ fn userblock_copy_dataset_roundtrip() {
         vec![7.5, 8.5]
     );
     assert_userblock_unchanged(&path, &userblock);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn userblock_copy_group_subtree_roundtrip() {
     // Copying a whole group deep-copies its nested dataset too; every child link
     // and data address in the copy is written base-relative.
-    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_copy_grp.h5");
+    let path = temp_path("hdf5_pure_ub_fu_copy_grp.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -293,15 +286,13 @@ fn userblock_copy_group_subtree_roundtrip() {
     groups.sort();
     assert_eq!(groups, vec!["grp".to_string(), "grp_copy".to_string()]);
     assert_userblock_unchanged(&path, &userblock);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn userblock_copy_chunked_dataset_roundtrip() {
     // Copying a chunked/filtered dataset enumerates the source chunks (on a
     // base-relative view of the file) and rebuilds the index at the new location.
-    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_copy_chunk.h5");
+    let path = temp_path("hdf5_pure_ub_fu_copy_chunk.h5");
     let mut b = FileBuilder::new();
     b.with_userblock(UB as u64);
     let data: Vec<f64> = (0..600).map(|i| (i % 9) as f64 * 0.25).collect();
@@ -324,8 +315,6 @@ fn userblock_copy_chunked_dataset_roundtrip() {
     assert_eq!(file.dataset("c").unwrap().read_f64().unwrap(), data);
     assert_eq!(file.dataset("c_copy").unwrap().read_f64().unwrap(), data);
     assert_userblock_unchanged(&path, &userblock);
-
-    std::fs::remove_file(&path).ok();
 }
 
 // ---- copy (cross-file, into a userblock destination) ----
@@ -334,8 +323,8 @@ fn userblock_copy_chunked_dataset_roundtrip() {
 fn userblock_cross_file_copy_into_userblock_dest() {
     // A base-0 source file is copied into a userblock destination. The destination
     // writes the copy base-relative even though the source was read base-0.
-    let dst_path = std::env::temp_dir().join("hdf5_pure_ub_fu_xcopy_dst.h5");
-    let src_path = std::env::temp_dir().join("hdf5_pure_ub_fu_xcopy_src.h5");
+    let dst_path = temp_path("hdf5_pure_ub_fu_xcopy_dst.h5");
+    let src_path = temp_path("hdf5_pure_ub_fu_xcopy_src.h5");
     let userblock = build_userblock_file(&dst_path);
 
     // A plain (no-userblock) source file.
@@ -374,9 +363,6 @@ fn userblock_cross_file_copy_into_userblock_dest() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     assert_userblock_unchanged(&dst_path, &userblock);
-
-    std::fs::remove_file(&dst_path).ok();
-    std::fs::remove_file(&src_path).ok();
 }
 
 // ---- reference screening (issue #317) ----
@@ -393,7 +379,7 @@ fn userblock_cross_file_copy_into_userblock_dest() {
 /// `resolve_reference_target` entirely (issue #317).
 #[test]
 fn userblock_reference_into_deleted_space_is_refused() {
-    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_ref_delete.h5");
+    let path = temp_path("hdf5_pure_ub_fu_ref_delete.h5");
     let mut b = FileBuilder::new();
     b.with_userblock(UB as u64);
     b.create_dataset("alpha").with_f64_data(&[1.0, 2.0]);
@@ -437,7 +423,6 @@ fn userblock_reference_into_deleted_space_is_refused() {
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_userblock_unchanged(&path, &userblock);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A path reference to an object the *same commit* places, on a userblock file.
@@ -449,7 +434,7 @@ fn userblock_reference_into_deleted_space_is_refused() {
 /// this edit — legal, and fine on a base-0 file — panicked in a debug build.
 #[test]
 fn userblock_reference_to_an_object_the_same_commit_places() {
-    let path = std::env::temp_dir().join("hdf5_pure_ub_fu_ref_same_commit.h5");
+    let path = temp_path("hdf5_pure_ub_fu_ref_same_commit.h5");
     let mut b = FileBuilder::new();
     b.with_userblock(UB as u64);
     b.create_dataset("alpha").with_f64_data(&[1.0, 2.0]);
@@ -493,5 +478,4 @@ fn userblock_reference_to_an_object_the_same_commit_places() {
     }
     drop(file);
     assert_userblock_unchanged(&path, &userblock);
-    std::fs::remove_file(&path).ok();
 }

@@ -11,9 +11,9 @@ use hdf5_pure::{
     MemoryStrategy,
 };
 
-fn tmp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(name)
-}
+#[path = "common/temp_fixture.rs"]
+mod temp_fixture;
+use temp_fixture::temp_path;
 
 /// The superblock's end-of-file must equal the actual file length after every
 /// commit, including ones that truncate.
@@ -29,7 +29,7 @@ fn assert_eof_matches_file(path: &std::path::Path) {
 
 #[test]
 fn delete_then_truncate_shrinks_within_session() {
-    let path = tmp("hdf5_pure_fs_shrink.h5");
+    let path = temp_path("hdf5_pure_fs_shrink.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep")
         .with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
@@ -67,12 +67,11 @@ fn delete_then_truncate_shrinks_within_session() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     assert!(file.dataset("big").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn churn_within_session_stays_bounded() {
-    let path = tmp("hdf5_pure_fs_churn.h5");
+    let path = temp_path("hdf5_pure_fs_churn.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
     b.write(&path).unwrap();
@@ -111,12 +110,11 @@ fn churn_within_session_stays_bounded() {
         file.dataset("keep").unwrap().read_i32().unwrap(),
         vec![1, 2, 3]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn reuse_keeps_survivors_byte_exact() {
-    let path = tmp("hdf5_pure_fs_reuse_exact.h5");
+    let path = temp_path("hdf5_pure_fs_reuse_exact.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("a").with_i32_data(&[10, 20, 30]);
     b.create_dataset("b").with_f64_data(&[1.5, 2.5]);
@@ -150,12 +148,11 @@ fn reuse_keeps_survivors_byte_exact() {
         vec![7, 8, 9, 10]
     );
     assert!(file.dataset("b").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn delete_subtree_reclaims_all_members() {
-    let path = tmp("hdf5_pure_fs_subtree.h5");
+    let path = temp_path("hdf5_pure_fs_subtree.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1]);
     b.write(&path).unwrap();
@@ -191,7 +188,6 @@ fn delete_subtree_reclaims_all_members() {
     let file = File::open(&path).unwrap();
     assert!(file.group("grp").is_err());
     assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), vec![1]);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -206,7 +202,7 @@ fn trailing_slack_past_recorded_eof_stays_readable() {
     // (It exercises the *outcome* of the ordering, not the ordering itself —
     // fault-injecting between the superblock sync and `set_len` would need a seam
     // File::open_rw does not yet expose, and remains future work.)
-    let path = tmp("hdf5_pure_fs_trailing_slack.h5");
+    let path = temp_path("hdf5_pure_fs_trailing_slack.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[11, 22, 33]);
     b.write(&path).unwrap();
@@ -268,7 +264,6 @@ fn trailing_slack_past_recorded_eof_stays_readable() {
         vec![11, 22, 33]
     );
     assert!(f.dataset("scratch").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -277,7 +272,7 @@ fn deleting_filtered_chunked_dataset_reclaims_storage() {
     // blocks plus the FAHD/FADB index — is now reclaimed on delete. Deleting it
     // shrinks the file below its size with the dataset present, the survivor
     // stays byte-exact, and the file stays valid.
-    let path = tmp("hdf5_pure_fs_chunked_filtered.h5");
+    let path = temp_path("hdf5_pure_fs_chunked_filtered.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[42, 43, 44]);
     b.write(&path).unwrap();
@@ -317,7 +312,6 @@ fn deleting_filtered_chunked_dataset_reclaims_storage() {
         vec![42, 43, 44]
     );
     assert!(file.dataset("comp").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -326,7 +320,7 @@ fn deleting_unfiltered_chunked_dataset_truncates_fully() {
     // data followed by the Fixed Array index, nothing between). Adding it at
     // end-of-file then deleting it in the same session reclaims the whole blob as
     // a trailing run, truncating the file back to essentially its prior size.
-    let path = tmp("hdf5_pure_fs_chunked_unfiltered.h5");
+    let path = temp_path("hdf5_pure_fs_chunked_unfiltered.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
     b.write(&path).unwrap();
@@ -365,7 +359,6 @@ fn deleting_unfiltered_chunked_dataset_truncates_fully() {
         vec![1, 2, 3]
     );
     assert!(file.dataset("big").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -374,7 +367,7 @@ fn deleting_paged_fixed_array_dataset_reclaims_storage() {
     // layout (a page-init bitmap and per-page checksums). 1100 chunks of 16 f64
     // exercise that index-sizing path end to end: the whole index plus chunk
     // data is reclaimed on delete.
-    let path = tmp("hdf5_pure_fs_paged_fa.h5");
+    let path = temp_path("hdf5_pure_fs_paged_fa.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[7]);
     b.write(&path).unwrap();
@@ -408,7 +401,6 @@ fn deleting_paged_fixed_array_dataset_reclaims_storage() {
     assert_eq!(file.root().datasets().unwrap(), vec!["keep".to_string()]);
     assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), vec![7]);
     assert!(file.dataset("paged").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -416,7 +408,7 @@ fn deleting_extensible_dataset_reclaims_storage() {
     // A dataset with an unlimited maximum dimension uses an Extensible Array chunk
     // index (EAHD/EAIB and, past the inline slots, data blocks). Deleting it
     // reclaims the whole index plus its chunk data.
-    let path = tmp("hdf5_pure_fs_extensible.h5");
+    let path = temp_path("hdf5_pure_fs_extensible.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[9]);
     b.write(&path).unwrap();
@@ -452,7 +444,6 @@ fn deleting_extensible_dataset_reclaims_storage() {
     assert_eq!(file.root().datasets().unwrap(), vec!["keep".to_string()]);
     assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), vec![9]);
     assert!(file.dataset("ext").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -460,7 +451,7 @@ fn deleting_single_chunk_dataset_reclaims_storage() {
     // A dataset whose single chunk covers the whole shape uses the single-chunk
     // index (the chunk address lives in the layout message, no separate index
     // structure). Deleting it reclaims that one chunk block.
-    let path = tmp("hdf5_pure_fs_single_chunk.h5");
+    let path = temp_path("hdf5_pure_fs_single_chunk.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[5, 6]);
     b.write(&path).unwrap();
@@ -500,14 +491,13 @@ fn deleting_single_chunk_dataset_reclaims_storage() {
         vec![5, 6]
     );
     assert!(file.dataset("one").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn chunked_churn_within_session_stays_bounded() {
     // Repeatedly add then delete a sizable chunked dataset in one session. With
     // chunk + index reclaim and reuse the file must not grow without bound.
-    let path = tmp("hdf5_pure_fs_chunked_churn.h5");
+    let path = temp_path("hdf5_pure_fs_chunked_churn.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
     b.write(&path).unwrap();
@@ -543,14 +533,13 @@ fn chunked_churn_within_session_stays_bounded() {
         file.dataset("keep").unwrap().read_i32().unwrap(),
         vec![1, 2, 3]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn deleting_subtree_with_chunked_members_reclaims() {
     // Deleting a group reclaims its chunked-dataset members' storage too (the
     // free walk descends the subtree).
-    let path = tmp("hdf5_pure_fs_chunked_subtree.h5");
+    let path = temp_path("hdf5_pure_fs_chunked_subtree.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1]);
     b.write(&path).unwrap();
@@ -587,14 +576,13 @@ fn deleting_subtree_with_chunked_members_reclaims() {
     let file = File::open(&path).unwrap();
     assert!(file.group("grp").is_err());
     assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), vec![1]);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn persisted_chunked_reclaim_is_disjoint_and_reusable() {
     // With persistence on, deleting a chunked dataset records its storage as
     // free sections that stay disjoint and are reused across reopen.
-    let path = tmp("hdf5_pure_fs_chunked_persist.h5");
+    let path = temp_path("hdf5_pure_fs_chunked_persist.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1; 50]);
     b.create_dataset("comp")
@@ -623,7 +611,6 @@ fn persisted_chunked_reclaim_is_disjoint_and_reusable() {
     }
     assert_eq!(f.dataset("keep").unwrap().read_i32().unwrap(), vec![1; 50]);
     assert!(f.dataset("comp").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -632,7 +619,7 @@ fn persisted_free_space_survives_reopen_and_is_reused() {
     // (the FSHD/FSSE managers), so a freed region survives close/reopen and a
     // later session reuses it instead of growing the file. This is the cross-
     // session counterpart to the within-session reuse above.
-    let path = tmp("hdf5_pure_fs_persist_roundtrip.h5");
+    let path = temp_path("hdf5_pure_fs_persist_roundtrip.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("a").with_i32_data(&[1; 100]);
     b.create_dataset("big").with_i32_data(&[7; 400]); // 1600 bytes of raw data
@@ -690,7 +677,6 @@ fn persisted_free_space_survives_reopen_and_is_reused() {
     assert_eq!(f.dataset("c").unwrap().read_i32().unwrap(), vec![3; 100]);
     // Persistence remains armed: the file still records its free space on disk.
     assert!(f.file_space_info().unwrap().persist);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -699,7 +685,7 @@ fn persisted_managers_stay_consistent_across_many_commits() {
     // managers and extension, recording them as free, so the file stays valid and
     // its tracked free space never double-counts or loses a region. Both this
     // crate and a fresh reader must agree on the result after every step.
-    let path = tmp("hdf5_pure_fs_persist_multi.h5");
+    let path = temp_path("hdf5_pure_fs_persist_multi.h5");
     let mut b = FileBuilder::new();
     for i in 0..6 {
         b.create_dataset(&format!("d{i}"))
@@ -749,7 +735,6 @@ fn persisted_managers_stay_consistent_across_many_commits() {
         );
     }
     assert!(f.dataset("d0").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 /// The bytes a chunked dataset of `elems` `f64` elements occupies, near enough:
@@ -768,7 +753,7 @@ fn chunked_dataset_reuses_the_hole_a_chunked_delete_left() {
     //
     // The hole is interior on purpose: `tail` sits above the deleted dataset, so
     // truncation cannot be what keeps the file small.
-    let path = tmp("hdf5_pure_fs_chunked_reuse.h5");
+    let path = temp_path("hdf5_pure_fs_chunked_reuse.h5");
     const ELEMS: usize = 32768; // 256 KiB of raw data
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
@@ -810,7 +795,6 @@ fn chunked_dataset_reuses_the_hole_a_chunked_delete_left() {
     );
     assert_eq!(f.dataset("tail").unwrap().read_i32().unwrap(), vec![9; 16]);
     assert!(f.dataset("big").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -818,7 +802,7 @@ fn filtered_chunked_dataset_reuses_freed_space() {
     // Same as above for a *filtered* dataset, whose compressed size is not known
     // until the pipeline has run: the placement is chosen from the compressed
     // set's size, so the filter pass still happens exactly once.
-    let path = tmp("hdf5_pure_fs_chunked_reuse_filtered.h5");
+    let path = temp_path("hdf5_pure_fs_chunked_reuse_filtered.h5");
     const ELEMS: usize = 32768;
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
@@ -859,7 +843,6 @@ fn filtered_chunked_dataset_reuses_freed_space() {
         (0..ELEMS).map(|i| i as f64).collect::<Vec<f64>>()
     );
     assert_eq!(f.dataset("tail").unwrap().read_i32().unwrap(), vec![9; 16]);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -868,7 +851,7 @@ fn reusing_a_chunked_hole_keeps_its_neighbors_byte_exact() {
     // happens to the *live* bytes on either side of it. Both neighbors — one
     // below the hole, one above — must read back exactly, and every chunk of the
     // dataset written into the hole must too.
-    let path = tmp("hdf5_pure_fs_chunked_reuse_neighbors.h5");
+    let path = temp_path("hdf5_pure_fs_chunked_reuse_neighbors.h5");
     const ELEMS: usize = 16384;
     let below: Vec<f64> = (0..2048).map(|i| i as f64 * 0.5).collect();
     let above: Vec<i32> = (0..2048).map(|i| i * 3).collect();
@@ -898,7 +881,6 @@ fn reusing_a_chunked_hole_keeps_its_neighbors_byte_exact() {
     assert_eq!(f.dataset("below").unwrap().read_f64().unwrap(), below);
     assert_eq!(f.dataset("above").unwrap().read_i32().unwrap(), above);
     assert_eq!(f.dataset("fresh").unwrap().read_f64().unwrap(), replacement);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -910,7 +892,7 @@ fn paged_commit_reuses_freed_space_within_its_page_type() {
     // The file stays valid and every page stays homogeneous — the crosscheck
     // suite reads these files with the reference C library, which is where a
     // mixed page would show up.
-    let path = tmp("hdf5_pure_fs_paged_reuse.h5");
+    let path = temp_path("hdf5_pure_fs_paged_reuse.h5");
     const ELEMS: usize = 32768;
     let mut b = FileBuilder::new();
     b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1);
@@ -952,7 +934,6 @@ fn paged_commit_reuses_freed_space_within_its_page_type() {
         vec![1, 2, 3]
     );
     assert_eq!(f.dataset("tail").unwrap().read_i32().unwrap(), vec![9; 16]);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -961,7 +942,7 @@ fn persisted_chunked_free_space_is_reused_after_a_reopen() {
     // one writes a fresh one. The second session only knows about the hole from
     // the on-disk managers it seeds its free list from, so this pins the seeding
     // and the chunked placement together.
-    let path = tmp("hdf5_pure_fs_chunked_persist_reuse.h5");
+    let path = temp_path("hdf5_pure_fs_chunked_persist_reuse.h5");
     const ELEMS: usize = 32768;
     let mut b = FileBuilder::new();
     b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
@@ -1005,7 +986,6 @@ fn persisted_chunked_free_space_is_reused_after_a_reopen() {
         f.dataset("keep").unwrap().read_i32().unwrap(),
         vec![1, 2, 3]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -1020,7 +1000,7 @@ fn both_read_write_backings_reuse_a_freed_hole_alike() {
         ("hdf5_pure_fs_backing_bounded.h5", MemoryStrategy::Bounded),
         ("hdf5_pure_fs_backing_mirrored.h5", MemoryStrategy::Mirrored),
     ] {
-        let path = tmp(name);
+        let path = temp_path(name);
         let mut b = FileBuilder::new();
         b.create_dataset("big")
             .with_f64_data(&vec![1.0; ELEMS])
@@ -1066,7 +1046,6 @@ fn both_read_write_backings_reuse_a_freed_hole_alike() {
             vec![2.0; ELEMS]
         );
         assert_eq!(f.dataset("tail").unwrap().read_i32().unwrap(), vec![9; 16]);
-        std::fs::remove_file(&path).ok();
     }
 }
 
@@ -1081,7 +1060,7 @@ fn churn_of_groups_attributes_and_datasets_stays_bounded() {
     // A "ceiling" dataset written above the first round is what makes this a test
     // of *reuse*. Without it every freed round would reach end-of-file and be
     // truncated away, which keeps the file just as small while reusing nothing.
-    let path = tmp("hdf5_pure_fs_full_churn.h5");
+    let path = temp_path("hdf5_pure_fs_full_churn.h5");
     const ROUNDS: usize = 5;
     const GROUPS: usize = 4;
     const ELEMS: usize = 8192; // 64 KiB per dataset
@@ -1185,7 +1164,6 @@ fn churn_of_groups_attributes_and_datasets_stays_bounded() {
             );
         }
     }
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -1194,7 +1172,7 @@ fn corrupt_persisted_section_is_skipped_not_fatal() {
     // section claims a region past end-of-file, seeding it and later handing it
     // out would write out of bounds. The editor skips such a section instead, so
     // the open + commit still succeeds and the live data stays intact.
-    let path = tmp("hdf5_pure_fs_persist_corrupt.h5");
+    let path = temp_path("hdf5_pure_fs_persist_corrupt.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[5; 50]);
     b.create_dataset("victim").with_i32_data(&[6; 300]); // 1200-byte data block
@@ -1255,7 +1233,6 @@ fn corrupt_persisted_section_is_skipped_not_fatal() {
         f.dataset("added").unwrap().read_i32().unwrap(),
         vec![9; 250]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// A paged file under delete-and-recreate churn stops growing rather than
@@ -1279,8 +1256,7 @@ fn paged_churn_reaches_a_steady_size() {
     const ROUNDS: usize = 12;
     const LIVE: usize = 2;
 
-    let path = tmp("hdf5_pure_fs_paged_churn.h5");
-    let _ = std::fs::remove_file(&path);
+    let path = temp_path("hdf5_pure_fs_paged_churn.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("seed").with_i32_data(&[0i32; 4]);
     b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
@@ -1356,7 +1332,6 @@ fn paged_churn_reaches_a_steady_size() {
     }
     drop(f);
     assert_eof_matches_file(&path);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A paged commit's tail — the rewritten extension and manager blocks — is
@@ -1372,8 +1347,7 @@ fn paged_churn_reaches_a_steady_size() {
 #[test]
 fn a_paged_commit_tail_is_placed_in_free_space() {
     const PAGE: u64 = 16384;
-    let path = tmp("hdf5_pure_fs_paged_tail_reuse.h5");
-    let _ = std::fs::remove_file(&path);
+    let path = temp_path("hdf5_pure_fs_paged_tail_reuse.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("seed").with_i32_data(&[0i32; 4]);
     b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
@@ -1431,7 +1405,6 @@ fn a_paged_commit_tail_is_placed_in_free_space() {
         }
     }
     assert_eof_matches_file(&path);
-    std::fs::remove_file(&path).ok();
 }
 
 /// Across a sweep of layouts, a paged commit that rewrites only its tail
@@ -1450,8 +1423,7 @@ fn a_paged_commit_tail_is_placed_in_free_space() {
 fn a_paged_tail_conserves_free_space_across_layouts() {
     const PAGE: u64 = 16384;
     for filler in 0..64usize {
-        let path = tmp(&format!("hdf5_pure_fs_paged_sweep_{filler}.h5"));
-        let _ = std::fs::remove_file(&path);
+        let path = temp_path(&format!("hdf5_pure_fs_paged_sweep_{filler}.h5"));
         let mut b = FileBuilder::new();
         b.create_dataset("seed")
             .with_i32_data(&(0..100 + filler as i32).collect::<Vec<i32>>());
@@ -1482,6 +1454,5 @@ fn a_paged_tail_conserves_free_space_across_layouts() {
             "filler {filler}: rewriting the tail must conserve free space, not \
              quietly retire some of it (totals {totals:?})"
         );
-        std::fs::remove_file(&path).ok();
     }
 }

@@ -4,6 +4,10 @@
 
 use hdf5_pure::{File, FileBuilder, LibVer, is_hdf5, is_hdf5_bytes};
 
+#[path = "common/temp_fixture.rs"]
+mod temp_fixture;
+use temp_fixture::temp_path;
+
 fn sample_file() -> Vec<u8> {
     let mut builder = FileBuilder::new();
     builder
@@ -22,7 +26,10 @@ fn is_hdf5_bytes_detects_signature() {
 
 #[test]
 fn is_hdf5_path_roundtrip() {
-    let dir = std::env::temp_dir();
+    // One directory, three names: this test wants a missing path alongside the
+    // two it writes, so it holds the directory rather than a single fixture.
+    let held = tempfile::tempdir().unwrap();
+    let dir = held.path();
     let h5 = dir.join("hdf5_pure_is_hdf5_yes.h5");
     let other = dir.join("hdf5_pure_is_hdf5_no.bin");
     std::fs::write(&h5, sample_file()).unwrap();
@@ -33,9 +40,6 @@ fn is_hdf5_path_roundtrip() {
 
     // A missing file is an I/O error, not `Ok(false)`.
     assert!(is_hdf5(dir.join("hdf5_pure_definitely_missing.h5")).is_err());
-
-    std::fs::remove_file(&h5).ok();
-    std::fs::remove_file(&other).ok();
 }
 
 #[test]
@@ -46,12 +50,11 @@ fn file_size_matches_buffer_and_metadata() {
     let file = File::from_bytes(bytes.clone()).unwrap();
     assert_eq!(file.file_size(), len);
 
-    let path = std::env::temp_dir().join("hdf5_pure_file_size.h5");
+    let path = temp_path("hdf5_pure_file_size.h5");
     std::fs::write(&path, &bytes).unwrap();
     let on_disk = File::open(&path).unwrap();
     assert_eq!(on_disk.file_size(), len);
     assert_eq!(on_disk.file_size(), std::fs::metadata(&path).unwrap().len());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]

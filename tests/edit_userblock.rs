@@ -18,7 +18,12 @@
 
 use hdf5_pure::{AttrValue, File, FileBuilder, Object};
 
+#[path = "common/temp_fixture.rs"]
+mod temp_fixture;
+use temp_fixture::temp_path;
+
 const UB: usize = 512;
+
 const MARKER: &[u8] = b"USERBLOCK-MARKER-0104";
 
 /// Build a userblock file with two root datasets and a nested group+dataset,
@@ -47,7 +52,7 @@ fn build_userblock_file(path: &std::path::Path) -> Vec<u8> {
 
 #[test]
 fn synthetic_userblock_file_roundtrip() {
-    let path = std::env::temp_dir().join("hdf5_pure_ub_roundtrip.h5");
+    let path = temp_path("hdf5_pure_ub_roundtrip.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -122,8 +127,6 @@ fn synthetic_userblock_file_roundtrip() {
     );
     assert_eq!(&after[..MARKER.len()], MARKER);
     assert_eq!(after[UB - 1], 0xAB);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -131,7 +134,7 @@ fn userblock_inplace_overwrite_only_takes_fast_path() {
     // A lone same-length overwrite takes the in-place fast path (no header
     // rewrite, no superblock flip); it must work on a userblock file and leave
     // the userblock untouched.
-    let path = std::env::temp_dir().join("hdf5_pure_ub_inplace_only.h5");
+    let path = temp_path("hdf5_pure_ub_inplace_only.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -155,8 +158,6 @@ fn userblock_inplace_overwrite_only_takes_fast_path() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// Cross-file copy *from* a userblock source is still refused (the source-file
@@ -166,8 +167,8 @@ fn userblock_inplace_overwrite_only_takes_fast_path() {
 /// exercised in `edit_userblock_followups.rs` / `edit_userblock_crosscheck.rs`.
 #[test]
 fn userblock_cross_file_copy_from_userblock_source_is_refused() {
-    let src_path = std::env::temp_dir().join("hdf5_pure_ub_xcopy_src_refuse.h5");
-    let dst_path = std::env::temp_dir().join("hdf5_pure_ub_xcopy_dst_refuse.h5");
+    let src_path = temp_path("hdf5_pure_ub_xcopy_src_refuse.h5");
+    let dst_path = temp_path("hdf5_pure_ub_xcopy_dst_refuse.h5");
     build_userblock_file(&src_path);
     build_userblock_file(&dst_path);
     let dst_before = std::fs::read(&dst_path).unwrap();
@@ -187,9 +188,6 @@ fn userblock_cross_file_copy_from_userblock_source_is_refused() {
         dst_before,
         "a refused cross-file copy must not modify the destination"
     );
-
-    std::fs::remove_file(&src_path).ok();
-    std::fs::remove_file(&dst_path).ok();
 }
 
 /// An empty (zero-element) dataset added on a userblock file must round-trip
@@ -200,7 +198,7 @@ fn userblock_cross_file_copy_from_userblock_source_is_refused() {
 /// identical, so only a non-zero base can catch a mistake here.
 #[test]
 fn userblock_add_empty_dataset_roundtrip() {
-    let path = std::env::temp_dir().join("hdf5_pure_ub_add_empty.h5");
+    let path = temp_path("hdf5_pure_ub_add_empty.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -223,8 +221,6 @@ fn userblock_add_empty_dataset_roundtrip() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// The chunked counterpart of the test above: an empty chunked dataset added on
@@ -239,7 +235,7 @@ fn userblock_add_empty_dataset_roundtrip() {
 /// where it landed.
 #[test]
 fn userblock_add_empty_chunked_dataset_and_grow_it() {
-    let path = std::env::temp_dir().join("hdf5_pure_ub_add_empty_chunked.h5");
+    let path = temp_path("hdf5_pure_ub_add_empty_chunked.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -299,8 +295,6 @@ fn userblock_add_empty_chunked_dataset_and_grow_it() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// A provenance-tagged dataset added on a userblock file must round-trip
@@ -312,7 +306,7 @@ fn userblock_add_empty_chunked_dataset_and_grow_it() {
 fn userblock_add_provenance_dataset_roundtrip() {
     use hdf5_pure::VerifyResult;
 
-    let path = std::env::temp_dir().join("hdf5_pure_ub_add_provenance.h5");
+    let path = temp_path("hdf5_pure_ub_add_provenance.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -338,8 +332,6 @@ fn userblock_add_provenance_dataset_roundtrip() {
         Some(&AttrValue::String("test-suite".into()))
     );
     assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// A dataset with a variable-length attribute, added on a userblock file,
@@ -348,7 +340,7 @@ fn userblock_add_provenance_dataset_roundtrip() {
 /// a no-op at `base == 0`) once `base` is non-zero.
 #[test]
 fn userblock_add_dataset_with_vlen_attribute_roundtrip() {
-    let path = std::env::temp_dir().join("hdf5_pure_ub_add_vlen_attr.h5");
+    let path = temp_path("hdf5_pure_ub_add_vlen_attr.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -375,8 +367,6 @@ fn userblock_add_dataset_with_vlen_attribute_roundtrip() {
         ]))
     );
     assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// A variable-length-string dataset added on a userblock file must round-trip
@@ -385,7 +375,7 @@ fn userblock_add_dataset_with_vlen_attribute_roundtrip() {
 /// an attribute.
 #[test]
 fn userblock_add_vlen_string_dataset_roundtrip() {
-    let path = std::env::temp_dir().join("hdf5_pure_ub_add_vlen_string_ds.h5");
+    let path = temp_path("hdf5_pure_ub_add_vlen_string_ds.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -405,8 +395,6 @@ fn userblock_add_vlen_string_dataset_roundtrip() {
         vec!["alpha".to_string(), String::new(), "gamma".to_string()]
     );
     assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
-
-    std::fs::remove_file(&path).ok();
 }
 
 /// An object-reference dataset added on a userblock file must round-trip
@@ -414,7 +402,7 @@ fn userblock_add_vlen_string_dataset_roundtrip() {
 /// address is otherwise only ever exercised as a no-op at `base == 0`.
 #[test]
 fn userblock_add_reference_dataset_roundtrip() {
-    let path = std::env::temp_dir().join("hdf5_pure_ub_add_ref.h5");
+    let path = temp_path("hdf5_pure_ub_add_ref.h5");
     let userblock = build_userblock_file(&path);
 
     {
@@ -439,15 +427,13 @@ fn userblock_add_reference_dataset_roundtrip() {
         other => panic!("expected a dataset reference, got {other:?}"),
     }
     assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn real_mat_add_dataset_preserves_userblock_and_data() {
     // Copy the fixture so the test never mutates the checked-in file.
     let src = std::path::Path::new("tests/fixtures/mat_real/test_string_v73.mat");
-    let path = std::env::temp_dir().join("hdf5_pure_ub_real_mat.mat");
+    let path = temp_path("hdf5_pure_ub_real_mat.mat");
     std::fs::copy(src, &path).unwrap();
 
     let original_userblock = std::fs::read(&path).unwrap()[..UB].to_vec();
@@ -509,6 +495,4 @@ fn real_mat_add_dataset_preserves_userblock_and_data() {
         after_userblock, original_userblock,
         "MATLAB userblock changed across the edit"
     );
-
-    std::fs::remove_file(&path).ok();
 }

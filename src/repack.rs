@@ -1857,7 +1857,8 @@ mod tests {
         use crate::reader::File;
         use crate::writer::FileBuilder;
 
-        let dir = std::env::temp_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let src = dir.join("hdf5_pure_repack_time_src.h5");
         let dst = dir.join("hdf5_pure_repack_time_dst.h5");
 
