@@ -1742,3 +1742,245 @@ fn a_replaced_object_is_read_by_the_c_library() {
         );
     }
 }
+
+// ---- hard-linked groups (issue #327) ----
+
+/// A file the C library writes: `/g` holding one dataset, hard-linked as
+/// `/alias`, plus an unrelated `/keep` so the refusals below can be shown to
+/// leave the rest of the file alone.
+fn write_hard_linked_group(path: &std::path::Path) {
+    let file = hdf5::File::create(path).unwrap();
+    let g = file.create_group("g").unwrap();
+    g.new_dataset::<i32>()
+        .shape((3,))
+        .create("inner")
+        .unwrap()
+        .write(&[1i32, 2, 3])
+        .unwrap();
+    file.link_hard("/g", "/alias").unwrap();
+    file.new_dataset::<f64>()
+        .shape((2,))
+        .create("keep")
+        .unwrap()
+        .write(&[9.0f64, 8.0])
+        .unwrap();
+    file.close().unwrap();
+}
+
+/// Editing a group with more than one hard link is refused rather than
+/// silently diverging its aliases (issue #327).
+///
+/// A commit rebuilds a dirty group's object header at a fresh address and
+/// patches the one link it resolved the group through. Every other link was
+/// left naming the old header, which the same commit freed — so `/alias` showed
+/// the pre-commit group, and the next commit in the session reused the span and
+/// made it unreadable to both libraries. This is the rule the three relocating
+/// *dataset* writes have always had, applied where it was missing.
+#[test]
+fn editing_a_hard_linked_group_is_refused() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_hardlink_group.h5");
+    write_hard_linked_group(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    session
+        .root()
+        .create_dataset("g/extra", |b| {
+            b.with_i32_data(&[9]);
+        })
+        .unwrap();
+    let refused = session.commit().unwrap_err();
+    assert!(
+        refused.to_string().contains("single hard link"),
+        "expected the hard-link refusal, got: {refused}"
+    );
+    drop(session);
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a refused commit must leave the file byte-identical"
+    );
+    // And both readers still see one object through both of its links.
+    let c = hdf5::File::open(&path).unwrap();
+    for name in ["g", "alias"] {
+        assert_eq!(
+            c.group(name).unwrap().member_names().unwrap(),
+            vec!["inner".to_string()],
+            "{name} must be untouched"
+        );
+    }
+}
+
+/// The refusal reaches an edit *below* a hard-linked group, because every
+/// ancestor on the edited path is rebuilt too.
+#[test]
+fn editing_below_a_hard_linked_group_is_refused() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_hardlink_group_deep.h5");
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        let g = file.create_group("g").unwrap();
+        g.create_group("child").unwrap();
+        file.link_hard("/g", "/alias").unwrap();
+        file.close().unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    session
+        .root()
+        .create_dataset("g/child/deep", |b| {
+            b.with_i32_data(&[1]);
+        })
+        .unwrap();
+    assert!(
+        session.commit().is_err(),
+        "rebuilding `child` rebuilds `g` above it, which is the hard-linked one"
+    );
+    drop(session);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// The rule is about *hard* links, and about groups that actually have more
+/// than one. Everything else still edits.
+#[test]
+fn the_hard_link_rule_does_not_refuse_an_ordinary_group() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_hardlink_group_ok.h5");
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        let g = file.create_group("g").unwrap();
+        g.create_group("child").unwrap();
+        // A *soft* link is not a hard link: it resolves by path, so it still
+        // finds the group after the rebuild and nothing is stranded.
+        file.link_soft("/g", "/pointer").unwrap();
+        file.close().unwrap();
+    }
+
+    let session = File::open_rw(&path).unwrap();
+    // The root group is rebuilt by every commit and is named by the superblock
+    // rather than by a link, so it must never be caught by this rule.
+    session
+        .root()
+        .create_dataset("at_root", |b| {
+            b.with_i32_data(&[1]);
+        })
+        .unwrap();
+    session
+        .root()
+        .create_dataset("g/child/deep", |b| {
+            b.with_i32_data(&[2]);
+        })
+        .unwrap();
+    session.commit().unwrap();
+    drop(session);
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("at_root").unwrap().read_raw::<i32>().unwrap(),
+        [1]
+    );
+    assert_eq!(
+        c.dataset("g/child/deep")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        [2]
+    );
+    assert_eq!(
+        c.dataset("pointer/child/deep")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        [2],
+        "the soft link still resolves to the rebuilt group"
+    );
+}
+
+/// A hard-linked *dataset* under a hard-linked group, deleted rather than
+/// edited: deletion does not relocate a header, so it is unaffected.
+#[test]
+fn deleting_a_link_to_a_hard_linked_group_still_works() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_hardlink_group_delete.h5");
+    write_hard_linked_group(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    session.root().delete("alias").unwrap();
+    session.commit().unwrap();
+    drop(session);
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert!(c.group("alias").is_err(), "the removed link is gone");
+    assert_eq!(
+        c.group("g").unwrap().member_names().unwrap(),
+        vec!["inner".to_string()],
+        "the object survives its other link"
+    );
+}
+
+/// When the link graph cannot be walked, the same edit is refused — with a
+/// different message, because it is a different problem.
+///
+/// The count that proves a group has one hard link is a file-wide walk, and it
+/// gives up on an object header it cannot parse. A file damaged that way was
+/// previously edited around; there is no way to establish that nothing else
+/// names the group being rebuilt, so it is refused rather than rebuilt on an
+/// assumption. Saying "it has more than one hard link" would send the reader
+/// looking for a second link that may not exist.
+#[test]
+fn editing_a_group_is_refused_when_the_links_cannot_be_walked() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_hardlink_group_damaged.h5");
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        let g = file.create_group("g").unwrap();
+        g.new_dataset::<i32>()
+            .shape((3,))
+            .create("inner")
+            .unwrap()
+            .write(&[1i32, 2, 3])
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape((1,))
+            .create("damaged")
+            .unwrap()
+            .write(&[1i32])
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    // Break one object header that is neither the root nor the edited group, by
+    // giving it a version no reader accepts. The link walk stops there.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = (0..bytes.len() - 4)
+        .rfind(|&i| &bytes[i..i + 4] == b"OHDR")
+        .expect("the fixture must carry version 2 object headers");
+    bytes[last + 4] = 9;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    session
+        .root()
+        .create_dataset("g/extra", |b| {
+            b.with_i32_data(&[9]);
+        })
+        .unwrap();
+    let refused = session.commit().unwrap_err().to_string();
+    assert!(
+        refused.contains("could not be walked"),
+        "expected the unwalkable-graph refusal, got: {refused}"
+    );
+    assert!(
+        !refused.contains("single hard link"),
+        "and not the one about aliases, which would misdirect: {refused}"
+    );
+    drop(session);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "a refused commit must leave the file byte-identical"
+    );
+}

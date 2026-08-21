@@ -3366,13 +3366,18 @@ impl WriteEngine {
         let mut inplace_writes: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut moving_writes: Vec<(PathKey, String, u64, MovingWrite)> = Vec::new();
         let mut write_targets: Vec<PathKey> = Vec::new();
-        // The file-wide hard-link count, computed lazily the first time a write
-        // relocates a header: such a write moves the dataset's object header and
-        // patches only the one parent link that names it, so a dataset reachable
-        // through more than one hard link would have its other links left pointing
-        // at the stale header. Refuse that rather than silently diverge the aliases
-        // (a same-length in-place overwrite is unaffected — it rewrites the shared
+        // The file-wide hard-link count, computed lazily the first time a commit
+        // relocates a header: such a write moves the object's header and patches
+        // only the one parent link that names it, so an object reachable through
+        // more than one hard link would have its other links left pointing at the
+        // stale header. Refuse that rather than silently diverge the aliases (a
+        // same-length in-place overwrite is unaffected — it rewrites the shared
         // data block, which every link sees).
+        //
+        // Read by four places, which is every way a header moves: a relocating
+        // overwrite, a staged append, a dataset attribute edit, and — since
+        // issue #327 — a rebuilt group, which had the same defect and none of
+        // the guard.
         let mut incoming_links: Option<Option<HashMap<u64, u32>>> = None;
         for (full, fd) in &staged.writes {
             // A path named twice in one commit would write it twice (and double-
@@ -3869,6 +3874,46 @@ impl WriteEngine {
                 })?;
                 let addr = usize::try_from(addr)
                     .map_err(|_| Error::EditUnsupported("group address exceeds this platform"))?;
+                // Rebuilding this group moves its header and patches only the
+                // link this commit resolved it through, so every other hard link
+                // to it would be left naming the old header — which this commit
+                // then frees. The aliases show the pre-commit group until
+                // something reuses the span, and are unreadable after (issue
+                // #327). Same rule, and the same lazily-computed count, as the
+                // three relocating dataset writes above.
+                //
+                // The root group is exempt because it is named by the superblock
+                // rather than by a link, so it has no entry in the count and
+                // nothing to strand. Every other group was resolved by path and
+                // therefore has at least one.
+                if !key.is_empty() {
+                    let counts = incoming_links
+                        .get_or_insert_with(|| self.count_incoming_hard_links())
+                        .as_ref();
+                    match counts.and_then(|c| c.get(&(addr as u64)).copied()) {
+                        Some(1) => {}
+                        // Known, and more than one: the aliases are the problem.
+                        Some(_) => {
+                            return Err(Error::EditUnsupported(
+                                "editing a group relocates its object header; only supported \
+                                 when it has a single hard link",
+                            ));
+                        }
+                        // Not known: the file-wide walk that counts links gave up
+                        // — an object header it could not parse, a group it could
+                        // not enumerate, or a link graph past its bound. A
+                        // different refusal because it is a different problem, and
+                        // "it has more than one hard link" would send the reader
+                        // looking for a second link that may not exist.
+                        None => {
+                            return Err(Error::EditUnsupported(
+                                "editing a group relocates its object header, and this file's \
+                                 links could not be walked to establish that nothing else \
+                                 names it",
+                            ));
+                        }
+                    }
+                }
                 let info = self.inspect_group(addr)?;
                 superseded_addrs.push((key.clone(), addr));
                 let node = nodes.get_mut(key).unwrap();
