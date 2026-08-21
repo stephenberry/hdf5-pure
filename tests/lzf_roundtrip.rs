@@ -6,9 +6,9 @@
 
 use hdf5_pure::{Error, File, FileBuilder, FormatError, RepackOptions, repack};
 
-fn tmp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(name)
-}
+#[path = "common/temp_fixture.rs"]
+mod temp_fixture;
+use temp_fixture::temp_path;
 
 #[test]
 fn lzf_i32_roundtrip() {
@@ -129,7 +129,7 @@ fn lzf_plus_deflate_refused() {
 /// requires `pipeline_reencodable` to accept the filter) and reads back exact.
 #[test]
 fn add_lzf_dataset_in_place() {
-    let path = tmp("hdf5_pure_edit_add_lzf.h5");
+    let path = temp_path("hdf5_pure_edit_add_lzf.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("original").with_f64_data(&[1.0, 2.0]);
@@ -150,14 +150,13 @@ fn add_lzf_dataset_in_place() {
 
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("lzf").unwrap().read_i32().unwrap(), data);
-    std::fs::remove_file(&path).ok();
 }
 
 /// Overwriting an LZF dataset in place re-encodes its chunks through the LZF
 /// compressor, the path `pipeline_reencodable` used to refuse.
 #[test]
 fn overwrite_lzf_dataset_in_place() {
-    let path = tmp("hdf5_pure_edit_overwrite_lzf.h5");
+    let path = temp_path("hdf5_pure_edit_overwrite_lzf.h5");
     let before: Vec<i32> = (0..256).collect();
     let after: Vec<i32> = (0..256).map(|i| i * 3).collect();
     {
@@ -177,7 +176,6 @@ fn overwrite_lzf_dataset_in_place() {
 
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("v").unwrap().read_i32().unwrap(), after);
-    std::fs::remove_file(&path).ok();
 }
 
 fn fixture(name: &str) -> std::path::PathBuf {
@@ -325,8 +323,8 @@ fn reads_h5py_lzf_multichunk() {
 /// re-encode paths.
 #[test]
 fn repack_roundtrips_lzf() {
-    let src = tmp("hdf5_pure_repack_lzf_src.h5");
-    let dst = tmp("hdf5_pure_repack_lzf_dst.h5");
+    let src = temp_path("hdf5_pure_repack_lzf_src.h5");
+    let dst = temp_path("hdf5_pure_repack_lzf_dst.h5");
     let data: Vec<f64> = (0..1024).map(|i| (i as f64).cos()).collect();
     let mut b = FileBuilder::new();
     b.create_dataset("vals")
@@ -342,7 +340,4 @@ fn repack_roundtrips_lzf() {
     let ds = file.dataset("vals").unwrap();
     assert_eq!(ds.filters(), vec![2, 32000]);
     assert_eq!(ds.read_f64().unwrap(), data);
-
-    std::fs::remove_file(&src).ok();
-    std::fs::remove_file(&dst).ok();
 }

@@ -1921,12 +1921,15 @@ mod tests {
     use crate::reader::File;
     use crate::types::AttrValue as ReaderAttr;
 
-    fn temp_path(name: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("hdf5pure-mat-{name}-{nanos}.mat"))
+    /// A `.mat` fixture in a directory of its own. The directory goes away with
+    /// the returned value, so bind it for as long as the file is needed.
+    ///
+    /// Replaces a nanosecond-stamped name in the shared temporary directory,
+    /// which no two runs collided on but no run ever cleaned up (issue #334).
+    fn temp_path(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("hdf5pure-mat-{name}.mat"));
+        (dir, path)
     }
 
     fn read_class(file: &File, ds_path: &str) -> String {
@@ -1944,7 +1947,7 @@ mod tests {
         mb.write_scalar_f64("x", 1.5).unwrap();
         let bytes = mb.finish().unwrap();
 
-        let path = temp_path("scalar-f64");
+        let (_dir, path) = temp_path("scalar-f64");
         std::fs::write(&path, &bytes).unwrap();
         let file = File::open(&path).unwrap();
         let ds = file.dataset("x").unwrap();
@@ -1964,7 +1967,7 @@ mod tests {
         .unwrap();
         let bytes = mb.finish().unwrap();
 
-        let path = temp_path("struct");
+        let (_dir, path) = temp_path("struct");
         std::fs::write(&path, &bytes).unwrap();
         let file = File::open(&path).unwrap();
         let group = file.group("payload").unwrap();
@@ -1989,7 +1992,7 @@ mod tests {
         .unwrap();
         let bytes = mb.finish().unwrap();
 
-        let path = temp_path("cell");
+        let (_dir, path) = temp_path("cell");
         std::fs::write(&path, &bytes).unwrap();
         let file = File::open(&path).unwrap();
         let cls = read_class(&file, "c");

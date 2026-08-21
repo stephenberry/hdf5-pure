@@ -6,6 +6,10 @@ use hdf5_pure::{
     FormatError, Object, ReferenceType, ScaleOffset, StringPadding,
 };
 
+#[path = "common/temp_fixture.rs"]
+mod temp_fixture;
+use temp_fixture::temp_path;
+
 /// Write a starter file with one dataset, returning its path.
 fn write_starter(path: &std::path::Path) {
     let mut b = FileBuilder::new();
@@ -16,7 +20,7 @@ fn write_starter(path: &std::path::Path) {
 
 #[test]
 fn add_dataset_preserves_original_and_adds_new() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_one.h5");
+    let path = temp_path("hdf5_pure_edit_add_one.h5");
     write_starter(&path);
     let size_before = std::fs::metadata(&path).unwrap().len();
 
@@ -49,13 +53,11 @@ fn add_dataset_preserves_original_and_adds_new() {
     let mut names = file.root().datasets().unwrap();
     names.sort();
     assert_eq!(names, vec!["added".to_string(), "original".to_string()]);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn add_multiple_datasets_in_one_commit() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_many.h5");
+    let path = temp_path("hdf5_pure_edit_add_many.h5");
     write_starter(&path);
 
     {
@@ -88,12 +90,11 @@ fn add_multiple_datasets_in_one_commit() {
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn successive_commits_accumulate() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_successive.h5");
+    let path = temp_path("hdf5_pure_edit_successive.h5");
     write_starter(&path);
 
     {
@@ -121,12 +122,11 @@ fn successive_commits_accumulate() {
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn add_dataset_with_multidim_shape() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_2d.h5");
+    let path = temp_path("hdf5_pure_edit_2d.h5");
     write_starter(&path);
 
     {
@@ -145,12 +145,11 @@ fn add_dataset_with_multidim_shape() {
     let m = file.dataset("matrix").unwrap();
     assert_eq!(m.shape().unwrap(), vec![2, 3]);
     assert_eq!(m.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn commit_without_staged_datasets_is_noop() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_noop.h5");
+    let path = temp_path("hdf5_pure_edit_noop.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -161,12 +160,11 @@ fn commit_without_staged_datasets_is_noop() {
 
     let after = std::fs::read(&path).unwrap();
     assert_eq!(before, after, "empty commit must not modify the file");
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn create_group_at_root() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_group.h5");
+    let path = temp_path("hdf5_pure_edit_group.h5");
     write_starter(&path);
 
     {
@@ -190,12 +188,11 @@ fn create_group_at_root() {
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn add_dataset_into_new_nested_group() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_nested.h5");
+    let path = temp_path("hdf5_pure_edit_nested.h5");
     write_starter(&path);
 
     {
@@ -223,12 +220,11 @@ fn add_dataset_into_new_nested_group() {
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn add_into_existing_group_across_commits() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_existing_group.h5");
+    let path = temp_path("hdf5_pure_edit_existing_group.h5");
     write_starter(&path);
 
     {
@@ -257,12 +253,11 @@ fn add_into_existing_group_across_commits() {
     let mut names = file.group("g").unwrap().datasets().unwrap();
     names.sort();
     assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn add_into_two_sibling_groups_one_commit() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_siblings.h5");
+    let path = temp_path("hdf5_pure_edit_siblings.h5");
     write_starter(&path);
 
     {
@@ -287,12 +282,11 @@ fn add_into_two_sibling_groups_one_commit() {
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("x/d").unwrap().read_i32().unwrap(), vec![1]);
     assert_eq!(file.dataset("y/d").unwrap().read_i32().unwrap(), vec![2]);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn dataset_into_missing_group_is_rejected() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_missing_group.h5");
+    let path = temp_path("hdf5_pure_edit_missing_group.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -308,12 +302,11 @@ fn dataset_into_missing_group_is_rejected() {
         assert!(err.to_string().contains("does not exist"), "got: {err}");
     }
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn duplicate_name_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_dup.h5");
+    let path = temp_path("hdf5_pure_edit_dup.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -349,13 +342,11 @@ fn duplicate_name_is_rejected_without_writing() {
         assert!(session.commit().is_err());
     }
     assert_eq!(std::fs::read(&path).unwrap(), before);
-
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn delete_dataset_from_root() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_del_root.h5");
+    let path = temp_path("hdf5_pure_edit_del_root.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
     b.create_dataset("remove").with_i32_data(&[9, 9]);
@@ -374,12 +365,11 @@ fn delete_dataset_from_root() {
         vec![1, 2, 3]
     );
     assert!(file.dataset("remove").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn delete_nested_group_subtree() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_del_nested.h5");
+    let path = temp_path("hdf5_pure_edit_del_nested.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -422,12 +412,11 @@ fn delete_nested_group_subtree() {
     roots.sort();
     assert_eq!(roots, vec!["original".to_string(), "sibling".to_string()]);
     assert!(file.root().groups().unwrap().is_empty());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn delete_one_of_nested_then_keep_group() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_del_one.h5");
+    let path = temp_path("hdf5_pure_edit_del_one.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -459,12 +448,11 @@ fn delete_one_of_nested_then_keep_group() {
         file.group("g").unwrap().datasets().unwrap(),
         vec!["b".to_string()]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn add_and_delete_in_one_commit() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_del.h5");
+    let path = temp_path("hdf5_pure_edit_add_del.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("old").with_i32_data(&[1]);
     b.write(&path).unwrap();
@@ -485,12 +473,11 @@ fn add_and_delete_in_one_commit() {
     assert_eq!(file.root().datasets().unwrap(), vec!["new".to_string()]);
     assert_eq!(file.dataset("new").unwrap().read_i32().unwrap(), vec![2]);
     assert!(file.dataset("old").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn delete_missing_or_overlapping_is_rejected() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_del_reject.h5");
+    let path = temp_path("hdf5_pure_edit_del_reject.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -523,12 +510,11 @@ fn delete_missing_or_overlapping_is_rejected() {
         assert!(err.to_string().contains("overlaps"), "got: {err}");
     }
     assert_eq!(std::fs::read(&path).unwrap(), mid);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn copy_dataset_to_new_name() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_ds.h5");
+    let path = temp_path("hdf5_pure_edit_copy_ds.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("src").with_f64_data(&[1.5, 2.5, 3.5]);
     b.write(&path).unwrap();
@@ -550,12 +536,11 @@ fn copy_dataset_to_new_name() {
         vec![1.5, 2.5, 3.5]
     );
     assert_eq!(file.dataset("dup").unwrap().dtype().unwrap(), DType::F64);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn copy_group_subtree() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_grp.h5");
+    let path = temp_path("hdf5_pure_edit_copy_grp.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -602,12 +587,11 @@ fn copy_group_subtree() {
         file.dataset("template/a").unwrap().read_i32().unwrap(),
         vec![1, 2]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn copy_into_subgroup() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_into.h5");
+    let path = temp_path("hdf5_pure_edit_copy_into.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("payload").with_i32_data(&[7, 8, 9]);
     b.write(&path).unwrap();
@@ -630,12 +614,11 @@ fn copy_into_subgroup() {
         file.dataset("payload").unwrap().read_i32().unwrap(),
         vec![7, 8, 9]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn copy_rejects_missing_source_and_cycle() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_reject.h5");
+    let path = temp_path("hdf5_pure_edit_copy_reject.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -664,12 +647,11 @@ fn copy_rejects_missing_source_and_cycle() {
         assert!(err.to_string().contains("itself"), "got: {err}");
     }
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn add_dataset_with_attributes() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_attrs.h5");
+    let path = temp_path("hdf5_pure_edit_add_attrs.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -690,12 +672,11 @@ fn add_dataset_with_attributes() {
     let attrs = ds.attrs().unwrap();
     assert_eq!(attrs.get("count"), Some(&AttrValue::I64(2)));
     assert_eq!(attrs.get("unit"), Some(&AttrValue::String("m/s".into())));
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn create_group_with_attributes() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_group_attrs.h5");
+    let path = temp_path("hdf5_pure_edit_group_attrs.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -720,12 +701,11 @@ fn create_group_with_attributes() {
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn edit_existing_group_attributes() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_existing_group_attrs.h5");
+    let path = temp_path("hdf5_pure_edit_existing_group_attrs.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
     g.set_attr("status", AttrValue::String("old".into()));
@@ -770,12 +750,11 @@ fn edit_existing_group_attributes() {
         file.root().attrs().unwrap().get("root_tag"),
         Some(&AttrValue::U64(9))
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn group_attribute_edit_uses_final_compact_count() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_group_attr_final_count.h5");
+    let path = temp_path("hdf5_pure_edit_group_attr_final_count.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
     for i in 0..8 {
@@ -804,12 +783,11 @@ fn group_attribute_edit_uses_final_compact_count() {
     assert_eq!(attrs.len(), 8);
     assert!(!attrs.contains_key("a0"));
     assert_eq!(attrs.get("new"), Some(&AttrValue::I64(99)));
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn remove_missing_group_attribute_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_missing_group_attr.h5");
+    let path = temp_path("hdf5_pure_edit_missing_group_attr.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
     g.set_attr("present", AttrValue::I64(1));
@@ -829,12 +807,11 @@ fn remove_missing_group_attribute_is_rejected_without_writing() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn add_variable_length_root_attribute_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_vlen_group_attr.h5");
+    let path = temp_path("hdf5_pure_edit_vlen_group_attr.h5");
     write_starter(&path);
 
     {
@@ -860,7 +837,6 @@ fn add_variable_length_root_attribute_via_edit_session() {
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -870,7 +846,7 @@ fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
     // variable-length — exercising `apply_group_attr_ops`'s pending-VL-attr
     // bookkeeping (a plain region edit alone cannot represent an unresolved
     // variable-length attribute).
-    let path = std::env::temp_dir().join("hdf5_pure_edit_vlen_group_attr_sequence.h5");
+    let path = temp_path("hdf5_pure_edit_vlen_group_attr_sequence.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
     g.set_attr(
@@ -911,7 +887,6 @@ fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
             "new3".into()
         ]))
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// A `Set` with a variable-length value must correctly drop a *fixed-size*
@@ -921,7 +896,7 @@ fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
 /// variable-length `Set` replacing a fixed-size value.
 #[test]
 fn set_variable_length_group_attribute_over_existing_fixed_attribute_in_one_commit() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_vlen_group_attr_over_fixed.h5");
+    let path = temp_path("hdf5_pure_edit_vlen_group_attr_over_fixed.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
     g.set_attr("fields", AttrValue::I64(42));
@@ -953,7 +928,6 @@ fn set_variable_length_group_attribute_over_existing_fixed_attribute_in_one_comm
             "new2".into()
         ]))
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// The compact-attribute budget check counts *pending* variable-length
@@ -963,7 +937,7 @@ fn set_variable_length_group_attribute_over_existing_fixed_attribute_in_one_comm
 /// still succeed, with every value intact.
 #[test]
 fn add_variable_length_group_attributes_at_budget_boundary_in_one_commit() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_vlen_group_attr_at_budget.h5");
+    let path = temp_path("hdf5_pure_edit_vlen_group_attr_at_budget.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
     for i in 0..6i64 {
@@ -1010,7 +984,6 @@ fn add_variable_length_group_attributes_at_budget_boundary_in_one_commit() {
         attrs.get("b1"),
         Some(&AttrValue::VarLenAsciiArray(vec!["y0".into(), "y1".into()]))
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// One variable-length attribute past the boundary above (6 existing fixed +
@@ -1021,7 +994,7 @@ fn add_variable_length_group_attributes_at_budget_boundary_in_one_commit() {
 /// own counting logic).
 #[test]
 fn add_variable_length_group_attributes_over_budget_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_vlen_group_attr_over_budget.h5");
+    let path = temp_path("hdf5_pure_edit_vlen_group_attr_over_budget.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
     for i in 0..6i64 {
@@ -1048,7 +1021,6 @@ fn add_variable_length_group_attributes_over_budget_is_rejected_without_writing(
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -1057,7 +1029,7 @@ fn dense_group_attribute_storage_is_still_rejected_without_writing() {
     // whether the edit is fixed-size or variable-length; this guards that the
     // variable-length `Set` path added for issue #105 still refuses it rather
     // than silently mishandling it.
-    let path = std::env::temp_dir().join("hdf5_pure_edit_dense_group_attr.h5");
+    let path = temp_path("hdf5_pure_edit_dense_group_attr.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
     for i in 0..12 {
@@ -1082,12 +1054,11 @@ fn dense_group_attribute_storage_is_still_rejected_without_writing() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn deleting_group_with_attribute_edit_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_delete_group_attr_overlap.h5");
+    let path = temp_path("hdf5_pure_edit_delete_group_attr_overlap.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
     g.set_attr("tag", AttrValue::I64(1));
@@ -1108,14 +1079,13 @@ fn deleting_group_with_attribute_edit_is_rejected_without_writing() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn copy_preserves_dataset_attributes() {
     // Exercises the "verbatim message bytes" claim: a copied dataset's
     // attributes (separate header messages) must survive byte-for-byte.
-    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_attrs.h5");
+    let path = temp_path("hdf5_pure_edit_copy_attrs.h5");
     let mut b = FileBuilder::new();
     let ds = b.create_dataset("src");
     ds.with_i32_data(&[5, 6, 7]);
@@ -1139,14 +1109,13 @@ fn copy_preserves_dataset_attributes() {
         dup.attrs().unwrap().get("label"),
         Some(&AttrValue::String("alpha".into()))
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// An unfiltered 2-D chunked dataset is copied: the values round-trip and the
 /// copy is still chunked (the index is rebuilt at the new location).
 #[test]
 fn copy_unfiltered_chunked_dataset() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_chunked.h5");
+    let path = temp_path("hdf5_pure_edit_copy_chunked.h5");
     let data: Vec<i32> = (0..24).collect();
     {
         let mut b = FileBuilder::new();
@@ -1171,7 +1140,6 @@ fn copy_unfiltered_chunked_dataset() {
         dup.chunk_cache_stats().index_loaded(),
         "copied dataset must still be chunked"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// A filtered (shuffle + deflate) chunked dataset is copied verbatim: the chunk
@@ -1180,7 +1148,7 @@ fn copy_unfiltered_chunked_dataset() {
 /// the dataset's attributes are carried over.
 #[test]
 fn copy_filtered_chunked_dataset_preserves_pipeline_and_attrs() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_filtered_chunked.h5");
+    let path = temp_path("hdf5_pure_edit_copy_filtered_chunked.h5");
     let data: Vec<i32> = (0..4096).map(|i| i % 4).collect(); // highly compressible
     {
         let mut b = FileBuilder::new();
@@ -1216,7 +1184,6 @@ fn copy_filtered_chunked_dataset_preserves_pipeline_and_attrs() {
         dup.attrs().unwrap().get("units"),
         Some(&AttrValue::String("counts".into()))
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// An extensible (unlimited-dimension) chunked dataset copied within the file
@@ -1224,7 +1191,7 @@ fn copy_filtered_chunked_dataset_preserves_pipeline_and_attrs() {
 /// source's unlimited maxshape).
 #[test]
 fn copy_extensible_chunked_dataset() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_extensible.h5");
+    let path = temp_path("hdf5_pure_edit_copy_extensible.h5");
     let data: Vec<f64> = (0..80).map(|i| i as f64 * 0.25).collect();
     write_starter(&path);
     {
@@ -1249,14 +1216,13 @@ fn copy_extensible_chunked_dataset() {
     let dup = file.dataset("dup").unwrap();
     assert_eq!(dup.read_f64().unwrap(), data);
     assert!(dup.chunk_cache_stats().index_loaded());
-    std::fs::remove_file(&path).ok();
 }
 
 /// A single-chunk dataset is copied (the chunk address lives in the layout
 /// message; the verbatim path re-emits a single-chunk layout).
 #[test]
 fn copy_single_chunk_dataset() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_single_chunk.h5");
+    let path = temp_path("hdf5_pure_edit_copy_single_chunk.h5");
     let data: Vec<i32> = (0..16).collect();
     {
         let mut b = FileBuilder::new();
@@ -1273,12 +1239,11 @@ fn copy_single_chunk_dataset() {
     }
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("dup").unwrap().read_i32().unwrap(), data);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn edit_preserves_multiple_root_datasets() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_multi_root.h5");
+    let path = temp_path("hdf5_pure_edit_multi_root.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("d0").with_i32_data(&[0]);
     b.create_dataset("d1").with_i32_data(&[1]);
@@ -1299,12 +1264,11 @@ fn edit_preserves_multiple_root_datasets() {
         assert_eq!(file.dataset(n).unwrap().read_i32().unwrap(), vec![i as i32]);
     }
     assert_eq!(file.root().groups().unwrap(), vec!["extra".to_string()]);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn mixed_add_delete_copy_in_one_commit() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_mixed.h5");
+    let path = temp_path("hdf5_pure_edit_mixed.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 1]);
     b.create_dataset("remove").with_i32_data(&[9]);
@@ -1338,14 +1302,13 @@ fn mixed_add_delete_copy_in_one_commit() {
         file.dataset("keep").unwrap().read_i32().unwrap(),
         vec![1, 1]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn copy_from_file_dataset() {
     // Cross-file H5Ocopy: copy a dataset out of a separate open file.
-    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_ds.h5");
-    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_ds.h5");
+    let src_path = temp_path("hdf5_pure_xcopy_src_ds.h5");
+    let dst_path = temp_path("hdf5_pure_xcopy_dst_ds.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("payload").with_f64_data(&[1.5, 2.5, 3.5]);
@@ -1378,16 +1341,13 @@ fn copy_from_file_dataset() {
     );
     // The source file was not modified at all.
     assert_eq!(std::fs::read(&src_path).unwrap(), src_bytes_before);
-
-    std::fs::remove_file(&src_path).ok();
-    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]
 fn copy_from_file_group_subtree() {
     // A whole group subtree copied across files keeps its deep structure.
-    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_grp.h5");
-    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_grp.h5");
+    let src_path = temp_path("hdf5_pure_xcopy_src_grp.h5");
+    let dst_path = temp_path("hdf5_pure_xcopy_dst_grp.h5");
     write_starter(&src_path);
     {
         // Build the nested source subtree (FileBuilder::create_dataset does not
@@ -1429,15 +1389,13 @@ fn copy_from_file_group_subtree() {
         file.group("run1").unwrap().groups().unwrap(),
         vec!["inner".to_string()]
     );
-    std::fs::remove_file(&src_path).ok();
-    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]
 fn copy_from_file_into_subgroup_created_same_session() {
     // The destination parent may be a group created earlier in this session.
-    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_into.h5");
-    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_into.h5");
+    let src_path = temp_path("hdf5_pure_xcopy_src_into.h5");
+    let dst_path = temp_path("hdf5_pure_xcopy_dst_into.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("payload").with_i32_data(&[7, 8, 9]);
@@ -1463,15 +1421,13 @@ fn copy_from_file_into_subgroup_created_same_session() {
             .unwrap(),
         vec![7, 8, 9]
     );
-    std::fs::remove_file(&src_path).ok();
-    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]
 fn copy_from_file_preserves_attributes() {
     // Fixed-size attributes survive a cross-file copy byte-for-byte.
-    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_attrs.h5");
-    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_attrs.h5");
+    let src_path = temp_path("hdf5_pure_xcopy_src_attrs.h5");
+    let dst_path = temp_path("hdf5_pure_xcopy_dst_attrs.h5");
     {
         let mut b = FileBuilder::new();
         let ds = b.create_dataset("src");
@@ -1495,16 +1451,14 @@ fn copy_from_file_preserves_attributes() {
     let dup = file.dataset("dup").unwrap();
     assert_eq!(dup.read_i32().unwrap(), vec![5, 6, 7]);
     assert_eq!(dup.attrs().unwrap(), src_attrs);
-    std::fs::remove_file(&src_path).ok();
-    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]
 fn copy_from_file_rejects_variable_length() {
     // A variable-length attribute stores global-heap references into the source
     // file; a verbatim cross-file copy cannot translate them, so it is refused.
-    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_vlen.h5");
-    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_vlen.h5");
+    let src_path = temp_path("hdf5_pure_xcopy_src_vlen.h5");
+    let dst_path = temp_path("hdf5_pure_xcopy_dst_vlen.h5");
     {
         let mut b = FileBuilder::new();
         let ds = b.create_dataset("src");
@@ -1533,8 +1487,6 @@ fn copy_from_file_rejects_variable_length() {
     // The destination is byte-unchanged; the same-file `copy` would have allowed
     // this (shared heap), but the cross-file path refuses it up front.
     assert_eq!(std::fs::read(&dst_path).unwrap(), dst_before);
-    std::fs::remove_file(&src_path).ok();
-    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]
@@ -1543,8 +1495,8 @@ fn copy_from_file_rejects_reference_dataset() {
     // verbatim cross-file copy cannot translate them. This exercises the
     // datatype-message refusal branch (the variable-length test above covers the
     // attribute branch).
-    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_ref.h5");
-    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_ref.h5");
+    let src_path = temp_path("hdf5_pure_xcopy_src_ref.h5");
+    let dst_path = temp_path("hdf5_pure_xcopy_dst_ref.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("target").with_i32_data(&[1, 2, 3]);
@@ -1564,14 +1516,12 @@ fn copy_from_file_rejects_reference_dataset() {
         );
     }
     assert_eq!(std::fs::read(&dst_path).unwrap(), dst_before);
-    std::fs::remove_file(&src_path).ok();
-    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]
 fn copy_from_file_rejects_missing_source() {
-    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_missing.h5");
-    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_missing.h5");
+    let src_path = temp_path("hdf5_pure_xcopy_src_missing.h5");
+    let dst_path = temp_path("hdf5_pure_xcopy_dst_missing.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("present").with_i32_data(&[1]);
@@ -1583,17 +1533,14 @@ fn copy_from_file_rejects_missing_source() {
     let session = File::open_rw(&dst_path).unwrap();
     let err = session.copy_from(&source, "ghost", "x").unwrap_err();
     assert!(err.to_string().contains("does not exist"), "got: {err}");
-
-    std::fs::remove_file(&src_path).ok();
-    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]
 fn copy_from_file_rejects_destination_collision() {
     // A destination name already present in the parent group is refused at commit,
     // leaving the file untouched.
-    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_collide.h5");
-    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_collide.h5");
+    let src_path = temp_path("hdf5_pure_xcopy_src_collide.h5");
+    let dst_path = temp_path("hdf5_pure_xcopy_dst_collide.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("payload").with_i32_data(&[1]);
@@ -1610,17 +1557,14 @@ fn copy_from_file_rejects_destination_collision() {
         assert!(err.to_string().contains("already exists"), "got: {err}");
     }
     assert_eq!(std::fs::read(&dst_path).unwrap(), dst_before);
-
-    std::fs::remove_file(&src_path).ok();
-    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]
 fn copy_from_file_rejects_streaming_source() {
     // The source must be buffered so its bytes are addressable; a streaming reader
     // is refused with a clear message.
-    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_stream.h5");
-    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_stream.h5");
+    let src_path = temp_path("hdf5_pure_xcopy_src_stream.h5");
+    let dst_path = temp_path("hdf5_pure_xcopy_dst_stream.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("payload").with_i32_data(&[1, 2, 3]);
@@ -1632,9 +1576,6 @@ fn copy_from_file_rejects_streaming_source() {
     let session = File::open_rw(&dst_path).unwrap();
     let err = session.copy_from(&source, "payload", "dup").unwrap_err();
     assert!(err.to_string().contains("buffered source"), "got: {err}");
-
-    std::fs::remove_file(&src_path).ok();
-    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]
@@ -1642,7 +1583,7 @@ fn copy_same_file_still_allows_variable_length_attribute() {
     // Regression guard: the foreign-address refusal is cross-file only. An in-file
     // `copy` of a dataset carrying a variable-length attribute still works (the
     // copy shares the source file's global heap).
-    let path = std::env::temp_dir().join("hdf5_pure_xcopy_infile_vlen.h5");
+    let path = temp_path("hdf5_pure_xcopy_infile_vlen.h5");
     {
         let mut b = FileBuilder::new();
         let ds = b.create_dataset("src");
@@ -1667,12 +1608,11 @@ fn copy_same_file_still_allows_variable_length_attribute() {
         file.dataset("dup").unwrap().read_i32().unwrap(),
         vec![1, 2, 3]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn superblock_eof_matches_file_size_after_edit() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_eof.h5");
+    let path = temp_path("hdf5_pure_edit_eof.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -1690,14 +1630,13 @@ fn superblock_eof_matches_file_size_after_edit() {
     // The edit updates the superblock's logical end-of-file to the new size.
     assert_eq!(file.file_size(), on_disk);
     assert_eq!(file.superblock().eof_address, on_disk);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A chunked (but unfiltered) dataset can be added in place and read back, and
 /// the original dataset is left intact.
 #[test]
 fn add_chunked_dataset() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked.h5");
+    let path = temp_path("hdf5_pure_edit_add_chunked.h5");
     write_starter(&path);
 
     let data: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
@@ -1724,14 +1663,13 @@ fn add_chunked_dataset() {
     // The superblock's end-of-file matches the physical size after appending the
     // chunk data, index, and header.
     assert_eq!(file.file_size(), std::fs::metadata(&path).unwrap().len());
-    std::fs::remove_file(&path).ok();
 }
 
 /// Deflate, shuffle+deflate, and fletcher32 filtered datasets each round-trip
 /// through the in-place editor and the reader.
 #[test]
 fn add_filtered_datasets() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_filtered.h5");
+    let path = temp_path("hdf5_pure_edit_add_filtered.h5");
     write_starter(&path);
 
     let data: Vec<f64> = (0..200).map(|i| i as f64).collect();
@@ -1770,13 +1708,12 @@ fn add_filtered_datasets() {
         );
     }
     assert_eq!(file.file_size(), std::fs::metadata(&path).unwrap().len());
-    std::fs::remove_file(&path).ok();
 }
 
 /// A lossless integer scale-offset dataset round-trips.
 #[test]
 fn add_scale_offset_dataset() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_scaleoffset.h5");
+    let path = temp_path("hdf5_pure_edit_add_scaleoffset.h5");
     write_starter(&path);
 
     let data: Vec<i32> = (0..120).map(|i| 1000 + (i % 7)).collect();
@@ -1795,14 +1732,13 @@ fn add_scale_offset_dataset() {
 
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("counts").unwrap().read_i32().unwrap(), data);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A 2-D chunked dataset whose chunks don't evenly divide the shape round-trips
 /// (exercises edge chunks and the fixed-array index used for >1 chunk).
 #[test]
 fn add_2d_chunked_dataset() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_2d_chunked.h5");
+    let path = temp_path("hdf5_pure_edit_add_2d_chunked.h5");
     write_starter(&path);
 
     let data: Vec<i32> = (0..(7 * 5)).collect();
@@ -1823,7 +1759,6 @@ fn add_2d_chunked_dataset() {
     let grid = file.dataset("grid").unwrap();
     assert_eq!(grid.shape().unwrap(), vec![7, 5]);
     assert_eq!(grid.read_i32().unwrap(), data);
-    std::fs::remove_file(&path).ok();
 }
 
 /// An extensible (unlimited-dimension) dataset can be added in place; its data
@@ -1831,7 +1766,7 @@ fn add_2d_chunked_dataset() {
 /// Extensible-Array chunk index.
 #[test]
 fn add_extensible_dataset() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_extensible.h5");
+    let path = temp_path("hdf5_pure_edit_add_extensible.h5");
     write_starter(&path);
 
     let data: Vec<i32> = (0..64).collect();
@@ -1854,14 +1789,13 @@ fn add_extensible_dataset() {
     assert_eq!(stream.shape().unwrap(), vec![64]);
     assert_eq!(stream.read_i32().unwrap(), data);
     assert_eq!(file.file_size(), std::fs::metadata(&path).unwrap().len());
-    std::fs::remove_file(&path).ok();
 }
 
 /// One commit can mix a contiguous dataset and a chunked/compressed dataset
 /// into a nested group, alongside the original.
 #[test]
 fn add_mixed_contiguous_and_chunked_in_group() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_mixed.h5");
+    let path = temp_path("hdf5_pure_edit_add_mixed.h5");
     write_starter(&path);
 
     let wave: Vec<f64> = (0..512).map(|i| (i as f64 * 0.1).cos()).collect();
@@ -1897,14 +1831,13 @@ fn add_mixed_contiguous_and_chunked_in_group() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     assert_eq!(file.file_size(), std::fs::metadata(&path).unwrap().len());
-    std::fs::remove_file(&path).ok();
 }
 
 /// A chunked dataset whose datatype is `f64` still reports the right dtype after
 /// an in-place add, confirming the header is a faithful chunked dataset header.
 #[test]
 fn added_chunked_dataset_reports_dtype() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_chunked_dtype.h5");
+    let path = temp_path("hdf5_pure_edit_chunked_dtype.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -1920,7 +1853,6 @@ fn added_chunked_dataset_reports_dtype() {
     }
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("c").unwrap().dtype().unwrap(), DType::F64);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A ZFP fixed-rate compressed dataset can be added in place and reads back
@@ -1928,7 +1860,7 @@ fn added_chunked_dataset_reports_dtype() {
 #[test]
 #[cfg(feature = "zfp")]
 fn add_zfp_dataset() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_zfp.h5");
+    let path = temp_path("hdf5_pure_edit_add_zfp.h5");
     write_starter(&path);
 
     let data: Vec<f64> = (0..256).map(|i| (i as f64 * 0.05).sin()).collect();
@@ -1952,7 +1884,6 @@ fn add_zfp_dataset() {
         .map(|(&a, &b)| (a - b).abs())
         .fold(0f64, f64::max);
     assert!(max_err < 1e-6, "ZFP max_err {max_err} > 1e-6");
-    std::fs::remove_file(&path).ok();
 }
 
 /// Malformed chunked-dataset requests are refused before any byte is written,
@@ -2029,7 +1960,7 @@ fn malformed_chunked_requests_are_rejected_without_writing() {
     ];
 
     for (label, configure, expected) in bad {
-        let path = std::env::temp_dir().join(format!(
+        let path = temp_path(&format!(
             "hdf5_pure_edit_reject_{}.h5",
             label.replace(' ', "_")
         ));
@@ -2055,7 +1986,6 @@ fn malformed_chunked_requests_are_rejected_without_writing() {
             before,
             "[{label}] file modified"
         );
-        std::fs::remove_file(&path).ok();
     }
 }
 
@@ -2063,7 +1993,7 @@ fn malformed_chunked_requests_are_rejected_without_writing() {
 
 #[test]
 fn write_dataset_same_size_overwrites_in_place() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_same_size.h5");
+    let path = temp_path("hdf5_pure_write_same_size.h5");
     write_starter(&path); // "original" = [1.0, 2.0, 3.0, 4.0] (contiguous f64)
     let size_before = std::fs::metadata(&path).unwrap().len();
 
@@ -2090,7 +2020,6 @@ fn write_dataset_same_size_overwrites_in_place() {
     let ds = file.dataset("original").unwrap();
     assert_eq!(ds.dtype().unwrap(), DType::F64);
     assert_eq!(ds.read_f64().unwrap(), vec![9.0, 8.0, 7.0, 6.0]);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -2100,7 +2029,7 @@ fn write_dataset_resize_keeping_shape_is_a_reshape_and_refused() {
     // reshape, not a value overwrite, and is refused. (The genuine relocation
     // path — overwriting a never-written, undefined-address dataset — is exercised
     // in the crosscheck against the C library, which can create one.)
-    let path = std::env::temp_dir().join("hdf5_pure_write_resize_refused.h5");
+    let path = temp_path("hdf5_pure_write_resize_refused.h5");
     write_starter(&path); // "original" = 4 f64
     let before = std::fs::read(&path).unwrap();
     {
@@ -2123,12 +2052,11 @@ fn write_dataset_resize_keeping_shape_is_a_reshape_and_refused() {
         before,
         "file modified on refusal"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn write_dataset_in_a_nested_group() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_nested.h5");
+    let path = temp_path("hdf5_pure_write_nested.h5");
     {
         let mut b = FileBuilder::new();
         let mut g = b.create_group("grp");
@@ -2153,12 +2081,11 @@ fn write_dataset_in_a_nested_group() {
         file.dataset("grp/inner").unwrap().read_i32().unwrap(),
         vec![10, 20, 30]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn write_dataset_rejects_datatype_mismatch() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_type_mismatch.h5");
+    let path = temp_path("hdf5_pure_write_type_mismatch.h5");
     write_starter(&path); // f64
     let before = std::fs::read(&path).unwrap();
     {
@@ -2182,12 +2109,11 @@ fn write_dataset_rejects_datatype_mismatch() {
         before,
         "file modified on refusal"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn write_dataset_rejects_shape_mismatch() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_shape_mismatch.h5");
+    let path = temp_path("hdf5_pure_write_shape_mismatch.h5");
     {
         let mut b = FileBuilder::new();
         // A 2-D dataset, so a 1-D replacement of the same element count is a
@@ -2218,12 +2144,11 @@ fn write_dataset_rejects_shape_mismatch() {
         before,
         "file modified on refusal"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn write_dataset_rejects_missing_target() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_missing.h5");
+    let path = temp_path("hdf5_pure_write_missing.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -2236,7 +2161,6 @@ fn write_dataset_rejects_missing_target() {
         );
         assert!(!session.has_staged_edits());
     }
-    std::fs::remove_file(&path).ok();
 }
 
 /// An unfiltered chunked dataset is overwritten chunk-by-chunk straight in its
@@ -2244,7 +2168,7 @@ fn write_dataset_rejects_missing_target() {
 /// and the new values read back.
 #[test]
 fn write_dataset_overwrites_unfiltered_chunked_in_place() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_chunked.h5");
+    let path = temp_path("hdf5_pure_write_chunked.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("c")
@@ -2280,14 +2204,13 @@ fn write_dataset_overwrites_unfiltered_chunked_in_place() {
         c.chunk_cache_stats().index_loaded(),
         "dataset must still be chunked"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// A 2-D chunked dataset whose chunks do not evenly divide the shape (edge
 /// chunks, Fixed-Array index) is overwritten in place.
 #[test]
 fn write_dataset_overwrites_2d_edge_chunked_in_place() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_2d_edge_chunked.h5");
+    let path = temp_path("hdf5_pure_write_2d_edge_chunked.h5");
     let orig: Vec<i32> = (0..35).collect();
     {
         let mut b = FileBuilder::new();
@@ -2315,14 +2238,13 @@ fn write_dataset_overwrites_2d_edge_chunked_in_place() {
     let g = file.dataset("g").unwrap();
     assert_eq!(g.shape().unwrap(), vec![7, 5]);
     assert_eq!(g.read_i32().unwrap(), updated);
-    std::fs::remove_file(&path).ok();
 }
 
 /// An extensible (unlimited-dimension, Extensible-Array index) chunked dataset is
 /// overwritten in place.
 #[test]
 fn write_dataset_overwrites_extensible_chunked_in_place() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_extensible_chunked.h5");
+    let path = temp_path("hdf5_pure_write_extensible_chunked.h5");
     let orig: Vec<f64> = (0..60).map(|i| i as f64).collect();
     write_starter(&path);
     {
@@ -2352,7 +2274,6 @@ fn write_dataset_overwrites_extensible_chunked_in_place() {
     }
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("ext").unwrap().read_f64().unwrap(), updated);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A size-preserving filter (Fletcher32 always appends a 4-byte checksum, so the
@@ -2360,7 +2281,7 @@ fn write_dataset_overwrites_extensible_chunked_in_place() {
 /// overwritten in place even when the values change.
 #[test]
 fn write_dataset_overwrites_fletcher32_chunked_in_place() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_fletcher_chunked.h5");
+    let path = temp_path("hdf5_pure_write_fletcher_chunked.h5");
     let orig: Vec<f64> = (0..128).map(|i| i as f64).collect();
     write_starter(&path);
     {
@@ -2398,14 +2319,13 @@ fn write_dataset_overwrites_fletcher32_chunked_in_place() {
     let ck = file.dataset("ck").unwrap();
     assert_eq!(ck.read_f64().unwrap(), updated);
     assert!(ck.chunk_cache_stats().index_loaded());
-    std::fs::remove_file(&path).ok();
 }
 
 /// Rewriting a deflate dataset with the *same* values reproduces identical
 /// compressed bytes, so the overwrite fits the existing slots and stays in place.
 #[test]
 fn write_dataset_overwrites_deflate_chunked_equal_size_in_place() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_deflate_equal.h5");
+    let path = temp_path("hdf5_pure_write_deflate_equal.h5");
     let data: Vec<f64> = (0..200).map(|i| i as f64).collect();
     {
         let mut b = FileBuilder::new();
@@ -2435,7 +2355,6 @@ fn write_dataset_overwrites_deflate_chunked_equal_size_in_place() {
     );
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("d").unwrap().read_f64().unwrap(), data);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A deflate dataset overwritten with values of different compressibility
@@ -2443,7 +2362,7 @@ fn write_dataset_overwrites_deflate_chunked_equal_size_in_place() {
 /// new values still read back and the dataset stays chunked + compressed.
 #[test]
 fn write_dataset_overwrites_deflate_chunked_relocates_on_size_change() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_deflate_relocate.h5");
+    let path = temp_path("hdf5_pure_write_deflate_relocate.h5");
     // Highly compressible original, then incompressible-ish replacement.
     let orig: Vec<i32> = vec![0; 4096];
     {
@@ -2476,7 +2395,6 @@ fn write_dataset_overwrites_deflate_chunked_relocates_on_size_change() {
         d.chunk_cache_stats().index_loaded(),
         "relocated dataset must still be chunked"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// A relocating chunked overwrite returns the old chunk storage to the session's
@@ -2486,7 +2404,7 @@ fn write_dataset_overwrites_deflate_chunked_relocates_on_size_change() {
 /// (a double-free or stale span would corrupt one of them).
 #[test]
 fn write_dataset_chunked_relocate_then_reuse_stays_valid() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_chunked_reclaim.h5");
+    let path = temp_path("hdf5_pure_write_chunked_reclaim.h5");
     {
         let mut b = FileBuilder::new();
         // Highly compressible start => tiny chunk slots.
@@ -2527,7 +2445,6 @@ fn write_dataset_chunked_relocate_then_reuse_stays_valid() {
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("d").unwrap().read_i32().unwrap(), updated);
     assert_eq!(file.dataset("filler").unwrap().read_f64().unwrap(), filler);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A filtered (deflate, Fixed-Array index) overwrite whose re-encoded chunks are
@@ -2537,7 +2454,7 @@ fn write_dataset_chunked_relocate_then_reuse_stays_valid() {
 /// be impossible if the index still recorded the old, larger sizes).
 #[test]
 fn write_dataset_overwrites_filtered_chunked_fits_with_slack_in_place() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_fits_slack_fa.h5");
+    let path = temp_path("hdf5_pure_write_fits_slack_fa.h5");
     // Incompressible start => large chunk slots (Fixed Array: 4 finite chunks).
     let orig: Vec<i32> = (0..2048i32)
         .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
@@ -2575,7 +2492,6 @@ fn write_dataset_overwrites_filtered_chunked_fits_with_slack_in_place() {
     let d = file.dataset("d").unwrap();
     assert_eq!(d.read_i32().unwrap(), updated);
     assert!(d.chunk_cache_stats().index_loaded(), "still chunked");
-    std::fs::remove_file(&path).ok();
 }
 
 /// The fits-with-slack in-place path also covers an extensible (unlimited,
@@ -2584,7 +2500,7 @@ fn write_dataset_overwrites_filtered_chunked_fits_with_slack_in_place() {
 /// back.
 #[test]
 fn write_dataset_overwrites_filtered_extensible_fits_with_slack() {
-    let path = std::env::temp_dir().join("hdf5_pure_write_fits_slack_ea.h5");
+    let path = temp_path("hdf5_pure_write_fits_slack_ea.h5");
     let orig: Vec<i32> = (0..2048i32)
         .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
         .collect();
@@ -2626,7 +2542,6 @@ fn write_dataset_overwrites_filtered_extensible_fits_with_slack() {
     let d = file.dataset("d").unwrap();
     assert_eq!(d.read_i32().unwrap(), updated);
     assert!(d.chunk_cache_stats().index_loaded(), "still chunked");
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -2634,7 +2549,7 @@ fn write_dataset_rejects_filtered_request() {
     // A builder that itself requests chunking/filtering is refused as "not a
     // value overwrite" before the on-disk dataset is even consulted — which is
     // why the refusal arrives from `write_staged` and not from the commit.
-    let path = std::env::temp_dir().join("hdf5_pure_write_filtered_request.h5");
+    let path = temp_path("hdf5_pure_write_filtered_request.h5");
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -2656,14 +2571,13 @@ fn write_dataset_rejects_filtered_request() {
             "a refused overwrite must not be left staged"
         );
     }
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn write_dataset_rejects_staged_attributes() {
     // Attributes set on the write_dataset builder cannot be applied by a value
     // overwrite, so they must be refused rather than silently dropped.
-    let path = std::env::temp_dir().join("hdf5_pure_write_attr_refused.h5");
+    let path = temp_path("hdf5_pure_write_attr_refused.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
     {
@@ -2690,13 +2604,12 @@ fn write_dataset_rejects_staged_attributes() {
         before,
         "file modified on refusal"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn write_dataset_alongside_other_edits() {
     // A value overwrite coexists with an addition and a delete in one commit.
-    let path = std::env::temp_dir().join("hdf5_pure_write_mixed.h5");
+    let path = temp_path("hdf5_pure_write_mixed.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("keep").with_f64_data(&[1.0, 2.0]);
@@ -2731,14 +2644,13 @@ fn write_dataset_alongside_other_edits() {
         vec![3, 4]
     );
     assert!(file.dataset("doomed").is_err());
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn write_dataset_with_no_other_edits_takes_inplace_fast_path() {
     // A lone same-size overwrite must not rewrite headers or flip the root: the
     // only on-disk bytes that change are the data block itself.
-    let path = std::env::temp_dir().join("hdf5_pure_write_fastpath.h5");
+    let path = temp_path("hdf5_pure_write_fastpath.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
     {
@@ -2758,7 +2670,6 @@ fn write_dataset_with_no_other_edits_takes_inplace_fast_path() {
         before,
         "in-place rewrite of identical data changed the file"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// A zero-element (empty) contiguous dataset — the on-disk equivalent of the
@@ -2767,7 +2678,7 @@ fn write_dataset_with_no_other_edits_takes_inplace_fast_path() {
 /// same commit.
 #[test]
 fn add_empty_dataset_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_empty.h5");
+    let path = temp_path("hdf5_pure_edit_add_empty.h5");
     write_starter(&path);
 
     {
@@ -2801,7 +2712,6 @@ fn add_empty_dataset_via_edit_session() {
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// An empty dataset whose supplied data does not match its (zero-element)
@@ -2810,7 +2720,7 @@ fn add_empty_dataset_via_edit_session() {
 /// the shape contains a `0` dimension, not just for non-empty shapes.
 #[test]
 fn add_empty_dataset_with_mismatched_data_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_empty_mismatched.h5");
+    let path = temp_path("hdf5_pure_edit_add_empty_mismatched.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -2827,7 +2737,6 @@ fn add_empty_dataset_with_mismatched_data_is_rejected_without_writing() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A provenance-tagged dataset (issue #105) can be added in place; the
@@ -2839,7 +2748,7 @@ fn add_empty_dataset_with_mismatched_data_is_rejected_without_writing() {
 fn add_provenance_dataset_via_edit_session() {
     use hdf5_pure::VerifyResult;
 
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_provenance.h5");
+    let path = temp_path("hdf5_pure_edit_add_provenance.h5");
     write_starter(&path);
 
     {
@@ -2874,7 +2783,6 @@ fn add_provenance_dataset_via_edit_session() {
         attrs.get("_provenance_source"),
         Some(&AttrValue::String("bench".into()))
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// A provenance-tagged dataset can also be chunked/compressed in the same
@@ -2886,7 +2794,7 @@ fn add_provenance_dataset_via_edit_session() {
 fn add_provenance_chunked_dataset_via_edit_session() {
     use hdf5_pure::VerifyResult;
 
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_provenance_chunked.h5");
+    let path = temp_path("hdf5_pure_edit_add_provenance_chunked.h5");
     write_starter(&path);
 
     {
@@ -2917,7 +2825,6 @@ fn add_provenance_chunked_dataset_via_edit_session() {
         !attrs.contains_key("_provenance_source"),
         "no source was given, so no source attribute should be written"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// Provenance attributes (up to 4) are appended to `attrs` before the
@@ -2928,7 +2835,7 @@ fn add_provenance_chunked_dataset_via_edit_session() {
 #[cfg(feature = "provenance")]
 #[test]
 fn add_provenance_dataset_at_attr_budget_boundary_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_provenance_at_budget.h5");
+    let path = temp_path("hdf5_pure_edit_add_provenance_at_budget.h5");
     write_starter(&path);
 
     {
@@ -2962,7 +2869,6 @@ fn add_provenance_dataset_at_attr_budget_boundary_via_edit_session() {
         attrs.get("_provenance_creator"),
         Some(&AttrValue::String("test-suite".into()))
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// One attribute past the boundary above (9 total, once provenance is
@@ -2970,7 +2876,7 @@ fn add_provenance_dataset_at_attr_budget_boundary_via_edit_session() {
 #[cfg(feature = "provenance")]
 #[test]
 fn add_provenance_dataset_over_attr_budget_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_provenance_over_budget.h5");
+    let path = temp_path("hdf5_pure_edit_add_provenance_over_budget.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -2992,7 +2898,6 @@ fn add_provenance_dataset_over_attr_budget_is_rejected_without_writing() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A dataset with a variable-length attribute (issue #105) can be added in
@@ -3000,7 +2905,7 @@ fn add_provenance_dataset_over_attr_budget_is_rejected_without_writing() {
 /// patched during commit, alongside the dataset's own fixed-size attributes.
 #[test]
 fn add_dataset_with_variable_length_attribute_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_dataset_vlen_attr.h5");
+    let path = temp_path("hdf5_pure_edit_add_dataset_vlen_attr.h5");
     write_starter(&path);
 
     {
@@ -3037,7 +2942,6 @@ fn add_dataset_with_variable_length_attribute_via_edit_session() {
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// A variable-length attribute is patched before the chunked/non-chunked
@@ -3046,7 +2950,7 @@ fn add_dataset_with_variable_length_attribute_via_edit_session() {
 /// refused when chunked, not VL attributes).
 #[test]
 fn add_chunked_dataset_with_variable_length_attribute_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked_vlen_attr.h5");
+    let path = temp_path("hdf5_pure_edit_add_chunked_vlen_attr.h5");
     write_starter(&path);
 
     let data: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
@@ -3074,7 +2978,6 @@ fn add_chunked_dataset_with_variable_length_attribute_via_edit_session() {
             "two".into()
         ]))
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// A dataset attribute whose serialized message overflows the object header's
@@ -3084,7 +2987,7 @@ fn add_chunked_dataset_with_variable_length_attribute_via_edit_session() {
 /// enough of them push the message past `u16::MAX` bytes).
 #[test]
 fn add_dataset_with_oversized_variable_length_attribute_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_oversized_vlen_attr.h5");
+    let path = temp_path("hdf5_pure_edit_add_oversized_vlen_attr.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3106,7 +3009,6 @@ fn add_dataset_with_oversized_variable_length_attribute_is_rejected_without_writ
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// Regression test for issue #105's silent-corruption bug: a variable-length
@@ -3117,7 +3019,7 @@ fn add_dataset_with_oversized_variable_length_attribute_is_rejected_without_writ
 /// added dataset.
 #[test]
 fn add_vlen_string_dataset_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_vlen_string_dataset.h5");
+    let path = temp_path("hdf5_pure_edit_add_vlen_string_dataset.h5");
     write_starter(&path);
 
     {
@@ -3142,12 +3044,11 @@ fn add_vlen_string_dataset_via_edit_session() {
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn add_chunked_vlen_string_dataset_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked_vlen_string.h5");
+    let path = temp_path("hdf5_pure_edit_add_chunked_vlen_string.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3167,7 +3068,6 @@ fn add_chunked_vlen_string_dataset_is_rejected_without_writing() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// An object-reference dataset (issue #105) can be added in place, targeting
@@ -3176,7 +3076,7 @@ fn add_chunked_vlen_string_dataset_is_rejected_without_writing() {
 /// untouched by this commit.
 #[test]
 fn add_reference_dataset_targeting_preexisting_object_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_preexisting.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_preexisting.h5");
     write_starter(&path);
 
     {
@@ -3197,7 +3097,6 @@ fn add_reference_dataset_targeting_preexisting_object_via_edit_session() {
         Object::Dataset(ds) => assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]),
         other => panic!("expected a dataset reference, got {other:?}"),
     }
-    std::fs::remove_file(&path).ok();
 }
 
 /// A reference dataset may target a sibling dataset added in the **same**
@@ -3206,7 +3105,7 @@ fn add_reference_dataset_targeting_preexisting_object_via_edit_session() {
 /// reference dataset in that group (issue #105).
 #[test]
 fn add_reference_dataset_targeting_sibling_added_in_same_commit() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_sibling.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_sibling.h5");
     write_starter(&path);
 
     {
@@ -3235,7 +3134,6 @@ fn add_reference_dataset_targeting_sibling_added_in_same_commit() {
         Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![7, 8, 9]),
         other => panic!("expected a dataset reference, got {other:?}"),
     }
-    std::fs::remove_file(&path).ok();
 }
 
 /// A path with no object anywhere — neither pre-existing nor added in this
@@ -3244,7 +3142,7 @@ fn add_reference_dataset_targeting_sibling_added_in_same_commit() {
 /// (issue #105).
 #[test]
 fn add_reference_dataset_targeting_nonexistent_path_becomes_undefined() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_nonexistent.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_nonexistent.h5");
     write_starter(&path);
 
     {
@@ -3266,7 +3164,6 @@ fn add_reference_dataset_targeting_nonexistent_path_becomes_undefined() {
     // (`u64::MAX`) from address 0 or any other unresolvable garbage address —
     // check the stored 8-byte element directly.
     assert_eq!(ds.read_raw().unwrap(), u64::MAX.to_le_bytes());
-    std::fs::remove_file(&path).ok();
 }
 
 /// A reference targeting an **ancestor group of its own dataset** is refused:
@@ -3275,7 +3172,7 @@ fn add_reference_dataset_targeting_nonexistent_path_becomes_undefined() {
 /// require a stale or made-up address (issue #105).
 #[test]
 fn add_reference_dataset_targeting_unprocessed_ancestor_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_ancestor.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_ancestor.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3292,7 +3189,6 @@ fn add_reference_dataset_targeting_unprocessed_ancestor_is_rejected_without_writ
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A reference targeting a same-depth sibling **group** that the deepest-first
@@ -3302,7 +3198,7 @@ fn add_reference_dataset_targeting_unprocessed_ancestor_is_rejected_without_writ
 /// (issue #105).
 #[test]
 fn add_reference_dataset_targeting_unprocessed_sibling_group_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_sibling_group.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_sibling_group.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3321,12 +3217,11 @@ fn add_reference_dataset_targeting_unprocessed_sibling_group_is_rejected_without
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn add_chunked_reference_dataset_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked_ref.h5");
+    let path = temp_path("hdf5_pure_edit_add_chunked_ref.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3343,7 +3238,6 @@ fn add_chunked_reference_dataset_is_rejected_without_writing() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// Every element of a multi-element `with_path_references` array is resolved
@@ -3352,7 +3246,7 @@ fn add_chunked_reference_dataset_is_rejected_without_writing() {
 /// test cannot.
 #[test]
 fn add_reference_dataset_with_multiple_elements_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_multi_element.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_multi_element.h5");
     write_starter(&path);
 
     {
@@ -3387,7 +3281,6 @@ fn add_reference_dataset_with_multiple_elements_via_edit_session() {
         Object::Dataset(ds) => assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]),
         other => panic!("expected a dataset reference, got {other:?}"),
     }
-    std::fs::remove_file(&path).ok();
 }
 
 /// A reference can resolve to a **group**, not just a dataset — the existing
@@ -3395,7 +3288,7 @@ fn add_reference_dataset_with_multiple_elements_via_edit_session() {
 /// arm of `dereference()`'s result was previously unexercised.
 #[test]
 fn add_reference_dataset_targeting_a_group_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_group.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_group.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("original")
         .with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
@@ -3426,7 +3319,6 @@ fn add_reference_dataset_targeting_a_group_via_edit_session() {
         }
         other => panic!("expected a group reference, got {other:?}"),
     }
-    std::fs::remove_file(&path).ok();
 }
 
 /// `with_path_references(&[])` is a valid degenerate case, consistent with
@@ -3436,7 +3328,7 @@ fn add_reference_dataset_targeting_a_group_via_edit_session() {
 /// empty dataset.
 #[test]
 fn add_zero_element_reference_dataset_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_zero_element.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_zero_element.h5");
     write_starter(&path);
 
     {
@@ -3454,7 +3346,6 @@ fn add_zero_element_reference_dataset_via_edit_session() {
     let ds = file.dataset("refs").unwrap();
     assert_eq!(ds.shape().unwrap(), vec![0]);
     assert_eq!(ds.dereference().unwrap().len(), 0);
-    std::fs::remove_file(&path).ok();
 }
 
 /// Regression test: a reference targeting an object **deleted in the same
@@ -3466,7 +3357,7 @@ fn add_zero_element_reference_dataset_via_edit_session() {
 /// still leave the file untouched.
 #[test]
 fn add_reference_dataset_targeting_same_commit_delete_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_deleted_target.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_deleted_target.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3494,7 +3385,6 @@ fn add_reference_dataset_targeting_same_commit_delete_is_rejected_without_writin
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A deletion takes the whole subtree with it, so a reference to a *child* of
@@ -3512,7 +3402,7 @@ fn add_reference_dataset_targeting_same_commit_delete_is_rejected_without_writin
 /// bug shipped; a grandchild catches a fix that only descends one level.
 #[test]
 fn add_reference_dataset_targeting_a_child_of_a_same_commit_delete_is_rejected() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_deleted_child.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_deleted_child.h5");
     let mut b = FileBuilder::new();
     let mut doomed = b.create_group("doomed");
     doomed.create_dataset("inner").with_i32_data(&[7, 7, 7]);
@@ -3548,7 +3438,6 @@ fn add_reference_dataset_targeting_a_child_of_a_same_commit_delete_is_rejected()
 
         assert_eq!(std::fs::read(&path).unwrap(), before, "{target}");
     }
-    std::fs::remove_file(&path).ok();
 }
 
 /// The floor under the guard above: a delete in the commit must not stop an
@@ -3558,7 +3447,7 @@ fn add_reference_dataset_targeting_a_child_of_a_same_commit_delete_is_rejected()
 /// supposed to succeed.
 #[test]
 fn a_delete_elsewhere_does_not_block_an_unrelated_reference() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_delete_elsewhere.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_delete_elsewhere.h5");
     let mut b = FileBuilder::new();
     let mut doomed = b.create_group("doomed");
     doomed.create_dataset("inner").with_i32_data(&[7]);
@@ -3588,7 +3477,6 @@ fn a_delete_elsewhere_does_not_block_an_unrelated_reference() {
         other => panic!("expected a dataset reference, got {other:?}"),
     }
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The interaction with issue #305: when the commit puts the deleted path
@@ -3604,7 +3492,7 @@ fn a_delete_elsewhere_does_not_block_an_unrelated_reference() {
 /// other test here does. It is not evidence that the guard is correct.
 #[test]
 fn a_reference_to_a_replaced_paths_new_child_resolves_to_the_replacement() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_replaced_child.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_replaced_child.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("g");
     g.create_dataset("inner").with_i32_data(&[7, 7, 7]);
@@ -3639,7 +3527,6 @@ fn a_reference_to_a_replaced_paths_new_child_resolves_to_the_replacement() {
         other => panic!("expected a dataset reference, got {other:?}"),
     }
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The delete guard runs *after* the three "still writing" ones, so a
@@ -3662,7 +3549,7 @@ fn a_reference_to_a_replaced_paths_new_child_resolves_to_the_replacement() {
 /// harder to fix rather than easier.
 #[test]
 fn a_reference_to_an_unplaced_replacement_reports_the_ordering_not_the_delete() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_unplaced_replacement.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_unplaced_replacement.h5");
     let mut b = FileBuilder::new();
     let mut a = b.create_group("a");
     a.create_dataset("seed").with_i32_data(&[0]);
@@ -3690,7 +3577,6 @@ fn a_reference_to_an_unplaced_replacement_reports_the_ordering_not_the_delete() 
     let err = session.commit().unwrap_err();
     assert!(err.to_string().contains("still writing"), "got: {err}");
     drop(session);
-    std::fs::remove_file(&path).ok();
 }
 
 /// Regression test: a reference targeting a **copy destination** in the same
@@ -3699,7 +3585,7 @@ fn a_reference_to_an_unplaced_replacement_reports_the_ordering_not_the_delete() 
 /// nested addition must not leak into the file when the refusal fires later.
 #[test]
 fn add_reference_dataset_targeting_copy_destination_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_copy_dest.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_copy_dest.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3724,7 +3610,6 @@ fn add_reference_dataset_targeting_copy_destination_is_rejected_without_writing(
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// Regression test: a reference targeting a `write_dataset` (value-overwrite)
@@ -3733,7 +3618,7 @@ fn add_reference_dataset_targeting_copy_destination_is_rejected_without_writing(
 /// again, an earlier-processed nested addition must not leak.
 #[test]
 fn add_reference_dataset_targeting_write_overwrite_target_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_write_target.h5");
+    let path = temp_path("hdf5_pure_edit_add_ref_write_target.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3764,7 +3649,6 @@ fn add_reference_dataset_targeting_write_overwrite_target_is_rejected_without_wr
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The fixture the address-side reference tests below share (issue #317): a
@@ -3800,7 +3684,7 @@ fn write_reference_fixture(path: &std::path::Path) -> u64 {
 /// just reported as reusable.
 #[test]
 fn an_added_reference_address_into_deleted_space_is_refused() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_add.h5");
+    let path = temp_path("hdf5_pure_edit_ref_addr_add.h5");
     let inner = write_reference_fixture(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3824,7 +3708,6 @@ fn an_added_reference_address_into_deleted_space_is_refused() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The same address through the *overwrite* door, which reaches neither
@@ -3833,7 +3716,7 @@ fn an_added_reference_address_into_deleted_space_is_refused() {
 /// is screened on its own (issue #317).
 #[test]
 fn an_overwritten_reference_address_into_deleted_space_is_refused() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_write.h5");
+    let path = temp_path("hdf5_pure_edit_ref_addr_write.h5");
     let inner = write_reference_fixture(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3856,7 +3739,6 @@ fn an_overwritten_reference_address_into_deleted_space_is_refused() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// An address naming an object the delete does not touch still commits, and
@@ -3868,7 +3750,7 @@ fn an_overwritten_reference_address_into_deleted_space_is_refused() {
 /// decides the verdict.
 #[test]
 fn a_reference_address_to_a_surviving_object_is_accepted_beside_a_delete() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_survivor.h5");
+    let path = temp_path("hdf5_pure_edit_ref_addr_survivor.h5");
     let mut b = FileBuilder::new();
     let mut doomed = b.create_group("doomed");
     doomed.create_dataset("inner").with_i32_data(&[7]);
@@ -3906,7 +3788,6 @@ fn a_reference_address_to_a_surviving_object_is_accepted_beside_a_delete() {
         other => panic!("expected a dataset reference, got {other:?}"),
     }
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// An in-file copy re-emits its source's element bytes verbatim, which for an
@@ -3916,7 +3797,7 @@ fn a_reference_address_to_a_surviving_object_is_accepted_beside_a_delete() {
 /// commit is refused (issue #317).
 #[test]
 fn a_copy_of_a_reference_dataset_beside_a_delete_is_refused() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_delete.h5");
+    let path = temp_path("hdf5_pure_edit_ref_copy_delete.h5");
     write_reference_fixture(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -3933,7 +3814,6 @@ fn a_copy_of_a_reference_dataset_beside_a_delete_is_refused() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The other half of that rule: with nothing deleted there is no reclaimed
@@ -3945,7 +3825,7 @@ fn a_copy_of_a_reference_dataset_beside_a_delete_is_refused() {
 /// removal in the same commit takes that away.
 #[test]
 fn a_copy_of_a_reference_dataset_without_a_delete_still_works() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_plain.h5");
+    let path = temp_path("hdf5_pure_edit_ref_copy_plain.h5");
     write_reference_fixture(&path);
 
     {
@@ -3966,7 +3846,6 @@ fn a_copy_of_a_reference_dataset_without_a_delete_still_works() {
         }
     }
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A copy of a reference dataset commits *beside* a delete when the reference
@@ -3981,7 +3860,7 @@ fn a_copy_of_a_reference_dataset_without_a_delete_still_works() {
 /// anything at all.
 #[test]
 fn a_copy_of_a_reference_dataset_is_allowed_beside_an_unrelated_delete() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_unrelated.h5");
+    let path = temp_path("hdf5_pure_edit_ref_copy_unrelated.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("g");
     g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
@@ -4005,7 +3884,6 @@ fn a_copy_of_a_reference_dataset_is_allowed_beside_an_unrelated_delete() {
         other => panic!("expected a dataset reference, got {other:?}"),
     }
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// An address naming an object the same commit *rewrites elsewhere* is refused
@@ -4020,7 +3898,7 @@ fn a_copy_of_a_reference_dataset_is_allowed_beside_an_unrelated_delete() {
 /// relocated-dataset test below pins the case where it does not.
 #[test]
 fn a_reference_address_to_a_group_this_commit_rewrites_is_refused() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_moved_group.h5");
+    let path = temp_path("hdf5_pure_edit_ref_addr_moved_group.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("g");
     g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
@@ -4083,7 +3961,6 @@ fn a_reference_address_to_a_group_this_commit_rewrites_is_refused() {
         other => panic!("expected a group reference, got {other:?}"),
     }
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The same rule for a *dataset* target, relocated by an attribute edit rather
@@ -4094,7 +3971,7 @@ fn a_reference_address_to_a_group_this_commit_rewrites_is_refused() {
 /// naming freed bytes.
 #[test]
 fn a_reference_address_to_a_relocated_dataset_is_refused() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_moved_dataset.h5");
+    let path = temp_path("hdf5_pure_edit_ref_addr_moved_dataset.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("d").with_i32_data(&[11, 22, 33]);
     b.create_dataset("refs").with_path_references(&["d"]);
@@ -4145,7 +4022,6 @@ fn a_reference_address_to_a_relocated_dataset_is_refused() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A datatype mixing an object reference this crate can locate with one it
@@ -4188,7 +4064,7 @@ fn a_datatype_mixing_locatable_and_unlocatable_references_is_refused() {
     ];
 
     for (tag, second) in unlocatable {
-        let path = std::env::temp_dir().join("hdf5_pure_edit_ref_mixed.h5");
+        let path = temp_path("hdf5_pure_edit_ref_mixed.h5");
         let inner = write_reference_fixture(&path);
         let before = std::fs::read(&path).unwrap();
 
@@ -4219,7 +4095,6 @@ fn a_datatype_mixing_locatable_and_unlocatable_references_is_refused() {
         }
 
         assert_eq!(std::fs::read(&path).unwrap(), before, "{tag}");
-        std::fs::remove_file(&path).ok();
     }
 }
 
@@ -4234,7 +4109,7 @@ fn a_datatype_mixing_locatable_and_unlocatable_references_is_refused() {
 /// C-written file are the doors.
 #[test]
 fn a_dataset_region_reference_is_refused_beside_a_delete() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_region.h5");
+    let path = temp_path("hdf5_pure_edit_ref_region.h5");
     let inner = write_reference_fixture(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -4265,7 +4140,6 @@ fn a_dataset_region_reference_is_refused_beside_a_delete() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The relocating-write half of `moved`, through the two doors an attribute
@@ -4311,7 +4185,7 @@ fn a_reference_address_to_a_dataset_a_write_relocates_is_refused() {
             }) as fn(&File),
         ),
     ] {
-        let path = std::env::temp_dir().join(format!("hdf5_pure_edit_ref_moved_{tag}.h5"));
+        let path = temp_path(&format!("hdf5_pure_edit_ref_moved_{tag}.h5"));
         let mut b = FileBuilder::new();
         // Zeros so every chunk compresses to almost nothing, leaving slots the
         // replacement below cannot fit back into.
@@ -4348,7 +4222,6 @@ fn a_reference_address_to_a_dataset_a_write_relocates_is_refused() {
         }
 
         assert_eq!(std::fs::read(&path).unwrap(), before, "{tag}");
-        std::fs::remove_file(&path).ok();
     }
 }
 
@@ -4362,7 +4235,7 @@ fn a_reference_address_to_a_dataset_a_write_relocates_is_refused() {
 /// anything" would refuse every supplied address there is.
 #[test]
 fn a_reference_address_to_an_object_this_commit_leaves_alone_is_accepted() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_untouched.h5");
+    let path = temp_path("hdf5_pure_edit_ref_addr_untouched.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("d").with_i32_data(&[11, 22, 33]);
     b.create_dataset("refs").with_path_references(&["d"]);
@@ -4391,14 +4264,13 @@ fn a_reference_address_to_an_object_this_commit_leaves_alone_is_accepted() {
         other => panic!("expected a dataset reference, got {other:?}"),
     }
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The screen reads every element, not just the first: here element 0 names a
 /// survivor and element 1 names the deleted object (issue #317).
 #[test]
 fn a_hazardous_reference_past_the_first_element_is_found() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_second_element.h5");
+    let path = temp_path("hdf5_pure_edit_ref_addr_second_element.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("g");
     g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
@@ -4438,14 +4310,13 @@ fn a_hazardous_reference_past_the_first_element_is_found() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A copied *group* is screened through its whole subtree, not just at its root:
 /// the reference dataset here is a child of the group being copied (issue #317).
 #[test]
 fn a_copied_groups_subtree_is_screened() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_subtree.h5");
+    let path = temp_path("hdf5_pure_edit_ref_copy_subtree.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("g");
     g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
@@ -4471,7 +4342,6 @@ fn a_copied_groups_subtree_is_screened() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// Build a file with a *chunked* object-reference dataset `crefs` holding two
@@ -4514,7 +4384,7 @@ fn write_chunked_reference_file(path: &std::path::Path, stored: u64) -> u64 {
 /// object-reference dataset outright.
 #[test]
 fn a_chunked_reference_copy_beside_a_delete_is_refused() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_chunked.h5");
+    let path = temp_path("hdf5_pure_edit_ref_copy_chunked.h5");
     let survivor = write_chunked_reference_file(&path, 0);
     assert_eq!(
         write_chunked_reference_file(&path, survivor),
@@ -4535,7 +4405,6 @@ fn a_chunked_reference_copy_beside_a_delete_is_refused() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The chunked refusal above is gated on the commit reclaiming something: with
@@ -4546,7 +4415,7 @@ fn a_chunked_reference_copy_beside_a_delete_is_refused() {
 /// rather than from the ones where an address could have gone stale.
 #[test]
 fn a_chunked_reference_copy_without_a_delete_still_works() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_chunked_ok.h5");
+    let path = temp_path("hdf5_pure_edit_ref_copy_chunked_ok.h5");
     let survivor = write_chunked_reference_file(&path, 0);
     assert_eq!(write_chunked_reference_file(&path, survivor), survivor);
 
@@ -4566,7 +4435,6 @@ fn a_chunked_reference_copy_without_a_delete_still_works() {
         }
     }
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// Build a file whose `crefs` dataset holds one object reference to `g/inner`
@@ -4607,7 +4475,7 @@ fn write_committed_reference_file(path: &std::path::Path, stored: u64) -> u64 {
 /// this copy would go through unscreened.
 #[test]
 fn a_copy_of_a_committed_reference_datatype_is_screened() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_committed.h5");
+    let path = temp_path("hdf5_pure_edit_ref_copy_committed.h5");
     let inner = write_committed_reference_file(&path, 0);
     assert_eq!(
         write_committed_reference_file(&path, inner),
@@ -4629,7 +4497,6 @@ fn a_copy_of_a_committed_reference_datatype_is_screened() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The other side of that resolution: a committed datatype that is *not* a
@@ -4645,7 +4512,7 @@ fn a_copy_of_a_committed_reference_datatype_is_screened() {
 /// Attribute message. Both have to be followed for this copy to go through.
 #[test]
 fn a_copy_of_a_committed_ordinary_datatype_still_commits_beside_a_delete() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_committed_ok.h5");
+    let path = temp_path("hdf5_pure_edit_ref_copy_committed_ok.h5");
     let mut b = FileBuilder::new();
     b.commit_datatype("mytype", hdf5_pure::make_f64_type());
     b.commit_datatype("counttype", hdf5_pure::make_i32_type());
@@ -4676,7 +4543,6 @@ fn a_copy_of_a_committed_ordinary_datatype_still_commits_beside_a_delete() {
     );
     assert!(file.group("g").is_err(), "g was deleted");
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The chunked/extensible variable-length-string refusal is an `||` of two
@@ -4685,7 +4551,7 @@ fn a_copy_of_a_committed_ordinary_datatype_still_commits_beside_a_delete() {
 /// which the test above does not (it only sets `with_chunks`).
 #[test]
 fn add_extensible_vlen_string_dataset_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_extensible_vlen_string.h5");
+    let path = temp_path("hdf5_pure_edit_add_extensible_vlen_string.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -4706,7 +4572,6 @@ fn add_extensible_vlen_string_dataset_is_rejected_without_writing() {
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A zero-element variable-length-string dataset (an empty `with_vlen_strings`
@@ -4715,7 +4580,7 @@ fn add_extensible_vlen_string_dataset_is_rejected_without_writing() {
 /// sentinel as any other empty dataset.
 #[test]
 fn add_zero_element_vlen_string_dataset_via_edit_session() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_zero_vlen_string.h5");
+    let path = temp_path("hdf5_pure_edit_add_zero_vlen_string.h5");
     write_starter(&path);
 
     {
@@ -4733,7 +4598,6 @@ fn add_zero_element_vlen_string_dataset_via_edit_session() {
     let ds = file.dataset("labels").unwrap();
     assert_eq!(ds.shape().unwrap(), vec![0]);
     assert_eq!(ds.read_string().unwrap(), Vec::<String>::new());
-    std::fs::remove_file(&path).ok();
 }
 
 /// Regression test: `write_dataset(...).with_vlen_strings(...)` must not
@@ -4743,7 +4607,7 @@ fn add_zero_element_vlen_string_dataset_via_edit_session() {
 /// refused up front, and the refusal must not write anything.
 #[test]
 fn write_dataset_rejects_vlen_strings_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_write_vlen_string_rejected.h5");
+    let path = temp_path("hdf5_pure_edit_write_vlen_string_rejected.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("labels").with_vlen_strings(&["a", "b"]);
     b.write(&path).unwrap();
@@ -4776,7 +4640,6 @@ fn write_dataset_rejects_vlen_strings_without_writing() {
         file.dataset("labels").unwrap().read_string().unwrap(),
         vec!["a".to_string(), "b".to_string()]
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// The object-reference counterpart of
@@ -4792,8 +4655,7 @@ fn write_dataset_rejects_vlen_strings_without_writing() {
 /// every write, and they are here for a version of this code where it does not.
 #[test]
 fn write_dataset_rejects_object_references_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_write_object_ref_rejected.h5");
-    std::fs::remove_file(&path).ok();
+    let path = temp_path("hdf5_pure_edit_write_object_ref_rejected.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("a").with_i32_data(&[1]);
     b.create_dataset("bb").with_i32_data(&[2]);
@@ -4835,7 +4697,6 @@ fn write_dataset_rejects_object_references_without_writing() {
         other => panic!("expected a dataset reference, got {other:?}"),
     }
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The boundary of the refusal above: what it rejects is an *unresolved* target,
@@ -4853,8 +4714,7 @@ fn write_dataset_rejects_object_references_without_writing() {
 /// which this refusal neither creates nor closes).
 #[test]
 fn write_dataset_accepts_resolved_reference_addresses() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_write_resolved_refs.h5");
-    std::fs::remove_file(&path).ok();
+    let path = temp_path("hdf5_pure_edit_write_resolved_refs.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("a").with_i32_data(&[1]);
     b.create_dataset("bb").with_i32_data(&[2]);
@@ -4890,7 +4750,6 @@ fn write_dataset_accepts_resolved_reference_addresses() {
         other => panic!("expected a dataset reference, got {other:?}"),
     }
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A staged dataset whose datatype occupies zero bytes per element is refused at
@@ -4900,7 +4759,7 @@ fn write_dataset_accepts_resolved_reference_addresses() {
 /// parse-side refusal (issue #268).
 #[test]
 fn a_zero_width_element_type_is_refused_by_a_staged_write() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_zero_width.h5");
+    let path = temp_path("hdf5_pure_edit_zero_width.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -4941,7 +4800,6 @@ fn a_zero_width_element_type_is_refused_by_a_staged_write() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// An empty (zero-element) chunked, unlimited dataset added in place: the shape
@@ -4954,7 +4812,7 @@ fn a_zero_width_element_type_is_refused_by_a_staged_write() {
 /// the index over zero chunks is a real Extensible Array and not a placeholder.
 #[test]
 fn add_empty_extensible_chunked_dataset_and_grow_it() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_empty_chunked.h5");
+    let path = temp_path("hdf5_pure_edit_empty_chunked.h5");
     write_starter(&path);
 
     {
@@ -5019,7 +4877,6 @@ fn add_empty_extensible_chunked_dataset_and_grow_it() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// The other empty-chunked shapes the same lifted refusal now admits: a
@@ -5028,7 +4885,7 @@ fn add_empty_extensible_chunked_dataset_and_grow_it() {
 /// nothing — a fixed array, and the filtered pipeline that never runs.
 #[test]
 fn add_empty_chunked_datasets_of_every_flavor() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_empty_chunked_flavors.h5");
+    let path = temp_path("hdf5_pure_edit_empty_chunked_flavors.h5");
     write_starter(&path);
 
     {
@@ -5130,7 +4987,6 @@ fn add_empty_chunked_datasets_of_every_flavor() {
         (0..40).collect::<Vec<i32>>()
     );
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -5159,7 +5015,7 @@ fn write_rotation_starter(path: &std::path::Path) {
 
 #[test]
 fn a_dataset_is_replaced_at_its_own_path_in_one_commit() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_dataset.h5");
+    let path = temp_path("hdf5_pure_edit_replace_dataset.h5");
     write_rotation_starter(&path);
 
     {
@@ -5200,12 +5056,11 @@ fn a_dataset_is_replaced_at_its_own_path_in_one_commit() {
         vec![7, 8]
     );
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn replacing_a_group_replaces_its_whole_subtree() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_group.h5");
+    let path = temp_path("hdf5_pure_edit_replace_group.h5");
     write_rotation_starter(&path);
 
     {
@@ -5247,12 +5102,11 @@ fn replacing_a_group_replaces_its_whole_subtree() {
         1
     );
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn a_dataset_is_replaced_below_the_root_too() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_nested.h5");
+    let path = temp_path("hdf5_pure_edit_replace_nested.h5");
     write_rotation_starter(&path);
 
     {
@@ -5273,12 +5127,11 @@ fn a_dataset_is_replaced_below_the_root_too() {
         vec![5, 5, 5]
     );
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn rotating_one_path_in_a_session_stops_growing_the_file() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_rotation_bounded.h5");
+    let path = temp_path("hdf5_pure_edit_rotation_bounded.h5");
     write_rotation_starter(&path);
 
     let mut sizes = Vec::new();
@@ -5314,14 +5167,13 @@ fn rotating_one_path_in_a_session_stops_growing_the_file() {
         vec![11i32; 256]
     );
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn an_addition_below_a_path_needs_that_path_replaced_too() {
     // Replacing `g` makes an addition below it unambiguous: `g/added` is placed
     // in the group this commit builds, not in the one it removes.
-    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_descendant_ok.h5");
+    let path = temp_path("hdf5_pure_edit_replace_descendant_ok.h5");
     write_rotation_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
@@ -5345,11 +5197,10 @@ fn an_addition_below_a_path_needs_that_path_replaced_too() {
         "the addition landed in the group being removed rather than its replacement"
     );
     drop(file);
-    std::fs::remove_file(&path).ok();
 
     // Without that replacement it is the ambiguity the refusal exists for: the
     // addition names a group whose own link this commit removes.
-    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_descendant.h5");
+    let path = temp_path("hdf5_pure_edit_replace_descendant.h5");
     write_rotation_starter(&path);
     let before = std::fs::read(&path).unwrap();
     let session = File::open_rw(&path).unwrap();
@@ -5368,12 +5219,11 @@ fn an_addition_below_a_path_needs_that_path_replaced_too() {
     // The refusal is a preflight, so not a byte of the file changed.
     drop(session);
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn a_group_and_a_dataset_replace_each_other() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_kind_swap.h5");
+    let path = temp_path("hdf5_pure_edit_replace_kind_swap.h5");
     write_rotation_starter(&path);
 
     // A dataset over a group: the whole subtree goes with the link.
@@ -5426,12 +5276,11 @@ fn a_group_and_a_dataset_replace_each_other() {
     );
     assert_eq!(file.dataset("g/back").unwrap().read_i32().unwrap(), vec![7]);
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn a_staged_edit_to_a_replaced_object_is_refused() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_edited.h5");
+    let path = temp_path("hdf5_pure_edit_replace_edited.h5");
     write_rotation_starter(&path);
 
     // `g` is replaced by a *dataset*, so the group-attribute edit at the same
@@ -5463,12 +5312,11 @@ fn a_staged_edit_to_a_replaced_object_is_refused() {
         vec![7, 8]
     );
     drop(file);
-    std::fs::remove_file(&path).ok();
 
     // The same rule one level down: `g` is replaced by a group this time, but
     // `g/sub` names the *original's* subgroup, which the replacement does not
     // create. Refused for the same reason and by the same guard.
-    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_edited_child.h5");
+    let path = temp_path("hdf5_pure_edit_replace_edited_child.h5");
     write_rotation_starter(&path);
     let before = std::fs::read(&path).unwrap();
     let session = File::open_rw(&path).unwrap();
@@ -5486,12 +5334,11 @@ fn a_staged_edit_to_a_replaced_object_is_refused() {
     );
     drop(session);
     assert_eq!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn a_copy_replaces_an_object_at_its_own_path() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_by_copy.h5");
+    let path = temp_path("hdf5_pure_edit_replace_by_copy.h5");
     write_rotation_starter(&path);
 
     // A copy is linked into its parent by the same apply-loop step as a created
@@ -5516,12 +5363,11 @@ fn a_copy_replaces_an_object_at_its_own_path() {
     );
     assert_eq!(file.dataset("slot").unwrap().shape().unwrap(), vec![2]);
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn a_copy_reading_from_a_replaced_path_is_refused() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_copy_source.h5");
+    let path = temp_path("hdf5_pure_edit_replace_copy_source.h5");
     write_rotation_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -5585,7 +5431,6 @@ fn a_copy_reading_from_a_replaced_path_is_refused() {
     );
     assert!(file.dataset("slot").is_err());
     drop(file);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A commit refused partway through its preflight must leave the staged set
@@ -5598,7 +5443,7 @@ fn a_copy_reading_from_a_replaced_path_is_refused() {
 /// valid edits and left `has_staged_edits()` answering `false`.
 #[test]
 fn a_refused_commit_leaves_its_other_staged_edits_alone() {
-    let path = std::env::temp_dir().join("hdf5_pure_refused_keeps_staged.h5");
+    let path = temp_path("hdf5_pure_refused_keeps_staged.h5");
     {
         let mut b = FileBuilder::new();
         let mut g = b.create_group("g");
@@ -5650,7 +5495,6 @@ fn a_refused_commit_leaves_its_other_staged_edits_alone() {
         before,
         "a refused commit wrote to the file"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// A commit refused in its *first* preflight loop must not leave the rest of
@@ -5663,7 +5507,7 @@ fn a_refused_commit_leaves_its_other_staged_edits_alone() {
 /// the batch it had been told was rejected.
 #[test]
 fn a_refused_commit_does_not_apply_its_survivors_later() {
-    let path = std::env::temp_dir().join("hdf5_pure_refused_no_partial_apply.h5");
+    let path = temp_path("hdf5_pure_refused_no_partial_apply.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
@@ -5710,7 +5554,6 @@ fn a_refused_commit_does_not_apply_its_survivors_later() {
         file.dataset("added_a").is_err(),
         "an edit from a refused batch reached the file"
     );
-    std::fs::remove_file(&path).ok();
 }
 
 /// The restore a refused commit performs covers *every* kind of staged edit,
@@ -5777,7 +5620,7 @@ fn a_refused_commit_restores_every_kind_of_staged_edit() {
         }),
     ];
 
-    let donor_path = std::env::temp_dir().join("hdf5_pure_restore_kinds_donor.h5");
+    let donor_path = temp_path("hdf5_pure_restore_kinds_donor.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("donor").with_i32_data(&[7]);
@@ -5785,8 +5628,7 @@ fn a_refused_commit_restores_every_kind_of_staged_edit() {
     }
 
     for (what, stage) in cases {
-        let path =
-            std::env::temp_dir().join(format!("hdf5_pure_restore_{}.h5", what.replace(' ', "_")));
+        let path = temp_path(&format!("hdf5_pure_restore_{}.h5", what.replace(' ', "_")));
         {
             let mut b = FileBuilder::new();
             b.create_dataset("original").with_i32_data(&[0]);
@@ -5831,9 +5673,7 @@ fn a_refused_commit_restores_every_kind_of_staged_edit() {
             before,
             "[{what}] a refused commit wrote to the file"
         );
-        std::fs::remove_file(&path).ok();
     }
-    std::fs::remove_file(&donor_path).ok();
 }
 
 /// A staging call that refuses stages nothing, even when it carries a batch.
@@ -5844,7 +5684,7 @@ fn a_refused_commit_restores_every_kind_of_staged_edit() {
 /// (issue #316), leaving the session as the call found it.
 #[test]
 fn a_refused_staging_call_stages_none_of_its_batch() {
-    let path = std::env::temp_dir().join("hdf5_pure_refused_staging_batch.h5");
+    let path = temp_path("hdf5_pure_refused_staging_batch.h5");
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
@@ -5890,7 +5730,6 @@ fn a_refused_staging_call_stages_none_of_its_batch() {
     );
     drop(file);
     assert_ne!(std::fs::read(&path).unwrap(), before);
-    std::fs::remove_file(&path).ok();
 }
 
 /// A group's added datasets are placed in staging order, which is the order
@@ -5904,7 +5743,7 @@ fn a_refused_staging_call_stages_none_of_its_batch() {
 /// "still writing" having already written part of itself.
 #[test]
 fn a_reference_datasets_placement_order_is_the_order_the_preflight_proved() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_placement_order.h5");
+    let path = temp_path("hdf5_pure_edit_ref_placement_order.h5");
     write_starter(&path);
 
     {
@@ -5940,7 +5779,6 @@ fn a_reference_datasets_placement_order_is_the_order_the_preflight_proved() {
         }
         other => panic!("expected a dataset reference, got {other:?}"),
     }
-    std::fs::remove_file(&path).ok();
 }
 
 /// A group gains its new links in the order the commit places them: copied
@@ -5954,8 +5792,8 @@ fn a_reference_datasets_placement_order_is_the_order_the_preflight_proved() {
 /// nothing else observes where in the sequence they land.
 #[test]
 fn a_group_gains_its_new_links_in_placement_order() {
-    let donor_path = std::env::temp_dir().join("hdf5_pure_link_order_donor.h5");
-    let path = std::env::temp_dir().join("hdf5_pure_link_order.h5");
+    let donor_path = temp_path("hdf5_pure_link_order_donor.h5");
+    let path = temp_path("hdf5_pure_link_order.h5");
     {
         let mut b = FileBuilder::new();
         b.create_dataset("donated").with_i32_data(&[3]);
@@ -5994,6 +5832,4 @@ fn a_group_gains_its_new_links_in_placement_order() {
         ]
     );
     drop(file);
-    std::fs::remove_file(&path).ok();
-    std::fs::remove_file(&donor_path).ok();
 }

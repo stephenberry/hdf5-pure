@@ -4825,7 +4825,8 @@ mod tests {
             .with_shape(&[30])
             .with_chunks(&[10]);
         let bytes = fw.finish().unwrap();
-        let path = std::env::temp_dir().join("rustyhdf5_chunked_multi.h5");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rustyhdf5_chunked_multi.h5");
         std::fs::write(&path, &bytes).unwrap();
         let script = "import sys,h5py,json; f=h5py.File(sys.argv[1],'r'); print(json.dumps({'a':f['a'][:].tolist(),'b':f['b'][:].tolist()}))";
         let Some(out) = h5py_run(&path, script) else {
@@ -4850,7 +4851,8 @@ mod tests {
             .with_chunks(&[25])
             .set_attr("units", AttrValue::String("meters".to_string()));
         let bytes = fw.finish().unwrap();
-        let path = std::env::temp_dir().join("rustyhdf5_chunked_attrs.h5");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rustyhdf5_chunked_attrs.h5");
         std::fs::write(&path, &bytes).unwrap();
         let script = "import sys,h5py,json; f=h5py.File(sys.argv[1],'r'); d=f['data']; print(json.dumps({'values':d[:].tolist(),'units':d.attrs['units'].decode() if isinstance(d.attrs['units'],bytes) else str(d.attrs['units'])}))";
         let Some(out) = h5py_run(&path, script) else {
