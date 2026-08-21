@@ -4410,6 +4410,22 @@ impl Dataset {
         FilterPipeline::parse(&body).ok()
     }
 
+    /// Whether this dataset's element bytes live in files outside this one
+    /// (`H5Pset_external`, the External Data Files header message, type 7).
+    ///
+    /// Such a dataset carries a *contiguous* layout message whose data address
+    /// is undefined — the same encoding a never-written dataset uses — so a
+    /// caller that reads "no address" as "no storage" would call a dataset full
+    /// of data empty. This crate does not follow the external files, so the only
+    /// safe answer is to refuse the dataset rather than reproduce it without its
+    /// data.
+    pub(crate) fn has_external_storage(&self) -> bool {
+        self.header
+            .messages
+            .iter()
+            .any(|m| m.msg_type == MessageType::Unknown(0x0007))
+    }
+
     /// The raw, still-compressed on-disk bytes of every allocated chunk of this
     /// chunked dataset, with each chunk's `(address, on-disk size, filter mask,
     /// logical offset)` — the same `ChunkInfo`s the chunked reader walks before

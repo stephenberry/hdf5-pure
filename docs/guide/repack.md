@@ -58,6 +58,7 @@ The operation is all-or-nothing: the entire source is validated and staged in me
 | Datatypes | fixed-point, floating-point, fixed-length string, time, bit-field, opaque, compound, enumeration, array; variable-length strings and sequences, and 8-byte object references (rewritten to their targets' new addresses) |
 | Embedded addresses | a compound with a variable-length member, an object-reference member, or both; an array of such compounds; and nesting of either. The embedded addresses are rewritten, the surrounding bytes carried through untouched |
 | Layout | contiguous / compact or chunked |
+| Unallocated storage | a dataset created and never written comes out storing nothing, rather than materialized full of the fill value a read of it answers with |
 | Filters | deflate, shuffle, fletcher32, LZF, and/or lossless integer scale-offset |
 | Structure | group hierarchy of arbitrary depth |
 | Attributes | every datatype above, carried across with the source's own encoding — width, charset, string padding, and rank included — on datasets, groups, and root |
@@ -67,6 +68,9 @@ A repacked file has no free space to persist, so even when the source recorded a
 
 !!! note "Attributes keep their own encoding"
     An attribute is copied as the source encoded it, not as `AttrValue` renders it. That matters because `AttrValue` is a deliberately lossy convenience view: it has no integer narrower than 64 bits, no variable-length string, and no rank above one, so an attribute rebuilt from one would come back widened and flattened. Only an attribute whose element bytes hold a *location* — variable-length data, or a reference — cannot be copied as-is; a variable-length string keeps its datatype and dataspace while its strings are restaged into the new file's heap, and a reference attribute is refused. See [Attributes](groups-attributes.md#attributes) for what a *read* still normalizes.
+
+!!! note "One deviation from byte-for-byte"
+    A dataset that was never written stores nothing in the destination as it did in the source — except a **resizable** one, which is given the eagerly built Extensible Array this crate gives every empty resizable dataset, because an in-place append needs the index to exist before the first chunk arrives. It stores no chunk either way; the index costs a few hundred bytes the source did not spend. A dataset that stores only *some* of its chunks is a separate case and is unaffected: a sparse grid cannot take the verbatim path, so the destination re-encodes and stores every slot.
 
 !!! note "Lossless filters only"
     `repack` reads each dataset's *decompressed* bytes and re-applies its filters. It can therefore reproduce only **lossless** filters, where the re-encoded chunks decompress to the exact same bytes. This includes deflate, shuffle, fletcher32, LZF, and lossless integer scale-offset. See [Compression](compression.md) for the full filter list.
@@ -81,7 +85,7 @@ These are reported as `Error::RepackUnsupported` naming the object, never silent
 | variable-length sequences whose base type is itself variable-length, or a reference | the copied element bytes would carry addresses that go stale on rewrite |
 | region references, and object references other than 8 bytes wide | their stored selections and addresses are not rewritten yet |
 | object references in a file with a userblock, or to an object being dropped | the new target address cannot be resolved safely, or will not exist |
-| virtual and external data layouts | not reproducible by rewriting |
+| a virtual data layout, and external data storage (`H5Pset_external`) | the element bytes live outside the file, and this crate does not read them |
 | lossy filters: float D-scale scale-offset and ZFP | re-encoding is not guaranteed idempotent |
 | SZIP filter | this crate cannot write it |
 | an attribute whose datatype is or contains a reference | its stored address is not rewritten yet, and no `AttrValue` can re-encode it |

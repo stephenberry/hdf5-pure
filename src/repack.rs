@@ -82,7 +82,9 @@
 //! target outside the hard-link hierarchy (a dangling or region target), and
 //! object references in a userblock file (non-zero base address); a
 //! non-string vlen sequence whose base type embeds an address (nested vlen or
-//! reference); virtual and external data layouts; a lossy filter on the
+//! reference); a virtual data layout, and external data storage
+//! (`H5Pset_external`), whose bytes live in files this crate does not read; a
+//! lossy filter on the
 //! contiguous re-encode or sparse-chunked fallback path; an attribute whose
 //! datatype is or contains a reference (its stored address is not rewritten yet,
 //! and no [`AttrValue`] can re-encode it); and a use of a committed datatype the
@@ -509,9 +511,28 @@ fn emit_dataset(
 
     check_datatype(&datatype, &format!("dataset {path}"))?;
     check_layout(&layout, path)?;
+    // An externally stored dataset carries a contiguous layout message with an
+    // undefined data address, exactly as a never-written one does, and this crate
+    // does not follow the external files. Refused rather than reproduced, which
+    // would silently emit a schema-only dataset in place of one holding data.
+    if ds.has_external_storage() {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: external data storage (H5Pset_external) cannot be repacked -- its \
+             element bytes live in files this crate does not read"
+        )));
+    }
 
     let dims = dataspace.dimensions.clone();
     let n_elements: u64 = dims.iter().product();
+
+    // The chunks the source holds, walked once. Both the unallocated test below
+    // and the verbatim planner further down need the list, and each walk is the
+    // whole chunk index. Empty for a layout that has no chunks at all, which is
+    // the answer both of them want for one.
+    let source_chunks = match &layout {
+        DataLayout::Chunked { .. } => ds.raw_chunks()?,
+        _ => Vec::new(),
+    };
 
     // Every variable-length reference the datatype reaches, whether it *is*
     // variable-length or merely contains one through a compound member or array
@@ -551,8 +572,9 @@ fn emit_dataset(
 
     // Storage the source never allocated is reproduced as storage, not as the
     // values reading it answers with. By default the reference library does not
-    // allocate a dataset's storage until something is written to it, so one
-    // created and never written holds nothing at all; since #292 reading it
+    // allocate a contiguous or chunked dataset's storage until something is
+    // written to it, so one created and never written holds nothing at all
+    // (compact data is inline and is always present); since #292 reading it
     // answers the fill value for every element, and re-writing those values
     // would turn a schema-only file into a fully materialized one of the size
     // its shape declares (issue #293).
@@ -564,7 +586,7 @@ fn emit_dataset(
     // source held. `check_pipeline` still runs, so a filter this crate could not
     // re-apply is refused here exactly as it is on the re-encode path below —
     // the filters are reproduced through the same `carry_shape_and_pipeline`.
-    if storage_is_unallocated(ds, &layout)? {
+    if storage_is_unallocated(&layout, &source_chunks) {
         check_pipeline(pipeline.as_ref(), path)?;
         db.fill = fill;
         db.with_unallocated_storage(datatype, &dims);
@@ -668,7 +690,7 @@ fn emit_dataset(
             .collect();
 
         if let Some(DenseChunkPlan { meta, grid_order }) =
-            try_plan_dense_chunks(ds, &dims, &chunk_dims)?
+            try_plan_dense_chunks(source_chunks, &dims, &chunk_dims)
         {
             let maxshape = dataspace
                 .max_dimensions
@@ -1132,25 +1154,23 @@ struct DenseChunkPlan {
 /// Plan a chunked dataset's verbatim copy without reading any chunk bytes: if
 /// every chunk-grid slot is present exactly once (a dense grid), return the
 /// per-chunk [`ChunkMeta`] (sizes + filter masks) and the source [`ChunkInfo`]
-/// for each slot, both in dense row-major grid order. Returns `Ok(None)` when
-/// the grid has holes (a sparse dataset), so the caller falls back to read-raw.
+/// for each slot, both in dense row-major grid order. Returns `None` when the
+/// grid has holes (a sparse dataset), so the caller falls back to read-raw.
 ///
-/// `dims` is the dataspace shape; `chunk_dims` the logical (rank-only) chunk
+/// `chunks` is the source's chunk list, which the caller has walked already;
+/// `dims` is the dataspace shape and `chunk_dims` the logical (rank-only) chunk
 /// dimensions. The grid has `num_chunks_per_dim[d] = ceil(dims[d]/chunk_dims[d])`
 /// slots per dimension; a chunk at N-d offset `o` maps to grid coordinate
 /// `o[d]/chunk_dims[d]` and linear (row-major) index over the grid.
 fn try_plan_dense_chunks(
-    ds: &Dataset,
+    chunks: Vec<ChunkInfo>,
     dims: &[u64],
     chunk_dims: &[u64],
-) -> Result<Option<DenseChunkPlan>, Error> {
+) -> Option<DenseChunkPlan> {
     // Map the source chunks onto the dense grid via the shared planner (the
     // single owner of grid-mapping logic, also used by the in-place editor); a
     // sparse grid (holes/duplicates/misalignment) returns `None`.
-    let Some(grid) = crate::chunked_read::plan_dense_grid(ds.raw_chunks()?, dims, chunk_dims)
-    else {
-        return Ok(None);
-    };
+    let grid = crate::chunked_read::plan_dense_grid(chunks, dims, chunk_dims)?;
     let grid_order = grid.grid_order;
     let meta = grid_order
         .iter()
@@ -1159,7 +1179,7 @@ fn try_plan_dense_chunks(
             filter_mask: info.filter_mask,
         })
         .collect();
-    Ok(Some(DenseChunkPlan { meta, grid_order }))
+    Some(DenseChunkPlan { meta, grid_order })
 }
 
 /// Whether an attribute's element bytes mean the same thing in another file.
@@ -1622,29 +1642,37 @@ fn resolve_reference_address(
     }
 }
 
-/// Reject data layouts that cannot be read and re-emitted (virtual datasets;
-/// contiguous/chunked with an undefined address are allowed — they are empty).
-/// Whether `ds` stores nothing at all: no chunk, no contiguous data region.
+/// Whether the source stores nothing at all: no chunk, no contiguous data
+/// region.
 ///
 /// Read from the file's own statement of where its data is rather than from the
 /// values a read answers with, which cannot tell the two apart — a dataset that
 /// stores a grid of fill values reads exactly like one that stores nothing.
 ///
-/// A contiguous dataset says so with the undefined data address. A chunked one
-/// is asked for its chunks rather than for its index address, because the two
+/// A contiguous dataset says so with the undefined data address — but only once
+/// external storage is out of the way, since `H5Pset_external` uses that same
+/// encoding for a dataset whose bytes live in other files. `emit_dataset` refuses
+/// one above, which is what leaves the address meaning what this reads it as. A
+/// chunked one
+/// is answered from `chunks` rather than from its index address, because the two
 /// can disagree: an index that exists and holds no chunk is still a dataset with
-/// nothing in it, and it is the chunks that a rewrite would materialize.
+/// nothing in it — this crate builds one eagerly for every empty resizable
+/// dataset — and it is the chunks that a rewrite would materialize. Only the
+/// chunked arm reads `chunks`, so a layout that has none passes an empty slice.
 ///
 /// Compact data is inline in the layout message, so it is always allocated;
 /// virtual layouts are refused by [`check_layout`] before this is asked.
-fn storage_is_unallocated(ds: &Dataset, layout: &DataLayout) -> Result<bool, Error> {
-    Ok(match layout {
+fn storage_is_unallocated(layout: &DataLayout, chunks: &[ChunkInfo]) -> bool {
+    match layout {
         DataLayout::Contiguous { address, .. } => address.is_none(),
-        DataLayout::Chunked { .. } => ds.raw_chunks()?.is_empty(),
+        DataLayout::Chunked { .. } => chunks.is_empty(),
         DataLayout::Compact { .. } | DataLayout::Virtual { .. } => false,
-    })
+    }
 }
 
+/// Reject data layouts that cannot be read and re-emitted (virtual datasets;
+/// contiguous/chunked with an undefined address are allowed — they store
+/// nothing, and [`storage_is_unallocated`] keeps them that way).
 fn check_layout(layout: &DataLayout, path: &str) -> Result<(), Error> {
     match layout {
         DataLayout::Compact { .. } | DataLayout::Contiguous { .. } | DataLayout::Chunked { .. } => {

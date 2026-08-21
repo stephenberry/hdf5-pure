@@ -1108,11 +1108,13 @@ pub(crate) fn fixed_array_len(
 
 /// Whether a dataset's storage is allocated at all.
 ///
-/// By default the reference library does not allocate a dataset's storage until
-/// something is written to it, so a dataset created and never written holds no
-/// chunks over a non-empty dataspace, and its layout message carries the
-/// undefined address rather than naming an index. A contiguous dataset created
-/// the same way is the same story without an index in it.
+/// By default the reference library does not allocate a *contiguous or chunked*
+/// dataset's storage until something is written to it — compact data is inline
+/// in the layout message and is always present — so one created and never
+/// written holds no chunks over a non-empty dataspace. Its layout message still
+/// names an index *type*; what it carries for that index is the undefined
+/// address, so no index structure exists. A contiguous dataset created the same
+/// way is the same story without an index in it.
 ///
 /// This has to be said rather than derived, because the element count cannot
 /// tell the two apart: a shape of 1,000 means "ten chunks of fill value" for one
@@ -1120,14 +1122,23 @@ pub(crate) fn fixed_array_len(
 /// fill value for every element exactly as the first does (issue #292). Deriving
 /// it from the staged bytes would be worse still, since "no bytes" is also what a
 /// caller who simply forgot the data looks like.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// There is deliberately no `Default`: like the `fill` parameter above, every
+/// caller names it, so a new write path cannot inherit "allocated" by omission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StorageAllocation {
     /// Storage covers the dataspace: a chunk in every grid slot the shape
     /// implies, or a contiguous run of every element's bytes.
-    #[default]
     Allocated,
-    /// No storage: no chunks, no index, and no data region. The layout message
-    /// carries the undefined address.
+    /// No chunk, and no run of element bytes: the dataset declares its shape
+    /// and stores none of it.
+    ///
+    /// What that leaves in the file depends on the layout. A contiguous or
+    /// fixed-shape chunked dataset carries the undefined address and occupies
+    /// nothing. A *resizable* one still gets the eagerly built Extensible Array
+    /// this crate gives every empty resizable dataset — an index over no chunk,
+    /// at a defined address, costing a few hundred bytes — because an in-place
+    /// append needs the index to exist before the first chunk arrives.
     Unallocated,
 }
 
@@ -1146,10 +1157,16 @@ pub(crate) enum ChunkIndexKind {
     /// chunks at all, whose layout message carries the undefined address.
     ///
     /// This is the reference C library's convention for a chunked dataset with
-    /// nothing stored, and for a fixed-shape one it is the only encoding it
-    /// accepts: a Fixed Array declaring zero entries makes `H5Dget_num_chunks`
-    /// fail on the dataset, where the undefined address reads back as zero
-    /// chunks. An *extensible* empty dataset is the opposite case and keeps its
+    /// nothing stored. For a fixed-shape dataset of *zero* slots it is the only
+    /// encoding that library accepts: a Fixed Array declaring zero entries makes
+    /// `H5Dget_num_chunks` fail on the dataset, where the undefined address
+    /// reads back as zero chunks.
+    ///
+    /// Over a non-empty dataspace — the never-written dataset of issue #293 —
+    /// that argument does not apply: measured, the library reads a Fixed Array
+    /// whose slots are all empty perfectly well, and reports zero chunks for it.
+    /// The undefined address is preferred there for the two weaker reasons, that
+    /// it is what the library itself writes and that it costs no index at all. An *extensible* empty dataset is the opposite case and keeps its
     /// (eagerly built) array — the C library reads and grows that happily, and
     /// this crate's in-place append needs the index to already exist.
     Unallocated,
@@ -2377,10 +2394,17 @@ pub(crate) fn plan_index_slots(
         .zip(chunk_dims)
         .map(|(d, c)| d.div_ceil(*c))
         .collect();
-    // The grid the shape implies, or none of it. The maximum-shape refusals
-    // below still run for an unallocated dataset: it is allowed to grow, and a
-    // maximum shape this writer could not index once it did is refused when the
-    // dataset is written rather than when the first chunk arrives.
+    // The grid the shape implies, or none of it.
+    //
+    // Note what this does to the two *budget* refusals further down. Both are
+    // driven by the slots the index spans, an unallocated dataset's index spans
+    // none, and so neither can fire for one however wide its maximum shape --
+    // measured, on a maximum shape that is refused outright once a single chunk
+    // is written. That is the intent rather than a gap: the index costs nothing
+    // until something is stored, and refusing to repack a file the reference
+    // library wrote happily would be the worse answer. The budgets apply again
+    // at the first chunk. The geometry `index_grid` itself refuses is a separate
+    // matter and is unaffected -- it never sees the count.
     let num_chunks = match allocation {
         StorageAllocation::Allocated => counts.iter().product::<u64>().to_usize()?,
         StorageAllocation::Unallocated => 0,

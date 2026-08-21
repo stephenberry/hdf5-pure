@@ -1592,9 +1592,11 @@ fn c_written_attribute_encodings_survive_a_repack() {
 /// Storage the C library never allocated survives a repack as storage rather
 /// than as the values reading it answers with (issue #293).
 ///
-/// By default the reference library does not allocate a dataset's storage until
-/// something is written to it, so one created and never written holds nothing at
-/// all. Since #292 reading one answers its fill value for every element, and
+/// By default the reference library does not allocate a contiguous or chunked
+/// dataset's storage until something is written to it, so one created and never
+/// written holds nothing at all. (Compact data is inline in the layout message
+/// and is always present, which is why it is not among the layouts below.)
+/// Since #292 reading one answers its fill value for every element, and
 /// repack used to write those values out — turning a schema-only file into a
 /// fully materialized one of whatever size its shape declared.
 ///
@@ -1611,7 +1613,11 @@ fn repack_preserves_c_written_unallocated_storage_in_every_layout() {
     const N: usize = 1000;
     const FILL: i32 = 7;
     // The bytes the elements would occupy if they were written out. Every
-    // destination has to come in under this, whatever its metadata costs.
+    // destination has to come in under this, whatever its metadata costs — a
+    // coarse bound, and deliberately the weaker of the two checks: measured
+    // before the fix, the *filtered* destination was 665 B, well inside it,
+    // because deflate had squeezed a thousand copies of the fill value. What
+    // catches that arm is the chunk count below.
     const MATERIALIZED: u64 = (N * core::mem::size_of::<i32>()) as u64;
 
     for layout in ["contiguous", "chunked", "filtered", "extensible"] {
@@ -1761,10 +1767,17 @@ fn repack_preserves_c_written_unallocated_storage_in_every_layout() {
 /// A predicate that answered "stores nothing" from the chunk count being less
 /// than the grid would throw the written chunks away, and the neighbouring
 /// sparse tests already catch that through the values they lose. What this adds
-/// beside the positive case is the geometry those do not have — one interior
-/// chunk of ten written, so there are holes on both sides of it, under a
-/// non-zero fill value — and an assertion about what the destination *stores*
-/// rather than only about what it reads back.
+/// beside the positive case is the geometry those do not have: one *interior*
+/// chunk of ten written, so there are holes on both sides of it rather than only
+/// a tail.
+///
+/// It also records what repack does with the holes, which is not what the
+/// never-written case does with its whole grid. A sparse source cannot take the
+/// verbatim path, so it falls back to read-and-re-encode and the destination
+/// stores every slot — one chunk in, ten out, 2,959 B to 4,309 B on this
+/// fixture. That is unchanged by #293 and is the case its predicate must *not*
+/// catch; asserting the count rather than merely that it is non-zero is what
+/// keeps the two apart, since "not empty" is equally true of one chunk and ten.
 #[test]
 fn repack_keeps_the_chunks_a_partly_written_dataset_holds() {
     const N: usize = 1000;
@@ -1806,9 +1819,12 @@ fn repack_keeps_the_chunks_a_partly_written_dataset_holds() {
         expected,
         "the written chunk must survive a repack"
     );
-    assert!(
-        !ds.chunks().unwrap().is_empty(),
-        "a dataset that stores something must not be rewritten as storing nothing"
+    assert_eq!(
+        ds.chunks().unwrap().len(),
+        10,
+        "the sparse fallback re-encodes the whole grid: the source stored one \
+         chunk of the ten and the destination stores all ten, which is the \
+         behaviour a dataset that stores *something* still gets"
     );
     drop(f);
 

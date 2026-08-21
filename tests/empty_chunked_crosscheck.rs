@@ -555,9 +555,13 @@ fn a_fill_value_the_file_says_is_never_written_reads_as_zeros() {
 /// the materializing version look correct: a dataset storing a grid of fill
 /// values reads exactly like one storing nothing. So the destination is checked
 /// for what it *stores* — no chunks, and a file too small to hold the elements —
-/// and the C library is asked to read it, since a chunked layout carrying the
-/// undefined address over a non-empty dataspace is the reference library's own
-/// convention and has to come back as its convention.
+/// and the C library is asked to read it.
+///
+/// That last one is a smoke test rather than a check of the encoding: measured,
+/// libhdf5 reads a Fixed Array over ten *empty* slots exactly as happily, and
+/// reports zero chunks for it too. What pins the encoding is the unit test in
+/// `chunked_write.rs`, which is what fails if the undefined address is traded
+/// for an index over an empty grid.
 #[test]
 fn repack_preserves_a_never_written_dataset() {
     const N: usize = 1000;
