@@ -1184,6 +1184,26 @@ mod tests {
         assert_eq!(err, FormatError::UnsupportedMessage(0x00FF));
     }
 
+    /// The must-understand guard fires on a message this parser cannot *name*,
+    /// not on every message it declines to act on. External Data Files (0x0007)
+    /// is named as of #331, so a header carrying it parses and the refusal moves
+    /// to the read, which reports external storage rather than an unsupported
+    /// message id.
+    ///
+    /// The reference library writes flags `0x01` (constant) on this message, not
+    /// `0x08`, so only a crafted file reaches the guard at all. The same guard is
+    /// written four times over — version 1 and version 2 headers, each with its
+    /// continuation form — and loosens identically in all four; this pins the
+    /// version 1 one.
+    #[test]
+    fn parse_v1_named_message_survives_must_understand() {
+        let messages = [(0x0007u16, &[0xAA][..], 0x08u8)];
+        let data = build_v1_header(&messages, 8, 8);
+        let hdr = ObjectHeader::parse(&data, 0, 8, 8).unwrap();
+        assert_eq!(hdr.messages.len(), 1);
+        assert_eq!(hdr.messages[0].msg_type, MessageType::ExternalDataFiles);
+    }
+
     #[test]
     fn parse_v2_no_timestamps_one_message() {
         let data = build_v2_header(0x00, &[(0x01, &[10, 20], 0)], None);

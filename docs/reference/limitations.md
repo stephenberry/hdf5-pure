@@ -35,6 +35,14 @@ A dataset staged with [`MatBuilder::write_blocks`](../interop/matlab.md#writing-
 
 Relatedly, a producer that fails partway leaves a **partial file** on the sink. That is inherent to a non-seekable destination, not a defect: write to a temporary path and rename on success if you need all-or-nothing.
 
+### External data files
+
+A dataset created with `H5Pset_external` keeps its elements in one or more files beside the HDF5 file. Its layout message records a contiguous layout with an **undefined** data address — byte-for-byte what a never-written dataset records — and a separate header message names the files. Reading one is refused with `FormatError::UnsupportedExternalStorage` rather than answering the fill value for data that exists but lives elsewhere, and `repack` refuses it rather than writing a copy with none of it ([#331](https://github.com/stephenberry/hdf5-pure/issues/331), [#293](https://github.com/stephenberry/hdf5-pure/issues/293)).
+
+Writing is refused for the same reason, with `Error::EditUnsupported`: `Dataset::write`, `write_staged`, and `append_staged` would otherwise take the address-less layout for never-allocated storage, append the new elements to the HDF5 file and point the layout at them, leaving the file disagreeing with the external files about where its data lives. Delete the dataset and create it again in the same commit to replace it.
+
+What still works is everything that does not touch the elements: the shape, the datatype, and the address-less layout all read, since that layout is the evidence a caller needs, and attributes can be set and removed. Following the external files is a separate feature rather than a gap here — it means resolving each named file against the reading process's own filesystem, which is outside what a self-contained HDF5 file describes.
+
 ### Repack faithfulness
 
 `repack` rewrites a file and refuses **lossy filter re-encoding** (lossy float scale-offset, ZFP) rather than silently altering data: only *lossless* integer scale-offset can be re-encoded faithfully, since re-compressing lossy data would change the values. The dataset's fill value comes with it, in whichever of the two forms the source's filter recorded. (Repack instead copies already-compressed chunks **verbatim** wherever it can, which preserves lossy filters byte-exact without re-encoding.)
@@ -110,10 +118,9 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 |---|---|
 | **Filter-encoded fractal-heap** objects | [#108](https://github.com/stephenberry/hdf5-pure/issues/108) |
 | **Virtual (VDS)** datasets | [#111](https://github.com/stephenberry/hdf5-pure/issues/111) |
-| Data stored in **external files** (`H5Pset_external`). Such a dataset carries a contiguous layout message with an undefined address and names its files in a separate header message, so a read answers the fill value for every element rather than the data. `repack` refuses one; a plain read does not yet | [#293](https://github.com/stephenberry/hdf5-pure/issues/293) |
 | Messages stored in the **shared-message (SOHM) heap**, refused with `FormatError::UnsupportedSohmReference`. A **committed** (`H5Tcommit`) datatype is not one of these — it references its own object header and is resolved, so a named type reads as the type it names | [#254](https://github.com/stephenberry/hdf5-pure/issues/254) |
 
-Virtual datasets and externally stored ones are also refused by `repack` (it cannot relocate data living outside the file); the virtual half lifts together with VDS read support ([#111](https://github.com/stephenberry/hdf5-pure/issues/111)).
+A virtual dataset is refused by `repack` as well, since it cannot relocate data living outside the file; that lifts together with VDS read support ([#111](https://github.com/stephenberry/hdf5-pure/issues/111)).
 
 ### Writing
 
