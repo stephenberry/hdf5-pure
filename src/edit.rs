@@ -692,6 +692,39 @@ pub(crate) struct WriteEngine {
     /// persists its free space (`persist` is `Some`), `open` instead seeds it
     /// from the on-disk free-space managers, so reuse spans sessions.
     free: FreeList,
+    /// Whether this file has been *proved* to hold no object reference at all —
+    /// the one thing that lets a commit skip the walk that repoints them
+    /// (issue #324).
+    ///
+    /// Set by a walk that reaches every object and finds no reference-holding
+    /// datatype; every later commit in this session then skips the walk
+    /// outright, which matters because the walk is linear in the file's object
+    /// count and the file that needs it is the exception.
+    ///
+    /// One bit rather than three states, because "not yet walked" and "walked
+    /// and found one" are the same instruction to the caller: walk. Only the
+    /// proof is worth carrying.
+    ///
+    /// Cleared by any commit that could introduce a reference the walk has not
+    /// seen. Four of [`StagedEdits`]' collections can: `datasets` and
+    /// `writes` carry a datatype the caller chose, and `copies` and
+    /// `cross_copies` carry whatever the source object was. The other five
+    /// cannot, each for its own reason, and each reason is a property of the API
+    /// rather than of the current implementation:
+    ///
+    /// - `groups` stages an empty group: no datatype, no data, no attributes.
+    /// - `group_attrs` and `dataset_attrs` carry an [`AttrValue`], which has no
+    ///   reference variant — the reason a reference-typed attribute can only
+    ///   have come from the reference C library.
+    /// - `appends` grows an *existing* dataset along its own datatype, so it can
+    ///   only add references to a dataset that already held them, which a file
+    ///   proved free of them has none of.
+    /// - `deletes` removes objects and adds nothing.
+    ///
+    /// A tenth collection would have to be classified the same way; the check
+    /// sits beside the reference screen in `commit`, which iterates the same two
+    /// datatype-carrying collections.
+    proved_free_of_references: bool,
     /// Free-space persistence read from the file's superblock extension on
     /// `open` (the file-creation `H5Pset_file_space_strategy(persist = true)`
     /// setting). `None` for the default non-persisting file; when `Some`, every
@@ -1754,6 +1787,7 @@ impl WriteEngine {
             next_appender_token: 0,
             appender_commit_in_progress: false,
             free: FreeList::new(),
+            proved_free_of_references: false,
             persist: None,
             located: HashMap::new(),
             swmr_mode: false,
@@ -3795,9 +3829,12 @@ impl WriteEngine {
         // Resolve / validate each node's base object-header region up front.
         // Every existing dirty group is rewritten to a freshly-appended header,
         // so its old header becomes dead bytes once the superblock is repointed;
-        // `superseded_addrs` records those old headers for reclamation (#21).
+        // `superseded_addrs` records those old headers for reclamation (#21),
+        // paired with the path whose rebuilt header replaces each — the two
+        // halves of one relocation, which is what an object reference stored
+        // elsewhere in the file has to be repointed across (issue #324).
         let keys: Vec<PathKey> = nodes.keys().cloned().collect();
-        let mut superseded_addrs: Vec<usize> = Vec::new();
+        let mut superseded_addrs: Vec<(PathKey, usize)> = Vec::new();
         for key in &keys {
             let is_new = nodes[key].is_new;
             if is_new {
@@ -3817,7 +3854,7 @@ impl WriteEngine {
                 let addr = usize::try_from(addr)
                     .map_err(|_| Error::EditUnsupported("group address exceeds this platform"))?;
                 let info = self.inspect_group(addr)?;
-                superseded_addrs.push(addr);
+                superseded_addrs.push((key.clone(), addr));
                 let node = nodes.get_mut(key).unwrap();
                 node.base_region = info.region;
                 node.existing_links = info.link_names;
@@ -3826,7 +3863,7 @@ impl WriteEngine {
 
         // A rebuilt group's old header is vacated just as a relocated dataset's is,
         // so the two join one list for the screen below.
-        moved_headers.extend(superseded_addrs.iter().map(|&a| a as u64));
+        moved_headers.extend(superseded_addrs.iter().map(|&(_, a)| a as u64));
 
         // Apply and validate group attribute edits before any writes. This keeps
         // unsupported attribute edits under the same all-or-nothing preflight
@@ -3938,14 +3975,18 @@ impl WriteEngine {
         // Removals only, and this is the one place the two halves part company. A
         // *supplied* address is a fresh claim about the file, and a commit that
         // moves the object falsifies it. A *copied* one repeats a claim the file
-        // already made: if the target moves, the reference the copy was taken from
-        // breaks whether or not the copy happens, so refusing the copy would not
-        // make that one valid. It would also cost what it cannot buy: every commit
-        // that reaches here rebuilds its root group, so `moved` is never empty, and
-        // a chunked object-reference dataset is refused on a non-empty screen alone
-        // rather than on a matching address — so every such copy would be refused,
-        // in every commit. That wider breakage is
-        // [#324](https://github.com/stephenberry/hdf5-pure/issues/324).
+        // already made, and since issue #324 a move no longer falsifies either
+        // one: the commit's last act walks the tree it published and repoints
+        // every reachable stored address, the copy's among them
+        // ([`crate::reference_patch`], and `a_copy_made_in_the_same_commit_that_
+        // moves_its_target_is_repointed`). A removal is the case that stays,
+        // because there is no new address to point at.
+        //
+        // Refusing on `moved` here would also cost what it cannot buy: every
+        // commit that reaches here rebuilds its root group, so `moved` is never
+        // empty, and a chunked object-reference dataset is refused on a non-empty
+        // screen alone rather than on a matching address — so every such copy
+        // would be refused, in every commit.
         let for_copied = InvalidatedAddresses {
             removed: deleted_free
                 .iter()
@@ -3989,6 +4030,24 @@ impl WriteEngine {
         // that path.
         for (_, fd) in staged.datasets.iter().chain(&staged.writes) {
             screen_resolved_references(&fd.dt, &fd.raw, &for_supplied)?;
+        }
+
+        // Anything this commit adds could be a reference container the last walk
+        // did not see, so it retires that walk's "no references in this file"
+        // finding (issue #324). The four collections that can carry one are read
+        // here — see `proved_free_of_references` for why the other five cannot — and
+        // the two carrying a caller-chosen datatype are narrowed by the same
+        // predicate the screen above uses, so adding an ordinary dataset does
+        // not cost the next commit a walk.
+        if staged
+            .datasets
+            .iter()
+            .chain(&staged.writes)
+            .any(|(_, fd)| datatype_holds_object_address(&fd.dt))
+            || !staged.copies.is_empty()
+            || !staged.cross_copies.is_empty()
+        {
+            self.proved_free_of_references = false;
         }
 
         // Prove every object-reference target resolves before any write (see
@@ -4048,7 +4107,7 @@ impl WriteEngine {
         // addresses by the userblock base and returns absolute file offsets), as is
         // the delete path (`collect_free_spans`), so all of this reclamation works
         // on userblock files too.
-        for &a in &superseded_addrs {
+        for &(_, a) in &superseded_addrs {
             if let Ok(spans) = self.oh_chunk_spans(a) {
                 to_free.extend(spans.into_iter().map(|(a, l)| (a, l, PageType::Meta)));
             }
@@ -4149,6 +4208,13 @@ impl WriteEngine {
         // group/dataset key convention: a group's own path, or a dataset's
         // full parent+name path). ---
         let mut path_addr: BTreeMap<PathKey, u64> = BTreeMap::new();
+        // Where each object-header address this commit vacates has been rewritten
+        // to, for repointing the object references the rest of the file already
+        // stores (issue #324). Filled from the two places a header moves: a
+        // relocating value overwrite, recorded in the loop below as its plan is
+        // applied, and a rebuilt group, joined from `superseded_addrs` once every
+        // group's new address is known.
+        let mut relocations: BTreeMap<u64, u64> = BTreeMap::new();
         let mut by_depth = keys.clone();
         by_depth.sort_by_key(|k| std::cmp::Reverse(k.len())); // deepest first
         for key in &by_depth {
@@ -4283,9 +4349,10 @@ impl WriteEngine {
             // link target is stored relative to the base address (`- base`); on a
             // userblock file only the chunked variant reaches here (contiguous and
             // compact resizes are refused in the write preflight).
-            for (leaf, _old_oh, mw) in &writes {
+            for (leaf, old_oh, mw) in &writes {
                 let new_oh = self.write_moving(mw)?;
                 patch_link_target(&mut region, leaf, new_oh - base)?;
+                relocations.insert(*old_oh, new_oh);
             }
 
             // Wire links to dirty child groups (new → add a link; existing →
@@ -4329,6 +4396,16 @@ impl WriteEngine {
             self.write_at(*data_addr, raw)?;
         }
 
+        // Every group's new header address is known now that the apply loop has
+        // run, so the rebuilt groups can join the relocation map. A group whose
+        // key is missing would be one the loop did not place, which cannot happen:
+        // `superseded_addrs` is filled from `keys`, and the loop visits all of it.
+        for (key, old) in &superseded_addrs {
+            if let Some(&new) = path_addr.get(key) {
+                relocations.insert(*old as u64, new);
+            }
+        }
+
         // Repoint the superblock at the new root last: this is the commit's
         // linearization point. Until it lands, the file on disk still points at
         // the old root (the appended objects are merely unreferenced trailing
@@ -4345,7 +4422,8 @@ impl WriteEngine {
         // A persisting file keeps its freed space recorded on disk rather than
         // truncating it away, so its commit takes a different, append-only tail.
         if self.persist.is_some() {
-            return self.commit_persisting(new_root, to_free);
+            self.commit_persisting(new_root, to_free)?;
+            return self.repoint_stored_references(&relocations);
         }
 
         // The new tree is fully written, so the regions this commit vacated are
@@ -4400,7 +4478,56 @@ impl WriteEngine {
             self.image.truncate(cut)?;
             self.barrier()?;
         }
-        Ok(())
+        self.repoint_stored_references(&relocations)
+    }
+
+    /// Repoint every object reference the file already stores at a header this
+    /// commit moved (issue #324).
+    ///
+    /// Called at the end of each commit tail, *after* the superblock repoint,
+    /// which is where it belongs on both counts. The commit is atomic at the
+    /// repoint and this is a fixup derived from it, so it must not run earlier:
+    /// a crash before the repoint has to leave the pre-commit file, its stored
+    /// references included. And the tree it walks has to be the committed one —
+    /// a rebuilt group's header is a fresh copy of the pre-commit one and
+    /// carries the old address of anything it referenced, so patching the
+    /// superseded header instead would correct bytes that are already dead.
+    ///
+    /// The writes are barriered, so a commit that returns under
+    /// [`SyncPolicy::Always`] is durable in full rather than durable except for
+    /// its references. That costs nothing on the files that do not need it: a
+    /// plan with nothing in it returns before the barrier, and on a file holding
+    /// no object reference there is never anything in it.
+    ///
+    /// A crash between the repoint and that barrier leaves the commit standing
+    /// with some references still stale, which is exactly the state every commit
+    /// left before this existed.
+    ///
+    /// Bounded by [`MAX_LINK_GRAPH_NODES`], the same budget
+    /// [`count_incoming_hard_links`](Self::count_incoming_hard_links) walks the
+    /// link graph under.
+    fn repoint_stored_references(&mut self, relocations: &BTreeMap<u64, u64>) -> Result<(), Error> {
+        if self.proved_free_of_references {
+            return Ok(());
+        }
+        let plan = crate::reference_patch::plan(
+            &self.image(),
+            &self.superblock,
+            relocations,
+            MAX_LINK_GRAPH_NODES,
+        )?;
+        // Record the walk's verdict before applying it, and only ever the
+        // positive proof: a walk that found a reference, or could not read some
+        // object, leaves the question open rather than answering "yes there are
+        // references", because the next commit's answer could differ.
+        if plan.proved_free_of_references() {
+            self.proved_free_of_references = true;
+        }
+        if plan.is_empty() {
+            return Ok(());
+        }
+        plan.apply(self)?;
+        self.barrier()
     }
 
     /// Commit tail for a file that persists its free space (issue #21). Unlike
@@ -9494,9 +9621,9 @@ fn oh_region_at(prefix: &[u8], addr: u64, file_len: u64) -> Result<(u64, u64), E
 /// checksum is never walked, and it has already been confirmed present. `span`
 /// covers the *whole* on-disk chunk including that checksum, so it can be handed
 /// to the free list when the header is reclaimed.
-struct OhChunk {
+pub(crate) struct OhChunk {
     /// Absolute file address and full on-disk length of the chunk.
-    span: (u64, u64),
+    pub(crate) span: (u64, u64),
     /// The chunk's bytes, from `span.0` through the end of its message region.
     buf: Vec<u8>,
     /// Offset of the first message within [`buf`](Self::buf).
@@ -9507,7 +9634,7 @@ impl OhChunk {
     /// The slice to walk messages in, and the offset to start at. The two are
     /// returned together because [`next_message`] must not read past the end of
     /// the message region into the checksum.
-    fn message_region(&self) -> (&[u8], usize) {
+    pub(crate) fn message_region(&self) -> (&[u8], usize) {
         (&self.buf, self.messages_start)
     }
 }
@@ -9538,7 +9665,7 @@ fn read_oh_chunk0<S: Source + ?Sized>(src: &S, addr: u64) -> Result<OhChunk, Err
 /// collects the messages out of the result and
 /// [`oh_chunk_spans`](WriteEngine::oh_chunk_spans) collects the extents, so the
 /// two cannot disagree about what a header occupies.
-fn read_oh_chunks<S: Source + ?Sized>(
+pub(crate) fn read_oh_chunks<S: Source + ?Sized>(
     src: &S,
     addr: u64,
     base: u64,
@@ -9632,7 +9759,7 @@ pub(crate) fn next_message(
 /// once in the shared-message table and referenced by an object-header address or
 /// fractal-heap id) rather than inline. Whatever the message type, that reference
 /// points into the source file and is meaningless after a cross-file copy.
-const MSG_FLAG_SHARED: u8 = 0x02;
+pub(crate) const MSG_FLAG_SHARED: u8 = 0x02;
 
 /// Refuse to copy an object whose header embeds a *source-file* absolute address
 /// that a verbatim copy into another file cannot translate. An in-file copy keeps
@@ -10073,6 +10200,25 @@ fn read_le(bytes: &[u8]) -> usize {
         v |= (b as u64) << (8 * i);
     }
     v as usize
+}
+
+/// The engine as the target a [`reference_patch::Plan`] is applied to
+/// (issue #324).
+///
+/// Deliberately the whole engine rather than the image alone: an object header
+/// is republished as one checksummed write, so applying a plan reads as well as
+/// writes, and both have to go through the same image the rest of the commit
+/// used — the same write-gathering, the same pending-write overlay, the same
+/// end-of-file bound.
+///
+/// [`reference_patch::Plan`]: crate::reference_patch::Plan
+impl crate::reference_patch::PatchTarget for WriteEngine {
+    fn read(&self, at: u64, len: usize) -> Result<Vec<u8>, Error> {
+        self.image().read_exact_at(at, len).map_err(Error::Format)
+    }
+    fn write(&mut self, at: u64, bytes: &[u8]) -> Result<(), Error> {
+        self.image.write_at(at, bytes)
+    }
 }
 
 #[cfg(test)]

@@ -218,6 +218,8 @@ pub(crate) mod image;
 #[cfg(feature = "std")]
 pub(crate) mod reader;
 #[cfg(feature = "std")]
+pub(crate) mod reference_patch;
+#[cfg(feature = "std")]
 pub(crate) mod repack;
 #[cfg(feature = "std")]
 pub(crate) mod types;

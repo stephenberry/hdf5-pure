@@ -1123,6 +1123,31 @@ impl Datatype {
         crate::convert::nonzero_usize_from(self.element_size()?)
     }
 }
+/// Whether a datatype of this encoded class *could* hold an object address,
+/// decided from the first byte of a datatype message rather than by parsing it.
+///
+/// A **necessary** condition for [`datatype_holds_object_address`] and never a
+/// sufficient one: a compound of two integers has a qualifying class and holds
+/// no address at all. It exists so a walk over every object in a file can reject
+/// the overwhelmingly common cases — a fixed-point, floating-point, string, or
+/// opaque dataset — without allocating a parsed [`Datatype`] for each. The
+/// classes it admits are exactly the ones `datatype_holds_object_address`
+/// recurses through, plus the reference itself; `class_predicate_admits_every_
+/// reference_holding_type` in this module's tests is what holds the two together.
+pub(crate) fn class_may_hold_object_address(class_and_version: u8) -> bool {
+    matches!(
+        class_and_version & 0x0F,
+        COMPOUND_CLASS | REFERENCE_CLASS | ENUMERATION_CLASS | VARIABLE_LENGTH_CLASS | ARRAY_CLASS
+    )
+}
+
+/// Datatype message class ids, as the low nibble of a datatype message's first
+/// byte. Only the classes that can carry an object address downward are named.
+const COMPOUND_CLASS: u8 = 6;
+const REFERENCE_CLASS: u8 = 7;
+const ENUMERATION_CLASS: u8 = 8;
+const VARIABLE_LENGTH_CLASS: u8 = 9;
+const ARRAY_CLASS: u8 = 10;
 
 /// Whether `dt` reaches an **object address** anywhere in its structure — an
 /// object or dataset-region reference, directly or through a compound member,
@@ -1292,6 +1317,141 @@ fn build_dt_header(class: u8, version: u8, bf: [u8; 3], size: u32) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every datatype that reaches an object address must have an encoded class
+    /// [`class_may_hold_object_address`] admits.
+    ///
+    /// The two are a pair with one job between them: the class predicate is the
+    /// cheap gate a whole-file walk applies before it will parse a datatype at
+    /// all (`crate::reference_patch`), and the type predicate is the answer it
+    /// gates. A type the gate rejects is never parsed, so if the gate ever
+    /// rejected one that holds an address, the walk would pass over a reference
+    /// in silence — no error, no refusal, just a stored address left dangling.
+    /// Nothing in either function's code says the other exists; this is what
+    /// says it.
+    #[test]
+    fn the_class_gate_admits_every_reference_holding_datatype() {
+        let object_ref = || Datatype::Reference {
+            size: 8,
+            ref_type: ReferenceType::Object,
+        };
+        let i32_le = || Datatype::FixedPoint {
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 32,
+        };
+        let holds_an_address = [
+            ("a bare object reference", object_ref()),
+            (
+                "a dataset-region reference",
+                Datatype::Reference {
+                    size: 12,
+                    ref_type: ReferenceType::DatasetRegion,
+                },
+            ),
+            (
+                "a compound holding one",
+                Datatype::Compound {
+                    size: 12,
+                    members: vec![
+                        CompoundMember {
+                            name: "r".into(),
+                            byte_offset: 0,
+                            datatype: object_ref(),
+                        },
+                        CompoundMember {
+                            name: "i".into(),
+                            byte_offset: 8,
+                            datatype: i32_le(),
+                        },
+                    ],
+                },
+            ),
+            (
+                "an array of them",
+                Datatype::Array {
+                    base_type: Box::new(object_ref()),
+                    dimensions: vec![2],
+                },
+            ),
+            (
+                "a variable length of them",
+                Datatype::VariableLength {
+                    is_string: false,
+                    padding: None,
+                    charset: None,
+                    base_type: Box::new(object_ref()),
+                },
+            ),
+            (
+                "an enumeration over one",
+                Datatype::Enumeration {
+                    size: 8,
+                    base_type: Box::new(object_ref()),
+                    members: vec![EnumMember {
+                        name: "a".into(),
+                        value: vec![0; 8],
+                    }],
+                },
+            ),
+            (
+                "one nested two deep",
+                Datatype::Array {
+                    base_type: Box::new(Datatype::Compound {
+                        size: 8,
+                        members: vec![CompoundMember {
+                            name: "r".into(),
+                            byte_offset: 0,
+                            datatype: object_ref(),
+                        }],
+                    }),
+                    dimensions: vec![3],
+                },
+            ),
+        ];
+        for (what, dt) in holds_an_address {
+            assert!(
+                datatype_holds_object_address(&dt),
+                "{what} holds an object address"
+            );
+            let encoded = dt.serialize();
+            assert!(
+                class_may_hold_object_address(encoded[0]),
+                "{what} encodes as class {}, which the gate rejects — a walk would \
+                 never parse it and would pass over the address inside it",
+                encoded[0] & 0x0F
+            );
+        }
+    }
+
+    /// The gate is a *necessary* condition and nothing more: it admits types
+    /// that hold no address, and that is not a defect. Stated so a later reading
+    /// of it as "this type holds a reference" has something to contradict it.
+    #[test]
+    fn the_class_gate_is_necessary_and_not_sufficient() {
+        let ints = Datatype::Compound {
+            size: 8,
+            members: vec![CompoundMember {
+                name: "a".into(),
+                byte_offset: 0,
+                datatype: Datatype::FixedPoint {
+                    size: 8,
+                    byte_order: DatatypeByteOrder::LittleEndian,
+                    signed: true,
+                    bit_offset: 0,
+                    bit_precision: 64,
+                },
+            }],
+        };
+        assert!(!datatype_holds_object_address(&ints));
+        assert!(
+            class_may_hold_object_address(ints.serialize()[0]),
+            "a compound of integers is admitted by the class gate and holds no address"
+        );
+    }
+
     use super::*;
 
     // Helper to build a fixed-point datatype message

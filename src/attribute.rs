@@ -80,6 +80,24 @@ impl AttributeMessage {
         length_size: u8,
         resolver: &dyn SharedResolver,
     ) -> Result<AttributeMessage, FormatError> {
+        Self::parse_resolving_at(data, length_size, resolver).map(|(attr, _)| attr)
+    }
+
+    /// [`parse_resolving`](Self::parse_resolving), also reporting where the
+    /// value bytes start within `data`.
+    ///
+    /// The offset is what lets a caller address an attribute's elements *in the
+    /// file* rather than only in the copy `raw_data` holds — needed to repoint a
+    /// stored object reference in place (issue #324). It is returned from the
+    /// same field walk that produces `raw_data` rather than recomputed by a
+    /// second one: the three versions pad their name, datatype and dataspace
+    /// fields differently, and a separate derivation of the same offset would be
+    /// free to drift from this one.
+    pub(crate) fn parse_resolving_at(
+        data: &[u8],
+        length_size: u8,
+        resolver: &dyn SharedResolver,
+    ) -> Result<(AttributeMessage, usize), FormatError> {
         ensure_len(data, 0, 2)?;
         let version = data[0];
 
@@ -91,7 +109,7 @@ impl AttributeMessage {
         }
     }
 
-    fn parse_v1(data: &[u8], length_size: u8) -> Result<AttributeMessage, FormatError> {
+    fn parse_v1(data: &[u8], length_size: u8) -> Result<(AttributeMessage, usize), FormatError> {
         // version(1) + reserved(1) + name_size(2) + datatype_size(2) + dataspace_size(2) = 8
         ensure_len(data, 0, 8)?;
         let name_size = u16::from_le_bytes([data[2], data[3]]) as usize;
@@ -119,20 +137,23 @@ impl AttributeMessage {
         // Raw data: num_elements × type_size bytes
         let raw_data = compute_raw_data(data, pos, &dataspace, &datatype)?;
 
-        Ok(AttributeMessage {
-            name,
-            datatype,
-            dataspace,
-            raw_data,
-            datatype_location: DatatypeLocation::Inline,
-        })
+        Ok((
+            AttributeMessage {
+                name,
+                datatype,
+                dataspace,
+                raw_data,
+                datatype_location: DatatypeLocation::Inline,
+            },
+            pos,
+        ))
     }
 
     fn parse_v2(
         data: &[u8],
         length_size: u8,
         resolver: &dyn SharedResolver,
-    ) -> Result<AttributeMessage, FormatError> {
+    ) -> Result<(AttributeMessage, usize), FormatError> {
         // version(1) + flags(1) + name_size(2) + datatype_size(2) + dataspace_size(2) = 8
         ensure_len(data, 0, 8)?;
         let flags = data[1];
@@ -161,20 +182,23 @@ impl AttributeMessage {
             decode_type_and_space(dt_field, ds_field, flags, length_size, resolver)?;
         let raw_data = compute_raw_data(data, pos, &dataspace, &datatype)?;
 
-        Ok(AttributeMessage {
-            name,
-            datatype,
-            dataspace,
-            raw_data,
-            datatype_location,
-        })
+        Ok((
+            AttributeMessage {
+                name,
+                datatype,
+                dataspace,
+                raw_data,
+                datatype_location,
+            },
+            pos,
+        ))
     }
 
     fn parse_v3(
         data: &[u8],
         length_size: u8,
         resolver: &dyn SharedResolver,
-    ) -> Result<AttributeMessage, FormatError> {
+    ) -> Result<(AttributeMessage, usize), FormatError> {
         // version(1) + flags(1) + name_size(2) + datatype_size(2) + dataspace_size(2) + encoding(1) = 9
         ensure_len(data, 0, 9)?;
         let flags = data[1];
@@ -204,13 +228,16 @@ impl AttributeMessage {
             decode_type_and_space(dt_field, ds_field, flags, length_size, resolver)?;
         let raw_data = compute_raw_data(data, pos, &dataspace, &datatype)?;
 
-        Ok(AttributeMessage {
-            name,
-            datatype,
-            dataspace,
-            raw_data,
-            datatype_location,
-        })
+        Ok((
+            AttributeMessage {
+                name,
+                datatype,
+                dataspace,
+                raw_data,
+                datatype_location,
+            },
+            pos,
+        ))
     }
 
     /// Serialize attribute message (v2 format, no padding).
