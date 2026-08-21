@@ -1106,22 +1106,13 @@ pub(crate) fn fixed_array_len(
     fa_layout(slots, chunk_bytes, offset_size, length_size, has_filters).total_len
 }
 
-/// Which chunk index a chunk set gets.
-///
-/// One rule, read by everything that has to agree on it: the writers that emit
-/// the index, and [`chunk_index_len`], which sizes it without emitting. Two
-/// copies of this `if` chain is how a length ends up describing a different
-/// structure from the one written.
-///
-/// The variant names match [`layout_info::ChunkIndex`](crate::layout_info::ChunkIndex),
-/// which classifies the same three shapes on the read side.
 /// Whether a dataset's storage is allocated at all.
 ///
-/// The reference library's default allocation time is *late*: a dataset created
-/// and never written holds no chunks over a non-empty dataspace, and its layout
-/// message carries the undefined address rather than naming an index. A
-/// contiguous dataset created the same way is the same story without an index in
-/// it.
+/// By default the reference library does not allocate a dataset's storage until
+/// something is written to it, so a dataset created and never written holds no
+/// chunks over a non-empty dataspace, and its layout message carries the
+/// undefined address rather than naming an index. A contiguous dataset created
+/// the same way is the same story without an index in it.
 ///
 /// This has to be said rather than derived, because the element count cannot
 /// tell the two apart: a shape of 1,000 means "ten chunks of fill value" for one
@@ -1140,6 +1131,15 @@ pub(crate) enum StorageAllocation {
     Unallocated,
 }
 
+/// Which chunk index a chunk set gets.
+///
+/// One rule, read by everything that has to agree on it: the writers that emit
+/// the index, and [`chunk_index_len`], which sizes it without emitting. Two
+/// copies of this `if` chain is how a length ends up describing a different
+/// structure from the one written.
+///
+/// The variant names match [`layout_info::ChunkIndex`](crate::layout_info::ChunkIndex),
+/// which classifies the same three shapes on the read side.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ChunkIndexKind {
     /// No index structure and no chunk address: a fixed-shape dataset with no
@@ -2299,10 +2299,13 @@ pub(crate) fn compress_chunks(
         allocation,
     )?;
 
-    // An unallocated dataset is not split: the splitter pads every slot the
-    // shape implies with the fill value, which is precisely the materialization
-    // this case exists to avoid. `plan_index_slots` already answered for the
-    // same `allocation`, so the assertion below still pairs the two.
+    // An unallocated dataset is not split. The splitter emits a chunk for every
+    // slot the shape implies and this dataset supplies no bytes for them, so it
+    // would write out the whole grid — and write it wrong, since a chunk that
+    // lies inside the shape is zero-padded where the data runs out and only one
+    // overhanging the edge takes the fill pattern. `plan_index_slots` already
+    // answered for the same `allocation`, so the assertion below still pairs the
+    // two.
     let chunks = match allocation {
         StorageAllocation::Allocated => {
             split_into_chunks(raw_data, shape, chunk_dims, element_size, fill)?
@@ -3341,11 +3344,16 @@ mod tests {
 
     /// The encoder does not split an unallocated dataset into chunks.
     ///
-    /// Compressing one is not merely wasted work: [`split_into_chunks`] pads
-    /// every slot the shape implies with the fill value, so a set built from it
-    /// would carry the whole materialized grid — the exact bytes issue #293 is
-    /// about — and would do it while `raw_data` is empty, which is what the
-    /// dataset staging this actually hands over.
+    /// Compressing one is not merely wasted work. [`split_into_chunks`] emits a
+    /// chunk for every slot the shape implies whatever it is given, and an
+    /// unallocated dataset gives it nothing, so a set built from it would carry
+    /// the whole materialized grid — the bytes issue #293 is about — with the
+    /// *wrong* contents in it: a chunk lying inside the shape is zero-padded
+    /// where the data runs out, and only a chunk overhanging the dataset's edge
+    /// takes the fill pattern — ten chunks of zeros, measured on this geometry,
+    /// under a dataset whose fill value is 7. The materialization is the reason
+    /// to skip the split; that the bytes would also be wrong is what makes it
+    /// worth skipping rather than merely wasteful.
     #[test]
     fn an_unallocated_dataset_encodes_no_chunk_bytes() {
         let shape = [1000u64];

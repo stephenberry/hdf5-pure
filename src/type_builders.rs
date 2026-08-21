@@ -1965,10 +1965,11 @@ impl DatasetBuilder {
     /// Stage a dataset that declares its shape and element type and allocates no
     /// storage.
     ///
-    /// The reference library's default allocation time is late, so a dataset
-    /// created and never written holds nothing: no chunks and no index under a
-    /// chunked layout, an undefined data address under a contiguous one. Reading
-    /// it answers the fill value for every element (issue #292), which is why a
+    /// By default the reference library does not allocate a dataset's storage
+    /// until something is written to it, so a dataset created and never written
+    /// holds nothing: no chunks and no index under a chunked layout, an
+    /// undefined data address under a contiguous one. Reading it answers the
+    /// fill value for every element (issue #292), which is why a
     /// rewrite cannot recover this state from the values it reads back — the
     /// dataset that stores a grid of fill values reads identically. Repack
     /// carries it across by saying so here instead (issue #293).

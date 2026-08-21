@@ -50,6 +50,12 @@
 //!   names the *same* object in the output rather than getting an inline copy of
 //!   the encoding, so `h5dump` still reports `DATATYPE "/mytype"` and the
 //!   object's reference count still matches its users.
+//! - **Unallocated storage**: a dataset the reference library created and never
+//!   wrote to holds nothing, and comes out holding nothing rather than holding
+//!   the fill value a read answers with for every element it declares (issue
+//!   #293). A *resizable* destination keeps the eagerly built chunk index every
+//!   empty resizable dataset here gets, since an in-place append needs one to
+//!   exist; it stores no chunk either way.
 //! - Group hierarchy of arbitrary depth.
 //! - Attributes, on datasets, groups, and root, carried across with the
 //!   encoding the source gave them rather than rebuilt from an [`AttrValue`],
@@ -544,11 +550,12 @@ fn emit_dataset(
     }
 
     // Storage the source never allocated is reproduced as storage, not as the
-    // values reading it answers with. The reference library allocates a chunked
-    // dataset late, so one created and never written holds nothing at all; since
-    // #292 reading it answers the fill value for every element, and re-writing
-    // those values would turn a schema-only file into a fully materialized one
-    // of the size its shape declares (issue #293).
+    // values reading it answers with. By default the reference library does not
+    // allocate a dataset's storage until something is written to it, so one
+    // created and never written holds nothing at all; since #292 reading it
+    // answers the fill value for every element, and re-writing those values
+    // would turn a schema-only file into a fully materialized one of the size
+    // its shape declares (issue #293).
     //
     // Placed after every refusal the datatype and layout share and before the
     // paths that move element bytes, all of which exist to rebuild an address

@@ -1689,6 +1689,18 @@ impl FileWriter {
             // that is not empty (issue #293).
             let allocation = db.allocation;
             let unallocated = allocation == StorageAllocation::Unallocated;
+            // Staging bytes for a dataset that stores nothing is a contradiction,
+            // and it is the builder's to prevent rather than this function's to
+            // resolve: whichever half were honored, the other would be dropped
+            // without a word. Asserted rather than refused because
+            // `with_unallocated_storage` is crate-internal and its one caller
+            // stages nothing — a caller could not construct this, only a change
+            // here could, and every test run is a debug build.
+            debug_assert!(
+                !(unallocated && (db.data.is_some() || produced.is_some() || raw_chunks.is_some())),
+                "dataset {:?} declares unallocated storage and stages data for it",
+                db.name,
+            );
             // Allow empty data for zero-element datasets (e.g. shape [0, 0]).
             let is_empty = shape.contains(&0);
             let raw = if is_empty || unallocated || raw_chunks.is_some() || produced.is_some() {

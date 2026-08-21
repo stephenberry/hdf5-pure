@@ -1592,10 +1592,11 @@ fn c_written_attribute_encodings_survive_a_repack() {
 /// Storage the C library never allocated survives a repack as storage rather
 /// than as the values reading it answers with (issue #293).
 ///
-/// The reference library allocates late, so a dataset created and never written
-/// holds nothing at all. Since #292 reading one answers its fill value for every
-/// element, and repack used to write those values out — turning a schema-only
-/// file into a fully materialized one of whatever size its shape declared.
+/// By default the reference library does not allocate a dataset's storage until
+/// something is written to it, so one created and never written holds nothing at
+/// all. Since #292 reading one answers its fill value for every element, and
+/// repack used to write those values out — turning a schema-only file into a
+/// fully materialized one of whatever size its shape declared.
 ///
 /// Every layout the source can be in is covered here because each reaches a
 /// different part of the writer: a contiguous dataset is preserved by leaving its
@@ -1757,11 +1758,13 @@ fn repack_preserves_c_written_unallocated_storage_in_every_layout() {
 /// chunks is not "unallocated", and repack must still carry every element it
 /// holds.
 ///
-/// A dataset with holes reads as data where a chunk exists and as the fill value
-/// everywhere else, so a predicate that answered "stores nothing" from the chunk
-/// count being less than the grid — or from the read coming back full — would
-/// throw the written chunks away and pass every value assertion anyway. This
-/// writes to one chunk of ten and checks that chunk survives.
+/// A predicate that answered "stores nothing" from the chunk count being less
+/// than the grid would throw the written chunks away, and the neighbouring
+/// sparse tests already catch that through the values they lose. What this adds
+/// beside the positive case is the geometry those do not have — one interior
+/// chunk of ten written, so there are holes on both sides of it, under a
+/// non-zero fill value — and an assertion about what the destination *stores*
+/// rather than only about what it reads back.
 #[test]
 fn repack_keeps_the_chunks_a_partly_written_dataset_holds() {
     const N: usize = 1000;
@@ -1815,4 +1818,56 @@ fn repack_keeps_the_chunks_a_partly_written_dataset_holds() {
         expected,
         "the C library reads the repacked dataset"
     );
+}
+
+/// A never-written dataset carrying a filter this crate cannot re-apply is still
+/// refused by name.
+///
+/// The unallocated path emits no chunk, so there is nothing for a lossy filter to
+/// perturb and a case could be made for letting it through. It is not made here:
+/// the filters are reproduced by the same `carry_shape_and_pipeline` the
+/// re-encode path uses, which reaches an `unreachable!` for any filter
+/// `check_pipeline` was supposed to have refused. Widening what repack accepts is
+/// a separate decision from preserving storage, so the refusal set is unchanged —
+/// and a path that skipped the check would panic rather than refuse, which is
+/// what this pins.
+#[test]
+fn repack_still_refuses_a_never_written_dataset_with_a_lossy_filter() {
+    use hdf5::filters::ScaleOffset as CScaleOffset;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_unwritten_lossy.h5");
+    let dst = dir.path().join("c_unwritten_lossy_repacked.h5");
+    {
+        let file = hdf5::FileBuilder::new()
+            .with_fapl(|fapl| fapl.libver_v110())
+            .create(&src)
+            .unwrap();
+        let ds = file
+            .new_dataset::<f64>()
+            .shape([2000])
+            .chunk([512])
+            .scale_offset(CScaleOffset::FloatDScale(3))
+            .create("data")
+            .unwrap();
+        drop(ds);
+        file.close().unwrap();
+    }
+
+    // Nothing was written, so this is the unallocated path rather than the
+    // sparse-fallback one the neighbouring test covers.
+    {
+        let f = File::open(&src).unwrap();
+        assert!(f.dataset("data").unwrap().chunks().unwrap().is_empty());
+    }
+
+    let err = repack(&src, &dst, &RepackOptions::new()).unwrap_err();
+    match err {
+        hdf5_pure::Error::RepackUnsupported(msg) => assert!(
+            msg.contains("data") && msg.contains("scale-offset"),
+            "error should name the dataset and reason: {msg}"
+        ),
+        other => panic!("expected RepackUnsupported, got {other:?}"),
+    }
+    assert!(!dst.exists(), "dst must not be created when repack refuses");
 }
