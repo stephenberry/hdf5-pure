@@ -353,34 +353,71 @@ fn no_write_reaches_an_external_dataset() {
     assert_eq!(r.dataset("d").unwrap().read_i32().unwrap(), vec![7i32; N]);
 }
 
-/// `File::copy` must never reproduce an externally stored dataset.
+/// `File::copy` must never reproduce an externally stored dataset, and must
+/// refuse it **by name** (issue #336).
 ///
-/// It refuses today, but only by accident: the copy planner reads the undefined
-/// data address as a real one and fails a bounds check, which is the same
-/// refusal a *never-written* contiguous dataset gets — a dataset that is
-/// perfectly valid and ought to copy. Teaching `copy` to carry unallocated
-/// storage, as `repack` learned in #293, would silently turn this into an `Ok`
-/// that writes a schema-only copy of a dataset holding data. This test is the
-/// tripwire for that; when it is addressed, the refusal here should stay a
-/// refusal and start naming external storage.
+/// It used to refuse by accident: the copy planner read the undefined data
+/// address as a real one and failed a bounds check — the same refusal a
+/// *never-written* contiguous dataset got, a dataset that is perfectly valid and
+/// ought to copy. Teaching `copy` to carry unallocated storage, as `repack`
+/// learned in #293, removed that accident, so the refusal now has to come from
+/// recognising the External Data Files message itself. Asserting the message
+/// rather than merely `Err` is what distinguishes the two: a bounds check that
+/// crept back would refuse this dataset just as firmly, and this test would go
+/// on passing while the never-written datasets in `edit_crosscheck` and
+/// `edit_in_place` broke.
+///
+/// Both directions are covered, because they read the source at different
+/// points: an in-file `copy` reads at commit and refuses there, while a
+/// cross-file `copy_from` reads the other file as the copy is staged (so the
+/// source need not outlive the call) and refuses on the spot.
 #[test]
-fn copy_does_not_reproduce_an_external_dataset() {
+fn copy_refuses_an_external_dataset_by_name() {
     let _c = c_lib_guard();
     let dir = tempdir().unwrap();
     let src = dir.path().join("external.h5");
     let payload = dir.path().join("copy_payload.bin");
     write_external_fixture(&src, payload.to_str().unwrap());
 
+    let expect = |err: hdf5_pure::Error, what: &str| {
+        let text = err.to_string();
+        assert!(
+            text.contains("external files") && text.contains("H5Pset_external"),
+            "{what}: expected external storage to be named, got {text}"
+        );
+    };
+
     let f = File::open_rw(&src).unwrap();
     f.copy("d", "d_copy").unwrap();
     let err = f.commit().unwrap_err();
     drop(f);
-    assert!(
-        matches!(err, hdf5_pure::Error::EditUnsupported(_)),
-        "expected the copy to be refused, got {err:?}"
-    );
+    expect(err, "in-file copy");
     assert!(
         File::open(&src).unwrap().dataset("d_copy").is_err(),
         "a refused copy must leave no dataset behind"
+    );
+
+    // Cross-file: the same dataset copied into a fresh file.
+    let dst = dir.path().join("dst.h5");
+    {
+        let mut b = hdf5_pure::FileBuilder::new();
+        b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+        b.write(&dst).unwrap();
+    }
+    let source = File::open(&src).unwrap();
+    let f = File::open_rw(&dst).unwrap();
+    let err = f.copy_from(&source, "d", "d_copy").unwrap_err();
+    f.commit().unwrap();
+    drop(f);
+    expect(err, "cross-file copy_from");
+    let after = File::open(&dst).unwrap();
+    assert!(
+        after.dataset("d_copy").is_err(),
+        "a refused cross-file copy must leave no dataset behind"
+    );
+    assert_eq!(
+        after.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3],
+        "the refused commit left the destination's own data alone"
     );
 }

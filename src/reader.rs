@@ -1958,6 +1958,14 @@ impl File {
     /// Copy the object at `src` to `dst` within this file (the in-file
     /// `H5Ocopy`), staged until [`commit`](Self::commit).
     ///
+    /// A dataset whose storage was never allocated is copied as the storage it
+    /// has — none — rather than as the fill value reading it answers with, so a
+    /// schema-only dataset stays one. A dataset whose elements live in external
+    /// files (`H5Pset_external`) carries that same empty storage while holding
+    /// data this crate does not read, and is refused with
+    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported) rather than
+    /// copied without it.
+    ///
     /// Requires a read-write file ([`File::open_rw`]); a read-only file returns
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
@@ -1975,7 +1983,10 @@ impl File {
     /// userblock; anything else is refused with
     /// [`Error::EditUnsupported`](crate::Error::EditUnsupported). The source
     /// subtree is read and validated eagerly, so `source` need not outlive this
-    /// call. Requires a read-write destination ([`File::open_rw`]); a read-only
+    /// call — and so a source this cannot reproduce, external storage included,
+    /// is refused by this call. Refusals that concern the *destination* — `dst`
+    /// already exists, or its parent group does not — still come from `commit`.
+    /// Requires a read-write destination ([`File::open_rw`]); a read-only
     /// one returns [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn copy_from(&self, source: &File, src: &str, dst: &str) -> Result<(), Error> {
         self.with_mirror_session(true, |session| session.copy_from(source, src, dst))

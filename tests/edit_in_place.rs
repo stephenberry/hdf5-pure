@@ -5833,3 +5833,63 @@ fn a_group_gains_its_new_links_in_placement_order() {
     );
     drop(file);
 }
+
+/// A zero-element contiguous dataset — one this crate writes itself, with no
+/// help from the reference library — copies rather than being refused as out of
+/// bounds (issue #336).
+///
+/// The issue reached this through a dataset the C library created and never
+/// wrote, but the encoding is the same one `FileBuilder` produces for a shape
+/// with no elements: there is nothing to store, so the layout message carries the
+/// undefined address. That makes this the half of the defect reachable with no
+/// reference library in the picture at all.
+#[test]
+fn a_zero_element_dataset_copies_as_the_storage_it_never_had() {
+    let path = temp_path("hdf5_pure_edit_copy_zero_element.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("empty")
+            .with_i32_data(&[])
+            .with_shape(&[0]);
+        b.create_dataset("full").with_i32_data(&[1, 2, 3]);
+        b.write(&path).unwrap();
+    }
+    // The fixture's premise: no data block, which is what the copy has to carry.
+    {
+        let f = File::open(&path).unwrap();
+        assert!(
+            matches!(
+                f.dataset("empty").unwrap().layout().unwrap(),
+                hdf5_pure::Layout::Contiguous { address: None, .. }
+            ),
+            "the fixture is meant to store nothing"
+        );
+    }
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("empty", "empty_copy").unwrap();
+        // Beside a dataset that does hold data, so the same commit proves the
+        // allocated path still places and repoints its block.
+        session.copy("full", "full_copy").unwrap();
+        session.commit().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let copied = f.dataset("empty_copy").unwrap();
+    assert!(
+        matches!(
+            copied.layout().unwrap(),
+            hdf5_pure::Layout::Contiguous { address: None, .. }
+        ),
+        "the copy materialized storage the source never had: {:?}",
+        copied.layout().unwrap()
+    );
+    assert_eq!(copied.shape().unwrap(), vec![0], "shape carried across");
+    assert_eq!(copied.read_i32().unwrap(), Vec::<i32>::new());
+    assert_eq!(
+        f.dataset("full_copy").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3],
+        "the dataset that does store data copied it"
+    );
+}

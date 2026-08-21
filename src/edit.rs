@@ -3155,6 +3155,14 @@ impl WriteEngine {
     /// links and attributes, single-chunk headers, and a chunk index this engine
     /// can enumerate (a version-2 B-tree, or a sparse/unallocated chunk grid, is
     /// refused) — otherwise `commit` reports [`Error::EditUnsupported`].
+    ///
+    /// A *contiguous* dataset whose storage was never allocated is copied as the
+    /// storage it has — none — rather than as the fill value a read answers with,
+    /// which is what keeps a schema-only source from arriving materialized at the
+    /// size its shape declares. A dataset storing its elements in external files
+    /// (`H5Pset_external`) carries that same empty storage over data this crate
+    /// does not read, and is refused by name so the two do not share an answer
+    /// (issue #336).
     pub fn copy(&mut self, src: &str, dst: &str) -> Result<(), Error> {
         let (s, d) = (split_path(src), split_path(dst));
         // Both ends matter: the source is read and the destination is written,
@@ -6127,10 +6135,18 @@ impl WriteEngine {
     /// into a fresh heap on write, within the bounds that heap declares (see
     /// `file_writer::dense_attrs_check`); an attribute too large to hold as a
     /// managed object is re-emitted as a *huge* object. Rejects multi-chunk
-    /// headers, dense or soft/external links, chunked/old-version data layouts, and
-    /// headers that are neither a dataset nor a group.
+    /// headers, dense or soft/external links, old-version data layouts, external
+    /// data storage ([`reject_external_storage`]), and headers that are neither a
+    /// dataset nor a group. (A *chunked* layout is modelled, not rejected —
+    /// [`ObjModel::DatasetChunked`].)
     fn read_object<S: Source + ?Sized>(src: &S, addr: u64, base: u64) -> Result<ObjModel, Error> {
         let region = Self::gather_oh_messages(src, addr, base)?;
+
+        // Ahead of the layout classification below, where external storage and
+        // never-allocated storage would otherwise share one undefined address
+        // and one answer — and ahead of the dense-attribute read, so a header
+        // this cannot copy says why rather than failing as something else.
+        reject_external_storage(&region)?;
 
         // First pass: detect whether attributes are stored densely (a defined
         // fractal-heap address in the Attribute Info message). A dense object is
@@ -6399,23 +6415,42 @@ impl WriteEngine {
                     reject_foreign_addresses(&region)?;
                     reject_foreign_dense_attrs(&dense_attrs)?;
                 }
-                // The stored data address is base-relative; shift it to an absolute
-                // offset into `src` before reading the data block out.
-                let start = data_addr
-                    .checked_add(base)
-                    .ok_or(Error::EditUnsupported("data address exceeds this platform"))?;
-                let len = usize::try_from(data_size)
-                    .map_err(|_| Error::EditUnsupported("data size exceeds this platform"))?;
-                start
-                    .checked_add(len as u64)
-                    .filter(|&e| e <= src.len())
-                    .ok_or(Error::EditUnsupported("dataset data is out of bounds"))?;
+                // Storage the source never allocated is copied as storage, not as
+                // the values reading it answers with. The reference library does
+                // not allocate a contiguous dataset's data until something is
+                // written to it, leaving the layout message's address undefined,
+                // and reading one answers the fill value for every element (#292)
+                // — so a copy that materialized what it read would turn a
+                // schema-only dataset into a fully written one of the size its
+                // shape declares. `repack` carries the same shape through as
+                // unallocated (#293); this is the copy path's half of it (#336).
+                //
+                // Only reached once external storage is out of the way: it uses
+                // this same undefined address for a dataset that *does* hold
+                // data, and `read_object` refuses it by name above.
+                let data = if data_addr == UNDEF {
+                    None
+                } else {
+                    // The stored data address is base-relative; shift it to an absolute
+                    // offset into `src` before reading the data block out.
+                    let start = data_addr
+                        .checked_add(base)
+                        .ok_or(Error::EditUnsupported("data address exceeds this platform"))?;
+                    let len = usize::try_from(data_size)
+                        .map_err(|_| Error::EditUnsupported("data size exceeds this platform"))?;
+                    start
+                        .checked_add(len as u64)
+                        .filter(|&e| e <= src.len())
+                        .ok_or(Error::EditUnsupported("dataset data is out of bounds"))?;
+                    Some(
+                        src.read_exact_at(start, len)
+                            .map_err(|_| Error::EditUnsupported("dataset data is out of bounds"))?,
+                    )
+                };
                 Ok(CopyTree::DatasetContiguous {
                     region,
                     addr_off,
-                    data: src
-                        .read_exact_at(start, len)
-                        .map_err(|_| Error::EditUnsupported("dataset data is out of bounds"))?,
+                    data,
                     dense_attrs,
                 })
             }
@@ -6574,12 +6609,18 @@ impl WriteEngine {
                 data,
                 dense_attrs,
             } => {
-                let new_data_addr = self.alloc_or_append_typed(data, PageType::Raw)?;
                 let mut region = region.clone();
-                // The placement is an absolute offset; the data-layout
-                // address field stores it relative to the userblock base.
-                region[*addr_off..*addr_off + 8]
-                    .copy_from_slice(&(new_data_addr - base).to_le_bytes());
+                // Storage the source never allocated is copied as storage: there
+                // is no block to place, and the region already carries the
+                // undefined address the source stored, so the copy declares the
+                // same empty storage (issue #336).
+                if let Some(data) = data {
+                    let new_data_addr = self.alloc_or_append_typed(data, PageType::Raw)?;
+                    // The placement is an absolute offset; the data-layout
+                    // address field stores it relative to the userblock base.
+                    region[*addr_off..*addr_off + 8]
+                        .copy_from_slice(&(new_data_addr - base).to_le_bytes());
+                }
                 // The dense heap is placed independently of the data — it is
                 // built for whatever address it gets (see `append_dense_attrs`),
                 // so no ordering between the two is owed.
@@ -7548,6 +7589,18 @@ impl WriteEngine {
             }
             // A truly unsupported object (one `read_object` cannot model): leave
             // its bytes in place rather than guess its extent.
+            //
+            // An externally stored dataset lands here as of #336, where before it
+            // was modelled as the contiguous dataset it structurally is and had
+            // its header chunks reclaimed. Deleting one therefore leaves those
+            // chunks behind: measured on the fixture in
+            // `tests/external_storage_crosscheck.rs`, a commit that deletes it
+            // reports 147 B reusable where it reported 431 B. That is a leak and
+            // not a hazard — `oh_chunk_spans` never covered the local heap the
+            // External Data Files message names either, so neither the old
+            // behaviour nor this one accounted for the whole object — and it is
+            // the price of stating the refusal once, in the one function both the
+            // copy planner and this walk read objects through.
             Err(_) => {}
         }
     }
@@ -7860,10 +7913,16 @@ enum CopyTree {
     /// A contiguous dataset: `data` is written first and its new address patched
     /// into the header `region` at `addr_off` before the header is written. See
     /// [`DatasetVerbatim`](CopyTree::DatasetVerbatim) for `dense_attrs`.
+    ///
+    /// `data` is `None` when the source allocated no storage at all: nothing is
+    /// written and `addr_off` keeps the undefined address the source stored, so
+    /// the copy declares the same absent storage rather than a block at a real
+    /// address. That is a statement about storage, not about length (issue
+    /// #336).
     DatasetContiguous {
         region: Vec<u8>,
         addr_off: usize,
-        data: Vec<u8>,
+        data: Option<Vec<u8>>,
         dense_attrs: Vec<crate::attribute::AttributeMessage>,
     },
     /// A chunked (and possibly filtered) dataset. The header `region` is written
@@ -9850,6 +9909,38 @@ pub(crate) fn next_message(
 /// points into the source file and is meaningless after a cross-file copy.
 pub(crate) const MSG_FLAG_SHARED: u8 = 0x02;
 
+/// Refuse to copy a dataset whose element bytes live in files outside this one
+/// (`H5Pset_external`, the External Data Files header message, type 7), which
+/// this crate does not follow (issue #336).
+///
+/// Such a dataset carries a *contiguous* layout message with an undefined data
+/// address, the same encoding a never-written dataset uses — and
+/// [`read_copy_subtree`](WriteEngine::read_copy_subtree) copies that encoding as
+/// the storage it does not have. The layout alone cannot tell the two apart, so
+/// naming this message is the only thing standing between a dataset that holds
+/// data and a copy carrying its schema and none of it; [`crate::repack`] refuses
+/// the same shape for the same reason.
+///
+/// Applied on both copy paths rather than only the cross-file one: an in-file
+/// copy would reproduce the header without its data just as readily. It is also
+/// the only screen that reads this message at all — [`reject_foreign_addresses`]
+/// inspects shared messages, datatypes, and attributes, not this body, which
+/// carries a local-heap address that would dangle in another file.
+fn reject_external_storage(region: &[u8]) -> Result<(), Error> {
+    let mut p = 0;
+    while let Some((msg_type, _, body_end)) = next_message(region, p)? {
+        if msg_type == MessageType::ExternalDataFiles {
+            return Err(Error::EditUnsupported(
+                "a dataset stores its elements in external files (H5Pset_external), \
+                 which a copy cannot reproduce -- its data lives in files this crate \
+                 does not read",
+            ));
+        }
+        p = body_end;
+    }
+    Ok(())
+}
+
 /// Refuse to copy an object whose header embeds a *source-file* absolute address
 /// that a verbatim copy into another file cannot translate. An in-file copy keeps
 /// these valid by sharing the source file's heaps and objects; a cross-file copy
@@ -10187,7 +10278,15 @@ fn screen_copied_references(
         // compact arm above refuses on a missing piece — there the datatype is
         // present and says a reference is in bytes it could not reach.
         CopyTree::DatasetContiguous { data, .. } => {
-            if let Some(dt) = &element_dt {
+            // A dataset whose storage the source never allocated (`None`) stores
+            // no elements, so it holds no address that could dangle. Skipped
+            // rather than screened as an empty run of element bytes: when
+            // `screen_resolved_references` cannot map a datatype's addresses — a
+            // dataset-region reference, a variable length of references, one
+            // wider than eight bytes — it refuses *unconditionally*, before it
+            // reads a byte, so an empty run would refuse this dataset for
+            // elements it does not have.
+            if let (Some(dt), Some(data)) = (&element_dt, data) {
                 screen_resolved_references(dt, data, invalidated)?;
             }
         }
