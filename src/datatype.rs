@@ -1303,6 +1303,36 @@ pub(crate) fn embedded_reference_slots(datatype: &Datatype) -> Option<Vec<usize>
     Some(slots)
 }
 
+/// Every 8-byte object reference stored in `raw`, as
+/// `(byte offset within raw, the address stored there)`.
+///
+/// `slots` is [`embedded_reference_slots`] for the datatype `raw` holds elements
+/// of, and `element_size` its `type_size`. Callers differ in what they do with
+/// an address — screen it against what a commit vacates, rewrite it to where the
+/// object moved — but not in how they find one, and this is the one place that
+/// walk lives. A second copy of it would be free to disagree about the element
+/// stride, about a trailing partial element, or about which slots exist.
+///
+/// A trailing run shorter than one element is skipped: `chunks_exact` yields
+/// whole elements only, which is the same thing every reader of these bytes does
+/// with a truncated tail.
+pub(crate) fn stored_object_references<'a>(
+    raw: &'a [u8],
+    element_size: usize,
+    slots: &'a [usize],
+) -> impl Iterator<Item = (usize, u64)> + 'a {
+    raw.chunks_exact(element_size.max(1))
+        .enumerate()
+        .flat_map(move |(i, element)| {
+            slots.iter().map(move |&at| {
+                let stored = u64::from_le_bytes(element[at..at + 8].try_into().expect(
+                    "embedded_reference_slots keeps every slot 8 bytes inside the element",
+                ));
+                (i * element_size + at, stored)
+            })
+        })
+}
+
 /// Build a datatype header (8 bytes) for testing.
 #[cfg(test)]
 fn build_dt_header(class: u8, version: u8, bf: [u8; 3], size: u32) -> Vec<u8> {

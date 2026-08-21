@@ -21,37 +21,56 @@
 //!
 //! # What it reaches
 //!
-//! Every 8-byte object reference in an **inline attribute's value** and in a
-//! **contiguous** or **compact** dataset's elements, at any depth of compound,
-//! array or enumeration nesting that [`embedded_reference_slots`] can address.
-//! A **committed** (`H5Tcommit`) datatype is followed rather than skipped, so a
-//! dataset of references through a named type is reached like any other.
+//! Two questions decide it, and both have to answer yes: **where** the bytes are
+//! stored, and **what** [`embedded_reference_slots`] can locate inside an
+//! element.
+//!
+//! Storage: an **inline attribute's value**, and a **contiguous** or **compact**
+//! dataset's elements. A **committed** (`H5Tcommit`) datatype is followed rather
+//! than skipped, so a dataset of references through a named type is reached like
+//! any other.
+//!
+//! Datatype: an 8-byte object reference, an **array** of them, a **compound**
+//! holding one, and any nesting of those two. That is the whole of it — see
+//! `datatype::embedded_reference_slots`, whose reach this inherits exactly.
 //!
 //! # What it does not
 //!
-//! Some shapes hold an address this walk cannot reach. Each is left as it was,
-//! which is the pre-#324 behaviour rather than a new failure, and each is
-//! recorded in `docs/reference/limitations.md`:
+//! Everything else, and none of it is refused. Each is left as it was, which is
+//! the pre-#324 behaviour rather than a new failure. By storage:
 //!
 //! - **Chunked** dataset elements. Unfiltered chunks would only need the index
 //!   walked; filtered ones hold their addresses compressed, the same obstacle
 //!   that makes [`crate::repack`] refuse a chunked object-reference dataset.
-//! - **Variable-length** references — a `vlen` of object reference, which is how
-//!   the dimension-scale attribute `DIMENSION_LIST` is encoded. The addresses
-//!   sit in a global heap collection rather than in the element bytes.
-//! - **Dense (fractal-heap) attributes**, whose values this walk does not
-//!   address in the file, and an attribute held as a **shared (SOHM) record**,
-//!   which is not stored in the header at all.
+//! - **Dense (fractal-heap) attributes**, whose values are not in the header,
+//!   and an attribute held as a **shared (SOHM) record**, which is not stored in
+//!   the header either.
 //! - **Version 1 object headers**, and version 2 headers that track message
-//!   creation order — the two [`read_oh_chunks`] declines. Such an object is
-//!   still descended through, since [`ObjectHeader::parse_from_source`] reads
-//!   both, so neither hides the objects below it from the walk.
+//!   creation order — what [`read_oh_chunks`] declines on a well-formed file; it
+//!   declines a malformed one too. Such an object is still descended through,
+//!   since [`ObjectHeader::parse_from_source`] reads both, so neither hides the
+//!   objects below it from the walk.
+//!
+//! And by datatype, every form `embedded_reference_slots` answers `None` for: an
+//! object reference **wider than 8 bytes**, a **dataset-region** reference, a
+//! **variable length** of references (the encoding the dimension-scale attribute
+//! `DIMENSION_LIST` uses, whose addresses sit in a global heap collection), an
+//! **enumeration** over one, and any compound or array reaching one of those.
+//!
+//! A file whose objects all carry version 1 headers — what the reference C
+//! library writes under its default, earliest-format bounds — is therefore
+//! walked in full on every commit and patched nowhere, and can never be proved
+//! free of references either. Measured at about 15% of a commit over 4,700
+//! objects. Reaching those headers is what would remove it; skipping the walk on
+//! them cannot, since a later commit may add a version 2 object holding a
+//! reference.
 //!
 //! Deliberately, none of these is a *refusal*. Every commit rebuilds at least
 //! its root group, so there is always a relocation in hand, and refusing on an
 //! unreachable shape would therefore refuse *every* commit on any file holding
 //! one — a ban rather than a check, imposed on files whose references were no
-//! better served before this module existed.
+//! better served before this module existed. `docs/reference/limitations.md`
+//! records the set as a whole.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -60,7 +79,7 @@ use crate::checksum::jenkins_lookup3;
 use crate::data_layout::{COMPACT_DATA_OFFSET, DataLayout};
 use crate::datatype::{
     Datatype, class_may_hold_object_address, datatype_holds_object_address,
-    embedded_reference_slots,
+    embedded_reference_slots, stored_object_references,
 };
 use crate::edit::{next_message, read_oh_chunks};
 use crate::error::Error;
@@ -201,6 +220,31 @@ impl Plan {
     }
 }
 
+std::thread_local! {
+    /// How many times a commit on this thread has walked the file to repoint its
+    /// stored references.
+    ///
+    /// The walk's *absence* is the whole of the `proved_free_of_references`
+    /// optimization, and absence is invisible from outside: a session that never
+    /// caches the proof produces byte-identical files and passes every
+    /// correctness test, having quietly gone back to walking the file on every
+    /// commit. The count is the only thing a test can hold that to. Per-thread
+    /// because the harness runs tests concurrently, each on its own thread.
+    static WALKS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Start counting reference walks on this thread from zero.
+#[cfg(test)]
+pub(crate) fn reset_walks() {
+    WALKS.with(|count| count.set(0));
+}
+
+/// How many reference walks this thread has run since the last reset.
+#[cfg(test)]
+pub(crate) fn walks() -> usize {
+    WALKS.with(|count| count.get())
+}
+
 /// Plan the repointing for `relocations` against the file `src` currently holds.
 ///
 /// `relocations` maps each vacated object-header address to the address the same
@@ -208,11 +252,13 @@ impl Plan {
 /// its root is the tree to walk.
 ///
 /// The walk is bounded by `budget` objects and terminates on cycles (hard links
-/// can form them). Running out of budget is not an error: the plan is applied
-/// for what was reached, leaving the rest as it was — the same
-/// conservative-and-incomplete stance
-/// [`count_incoming_hard_links`](crate::edit::WriteEngine) takes on a graph too
-/// large to walk.
+/// can form them). Running out of budget is not an error: the plan keeps and
+/// applies what it reached, and only the *proof* of a reference-free file is
+/// withheld. That is the opposite of what `WriteEngine::count_incoming_hard_links`
+/// does with a graph too large to walk — it discards the whole walk and reclaims
+/// nothing — and the two differ because their partial results do. Half a link
+/// count would over-reclaim and corrupt a survivor; half a repointing is half
+/// the references corrected and the rest exactly as they were.
 pub(crate) fn plan<S: Source + ?Sized>(
     src: &S,
     superblock: &Superblock,
@@ -223,6 +269,7 @@ pub(crate) fn plan<S: Source + ?Sized>(
     if relocations.is_empty() {
         return Ok(plan);
     }
+    WALKS.with(|count| count.set(count.get() + 1));
     let os = superblock.offset_size;
     let ls = superblock.length_size;
     let base = superblock.base_address;
@@ -236,6 +283,19 @@ pub(crate) fn plan<S: Source + ?Sized>(
         if !visited.insert(addr) {
             continue; // already expanded (also breaks hard-link cycles)
         }
+        // Never scan a header this commit vacated. Walking the *committed* tree
+        // is supposed to make that impossible, and a link naming a superseded
+        // header is a link the commit failed to repoint — which happens today
+        // when a group with more than one hard link is rebuilt, since only the
+        // parent link is patched. Those bytes are already in the free list by
+        // the time this runs, so editing them writes into space the next
+        // allocation may take. Nothing is lost by skipping: a superseded group
+        // lists the same children as the rebuilt one the walk reaches by the
+        // link that *was* repointed.
+        if relocations.contains_key(&addr) {
+            complete = false;
+            continue;
+        }
         if budget == 0 {
             complete = false;
             break;
@@ -247,12 +307,16 @@ pub(crate) fn plan<S: Source + ?Sized>(
         // group is parsed a second time, into the form
         // `resolve_group_entries_from_source` needs. The file's datasets are the
         // many, and parsing every one of them again only to learn it has no
-        // children was most of what this walk cost: over a file of 8,000
-        // datasets, 32.3 ms a commit against 13.4 ms.
+        // children was most of what this walk cost. Measured on a release build
+        // over a file of 8,000 root datasets, timing `plan` alone across five
+        // commits: 32.3 ms a commit when every object was parsed twice, 13.4 ms
+        // once only groups were. No test holds those figures — unlike
+        // `publish_checksummed`, whose claim its own crash test pins — so treat
+        // them as a record of one measurement rather than as a bound.
         let outcome = scan_object(src, addr, base, relocations, &mut plan)?;
         saw_reference |= outcome.holds_a_reference;
         complete &= outcome.fully_read;
-        if !outcome.is_group {
+        if !outcome.descend {
             continue;
         }
         // A group whose header or links cannot be read hides its subtree from
@@ -277,9 +341,14 @@ pub(crate) fn plan<S: Source + ?Sized>(
 
 /// What one object contributed to the walk beyond its byte edits.
 struct Scanned {
-    /// The header holds a link, link-info, or symbol-table message, so the
-    /// caller should descend through it.
-    is_group: bool,
+    /// The caller should look for children below this object. True for a header
+    /// holding a link, link-info, or symbol-table message — and *also* for one
+    /// this could not read at all, which cannot be ruled out as a group and
+    /// which `ObjectHeader::parse_from_source` may well manage where
+    /// [`read_oh_chunks`] did not. Not "this object is a group": the two answers
+    /// differ exactly where it matters, and the field is named for the
+    /// instruction rather than for the fact.
+    descend: bool,
     /// Some datatype in the object — its elements' or an attribute's — reaches
     /// an object address. True whether or not any address needed repointing:
     /// the question this answers is whether the file *can* hold one, which is
@@ -294,9 +363,9 @@ struct Scanned {
 /// its inline attributes' values, and its own elements when they are stored
 /// where this can address them.
 ///
-/// Reports whether the object is a **group**, which the caller needs in order to
-/// descend and which this walk establishes on the way past — a header holding a
-/// link, link-info, or symbol-table message.
+/// Reports whether the caller should descend through this object looking for
+/// children, which this walk establishes on the way past — see
+/// [`Scanned::descend`], which is not quite "this object is a group".
 fn scan_object<S: Source + ?Sized>(
     src: &S,
     addr: u64,
@@ -311,14 +380,22 @@ fn scan_object<S: Source + ?Sized>(
     // hide the objects below it from the walk.
     let Ok(chunks) = read_oh_chunks(src, addr, base) else {
         return Ok(Scanned {
-            is_group: true,
+            descend: true,
             holds_a_reference: false,
             fully_read: false,
         });
     };
     use crate::shared_message::SharedResolver as _;
+    // Framed at the base address, which is what a shared-message resolver
+    // requires: a committed datatype's message body holds a *base-relative*
+    // address, and `SourceResolver` reads it as absolute within the view it is
+    // given. Unframed, every committed datatype on a userblock file resolves to
+    // the wrong offset, fails to parse, and takes the object's references with
+    // it — silently, since a datatype that will not parse is treated as one this
+    // walk cannot read. Every other resolver in the crate is framed this way.
+    let framed = crate::source::BaseOffsetSource { inner: src, base };
     let resolver = crate::shared_message::SourceResolver::new(
-        src,
+        &framed,
         crate::file_writer::OFFSET_SIZE,
         crate::file_writer::LENGTH_SIZE,
     );
@@ -329,7 +406,7 @@ fn scan_object<S: Source + ?Sized>(
     // hold an address, and most datasets say they could not.
     let mut layout_msg: Option<(&[u8], u64)> = None;
     let mut out = Scanned {
-        is_group: false,
+        descend: false,
         holds_a_reference: false,
         fully_read: true,
     };
@@ -348,7 +425,7 @@ fn scan_object<S: Source + ?Sized>(
             let shared = region[p + 3] & crate::edit::MSG_FLAG_SHARED != 0;
             match msg_type {
                 MessageType::SymbolTable | MessageType::Link | MessageType::LinkInfo => {
-                    out.is_group = true;
+                    out.descend = true;
                 }
                 MessageType::Datatype => {
                     // A committed (shared) datatype's message body names the
@@ -389,6 +466,18 @@ fn scan_object<S: Source + ?Sized>(
                 }
                 MessageType::DataLayout => {
                     layout_msg = Some((&region[body..body_end], body_at));
+                }
+                // Dense (fractal-heap) attributes are not held in the header at
+                // all, so an object storing them this way presents no Attribute
+                // message here and would otherwise read as *proven* free of
+                // references while holding any number of them. The test is a
+                // defined heap address rather than the message's presence: the
+                // reference C library and h5py emit an Attribute Info message
+                // for compact attributes too, to carry creation-order metadata.
+                MessageType::AttributeInfo
+                    if crate::edit::attribute_info_is_dense(&region[body..body_end]) =>
+                {
+                    out.fully_read = false;
                 }
                 // A *shared record* attribute — the whole message held in the
                 // file's shared-message table — is not stored here, so its
@@ -498,19 +587,17 @@ fn scan_object<S: Source + ?Sized>(
     Ok(out)
 }
 
-/// File the absolute edits `edits` under the object-header chunk at `span`,
-/// as offsets within that chunk.
+/// File the absolute edits `edits` under the object-header chunk at `span`, as
+/// offsets within that chunk.
 ///
-/// An edit that does not fall inside the chunk is dropped rather than filed
-/// somewhere it does not belong: the callers derive `span` from the same header
-/// walk that produced the offsets, so this cannot happen, and silently
-/// mis-filing one would corrupt a header rather than leave a reference stale.
+/// An edit *below* the chunk cannot be expressed as an offset into it and is
+/// dropped. One past its end is filed and refused by [`Plan::apply`], which
+/// bounds every offset against the chunk's message region before writing: two
+/// responses to one impossibility would only disagree, and `apply`'s is the
+/// tighter and the one that reports.
 fn record_header_edits(plan: &mut Plan, span: (u64, u64), edits: &[(u64, u64)]) {
     for &(at, value) in edits {
-        let Some(offset) = at.checked_sub(span.0).filter(|&o| o < span.1) else {
-            continue;
-        };
-        let Ok(offset) = usize::try_from(offset) else {
+        let Some(offset) = at.checked_sub(span.0).and_then(|o| usize::try_from(o).ok()) else {
             continue;
         };
         plan.header_writes
@@ -521,15 +608,20 @@ fn record_header_edits(plan: &mut Plan, span: (u64, u64), edits: &[(u64, u64)]) 
 }
 
 /// Where the 8-byte object references sit within one element of `dt`, or `None`
-/// when the type holds no address this can reach.
+/// when there are none to rewrite.
 ///
-/// The empty list is folded into `None` deliberately. It is what
-/// [`embedded_reference_slots`] returns for a type it recognises as holding an
-/// address but cannot map — a width other than eight, a dataset-region
-/// reference, a variable length of them — and reading that as "nothing to do"
-/// is the same conflation that was found to be a hole in the #317 screen. Here
-/// the two answers happen to lead to the same silence, but they are different
-/// facts, and only one of them is "this type holds no reference".
+/// [`embedded_reference_slots`] answers in three ways and this collapses two of
+/// them. `None` means the type reaches an address this cannot locate — wider
+/// than eight bytes, a dataset-region reference, a variable length of them, an
+/// enumeration over one. `Some([])` means the type holds no address at all. The
+/// difference matters where a caller must *refuse* what it could not screen —
+/// which is what `edit::screen_resolved_references` does, and why conflating the
+/// two was a hole in the #317 screen — but nothing here refuses, so both answers
+/// lead to the same silence.
+///
+/// Folding them anyway is what keeps a data block from being read for a dataset
+/// with no slots to patch, which the walk would otherwise do once per dataset
+/// per commit.
 fn element_slots(dt: &Datatype) -> Option<Vec<usize>> {
     embedded_reference_slots(dt).filter(|s| !s.is_empty())
 }
@@ -544,6 +636,10 @@ fn element_slots(dt: &Datatype) -> Option<Vec<usize>> {
 /// `(absolute file offset, value)`; where those bytes live is the caller's to
 /// know, and decides whether they are written directly or resealed inside a
 /// header chunk.
+///
+/// Finding the addresses is [`stored_object_references`], shared with
+/// `edit::screen_resolved_references`: the two do different things with an
+/// address and must not come to differ about where one is.
 fn collect_slots(
     dt: &Datatype,
     slots: &[usize],
@@ -553,33 +649,23 @@ fn collect_slots(
     relocations: &BTreeMap<u64, u64>,
     out: &mut Vec<(u64, u64)>,
 ) {
-    let element_size = dt.type_size() as usize;
-    if element_size == 0 {
-        return;
-    }
-    for (i, element) in raw.chunks_exact(element_size).enumerate() {
-        for &at in slots {
-            let stored =
-                u64::from_le_bytes(element[at..at + 8].try_into().expect(
-                    "embedded_reference_slots keeps every slot 8 bytes inside the element",
-                ));
-            // The two sentinels name no object and are never relocated; skipping
-            // them keeps a zero-based file from matching a relocation whose old
-            // address happened to be the base.
-            if stored == 0 || stored == u64::MAX {
-                continue;
-            }
-            let Some(abs) = stored.checked_add(base) else {
-                continue;
-            };
-            let Some(&new) = relocations.get(&abs) else {
-                continue;
-            };
-            let Some(value) = new.checked_sub(base) else {
-                continue;
-            };
-            out.push((raw_at + (i * element_size + at) as u64, value));
+    for (offset, stored) in stored_object_references(raw, dt.type_size() as usize, slots) {
+        // The two sentinels name no object and are never relocated; skipping
+        // them keeps a zero-based file from matching a relocation whose old
+        // address happened to be the base.
+        if stored == 0 || stored == u64::MAX {
+            continue;
         }
+        let Some(abs) = stored.checked_add(base) else {
+            continue;
+        };
+        let Some(&new) = relocations.get(&abs) else {
+            continue;
+        };
+        let Some(value) = new.checked_sub(base) else {
+            continue;
+        };
+        out.push((raw_at + offset as u64, value));
     }
 }
 
@@ -639,6 +725,34 @@ mod tests {
             let at = at as usize;
             self.0[at..at + bytes.len()].copy_from_slice(bytes);
             Ok(())
+        }
+    }
+
+    /// An Attribute Info (0x0015) message body: version, flags, then the fractal
+    /// heap and name-index addresses, `None` encoding as the undefined address.
+    /// Mirrors `file_writer::serialize_attribute_info`, whose compact form
+    /// (`None`) is what this crate and the reference library attach to an object
+    /// with ordinary inline attributes.
+    fn attribute_info(fractal_heap: Option<u64>) -> Vec<u8> {
+        let mut body = vec![0u8, 0x00];
+        body.extend_from_slice(&fractal_heap.unwrap_or(u64::MAX).to_le_bytes());
+        body.extend_from_slice(&u64::MAX.to_le_bytes());
+        body
+    }
+
+    /// A [`PatchTarget`] that records where each write started and how long it
+    /// was, for the tests that are about the write *shape* rather than the bytes.
+    struct Recording {
+        bytes: Bytes,
+        writes: Vec<(u64, usize)>,
+    }
+    impl PatchTarget for Recording {
+        fn read(&self, at: u64, len: usize) -> Result<Vec<u8>, Error> {
+            self.bytes.read(at, len)
+        }
+        fn write(&mut self, at: u64, bytes: &[u8]) -> Result<(), Error> {
+            self.writes.push((at, bytes.len()));
+            self.bytes.write(at, bytes)
         }
     }
 
@@ -776,6 +890,194 @@ mod tests {
             scanned.holds_a_reference,
             "an unmappable reference is still a reference: the file must never be \
              proved free of them"
+        );
+    }
+
+    #[test]
+    fn dense_attribute_storage_leaves_the_object_unproven() {
+        // An object storing its attributes in a fractal heap presents no
+        // Attribute message in its header, so nothing here can see what they
+        // hold. Reading that as "no references in this object" is what would let
+        // a later commit skip the walk over a file full of them.
+        let dense = message_record(MessageType::AttributeInfo, &attribute_info(Some(4096)));
+        let (src, _) = image_with_header(&dense);
+        let (plan, scanned) = scan(&src, &[(300, 900)]);
+        assert!(plan.is_empty(), "there is nothing here this can address");
+        assert!(
+            !scanned.fully_read,
+            "a dense attribute set is unread, so the object cannot be counted \
+             towards a file proved free of references"
+        );
+
+        // The same message with an *undefined* heap address is the compact form
+        // nearly every object the C library writes carries, and it hides nothing.
+        let compact = message_record(MessageType::AttributeInfo, &attribute_info(None));
+        let (src, _) = image_with_header(&compact);
+        let (_, scanned) = scan(&src, &[(300, 900)]);
+        assert!(
+            scanned.fully_read,
+            "an Attribute Info message is not dense storage by itself"
+        );
+    }
+
+    #[test]
+    fn a_shared_attribute_record_leaves_the_object_unproven() {
+        // An attribute held in the file's shared-message table is not in this
+        // header, so nothing here can see what it holds. Reading that as "no
+        // references in this object" is what would let a later commit skip the
+        // walk over a file that needs it.
+        let attr = reference_attr("target", 300).serialize_v3(crate::file_writer::LENGTH_SIZE);
+        let mut record = message_record(MessageType::Attribute, &attr);
+        record[3] = crate::edit::MSG_FLAG_SHARED;
+        let (src, _) = image_with_header(&record);
+        let (plan, scanned) = scan(&src, &[(300, 900)]);
+        assert!(
+            plan.is_empty(),
+            "the message body is a pointer into the shared table, not the value"
+        );
+        assert!(
+            !scanned.fully_read,
+            "an unread attribute leaves the object unproven"
+        );
+    }
+
+    #[test]
+    fn a_header_chunk_is_written_from_the_byte_that_changed() {
+        // The read covers the whole chunk, because the checksum does; the write
+        // must not, or repointing one attribute near the end of a wide header
+        // rewrites the header. Borrowed wholesale from `publish_checksummed`,
+        // and worth its own assertion for the same reason that one has: the
+        // write *count* is identical either way, so nothing else notices.
+        let region = message_record(
+            MessageType::Attribute,
+            &reference_attr("target", 300).serialize_v3(crate::file_writer::LENGTH_SIZE),
+        );
+        let (src, bytes) = image_with_header(&region);
+        let (plan, _) = scan(&src, &[(300, 900)]);
+        let site = plan.sites()[0];
+
+        let mut target = Recording {
+            bytes: Bytes(bytes),
+            writes: Vec::new(),
+        };
+        plan.apply(&mut target).unwrap();
+        assert_eq!(
+            target.writes.len(),
+            1,
+            "one chunk, one write — value and checksum together"
+        );
+        assert_eq!(
+            target.writes[0].0, site,
+            "the write starts at the repointed address, not at the chunk"
+        );
+    }
+
+    /// A committed datatype is resolved through the base address, so a file with
+    /// a userblock reaches its references like any other.
+    ///
+    /// A committed type's message body holds a *base-relative* address, and the
+    /// resolver reads it as absolute within the view it is handed. Hand it the
+    /// unframed image and every such datatype on a userblock file resolves to
+    /// the wrong offset and fails to parse — which this walk cannot distinguish
+    /// from a datatype it is not able to read, so the object's references are
+    /// passed over in silence. Base zero is the control: it cannot fail, which
+    /// is exactly why the bug survived one.
+    #[test]
+    fn a_committed_datatype_is_resolved_through_the_base_address() {
+        for base in [0u64, 1024] {
+            const TYPE_AT: u64 = 2048;
+            let committed = build_v2_object_header(&message_record(
+                MessageType::Datatype,
+                &make_object_reference_type().serialize(),
+            ))
+            .unwrap();
+
+            // The dataset's own header: a *shared* datatype message naming the
+            // committed object, and a compact element holding the address.
+            let mut shared = message_record(
+                MessageType::Datatype,
+                &crate::shared_message::encode_committed_ref(
+                    TYPE_AT - base,
+                    crate::file_writer::OFFSET_SIZE,
+                ),
+            );
+            shared[3] = crate::edit::MSG_FLAG_SHARED;
+            let mut layout = vec![3u8, 0];
+            layout.extend_from_slice(&8u16.to_le_bytes());
+            layout.extend_from_slice(&(300u64).to_le_bytes());
+            shared.extend_from_slice(&message_record(MessageType::DataLayout, &layout));
+            let dataset = build_v2_object_header(&shared).unwrap();
+
+            let mut bytes = vec![0xAAu8; TYPE_AT as usize];
+            bytes.extend_from_slice(&committed);
+            bytes.resize(HEADER_AT as usize, 0xAA);
+            bytes.extend_from_slice(&dataset);
+
+            let mut plan = Plan::default();
+            let map: BTreeMap<u64, u64> = [(300 + base, 900 + base)].into_iter().collect();
+            let scanned =
+                scan_object(&BytesSource::new(bytes), HEADER_AT, base, &map, &mut plan).unwrap();
+            assert!(
+                scanned.holds_a_reference,
+                "base {base}: the committed type must be followed far enough to \
+                 see it names a reference"
+            );
+            assert_eq!(plan.len(), 1, "base {base}: the element must be repointed");
+        }
+    }
+
+    /// A header the commit vacated is never scanned, even when a link still
+    /// names it.
+    ///
+    /// Walking the committed tree is meant to make that unreachable, and it does
+    /// — unless a link the commit *failed* to repoint still points at the old
+    /// header. A group with two hard links is rebuilt today with only its parent
+    /// link patched, so the alias is exactly such a link. The vacated span is in
+    /// the free list by the time this runs, so an edit filed against it is a
+    /// write into space the next allocation may take.
+    #[test]
+    fn a_vacated_header_is_not_scanned_even_when_a_link_still_names_it() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vacated.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        b.create_dataset("d").with_i32_data(&[1, 2, 3]);
+        b.create_dataset("refs").with_path_references(&["d"]);
+        b.write(&path).unwrap();
+
+        let file = crate::File::open(&path).unwrap();
+        let superblock = file.superblock().clone();
+        let root = superblock.root_group_address;
+        // What `refs` stores, which is `d`'s header address. The file has no
+        // userblock, so the stored base-relative address is the absolute one.
+        let stored = u64::from_le_bytes(
+            file.dataset("refs").unwrap().read_raw().unwrap()[..8]
+                .try_into()
+                .unwrap(),
+        );
+        drop(file);
+        let source = crate::source::BytesSource::new(std::fs::read(&path).unwrap());
+
+        // The control: `d` has moved, the root has not, so the walk descends
+        // through the root and repoints the one element in `refs`.
+        let moved: BTreeMap<u64, u64> = [(stored, stored + 4096)].into_iter().collect();
+        let reached = super::plan(&source, &superblock, &moved, 1 << 20).unwrap();
+        assert_eq!(reached.len(), 1, "the walk must reach `refs` at all");
+
+        // The same file and the same target, with the root itself vacated. The
+        // root is the only way in, so the guard makes the whole file
+        // unreachable — and the edit the control found must not be made, because
+        // reaching it meant walking a header that is no longer part of any tree.
+        let mut vacated = moved.clone();
+        vacated.insert(root, root + 8192);
+        let skipped = super::plan(&source, &superblock, &vacated, 1 << 20).unwrap();
+        assert!(
+            skipped.is_empty(),
+            "a vacated header must not be scanned, nor descended through"
+        );
+        assert!(
+            !skipped.proved_free_of_references(),
+            "and skipping it leaves the file unproven rather than proven clean"
         );
     }
 

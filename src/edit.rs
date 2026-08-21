@@ -216,6 +216,7 @@ use crate::data_layout::DataLayout;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
     Datatype, DatatypeByteOrder, datatype_holds_object_address, embedded_reference_slots,
+    stored_object_references,
 };
 use crate::error::{Error, FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::extensible_array::ExtensibleArrayHeader;
@@ -706,23 +707,38 @@ pub(crate) struct WriteEngine {
     /// proof is worth carrying.
     ///
     /// Cleared by any commit that could introduce a reference the walk has not
-    /// seen. Four of [`StagedEdits`]' collections can: `datasets` and
-    /// `writes` carry a datatype the caller chose, and `copies` and
-    /// `cross_copies` carry whatever the source object was. The other five
-    /// cannot, each for its own reason, and each reason is a property of the API
-    /// rather than of the current implementation:
+    /// seen. Exactly one of [`StagedEdits`]' nine collections can: `datasets`,
+    /// which carries a datatype and attributes the caller chose. The check
+    /// covers four, and the other three are belt-and-braces rather than
+    /// load-bearing — recorded here because a reason that does not hold is worse
+    /// than no reason:
     ///
-    /// - `groups` stages an empty group: no datatype, no data, no attributes.
+    /// - `writes` is a *value* overwrite, whose datatype must match the on-disk
+    ///   dataset's exactly. A reference-typed one therefore overwrites a dataset
+    ///   that already held references, which a file proved free of them does not
+    ///   have. Checked anyway, because that match is a commit-time check running
+    ///   after this one, so `fd.dt` here is still whatever the caller supplied.
+    /// - `copies` re-emits an object *from this same file* — one the walk that
+    ///   granted the proof had already visited and found reference-free.
+    /// - `cross_copies` reads from another file, where `reject_foreign_addresses`
+    ///   refuses a reference datatype outright.
+    ///
+    /// The remaining five cannot, and these reasons do hold:
+    ///
+    /// - `groups` stages a bare path: no datatype, no data, no attributes.
     /// - `group_attrs` and `dataset_attrs` carry an [`AttrValue`], which has no
     ///   reference variant — the reason a reference-typed attribute can only
     ///   have come from the reference C library.
     /// - `appends` grows an *existing* dataset along its own datatype, so it can
-    ///   only add references to a dataset that already held them, which a file
-    ///   proved free of them has none of.
+    ///   only add references to a dataset that already held them.
     /// - `deletes` removes objects and adds nothing.
     ///
+    /// The commit fast path returns before the check and needs no reason of its
+    /// own: it is taken only when every staged edit is a same-length in-place
+    /// overwrite, which is the `writes` case above.
+    ///
     /// A tenth collection would have to be classified the same way; the check
-    /// sits beside the reference screen in `commit`, which iterates the same two
+    /// sits beside the reference screen in `commit`, which iterates the same
     /// datatype-carrying collections.
     proved_free_of_references: bool,
     /// Free-space persistence read from the file's superblock extension on
@@ -4034,17 +4050,23 @@ impl WriteEngine {
 
         // Anything this commit adds could be a reference container the last walk
         // did not see, so it retires that walk's "no references in this file"
-        // finding (issue #324). The four collections that can carry one are read
-        // here — see `proved_free_of_references` for why the other five cannot — and
-        // the two carrying a caller-chosen datatype are narrowed by the same
-        // predicate the screen above uses, so adding an ordinary dataset does
-        // not cost the next commit a walk.
-        if staged
-            .datasets
-            .iter()
-            .chain(&staged.writes)
-            .any(|(_, fd)| datatype_holds_object_address(&fd.dt))
-            || !staged.copies.is_empty()
+        // finding (issue #324). See `proved_free_of_references` for which of
+        // these four clauses is load-bearing and which are belt-and-braces, and
+        // for why the other five staged collections need no clause at all.
+        //
+        // A staged dataset's *attributes* are screened beside its element
+        // datatype. Neither can carry a reference today — a committed one is
+        // refused by `flatten_dataset`, and `AttrValue` has no reference variant
+        // — but that is a refusal in another function rather than a property of
+        // this collection, and the check that means what it says is the one that
+        // looks.
+        if staged.datasets.iter().chain(&staged.writes).any(|(_, fd)| {
+            datatype_holds_object_address(&fd.dt)
+                || fd
+                    .attrs
+                    .iter()
+                    .any(|a| datatype_holds_object_address(&a.datatype))
+        }) || !staged.copies.is_empty()
             || !staged.cross_copies.is_empty()
         {
             self.proved_free_of_references = false;
@@ -4092,9 +4114,12 @@ impl WriteEngine {
 
         // Gather the regions this commit will vacate, read from the current
         // on-disk layout before any byte moves: every deleted object's owned
-        // blocks plus every superseded group header. These are not added to the
-        // free list until after the superblock repoint (they remain live until
-        // then), so the appends below never reuse them. Enumeration is
+        // blocks plus every superseded group header. They stay out of the free
+        // list until every append this commit makes is behind it, so none of
+        // them is reused while it is still live. (On the non-persisting tail
+        // that point is a few lines *before* the superblock write rather than
+        // after it — the apply loop is where the appends happen, and it is long
+        // done by then.) Enumeration is
         // best-effort — `collect_free_spans` simply omits anything it cannot
         // account for exhaustively, so the worst case is unreclaimed dead bytes,
         // never a freed-but-live region.
@@ -4493,11 +4518,13 @@ impl WriteEngine {
     /// carries the old address of anything it referenced, so patching the
     /// superseded header instead would correct bytes that are already dead.
     ///
-    /// The writes are barriered, so a commit that returns under
-    /// [`SyncPolicy::Always`] is durable in full rather than durable except for
-    /// its references. That costs nothing on the files that do not need it: a
-    /// plan with nothing in it returns before the barrier, and on a file holding
-    /// no object reference there is never anything in it.
+    /// The writes are followed by a [`barrier`](Self::barrier), so a commit that
+    /// returns under [`SyncPolicy::Always`] has put its references on disk and
+    /// not merely its tree. That rests on `barrier`'s own contract rather than
+    /// on a crash test — nothing here sweeps the window — and it costs nothing
+    /// on the files that do not need it: a plan with nothing in it returns
+    /// first, and on a file holding no object reference there is never anything
+    /// in it.
     ///
     /// A crash between the repoint and that barrier leaves the commit standing
     /// with some references still stale, which is exactly the state every commit
@@ -9369,7 +9396,7 @@ fn apply_group_attr_ops(
 /// address is. An unparseable message is treated as dense (refused conservatively).
 /// Mirrors the copy path's dense detection so the compact-attribute editors accept
 /// the undefined-address message that nearly every real-world object carries.
-fn attribute_info_is_dense(body: &[u8]) -> bool {
+pub(crate) fn attribute_info_is_dense(body: &[u8]) -> bool {
     match crate::attribute_info::AttributeInfoMessage::parse(body, OFFSET_SIZE) {
         Ok(ai) => ai.fractal_heap_address.is_some(),
         Err(_) => true,
@@ -9936,17 +9963,10 @@ fn screen_resolved_references(
         ));
     };
     // Non-empty slots mean the datatype has room for at least one 8-byte
-    // address, so the element size is at least 8 and `chunks_exact` is safe.
-    let element_size = dt.type_size() as usize;
-    for element in raw.chunks_exact(element_size) {
-        for &at in &slots {
-            let stored =
-                u64::from_le_bytes(element[at..at + 8].try_into().expect(
-                    "embedded_reference_slots keeps every slot 8 bytes inside the element",
-                ));
-            if let Some(refusal) = invalidated.refusal(stored) {
-                return Err(Error::EditUnsupported(refusal));
-            }
+    // address, so the element size is at least 8.
+    for (_, stored) in stored_object_references(raw, dt.type_size() as usize, &slots) {
+        if let Some(refusal) = invalidated.refusal(stored) {
+            return Err(Error::EditUnsupported(refusal));
         }
     }
     Ok(())
@@ -10467,6 +10487,61 @@ mod tests {
     /// undefined references alone. The arm exists so that the two ways a target
     /// can name an object answer to the same rule rather than to whichever one
     /// a caller happened to use, and this is what holds it to that.
+    /// A file with nothing a reference could live in is walked once and never
+    /// again, and one that holds a reference is walked every time.
+    ///
+    /// The first half is the whole of `proved_free_of_references`, and it is
+    /// invisible from outside the session: a build that never caches the proof
+    /// writes byte-identical files and passes every other test here, having
+    /// silently gone back to walking the file on every commit. The second half
+    /// is what stops a too-eager proof from being the fix for the first.
+    #[test]
+    fn a_file_proved_free_of_references_is_walked_once_and_no_more() {
+        use crate::reference_patch::{reset_walks, walks};
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+
+        let commit_three = |path: &std::path::Path| {
+            let session = crate::File::open_rw(path).unwrap();
+            for i in 0..3 {
+                session
+                    .root()
+                    .create_dataset(&format!("added{i}"), |b| {
+                        b.with_i32_data(&[i]);
+                    })
+                    .unwrap();
+                session.commit().unwrap();
+            }
+        };
+
+        let plain = dir.path().join("plain.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        b.create_dataset("d").with_i32_data(&[1, 2, 3]);
+        b.write(&plain).unwrap();
+        reset_walks();
+        commit_three(&plain);
+        assert_eq!(
+            walks(),
+            1,
+            "the first commit's walk proves the file reference-free; the rest \
+             must take its word for it"
+        );
+
+        let referencing = dir.path().join("referencing.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        b.create_dataset("d").with_i32_data(&[1, 2, 3]);
+        b.create_dataset("refs").with_path_references(&["d"]);
+        b.write(&referencing).unwrap();
+        reset_walks();
+        commit_three(&referencing);
+        assert_eq!(
+            walks(),
+            3,
+            "a file that holds a reference is never proved free of one, so every \
+             commit walks it"
+        );
+    }
+
     #[test]
     fn a_raw_reference_target_is_screened_like_a_path_one() {
         use tempfile::tempdir;

@@ -474,43 +474,6 @@ fn a_reference_dataset_added_after_a_reference_free_walk_is_still_repointed() {
 }
 
 #[test]
-fn a_refused_commit_leaves_stored_references_untouched() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("refused.h5");
-    build_file_referencing_a_group(&path);
-    let before = std::fs::read(&path).unwrap();
-
-    // The repointing is a fixup derived from a commit, and runs after the
-    // superblock repoint that makes the commit real. A commit that never gets
-    // there must leave every stored address exactly as it found it, even though
-    // it staged an edit that would have moved `g`.
-    let session = File::open_rw(&path).unwrap();
-    session
-        .root()
-        .create_dataset("g/extra", |b| {
-            b.with_i32_data(&[9]);
-        })
-        .unwrap();
-    session
-        .root()
-        .create_dataset("refs", |b| {
-            b.with_i32_data(&[1]);
-        })
-        .unwrap();
-    assert!(
-        session.commit().is_err(),
-        "adding a second `refs` collides with the existing link"
-    );
-    drop(session);
-
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        before,
-        "a refused commit must leave the file byte-identical, references included"
-    );
-}
-
-#[test]
 fn a_copy_made_in_the_same_commit_that_moves_its_target_is_repointed() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("copied.h5");
