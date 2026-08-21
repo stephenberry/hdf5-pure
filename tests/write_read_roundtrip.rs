@@ -1,6 +1,6 @@
 use hdf5_pure::{
     AttrValue, CompoundTypeBuilder, DType, Datatype, Error, File, FileBuilder, FormatError,
-    make_f64_type,
+    make_f64_type, make_i32_type,
 };
 
 #[test]
@@ -1230,6 +1230,150 @@ fn shape_data_mismatch_is_rejected() {
         }
         other => panic!("expected ShapeDataMismatch, got {other:?}"),
     }
+}
+
+/// A zero-element shape is held to the same shape/data agreement every other
+/// shape is (issue #332), rather than exempted from it.
+///
+/// The exemption wrote the one combination that cannot be written correctly.
+/// Contiguously it put the staged bytes at a defined address under a dataspace
+/// declaring no elements, which the reference library calls corruption and
+/// refuses to open, and which this crate's own reader answers `Ok([])` for
+/// without ever looking at the region. Chunked it produced a grid of no chunks,
+/// so the bytes went nowhere and the caller was told `Ok`.
+///
+/// Swept over every way to reach the shape rather than over one picked case:
+/// the guard is a single condition, and each arm has to land on the same side
+/// of it. The reference library's verdict on the file the exemption wrote is
+/// recorded in the issue rather than kept as a fixture here — the writer can no
+/// longer produce it, which is the point.
+#[test]
+fn zero_element_shape_with_data_is_rejected() {
+    for shape in [&[0u64][..], &[0, 3][..], &[3, 0][..]] {
+        for chunked in [false, true] {
+            let mut builder = FileBuilder::new();
+            {
+                let db = builder
+                    .create_dataset("bad")
+                    .with_i32_data(&[1, 2, 3])
+                    .with_shape(shape);
+                if chunked {
+                    db.with_chunks(&[2, 2][..shape.len()]);
+                }
+            }
+            let case = format!("shape {shape:?}, chunked {chunked}");
+            match builder.finish() {
+                Err(Error::Format(FormatError::ShapeDataMismatch {
+                    expected,
+                    actual,
+                    element_size,
+                })) => {
+                    assert_eq!(expected, 0, "{case}: the shape holds no elements");
+                    assert_eq!(actual, 3 * 4, "{case}: three i32 were supplied");
+                    assert_eq!(element_size.get(), 4, "{case}");
+                }
+                other => panic!("{case}: expected ShapeDataMismatch, got {other:?}"),
+            }
+        }
+    }
+}
+
+/// Staging no data for a zero-element shape stays legal, which is the half of
+/// the guard the refusal above must not take with it: both the extent and the
+/// staged region are zero bytes there, so they agree.
+///
+/// Swept over how the emptiness is declared as well as over the shape. The two
+/// are not the same case: staging an empty slice satisfies the writer's
+/// "a dataset has data" requirement outright, while omitting the data reaches it
+/// through the zero-element exemption, and only the second reads the shape to
+/// decide. A sweep that fixed this axis at the empty slice passed unchanged
+/// with the exemption narrowed to the *first* dimension, which would have made
+/// a `[3, 0]` dataset with no data fail as one missing its data.
+#[test]
+fn zero_element_shape_without_data_is_accepted() {
+    for shape in [&[0u64][..], &[0, 3][..], &[3, 0][..]] {
+        for chunked in [false, true] {
+            for staged_empty_slice in [false, true] {
+                let mut builder = FileBuilder::new();
+                {
+                    let db = builder.create_dataset("empty");
+                    if staged_empty_slice {
+                        db.with_i32_data(&[]);
+                    } else {
+                        db.with_dtype(make_i32_type());
+                    }
+                    db.with_shape(shape);
+                    if chunked {
+                        db.with_chunks(&[2, 2][..shape.len()]);
+                    }
+                }
+                let case =
+                    format!("shape {shape:?}, chunked {chunked}, slice {staged_empty_slice}");
+                let bytes = builder.finish().unwrap_or_else(|e| panic!("{case}: {e}"));
+                let file = File::from_bytes(bytes).unwrap();
+                let ds = file.dataset("empty").unwrap();
+                assert_eq!(ds.shape().unwrap(), shape.to_vec(), "{case}");
+                assert_eq!(ds.read_i32().unwrap(), Vec::<i32>::new(), "{case}");
+                if !chunked {
+                    // The contrast with the refused case, stated as a layout: an
+                    // empty dataset names no data region at all. The exempted write
+                    // named one of twelve bytes at a defined address, which is the
+                    // thing the reference library refuses to open.
+                    assert_eq!(
+                        ds.layout().unwrap(),
+                        hdf5_pure::Layout::Contiguous {
+                            address: None,
+                            size: 0
+                        },
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The refusal lands before any byte reaches the filesystem, which is what
+/// decides whether it destroys the file it was overwriting.
+///
+/// `FileBuilder::write` creates its path on the first byte emitted rather than
+/// up front, so a build refused before that point leaves the destination alone
+/// while one refused during layout still leaves a partial file. That mechanism
+/// is pinned elsewhere (`file_properties`, `attr_message_size_limit`); what this
+/// adds is that *this* guard is among the refusals that reach it, which nothing
+/// about where it sits in `flatten_dataset` says on its own.
+#[test]
+fn a_rejected_zero_element_write_leaves_the_destination_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("target.h5");
+
+    let mut good = FileBuilder::new();
+    good.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    good.write(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let mut bad = FileBuilder::new();
+    bad.create_dataset("bad")
+        .with_i32_data(&[1, 2, 3])
+        .with_shape(&[0]);
+    bad.write(&path).unwrap_err();
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a refused write must not disturb the file it was overwriting"
+    );
+
+    let fresh = dir.path().join("never.h5");
+    let mut bad = FileBuilder::new();
+    bad.create_dataset("bad")
+        .with_i32_data(&[1, 2, 3])
+        .with_shape(&[0]);
+    bad.write(&fresh).unwrap_err();
+    assert!(
+        !fresh.exists(),
+        "a refused write must not leave a stub behind"
+    );
 }
 
 #[test]

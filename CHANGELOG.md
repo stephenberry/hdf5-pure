@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Breaking:** `FileBuilder` refuses a dataset that stages element data under a zero-element shape, instead of writing a file the reference library refuses to open as corrupt (or, chunked, silently dropping the data). Staging no data for such a shape is unchanged ([#332](https://github.com/stephenberry/hdf5-pure/issues/332)).
 - **Breaking:** Reading a dataset whose data lives in external files (`H5Pset_external`) is refused with `FormatError::UnsupportedExternalStorage` instead of answering the fill value for every element of data this crate never looked at. Its shape, datatype, and layout still read ([#331](https://github.com/stephenberry/hdf5-pure/issues/331)).
 - **Breaking:** Overwriting or appending to such a dataset is refused too, instead of writing the new elements into the HDF5 file and leaving it disagreeing with the external files about where the data is — a write that reported `Ok` and was then visible to neither library. Attribute edits are unaffected, and deleting and recreating the dataset in one commit replaces it ([#331](https://github.com/stephenberry/hdf5-pure/issues/331)).
 - **Breaking:** `repack` refuses a dataset whose data lives in external files (`H5Pset_external`) instead of returning `Ok` having written a copy with none of it. Such a dataset carries the same undefined data address a never-written one does, and this crate does not follow the external files ([#293](https://github.com/stephenberry/hdf5-pure/issues/293)).
