@@ -206,7 +206,7 @@ use crate::chunked_read::{
     chunk_index_spans_from_source, enumerate_chunks_from_source, plan_dense_grid,
 };
 use crate::chunked_write::{
-    ChunkMeta, ChunkOptions, ChunkProvider, WrittenChunk, assemble_chunked_at,
+    ChunkMeta, ChunkOptions, ChunkProvider, StorageAllocation, WrittenChunk, assemble_chunked_at,
     build_extensible_array_at, chunked_data_len, compress_chunks, emit_chunked_data_verbatim,
     extensible_array_len, full_chunk_bytes, plan_chunked_data_verbatim,
     serialize_v4_extensible_array, split_into_chunks,
@@ -7341,6 +7341,9 @@ impl WriteEngine {
             &fd.chunk_options,
             fd.maxshape.as_deref(),
             fill,
+            // `flatten_dataset` refuses an unallocated dataset outright, so
+            // every dataset this engine builds allocates its storage.
+            StorageAllocation::Allocated,
         )?;
         // Chunk data and the index beside it are raw (see `chunked_storage_spans`,
         // which reclaims both as raw).
@@ -8458,6 +8461,18 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         .ok_or(Error::EditUnsupported("dataset has no shape"))?;
     let is_empty = shape.contains(&0);
     let chunked = db.chunk_options.is_chunked() || db.maxshape.is_some();
+    // Storage this engine allocates for every dataset it places: it appends into
+    // an existing layout, and the undefined data address the whole-file writer
+    // gives an unallocated dataset (issue #293) has no equivalent here. Refused
+    // by name rather than left to the "dataset has no data" arm below, which is
+    // the same symptom from the opposite cause, and refused rather than ignored,
+    // since ignoring it would write out the grid of fill values the caller asked
+    // not to have.
+    if db.allocation == StorageAllocation::Unallocated {
+        return Err(Error::EditUnsupported(
+            "a dataset with unallocated storage cannot be added to an existing file in place",
+        ));
+    }
     // Variable-length string element references live in the global heap, whose
     // address is only known once the apply loop places the collection. For
     // chunked/filtered/resizable storage the references sit inside chunks
@@ -9064,6 +9079,8 @@ fn try_rebuild_index_in_place<S: Source + ?Sized>(
         ds.max_dimensions.as_deref(),
         raw_size,
         true,
+        // Rebuilding the index of a dataset whose chunks are in hand.
+        crate::chunked_write::StorageAllocation::Allocated,
     )
     .ok()?;
     let slots =
@@ -13127,6 +13144,41 @@ mod tests {
         let err = s.stage_dataset_write("/", db).unwrap_err();
         assert!(
             matches!(&err, Error::EditUnsupported(m) if m.contains("root group")),
+            "unexpected error: {err:?}"
+        );
+        assert!(!s.has_staged_edits());
+    }
+
+    /// Unallocated storage is refused by this engine rather than materialized.
+    ///
+    /// The whole-file writer leaves such a dataset's data address undefined
+    /// (issue #293); this engine appends into an existing layout and has no
+    /// equivalent, so the flag has to be answered rather than dropped. Dropping
+    /// it would write out the grid of fill values the caller asked not to have,
+    /// and every value assertion would pass.
+    ///
+    /// The message is checked, not just the failure: the arm below this one
+    /// refuses a dataset with no data for the opposite reason — the caller forgot
+    /// it — and reporting that one here would send a caller looking for a bug in
+    /// their own code.
+    #[test]
+    fn staging_unallocated_storage_into_an_existing_file_is_refused() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("unallocated.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("d").with_i32_data(&[1]);
+        b.write(&path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        let mut db = crate::type_builders::DatasetBuilder::new("sparse");
+        db.with_unallocated_storage(make_i32_type(), &[1000]);
+        db.with_chunks(&[100]);
+        let err = s.stage_created_dataset("/sparse", db).unwrap_err();
+        assert!(
+            matches!(&err, Error::EditUnsupported(m) if m.contains("unallocated storage")),
             "unexpected error: {err:?}"
         );
         assert!(!s.has_staged_edits());

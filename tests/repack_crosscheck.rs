@@ -1588,3 +1588,302 @@ fn c_written_attribute_encodings_survive_a_repack() {
         );
     }
 }
+
+/// Storage the C library never allocated survives a repack as storage rather
+/// than as the values reading it answers with (issue #293).
+///
+/// By default the reference library does not allocate a contiguous or chunked
+/// dataset's storage until something is written to it, so one created and never
+/// written holds nothing at all. (Compact data is inline in the layout message
+/// and is always present, which is why it is not among the layouts below.)
+/// Since #292 reading one answers its fill value for every element, and
+/// repack used to write those values out — turning a schema-only file into a
+/// fully materialized one of whatever size its shape declared.
+///
+/// Every layout the source can be in is covered here because each reaches a
+/// different part of the writer: a contiguous dataset is preserved by leaving its
+/// data address undefined, a chunked one by emitting no chunks and no index, and
+/// a filtered one has to carry its pipeline across without a single chunk to
+/// apply it to. The attribute on each is what proves the new path still ends at
+/// `copy_dataset_attrs` — an early return that skipped it would lose every
+/// attribute silently, which is the failure mode that makes each of repack's
+/// other exits end there too.
+#[test]
+fn repack_preserves_c_written_unallocated_storage_in_every_layout() {
+    const N: usize = 1000;
+    const FILL: i32 = 7;
+    // The bytes the elements would occupy if they were written out. Every
+    // destination has to come in under this, whatever its metadata costs — a
+    // coarse bound, and deliberately the weaker of the two checks: measured
+    // before the fix, the *filtered* destination was 665 B, well inside it,
+    // because deflate had squeezed a thousand copies of the fill value. What
+    // catches that arm is the chunk count below.
+    const MATERIALIZED: u64 = (N * core::mem::size_of::<i32>()) as u64;
+
+    for layout in ["contiguous", "chunked", "filtered", "extensible"] {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("src.h5");
+        let dst = dir.path().join("dst.h5");
+        {
+            let file = hdf5::File::create(&src).unwrap();
+            let b = file.new_dataset::<i32>().fill_value(FILL);
+            // The C builder's shape call changes its type, so each layout is
+            // built to completion in its own arm rather than accumulated.
+            let ds = match layout {
+                "contiguous" => b.shape((N,)).create("col"),
+                "chunked" => b.shape((N,)).chunk((100,)).create("col"),
+                "filtered" => b
+                    .shape((N,))
+                    .chunk((100,))
+                    .shuffle()
+                    .deflate(6)
+                    .create("col"),
+                _ => b
+                    .shape((hdf5::Extent::resizable(N),))
+                    .chunk((100,))
+                    .create("col"),
+            }
+            .unwrap();
+            ds.new_attr::<i32>()
+                .shape(())
+                .create("units")
+                .unwrap()
+                .write_scalar(&42i32)
+                .unwrap();
+            drop(ds);
+            file.close().unwrap();
+        }
+
+        // Ground truth: the source stores nothing, and the C library reads it as
+        // the fill value anyway.
+        {
+            let c = hdf5::File::open(&src).unwrap();
+            assert_eq!(
+                c.dataset("col").unwrap().read_raw::<i32>().unwrap(),
+                vec![FILL; N],
+                "[{layout}] C ground truth"
+            );
+        }
+
+        repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+        let f = File::open(&dst).unwrap();
+        let ds = f.dataset("col").unwrap();
+        assert_eq!(ds.shape().unwrap(), vec![N as u64], "[{layout}] shape");
+        assert_eq!(
+            ds.read_i32().unwrap(),
+            vec![FILL; N],
+            "[{layout}] values still read as the fill value"
+        );
+        assert_eq!(
+            ds.fill_value::<i32>().unwrap(),
+            Some(FILL),
+            "[{layout}] fill value carried"
+        );
+        assert_eq!(
+            ds.attrs().unwrap().get("units"),
+            // The reader normalizes a fixed-point attribute to its widest
+            // signed form; what matters here is that it is there at all.
+            Some(&hdf5_pure::AttrValue::I64(42)),
+            "[{layout}] the attribute survived the new path"
+        );
+
+        // Nothing is stored. A contiguous dataset says so by leaving its address
+        // undefined; a chunked one by holding no chunks. The chunked
+        // destinations index differently from the source — the C library
+        // defaults to the 1.8 format and its version-1 B-tree, and this crate
+        // writes the 1.10 indices — so only the contiguous layout is comparable
+        // field for field, and it has to be: the size recorded beside an
+        // undefined address is the extent the dataset would occupy, and writing
+        // zero there would contradict `Layout::Contiguous`'s own promise.
+        match ds.layout().unwrap() {
+            hdf5_pure::Layout::Contiguous { address, size } => {
+                assert_eq!(
+                    (address, size),
+                    (None, MATERIALIZED),
+                    "[{layout}] the destination must match the source's undefined \
+                     address and declared extent"
+                );
+            }
+            hdf5_pure::Layout::Chunked { .. } => assert_eq!(
+                ds.chunks().unwrap().len(),
+                0,
+                "[{layout}] the destination wrote chunks"
+            ),
+            other => panic!("[{layout}] unexpected destination layout: {other:?}"),
+        }
+
+        if layout == "filtered" {
+            assert_eq!(
+                ds.filter_pipeline().len(),
+                2,
+                "[{layout}] shuffle + deflate must be carried onto a dataset with \
+                 no chunk to apply them to"
+            );
+        }
+        if layout == "extensible" {
+            assert_eq!(
+                ds.maxshape().unwrap(),
+                Some(vec![u64::MAX]),
+                "[{layout}] resizability carried"
+            );
+            // The one case where the destination is not smaller than the source:
+            // an extensible dataset keeps its eagerly built Extensible Array over
+            // zero chunks, the same index this crate gives every empty resizable
+            // dataset, because an in-place append needs the index to exist
+            // already. That costs a few hundred bytes of index and still stores
+            // no chunk, which is the part this test is about.
+            assert!(
+                matches!(
+                    ds.chunk_index().unwrap(),
+                    Some(hdf5_pure::ChunkIndex::ExtensibleArray)
+                ),
+                "[{layout}] a resizable destination keeps its growable index"
+            );
+        }
+        drop(f);
+
+        let dst_len = std::fs::metadata(&dst).unwrap().len();
+        assert!(
+            dst_len < MATERIALIZED,
+            "[{layout}] the destination ({dst_len} B) still carries the \
+             {MATERIALIZED} B of elements the source never stored"
+        );
+
+        // And the reference library reads back what it wrote in the first place.
+        let c = hdf5::File::open(&dst).unwrap();
+        assert_eq!(
+            c.dataset("col").unwrap().read_raw::<i32>().unwrap(),
+            vec![FILL; N],
+            "[{layout}] the C library reads the repacked dataset"
+        );
+    }
+}
+
+/// The other side of the same predicate: a dataset that stores *some* of its
+/// chunks is not "unallocated", and repack must still carry every element it
+/// holds.
+///
+/// A predicate that answered "stores nothing" from the chunk count being less
+/// than the grid would throw the written chunks away, and the neighbouring
+/// sparse tests already catch that through the values they lose. What this adds
+/// beside the positive case is the geometry those do not have: one *interior*
+/// chunk of ten written, so there are holes on both sides of it rather than only
+/// a tail.
+///
+/// It also records what repack does with the holes, which is not what the
+/// never-written case does with its whole grid. A sparse source cannot take the
+/// verbatim path, so it falls back to read-and-re-encode and the destination
+/// stores every slot — one chunk in, ten out, 2,959 B to 4,309 B on this
+/// fixture. That is unchanged by #293 and is the case its predicate must *not*
+/// catch; asserting the count rather than merely that it is non-zero is what
+/// keeps the two apart, since "not empty" is equally true of one chunk and ten.
+#[test]
+fn repack_keeps_the_chunks_a_partly_written_dataset_holds() {
+    const N: usize = 1000;
+    const FILL: i32 = 7;
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src.h5");
+    let dst = dir.path().join("dst.h5");
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape((N,))
+            .chunk((100,))
+            .fill_value(FILL)
+            .create("col")
+            .unwrap();
+        // One chunk of the ten, so the dataset is neither empty nor dense.
+        ds.write_slice(&[5i32; 100], 300..400).unwrap();
+        file.close().unwrap();
+    }
+
+    let mut expected = vec![FILL; N];
+    expected[300..400].fill(5);
+    {
+        let c = hdf5::File::open(&src).unwrap();
+        assert_eq!(
+            c.dataset("col").unwrap().read_raw::<i32>().unwrap(),
+            expected,
+            "C ground truth"
+        );
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = File::open(&dst).unwrap();
+    let ds = f.dataset("col").unwrap();
+    assert_eq!(
+        ds.read_i32().unwrap(),
+        expected,
+        "the written chunk must survive a repack"
+    );
+    assert_eq!(
+        ds.chunks().unwrap().len(),
+        10,
+        "the sparse fallback re-encodes the whole grid: the source stored one \
+         chunk of the ten and the destination stores all ten, which is the \
+         behaviour a dataset that stores *something* still gets"
+    );
+    drop(f);
+
+    let c = hdf5::File::open(&dst).unwrap();
+    assert_eq!(
+        c.dataset("col").unwrap().read_raw::<i32>().unwrap(),
+        expected,
+        "the C library reads the repacked dataset"
+    );
+}
+
+/// A never-written dataset carrying a filter this crate cannot re-apply is still
+/// refused by name.
+///
+/// The unallocated path emits no chunk, so there is nothing for a lossy filter to
+/// perturb and a case could be made for letting it through. It is not made here:
+/// the filters are reproduced by the same `carry_shape_and_pipeline` the
+/// re-encode path uses, which reaches an `unreachable!` for any filter
+/// `check_pipeline` was supposed to have refused. Widening what repack accepts is
+/// a separate decision from preserving storage, so the refusal set is unchanged —
+/// and a path that skipped the check would panic rather than refuse, which is
+/// what this pins.
+#[test]
+fn repack_still_refuses_a_never_written_dataset_with_a_lossy_filter() {
+    use hdf5::filters::ScaleOffset as CScaleOffset;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_unwritten_lossy.h5");
+    let dst = dir.path().join("c_unwritten_lossy_repacked.h5");
+    {
+        let file = hdf5::FileBuilder::new()
+            .with_fapl(|fapl| fapl.libver_v110())
+            .create(&src)
+            .unwrap();
+        let ds = file
+            .new_dataset::<f64>()
+            .shape([2000])
+            .chunk([512])
+            .scale_offset(CScaleOffset::FloatDScale(3))
+            .create("data")
+            .unwrap();
+        drop(ds);
+        file.close().unwrap();
+    }
+
+    // Nothing was written, so this is the unallocated path rather than the
+    // sparse-fallback one the neighbouring test covers.
+    {
+        let f = File::open(&src).unwrap();
+        assert!(f.dataset("data").unwrap().chunks().unwrap().is_empty());
+    }
+
+    let err = repack(&src, &dst, &RepackOptions::new()).unwrap_err();
+    match err {
+        hdf5_pure::Error::RepackUnsupported(msg) => assert!(
+            msg.contains("data") && msg.contains("scale-offset"),
+            "error should name the dataset and reason: {msg}"
+        ),
+        other => panic!("expected RepackUnsupported, got {other:?}"),
+    }
+    assert!(!dst.exists(), "dst must not be created when repack refuses");
+}

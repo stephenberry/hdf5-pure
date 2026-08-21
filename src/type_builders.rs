@@ -10,7 +10,7 @@ use core::fmt;
 use core::num::NonZeroUsize;
 
 use crate::attribute::AttributeMessage;
-use crate::chunked_write::{ChunkMeta, ChunkOptions, ChunkProvider};
+use crate::chunked_write::{ChunkMeta, ChunkOptions, ChunkProvider, StorageAllocation};
 use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
@@ -1621,6 +1621,11 @@ pub struct DatasetBuilder {
     /// value message untouched. Its byte width is checked against the datatype's
     /// element size when the dataset is serialized.
     pub(crate) fill: Option<Vec<u8>>,
+    /// Whether this dataset allocates storage at all. `Unallocated` declares the
+    /// shape, datatype and fill value and writes no data region, which is what
+    /// preserves a never-written dataset through a rewrite rather than
+    /// materializing a grid of fill values (issue #293).
+    pub(crate) allocation: StorageAllocation,
     /// Where this dataset's element type is written: in its own header, or as a
     /// reference to a committed datatype object named by path.
     pub(crate) datatype_location: DatatypeLocation,
@@ -1643,6 +1648,7 @@ impl DatasetBuilder {
             reference_targets: None,
             vl_string_staging: None,
             fill: None,
+            allocation: StorageAllocation::Allocated,
             datatype_location: DatatypeLocation::Inline,
             #[cfg(feature = "provenance")]
             provenance: None,
@@ -1953,6 +1959,36 @@ impl DatasetBuilder {
         if self.shape.is_none() {
             self.shape = Some(vec![num_elements]);
         }
+        self
+    }
+
+    /// Stage a dataset that declares its shape and element type and allocates no
+    /// storage.
+    ///
+    /// By default the reference library does not allocate a *contiguous or
+    /// chunked* dataset's storage until something is written to it — compact
+    /// data is inline in the layout message and is always present — so one
+    /// created and never written holds nothing: no index structure under a
+    /// chunked layout, an undefined data address under a contiguous one. Reading it answers the
+    /// fill value for every element (issue #292), which is why a
+    /// rewrite cannot recover this state from the values it reads back — the
+    /// dataset that stores a grid of fill values reads identically. Repack
+    /// carries it across by saying so here instead (issue #293).
+    ///
+    /// The chunk geometry, maximum shape, filters and fill value are set the
+    /// usual way and are all reproduced; only the data region is absent. Unlike
+    /// every other data entry point this stages no bytes, so the shape/data
+    /// agreement the writer enforces does not apply to it.
+    pub(crate) fn with_unallocated_storage(
+        &mut self,
+        datatype: Datatype,
+        dims: &[u64],
+    ) -> &mut Self {
+        self.datatype = Some(datatype);
+        if self.shape.is_none() {
+            self.shape = Some(dims.to_vec());
+        }
+        self.allocation = StorageAllocation::Unallocated;
         self
     }
 

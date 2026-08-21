@@ -547,19 +547,24 @@ fn a_fill_value_the_file_says_is_never_written_reads_as_zeros() {
     }
 }
 
-/// `repack` of a dataset whose storage was never allocated **materializes** it:
-/// the destination holds one written chunk per grid slot, each full of the fill
-/// value, where the source held none.
+/// `repack` of a dataset whose storage was never allocated **preserves** it: the
+/// destination holds no chunks either, where it used to hold one written chunk
+/// per grid slot, each full of the fill value (issue #293).
 ///
-/// Pinned rather than fixed. Values round-trip correctly and the fill value is
-/// carried across, so the result is right — but storage is not preserved, and a
-/// never-written dataset of any size becomes that size on disk. Preserving it
-/// needs the writer to be able to express "chunked, non-zero shape, no storage",
-/// which it cannot today; before unallocated storage was readable at all,
-/// repack refused such a dataset instead. This test exists so the change is
-/// visible and so a fix has something to invert.
+/// The values a read answers with cannot distinguish the two, which is what made
+/// the materializing version look correct: a dataset storing a grid of fill
+/// values reads exactly like one storing nothing. So the destination is checked
+/// for what it *stores* — no chunks, and a file too small to hold the elements —
+/// and the C library is asked to read it.
+///
+/// That last one is a smoke test rather than a check of the encoding: measured,
+/// libhdf5 reads a Fixed Array over ten *empty* slots exactly as happily, and
+/// reports zero chunks for it too. What pins the encoding is the unit test in
+/// `chunked_write.rs`, which is what fails if the undefined address is traded
+/// for an index over an empty grid.
 #[test]
-fn repack_materializes_a_never_written_dataset() {
+fn repack_preserves_a_never_written_dataset() {
+    const N: usize = 1000;
     let dir = tempdir().unwrap();
     let src = dir.path().join("src.h5");
     let dst = dir.path().join("dst.h5");
@@ -567,7 +572,7 @@ fn repack_materializes_a_never_written_dataset() {
         let file = hdf5::File::create(&src).unwrap();
         let ds = file
             .new_dataset::<i32>()
-            .shape((1000,))
+            .shape((N,))
             .chunk((100,))
             .fill_value(7i32)
             .create("col")
@@ -584,24 +589,37 @@ fn repack_materializes_a_never_written_dataset() {
 
     let after = File::open(&dst).unwrap();
     let ds = after.dataset("col").unwrap();
-    assert_eq!(
-        ds.read_i32().unwrap(),
-        vec![7i32; 1000],
-        "values round-trip"
-    );
+    assert_eq!(ds.read_i32().unwrap(), vec![7i32; N], "values round-trip");
     assert_eq!(
         ds.fill_value::<i32>().unwrap(),
         Some(7),
         "fill carried across"
     );
+    assert_eq!(ds.shape().unwrap(), vec![N as u64], "shape carried across");
     assert_eq!(
         ds.chunks().unwrap().len(),
-        10,
-        "every grid slot is written out, which is the cost this pins"
+        0,
+        "nothing was stored, so nothing is written out"
     );
+    drop(after);
+
+    // The elements are absent rather than merely compressed: the whole file is
+    // smaller than the run of bytes they would occupy. Stated as a rule against
+    // the dataset's own size so it holds whatever the surrounding metadata costs.
+    let materialized = (N * core::mem::size_of::<i32>()) as u64;
+    let dst_len = std::fs::metadata(&dst).unwrap().len();
     assert!(
-        std::fs::metadata(&dst).unwrap().len() > std::fs::metadata(&src).unwrap().len(),
-        "the destination is larger than the source it came from"
+        dst_len < materialized,
+        "the destination ({dst_len} B) still carries the {materialized} B of \
+         elements the source never stored"
+    );
+
+    // The reference library reads its own convention back.
+    let c = hdf5::File::open(&dst).unwrap();
+    assert_eq!(
+        c.dataset("col").unwrap().read_raw::<i32>().unwrap(),
+        vec![7i32; N],
+        "the C library reads the repacked dataset as its fill value"
     );
 }
 
