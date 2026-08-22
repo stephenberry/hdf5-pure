@@ -107,9 +107,15 @@ NEXT="$(printf '%s' "$LAST_TAG" | awk -F. '{printf "%d.%d.0", $1, $2 + 1}')"
 note "Releasing $LAST_TAG -> $NEXT in the clone"
 
 # The clone tracks the working tree's release.sh, not HEAD's, so an uncommitted
-# change to it is what gets checked.
+# change to it is what gets checked. It has to be committed, because release.sh
+# refuses to release from a dirty tree — and it has to survive being identical to
+# HEAD, which is the case whenever this runs on a clean checkout: `git commit`
+# exits non-zero with nothing staged, and under `set -e` that ends the run before
+# a single check.
 cp "$REPO_ROOT/scripts/release.sh" "$WORK/repo/scripts/release.sh"
-git -C "$WORK/repo" commit -qam "the release.sh under test"
+if ! git -C "$WORK/repo" diff --quiet; then
+  git -C "$WORK/repo" commit -qam "the release.sh under test"
+fi
 BASELINE="$(git -C "$WORK/repo" rev-parse HEAD)"
 
 # Back to the committed baseline, tag included: a case that runs --commit leaves
