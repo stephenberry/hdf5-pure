@@ -1070,6 +1070,23 @@ pub enum Error {
     /// recovery for the latter. A live SWMR writer can still be followed with
     /// [`crate::File::open_swmr`]. The payload is a human-readable reason.
     FileMarkedInUse(String),
+    /// A [`commit`](crate::File::commit) failed, *and* could not put back a
+    /// value it had already written over — so the file holds part of a batch
+    /// that was refused.
+    ///
+    /// Every other edit a commit applies lands where nothing reaches it until
+    /// the superblock is repointed, so a commit that stops short of that leaves
+    /// the file exactly as it found it. A same-length value overwrite is the
+    /// exception: it writes straight over the dataset's existing data block,
+    /// which the live root already reaches. A refused commit therefore replays
+    /// the prior bytes over each such write before returning, and this is what
+    /// it returns instead when that replay itself failed.
+    ///
+    /// It is the one refusal after which a caller must **re-read** rather than
+    /// simply retry: the datasets the batch overwrote may hold either value.
+    /// The carried error is the write failure that prevented the restore, not
+    /// the one that refused the commit.
+    CommitPartiallyApplied(Box<Error>),
 }
 
 #[cfg(feature = "std")]
@@ -1118,6 +1135,11 @@ impl fmt::Display for Error {
             }
             Error::FileLocked(reason) => write!(f, "file is locked: {reason}"),
             Error::FileMarkedInUse(reason) => write!(f, "file is marked in use: {reason}"),
+            Error::CommitPartiallyApplied(cause) => write!(
+                f,
+                "a refused commit could not restore a value it had overwritten, so the file \
+                 holds part of the refused batch: {cause}"
+            ),
         }
     }
 }
@@ -1128,6 +1150,7 @@ impl std::error::Error for Error {
         match self {
             Error::Io(e) => Some(e),
             Error::Format(e) => Some(e),
+            Error::CommitPartiallyApplied(e) => Some(&**e),
             _ => None,
         }
     }

@@ -787,6 +787,26 @@ pub(crate) struct WriteEngine {
     /// there. Drained into the commit's `to_free` list; cleared at commit entry,
     /// so an attempt that fails partway frees nothing on the next one.
     superseded_heaps: Vec<(u64, u64)>,
+    /// The bytes each same-length in-place overwrite of the commit in flight
+    /// wrote over, so a commit that fails before its linearization point can put
+    /// the dataset's values back (issue #344).
+    ///
+    /// Everything else a commit places is written where nothing reaches it until
+    /// the superblock is repointed, so an attempt that stops short of the
+    /// repoint is invisible. A same-length value overwrite is the exception:
+    /// [`WritePlan::InPlace`] writes straight over the dataset's existing data
+    /// block, which the *current* root already reaches, so there is no repoint
+    /// to withhold and the new values are live the moment they land. This
+    /// journal is how they are withheld anyway.
+    ///
+    /// Written only by
+    /// [`write_inplace_journaled`](Self::write_inplace_journaled) and drained
+    /// only by [`undo_inplace_writes`](Self::undo_inplace_writes), and empty
+    /// whenever [`commit`](Self::commit) is not running: it holds a copy of
+    /// every value the attempt replaced, which is the same order as the
+    /// replacement bytes the staged set is already holding, but only for the
+    /// length of one apply phase.
+    inplace_undo: Vec<(usize, Vec<u8>)>,
     /// True when this engine was opened for SWMR writing
     /// ([`open_swmr_writer`](Self::open_swmr_writer)): the append engine then
     /// enforces the SWMR subset (unfiltered, chunk-aligned) so a concurrent
@@ -892,8 +912,11 @@ pub(crate) struct WriteEngine {
 /// a chunk blob leaves the list immediately, so no two objects in the same commit
 /// can be handed the same region. If the commit then fails, those regions are as
 /// dead as they were before it started: nothing the commit wrote is reachable,
-/// because the superblock still names the old root. Restoring this snapshot gives
-/// them back instead of leaking them for the rest of the session.
+/// because the superblock still names the old root — and the one write that does
+/// not wait for the repoint, a same-length value overwrite, has been put back by
+/// [`WriteEngine::undo_inplace_writes`] before this is restored (issue #344).
+/// Restoring this snapshot gives them back instead of leaking them for the rest
+/// of the session.
 ///
 /// The restore is sound only *before* the repoint. After it, the objects written
 /// into those regions are live, and handing the same addresses out again would
@@ -1648,6 +1671,24 @@ impl WriteEngine {
         })
     }
 
+    /// Open exactly as [`open_with_locking`](Self::open_with_locking) does, but
+    /// behind an image whose writes into `fails` behave like a dying device:
+    /// the first alters the file and then errors, the rest are refused
+    /// outright. See [`crate::image::TornWriteImage`] for why it takes both to
+    /// reach the state a refused commit cannot repair.
+    #[cfg(test)]
+    pub(crate) fn open_torn_writes(
+        path: &Path,
+        fails: core::ops::Range<u64>,
+    ) -> Result<Self, Error> {
+        Self::open_imaged(path, Some(FileLocking::Enabled), |handle, _len| {
+            Ok(Box::new(crate::image::TornWriteImage::new(
+                Self::read_mirror(handle)?,
+                fails,
+            )))
+        })
+    }
+
     /// Open a bounded session whose image counts the bytes read through it, so a
     /// test can assert that an operation touches only a small part of the file.
     /// The counter is shared with the caller.
@@ -2029,6 +2070,7 @@ impl WriteEngine {
             located: HashMap::new(),
             vl_overwrite_heaps: HashMap::new(),
             superseded_heaps: Vec::new(),
+            inplace_undo: Vec::new(),
             swmr_mode: false,
             paged: None,
             committed: false,
@@ -3623,9 +3665,28 @@ impl WriteEngine {
     /// staged set rather than restoring it: the file is valid but some of the
     /// batch is in it as slack, and a later `commit` must not re-issue the rest
     /// as if nothing had happened.
+    ///
+    /// **What the file holds is a separate promise, and it survives that
+    /// failure: a refused commit leaves every dataset reading what it read
+    /// before.** "Slack" describes all but one of the edits a commit applies.
+    /// The exception is a same-length value overwrite, which writes straight
+    /// over the dataset's existing data block and so is live the moment it
+    /// lands, with no repoint to withhold; a commit that fails before its
+    /// repoint writes the prior bytes back over every one of them (issue #344).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::CommitPartiallyApplied`] — carrying the write failure,
+    /// not the refusal — when that restore itself failed, which is the one
+    /// refusal after which a dataset the batch named may hold either value.
+    /// Every other refusal leaves them all as they were.
     pub fn commit(&mut self) -> Result<(), Error> {
         let snapshot = self.snapshot_free();
         self.repointed = false;
+        debug_assert!(
+            self.inplace_undo.is_empty(),
+            "a commit leaves no journal behind, whichever way it ends"
+        );
         // The staged set comes out for the duration of the attempt and goes back
         // if the attempt refuses, so a refusal costs the session no staged work
         // (issue #316). What goes back is whatever the attempt did not take: its
@@ -3634,11 +3695,29 @@ impl WriteEngine {
         // edit and a failure past that point restores nothing.
         let mut staged = std::mem::take(&mut self.staged);
         let result = self.commit_inner(&mut staged);
-        if result.is_err() && !self.repointed {
+        let restored = if result.is_err() && !self.repointed {
+            // The values go back *before* the free lists. Nothing today writes
+            // an allocated address into an in-place overwrite — `prepare_write`
+            // relocates a staged variable-length one for exactly that reason
+            // (issue #321) — so this order decides nothing yet. It is the order
+            // that stays correct if that ever changes, and it costs nothing:
+            // restore the file, then re-offer its regions (issue #344).
+            let restored = self.undo_inplace_writes();
             self.restore_free(snapshot);
             self.staged = staged;
+            restored
+        } else {
+            Ok(())
+        };
+        // Past the repoint the overwrite is part of what the commit published,
+        // and on success it is the file's value: neither is anything to undo.
+        self.inplace_undo.clear();
+        match restored {
+            // The refusal is the less consequential of the two: the caller can
+            // act on it only after re-reading the datasets this batch named.
+            Err(e) => Err(Error::CommitPartiallyApplied(Box::new(e))),
+            Ok(()) => result,
         }
-        result
     }
 
     /// The free lists as they stand now, for [`commit`](Self::commit) to restore
@@ -3657,12 +3736,79 @@ impl WriteEngine {
     /// Put the free lists back as [`snapshot_free`](Self::snapshot_free) found
     /// them. Called only for a commit that failed before publishing anything, so
     /// every region it restores is dead again.
+    ///
+    /// That rests on nothing the live tree reaches naming a span the attempt
+    /// allocated, which takes two rules rather than one. Every object a commit
+    /// *places* is unreachable until the superblock repoint; and the one write
+    /// that does not wait for the repoint — a same-length value overwrite — is
+    /// planned only over bytes that carry no allocated address, because
+    /// [`prepare_write`](Self::prepare_write) relocates a staged
+    /// variable-length overwrite instead of writing it in place, which is
+    /// exactly the counterexample (issue #321).
+    ///
+    /// [`undo_inplace_writes`](Self::undo_inplace_writes) has nevertheless run
+    /// by the time this does, so the file's values are back before its regions
+    /// are offered again (issue #344).
     fn restore_free(&mut self, snapshot: FreeSnapshot) {
         self.vl_overwrite_heaps = snapshot.vl_overwrite_heaps;
         self.free = snapshot.free;
         if let (Some(pg), Some((meta, raw))) = (self.paged.as_mut(), snapshot.paged) {
             pg.meta = meta;
             pg.raw = raw;
+        }
+    }
+
+    /// Overwrite `raw` at `at`, keeping the bytes it replaces so a commit that
+    /// fails before its repoint can put them back.
+    ///
+    /// The read covers exactly the range about to be written, which the write
+    /// preflight sized and bounds-checked against the on-disk dataset — a
+    /// same-length overwrite by construction.
+    fn write_inplace_journaled(&mut self, at: usize, raw: &[u8]) -> Result<(), Error> {
+        let prior = self.image().read_exact_at(at as u64, raw.len())?;
+        self.inplace_undo.push((at, prior));
+        self.write_at(at, raw)
+    }
+
+    /// Put back the values the refused commit's same-length in-place overwrites
+    /// replaced, and drop the journal.
+    ///
+    /// The third leg of a refused commit's rollback, beside
+    /// [`restore_free`](Self::restore_free) and the staged set: those two give
+    /// back what the attempt *consumed*, this gives back what it *changed*. It
+    /// is the only one of the three that has to touch the file, because a
+    /// same-length overwrite is the only edit a commit writes over bytes the
+    /// live root already reaches (issue #344).
+    ///
+    /// # Errors
+    ///
+    /// Every entry is attempted even after one fails, so the file is restored as
+    /// far as it can be, and the first failure met is what comes back. That is the
+    /// one outcome leaving values from a batch that was refused, which is why
+    /// [`commit`](Self::commit) reports it as
+    /// [`Error::CommitPartiallyApplied`] rather than as the refusal.
+    fn undo_inplace_writes(&mut self) -> Result<(), Error> {
+        let journal = core::mem::take(&mut self.inplace_undo);
+        if journal.is_empty() {
+            return Ok(());
+        }
+        let mut failed = None;
+        // Newest first, which is what an undo log means. Today's entries cannot
+        // overlap — one commit refuses to overwrite the same dataset twice — so
+        // the order decides nothing, and saying it here is cheaper than
+        // depending on that.
+        for (at, prior) in journal.into_iter().rev() {
+            if let Err(e) = self.write_at(at, &prior) {
+                failed.get_or_insert(e);
+            }
+        }
+        match failed {
+            Some(e) => Err(e),
+            // The commit orders these writes with a barrier of its own, so
+            // order the replacements the same way rather than leaving them
+            // behind whatever it managed to issue. They move no end-of-file,
+            // so the data-only barrier is the one that fits.
+            None => self.barrier_data(),
         }
     }
 
@@ -3983,14 +4129,16 @@ impl WriteEngine {
             // retryable — these overwrites are same-length writes to fixed
             // addresses, so repeating them is idempotent — but that reads the
             // rule the other way round for one path, on an argument nothing
-            // enforces, and the only case that can tell the two apart is a
-            // `write_at` that fails partway, which no test here can produce.
+            // enforces. What the file holds is settled separately and the same
+            // way on both paths: a `write_at` that fails partway is undone
+            // through the journal below, so the batch is dropped but the
+            // dataset's values are the ones it had (issue #344).
             drop(std::mem::take(staged));
             for (data_addr, bytes) in &inplace_writes {
                 // Every entry here stages nothing (the guard above), so this
                 // hands back the staged bytes unchanged and unallocated.
                 let raw = self.resolve_overwrite_bytes(bytes)?;
-                self.write_at(*data_addr, &raw)?;
+                self.write_inplace_journaled(*data_addr, &raw)?;
             }
             self.barrier()?;
             return Ok(());
@@ -4848,14 +4996,15 @@ impl WriteEngine {
         // unchanged), so the write is independent of the superblock flip; it is
         // ordered before the barrier sync below so the new bytes are durable
         // alongside everything else this commit appended.
-        // A staged variable-length overwrite resolves here: its global heap
-        // collections are placed and their addresses patched into the element
-        // references before the data block is written (issue #321). The
-        // collections are appended, which the superblock this path rewrites
-        // below records.
+        // Nothing resolved here allocates: `prepare_write` plans a staged
+        // variable-length overwrite as a relocating write rather than an
+        // in-place one (issue #321), so every entry hands its staged bytes back
+        // untouched — which the `vlen.is_none()` assertion guarding the fast
+        // path states for the whole list, this one included. The journal
+        // therefore costs one copy of each value being replaced and no more.
         for (data_addr, bytes) in &inplace_writes {
             let raw = self.resolve_overwrite_bytes(bytes)?;
-            self.write_at(*data_addr, &raw)?;
+            self.write_inplace_journaled(*data_addr, &raw)?;
         }
 
         // Every group's new header address is known now that the apply loop has
@@ -12739,6 +12888,239 @@ mod tests {
         assert_eq!(f.dataset("ceiling").unwrap().read_i32().unwrap(), ceiling);
         assert!(f.dataset("victim").is_err());
         assert!(f.dataset("fresh").is_err());
+    }
+
+    /// A refused commit leaves every dataset reading what it read before —
+    /// including the one whose values it had already written over (issue #344).
+    ///
+    /// Everything else a commit places lands where nothing reaches it until the
+    /// superblock is repointed, so an attempt that stops short of the repoint is
+    /// invisible. A same-length value overwrite is the exception: it writes
+    /// straight over the data block the *current* root already reaches, so there
+    /// is no repoint to withhold and the write is live the moment it lands. Both
+    /// halves of one refused batch are asserted here, because the defect was
+    /// that they disagreed: the overwrite survived and the object creation
+    /// beside it did not.
+    ///
+    /// Closing the session is enough to expose it — no later commit is needed,
+    /// since the bytes are in the file already and write gathering only delays
+    /// when they reach the disk.
+    ///
+    /// A second staged edit is what keeps this on the full commit path; a batch
+    /// of nothing but same-length overwrites takes the fast path, which
+    /// `a_failed_fast_path_commit_puts_back_the_value_it_overwrote` covers. The
+    /// failure is induced the same way as
+    /// [`failed_paged_commit_leaves_the_free_lists_untouched`]: an unreadable
+    /// superblock extension, which fails the commit in its tail, after the apply
+    /// phase has done the in-place write.
+    #[test]
+    fn a_failed_commit_puts_back_the_value_it_overwrote() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("inplace_partial.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("nums").with_i32_data(&[1, 2, 3]);
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+        b.write(&path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+
+        let good_ext = s.superblock.superblock_extension_address;
+        s.superblock.superblock_extension_address = Some(0);
+        s.stage_dataset_write("/nums", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&[9, 9, 9]);
+            db
+        })
+        .unwrap();
+        s.stage_created_dataset("/extra", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&[42]);
+            db
+        })
+        .unwrap();
+        let refused = s.commit();
+        assert!(
+            matches!(refused, Err(Error::EditUnsupported(_))),
+            "the refusal, not a rollback failure: {refused:?}"
+        );
+
+        // The session stays usable, and its next commit is not carrying any of
+        // the refused batch.
+        s.superblock.superblock_extension_address = good_ext;
+        s.stage_created_dataset("/later", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&[7]);
+            db
+        })
+        .unwrap();
+        s.commit()
+            .expect("the session is usable after a failed commit");
+
+        // Release the session's exclusive OS lock before reading the file back;
+        // those locks are mandatory on Windows.
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("nums").unwrap().read_i32().unwrap(),
+            vec![1, 2, 3],
+            "the refused batch's value overwrite is in the file"
+        );
+        assert!(
+            f.dataset("extra").is_err(),
+            "/extra was correctly discarded"
+        );
+        assert_eq!(f.dataset("later").unwrap().read_i32().unwrap(), vec![7]);
+    }
+
+    /// The same guarantee on the commit fast path, where a batch of nothing but
+    /// same-length overwrites skips the header rebuild and the superblock flip
+    /// entirely (issue #344).
+    ///
+    /// That path has no tail to fail in, so the only failure it can suffer is
+    /// one of its own writes — which is also the one failure the rollback cannot
+    /// fully repair, since putting the prior bytes back means writing to the
+    /// address that just refused them. Both outcomes are pinned here: the
+    /// overwrite that *did* land is put back, the one that could not be is
+    /// reported as [`Error::CommitPartiallyApplied`] rather than as a plain I/O
+    /// error, and the values in the file are exactly what those two statements
+    /// predict.
+    ///
+    /// `TornWriteImage` supplies the failure at a byte range rather than at a
+    /// call ordinal, so the test names the block it means (`victim`'s) instead
+    /// of depending on how many writes a commit happens to issue.
+    ///
+    /// `kept` is staged first on purpose. Staged writes are applied in the order
+    /// they were staged (`StagedEdits::writes` is a `Vec`), so it is the entry
+    /// already in the journal when `victim` fails — and restoring it is what
+    /// shows the rollback carrying on past a failure rather than giving up at
+    /// the first one. Stage them the other way round and that half goes quiet.
+    #[test]
+    fn a_failed_fast_path_commit_puts_back_the_value_it_overwrote() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("inplace_fast_path_torn.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("kept").with_i32_data(&[1, 2, 3]);
+        b.create_dataset("victim").with_i32_data(&[4, 5, 6]);
+        b.write(&path).unwrap();
+
+        // The data block the fake device refuses, named rather than guessed.
+        let victim_block = {
+            let f = crate::reader::File::open(&path).unwrap();
+            match f.dataset("victim").unwrap().layout().unwrap() {
+                crate::Layout::Contiguous {
+                    address: Some(a),
+                    size,
+                } => a..a + size,
+                other => panic!("expected a contiguous victim: {other:?}"),
+            }
+        };
+
+        let mut s = WriteEngine::open_torn_writes(&path, victim_block).unwrap();
+        for (name, data) in [("/kept", [9, 9, 9]), ("/victim", [8, 8, 8])] {
+            s.stage_dataset_write(name, {
+                let mut db = crate::type_builders::DatasetBuilder::new("");
+                db.with_i32_data(&data);
+                db
+            })
+            .unwrap();
+        }
+        let refused = s.commit();
+        assert!(
+            matches!(refused, Err(Error::CommitPartiallyApplied(_))),
+            "a rollback that could not run is not an ordinary refusal: {refused:?}"
+        );
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("kept").unwrap().read_i32().unwrap(),
+            vec![1, 2, 3],
+            "the overwrite the rollback could reach is put back"
+        );
+        assert_eq!(
+            f.dataset("victim").unwrap().read_i32().unwrap(),
+            vec![8, 8, 8],
+            "the overwrite it could not reach is the value the error is about"
+        );
+    }
+
+    /// Past the superblock repoint the overwrite is part of what the commit
+    /// *published*, so a failure after that point must leave it standing —
+    /// the same boundary [`FreeSnapshot`] draws for the free lists (issue #344).
+    ///
+    /// The window is real rather than theoretical: `repoint_stored_references`
+    /// runs after the repoint and writes into live objects. A reference to the
+    /// root group is what makes it run on any commit at all, since every commit
+    /// rebuilds the root; the fake device then fails that write, so the commit
+    /// returns an error having already committed.
+    ///
+    /// What the file holds afterwards is the new tree — the value overwrite
+    /// included — with one stale reference. That is not a state a rollback can
+    /// improve on: the root the reference would have to be re-pointed at is
+    /// already the live one.
+    #[test]
+    fn a_commit_that_fails_past_its_repoint_keeps_the_value_it_published() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("inplace_after_repoint.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("nums").with_i32_data(&[1, 2, 3]);
+        b.create_dataset("refs").with_path_references(&[""]);
+        b.write(&path).unwrap();
+
+        let refs_block = {
+            let f = crate::reader::File::open(&path).unwrap();
+            match f.dataset("refs").unwrap().layout().unwrap() {
+                crate::Layout::Contiguous {
+                    address: Some(a),
+                    size,
+                } => a..a + size,
+                other => panic!("expected a contiguous reference dataset: {other:?}"),
+            }
+        };
+
+        let mut s = WriteEngine::open_torn_writes(&path, refs_block).unwrap();
+        s.stage_dataset_write("/nums", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&[9, 9, 9]);
+            db
+        })
+        .unwrap();
+        // A second edit, so the batch takes the full commit path and reaches a
+        // repoint at all.
+        s.stage_created_dataset("/extra", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&[42]);
+            db
+        })
+        .unwrap();
+        let failed = s.commit();
+        assert!(
+            matches!(failed, Err(Error::Io(_))),
+            "the reference write is what failed, after the commit published: {failed:?}"
+        );
+        assert!(
+            s.repointed,
+            "the failure has to be past the repoint for this test to mean anything"
+        );
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("nums").unwrap().read_i32().unwrap(),
+            vec![9, 9, 9],
+            "the published overwrite must not be rolled back under it"
+        );
+        assert_eq!(f.dataset("extra").unwrap().read_i32().unwrap(), vec![42]);
     }
 
     #[test]

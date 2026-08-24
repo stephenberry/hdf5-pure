@@ -2088,6 +2088,21 @@ impl File {
     /// [`SyncPolicy::Always`]; under
     /// [`SyncPolicy::OnClose`](crate::SyncPolicy::OnClose) it has reached the
     /// operating system and waits for a [`sync`](Self::sync).
+    ///
+    /// **A refused commit leaves every dataset reading what it read before.**
+    /// Almost everything a commit writes lands where nothing reaches it until
+    /// the commit's linearization point; the one edit that does not is a
+    /// same-length [`Dataset::write`], which overwrites the dataset's existing
+    /// block, and a refusal writes those bytes back on its way out. A refusal
+    /// raised before the first write keeps the staged batch too, so it can be
+    /// corrected and committed again (issue #316).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::CommitPartiallyApplied`](crate::Error::CommitPartiallyApplied)
+    /// is the one refusal that does not carry that promise — the restore itself
+    /// failed, so a dataset the batch named may hold either value — and calls
+    /// for re-reading those datasets rather than for a retry.
     pub fn commit(&self) -> Result<(), Error> {
         self.with_mirror_session(true, |session| session.commit())
     }

@@ -1347,6 +1347,105 @@ impl FileImage for CountingImage {
     }
 }
 
+/// A [`MirrorImage`] whose writes into one byte range fail the way a dying
+/// device does: the first such write **alters the file and then reports an
+/// error**, and every one after it is refused outright, having changed nothing.
+///
+/// Both halves are needed to reach the single state that a refused commit
+/// cannot repair (issue #344). The first makes the commit's in-place overwrite
+/// land while failing the commit; the second makes the undo that would put the
+/// prior bytes back fail in turn, so the file keeps a value from a batch that
+/// was refused. A fake that merely refused the write would leave the file intact
+/// and prove nothing about that state, and one that applied the write without
+/// reporting an error would not fail the commit at all.
+///
+/// Writes outside the range are ordinary writes, so a commit can be given one
+/// overwrite that survives its rollback and one that does not.
+#[cfg(test)]
+pub(crate) struct TornWriteImage {
+    inner: MirrorImage,
+    fails: core::ops::Range<u64>,
+    struck: bool,
+}
+
+#[cfg(test)]
+impl TornWriteImage {
+    pub(crate) fn new(inner: MirrorImage, fails: core::ops::Range<u64>) -> Self {
+        Self {
+            inner,
+            fails,
+            struck: false,
+        }
+    }
+
+    /// Whether `[offset, offset + len)` meets the failing range.
+    fn hits(&self, offset: u64, len: usize) -> bool {
+        offset < self.fails.end && self.fails.start < offset.saturating_add(len as u64)
+    }
+
+    fn failure() -> Error {
+        Error::Io(std::io::Error::other("simulated device write failure"))
+    }
+}
+
+#[cfg(test)]
+impl Source for TornWriteImage {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        self.inner.read_at(offset, buf)
+    }
+}
+
+#[cfg(test)]
+impl FileImage for TornWriteImage {
+    fn append(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        self.inner.append(bytes)
+    }
+
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
+        if !self.hits(offset, bytes.len()) {
+            return self.inner.write_at(offset, bytes);
+        }
+        if self.struck {
+            return Err(Self::failure());
+        }
+        self.struck = true;
+        self.inner.write_at(offset, bytes)?;
+        Err(Self::failure())
+    }
+
+    fn truncate(&mut self, len: u64) -> Result<(), Error> {
+        self.inner.truncate(len)
+    }
+
+    fn sync_data(&mut self) -> Result<(), Error> {
+        self.inner.sync_data()
+    }
+
+    fn sync_all(&mut self) -> Result<(), Error> {
+        self.inner.sync_all()
+    }
+
+    fn ordering_barrier(&mut self) -> Result<(), Error> {
+        self.inner.ordering_barrier()
+    }
+
+    fn issued_write_order(&self) -> Vec<(u64, u64)> {
+        self.inner.issued_write_order()
+    }
+
+    fn set_write_buffering(&mut self, mode: WriteBuffering) -> Result<(), Error> {
+        self.inner.set_write_buffering(mode)
+    }
+
+    fn as_slice(&self) -> Option<&[u8]> {
+        self.inner.as_slice()
+    }
+}
+
 /// A [`MirrorImage`] that withholds its slice, so every read routed through it
 /// takes the [`Source`] path instead of the whole-file fast path.
 ///
