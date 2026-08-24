@@ -193,6 +193,7 @@
 //! repoint leaves the prior file wholly intact. Whole-file compaction that
 //! reclaims every hole at once is still the separate repack path.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -886,6 +887,15 @@ pub(crate) struct WriteEngine {
 struct FreeSnapshot {
     free: FreeList,
     paged: Option<(FreeList, FreeList)>,
+    /// The heap-collection provenance, rolled back with the free lists.
+    ///
+    /// [`resolve_overwrite_bytes`](WriteEngine::resolve_overwrite_bytes) records
+    /// a placement in the *apply* phase, so a commit that fails after that and
+    /// before its repoint hands the space back to the free list while leaving a
+    /// record naming it. The next overwrite of that path would then free a
+    /// region already handed out — the one piece of engine state naming file
+    /// addresses that this rollback used to miss (issue #321).
+    vl_overwrite_heaps: HashMap<PathKey, Vec<(u64, u64)>>,
 }
 
 /// How much memory a read-write open may use to hold the file being edited.
@@ -3338,6 +3348,7 @@ impl WriteEngine {
                 .paged
                 .as_ref()
                 .map(|pg| (pg.meta.clone(), pg.raw.clone())),
+            vl_overwrite_heaps: self.vl_overwrite_heaps.clone(),
         }
     }
 
@@ -3345,6 +3356,7 @@ impl WriteEngine {
     /// them. Called only for a commit that failed before publishing anything, so
     /// every region it restores is dead again.
     fn restore_free(&mut self, snapshot: FreeSnapshot) {
+        self.vl_overwrite_heaps = snapshot.vl_overwrite_heaps;
         self.free = snapshot.free;
         if let (Some(pg), Some((meta, raw))) = (self.paged.as_mut(), snapshot.paged) {
             pg.meta = meta;
@@ -4588,6 +4600,12 @@ impl WriteEngine {
                 .drain(..)
                 .map(|(addr, len)| (addr, len, PageType::Meta)),
         );
+        // Re-run the whole-commit invariant over the set these just joined. The
+        // pass above ran before the in-place writes resolved, so it never saw
+        // them — and a heap collection is the span that most needs the check,
+        // being the only one freed on the strength of a *record* rather than of
+        // a structure read back out of the file this commit is rewriting.
+        retain_disjoint_in_bounds(&mut to_free, self.image.len());
 
         // A persisting file keeps its freed space recorded on disk rather than
         // truncating it away, so its commit takes a different, append-only tail.
@@ -6903,8 +6921,8 @@ impl WriteEngine {
                 bytes,
                 ..
             } => {
-                let raw = &self.resolve_overwrite_bytes(bytes)?;
-                let new_data_addr = self.alloc_or_append_typed(raw, PageType::Raw)?;
+                let raw = self.resolve_overwrite_bytes(bytes)?;
+                let new_data_addr = self.alloc_or_append_typed(&raw, PageType::Raw)?;
                 let mut region = region.clone();
                 // The placement is an absolute file offset; the contiguous
                 // data-layout field stores it relative to the userblock base (`-
@@ -7327,11 +7345,19 @@ impl WriteEngine {
     /// nothing has been able to name them twice — see
     /// [`vl_overwrite_heaps`](Self::vl_overwrite_heaps) for why that provenance
     /// is the whole proof, and `repack` for the collections it cannot make.
-    fn resolve_overwrite_bytes(&mut self, bytes: &OverwriteBytes) -> Result<Vec<u8>, Error> {
-        let mut raw = bytes.raw.clone();
+    fn resolve_overwrite_bytes<'a>(
+        &mut self,
+        bytes: &'a OverwriteBytes,
+    ) -> Result<Cow<'a, [u8]>, Error> {
         let Some(staging) = &bytes.staging else {
-            return Ok(raw);
+            // Nothing to resolve, and nothing to copy: every overwrite but a
+            // variable-length one takes this path, and the in-place loop writes
+            // straight through the borrow as it did before any of this. Cloning
+            // here would charge each of them a second copy of its whole payload,
+            // which the bounded backing in particular is built not to pay.
+            return Ok(Cow::Borrowed(&bytes.raw));
         };
+        let mut raw = bytes.raw.clone();
         // An all-null (or empty) dataset stages no collection at all, and
         // patching nothing is the correct answer for it: a null element's
         // reference must keep the zero address that makes it read back null.
@@ -7353,7 +7379,7 @@ impl WriteEngine {
             self.vl_overwrite_heaps.insert(bytes.path.clone(), placed);
         }
         self.superseded_heaps.extend_from_slice(&bytes.superseded);
-        Ok(raw)
+        Ok(Cow::Owned(raw))
     }
 
     /// Forget every heap collection this session recorded as exclusively one
@@ -12173,6 +12199,86 @@ mod tests {
         assert!(
             freed < live_end,
             "the recorded free space cannot cover the whole file"
+        );
+    }
+
+    /// A commit that fails partway must roll back the heap-collection
+    /// provenance along with the free lists (issue #321).
+    ///
+    /// `resolve_overwrite_bytes` places a collection and records it in the
+    /// *apply* phase. A commit that then fails before its repoint gives that
+    /// space back to the free list — and used to keep the record, which is the
+    /// one piece of engine state naming file addresses that the rollback missed.
+    /// The next overwrite of that path would free the region a *later* commit
+    /// had since been handed, so the file's live variable-length data would sit
+    /// in space the allocator considers free, and the next unrelated write would
+    /// land on it.
+    ///
+    /// Induced the same way as
+    /// [`failed_paged_commit_leaves_the_free_lists_untouched`]: an unreadable
+    /// superblock extension fails the commit after the apply phase has run.
+    #[test]
+    fn a_failed_commit_rolls_back_the_heap_collection_provenance() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("failed_commit_vl_provenance.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("labels")
+            .with_vlen_strings(&["seed-one", "seed-two"]);
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+        b.write(&path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+
+        // One good round, so there is a record to roll back.
+        s.stage_dataset_write("/labels", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_vlen_strings(&["round-one-aaaa", "round-one-bbbb"]);
+            db
+        })
+        .unwrap();
+        s.commit().unwrap();
+        let recorded = s.vl_overwrite_heaps.clone();
+        assert!(!recorded.is_empty(), "the good round recorded nothing");
+
+        // Break the extension so the next commit fails after the apply phase.
+        let good_ext = s.superblock.superblock_extension_address;
+        s.superblock.superblock_extension_address = Some(0);
+        s.stage_dataset_write("/labels", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_vlen_strings(&["round-two-aaaa", "round-two-bbbb"]);
+            db
+        })
+        .unwrap();
+        assert!(
+            s.commit().is_err(),
+            "a commit with an unreadable extension must fail"
+        );
+
+        assert_eq!(
+            s.vl_overwrite_heaps, recorded,
+            "a failed commit must not leave a record naming space it gave back"
+        );
+
+        // The session stays usable, and the collections the rolled-back record
+        // names are still the live ones.
+        s.superblock.superblock_extension_address = good_ext;
+        s.stage_dataset_write("/labels", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_vlen_strings(&["round-three-a", "round-three-b"]);
+            db
+        })
+        .unwrap();
+        s.commit()
+            .expect("the session is usable after a failed commit");
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("labels").unwrap().read_string().unwrap(),
+            vec!["round-three-a".to_string(), "round-three-b".to_string()]
         );
     }
 

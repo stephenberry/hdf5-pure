@@ -6217,3 +6217,77 @@ fn a_copy_stops_a_vlen_overwrite_from_reclaiming_the_shared_collection() {
         generation(7)
     );
 }
+
+/// A builder's variable-length staging describes the bytes in its `data` field,
+/// so replacing those bytes must drop it (issue #321).
+///
+/// `with_raw_data` after `with_vlen_strings` used to leave a staging that owned
+/// one patch offset while `data` held a whole new array: the commit patched
+/// element 0 against a fresh collection and wrote the caller's bytes verbatim
+/// into the rest. Where those bytes were element references read out of another
+/// dataset — which is what `read_raw` hands back and what `with_raw_data`
+/// documents taking — two datasets ended up naming one global heap collection
+/// with nothing recording it, and the next overwrite of the first freed the
+/// collection the second reads.
+///
+/// The assertion is on the *aliased* dataset after later rounds have had the
+/// chance to reuse the freed space, for the same reason as the copy test above:
+/// a free alone leaves the bytes intact.
+#[test]
+fn replacing_a_builders_data_drops_the_vlen_staging_that_described_it() {
+    let path = temp_path("hdf5_pure_edit_raw_data_drops_staging.h5");
+    let generation =
+        |n: u32| -> Vec<String> { (0..2).map(|i| format!("gen-{n:02}-element-{i}")).collect() };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&generation(1).iter().map(String::as_str).collect::<Vec<_>>());
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let labels_dt = session.dataset("labels").unwrap().datatype().unwrap();
+        let labels_raw = session.dataset("labels").unwrap().read_raw().unwrap();
+
+        // A builder carrying *both* a staging and raw bytes lifted from
+        // "labels". Its element 1 is "labels"'s own element reference.
+        session
+            .root()
+            .create_dataset("alias", |b| {
+                b.with_shape(&[2]);
+                b.with_vlen_strings(&["only-one"]);
+                b.with_raw_data(labels_dt, labels_raw, 2);
+            })
+            .unwrap();
+        session.commit().unwrap();
+
+        // Rotate "labels". If the staging had survived the raw-bytes call, the
+        // provenance screen would have skipped this entry and these rounds
+        // would free and then overwrite what "alias" points at.
+        for n in 2..10 {
+            let data = generation(n);
+            session
+                .dataset("labels")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>());
+                })
+                .unwrap();
+            session.commit().unwrap();
+        }
+    }
+
+    let file = File::open(&path).unwrap();
+    // Whatever "alias" holds, it must still be readable and unchanged by the
+    // rotation of an unrelated dataset.
+    let alias = file.dataset("alias").unwrap().read_string().unwrap();
+    assert_eq!(
+        alias[1],
+        generation(1)[1],
+        "the aliased element was freed out from under it and written over"
+    );
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        generation(9)
+    );
+}
