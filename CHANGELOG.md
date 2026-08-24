@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A `DatasetBuilder` given element data twice — `with_vlen_strings` or `with_path_references` followed by `with_raw_data`, say — no longer keeps the first call's staging, which patched part of the second call's bytes and panicked outright when they were shorter ([#321](https://github.com/stephenberry/hdf5-pure/issues/321)).
 - `repack` reproduces a dataset's filter pipeline in the order the source stored it, and keeps each filter's optional flag, instead of rebuilding it in this crate's own order with every filter but LZF marked mandatory. A source that ordered `fletcher32` before deflate checksummed the uncompressed bytes and arrived checksumming the compressed ones; the verbatim chunk-copy path was never affected ([#333](https://github.com/stephenberry/hdf5-pure/issues/333)).
 - `File::copy` and `File::copy_from` reproduce a dataset whose storage was never allocated, instead of refusing it as out of bounds. The copy declares the same empty storage rather than materializing the fill value it reads as, matching `repack` ([#336](https://github.com/stephenberry/hdf5-pure/issues/336)).
 - `File::copy` and `File::copy_from` refuse a dataset whose data lives in external files (`H5Pset_external`) by name, instead of by an out-of-bounds error a valid never-written dataset also got. Deleting such a dataset now leaves its object header as dead space rather than reclaiming it ([#336](https://github.com/stephenberry/hdf5-pure/issues/336)).

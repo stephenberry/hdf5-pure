@@ -6373,3 +6373,40 @@ fn replacing_a_builders_data_drops_the_vlen_staging_that_described_it() {
         generation(9)
     );
 }
+
+/// The crash half of the same defect: a builder whose staged element data is
+/// replaced by *fewer* bytes than the staging describes (issue #321).
+///
+/// `patch_vl_refs_masked` writes eight bytes at each staged offset without
+/// checking them against the buffer, so a surviving staging over a shorter
+/// replacement indexed out of bounds. On the whole-file writer that was a panic
+/// out of `FileBuilder::write` in every released version, reachable from a
+/// public builder with no unsafe and no malformed file involved.
+///
+/// Dropping the staging with the bytes it described removes the crash and the
+/// silent half together, which is why this asserts a plain successful write.
+#[test]
+fn replacing_staged_data_with_fewer_bytes_does_not_panic() {
+    let path = temp_path("hdf5_pure_edit_short_raw_after_staging.h5");
+    let dt = {
+        let seed = temp_path("hdf5_pure_edit_short_raw_seed.h5");
+        let mut t = FileBuilder::new();
+        t.create_dataset("x").with_vlen_strings(&["a", "b"]);
+        t.write(&seed).unwrap();
+        let f = File::open(&seed).unwrap();
+        f.dataset("x").unwrap().datatype().unwrap()
+    };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("d")
+        .with_shape(&[1])
+        .with_vlen_strings(&["aa", "bb"])
+        .with_raw_data(dt, vec![0u8; 16], 1);
+    b.write(&path)
+        .expect("a shorter replacement must not panic");
+
+    // One element, and it is the raw bytes as given: an all-zero reference,
+    // which is the null every reader answers for it.
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("d").unwrap().read_string().unwrap(), vec![""]);
+}
