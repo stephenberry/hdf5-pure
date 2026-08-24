@@ -1956,6 +1956,20 @@ impl DatasetBuilder {
     /// example from reading an existing dataset — be re-emitted without a typed
     /// helper. The shape defaults to `[num_elements]` unless
     /// [`with_shape`](Self::with_shape) sets it.
+    pub fn with_raw_data(
+        &mut self,
+        datatype: Datatype,
+        raw_data: Vec<u8>,
+        num_elements: u64,
+    ) -> &mut Self {
+        self.datatype = Some(datatype);
+        self.set_element_bytes(raw_data);
+        if self.shape.is_none() {
+            self.shape = Some(vec![num_elements]);
+        }
+        self
+    }
+
     /// Replace the staged element bytes, dropping any staging that described the
     /// *previous* ones.
     ///
@@ -1983,20 +1997,6 @@ impl DatasetBuilder {
         self.data = Some(data);
         self.vl_string_staging = None;
         self.reference_targets = None;
-    }
-
-    pub fn with_raw_data(
-        &mut self,
-        datatype: Datatype,
-        raw_data: Vec<u8>,
-        num_elements: u64,
-    ) -> &mut Self {
-        self.datatype = Some(datatype);
-        self.set_element_bytes(raw_data);
-        if self.shape.is_none() {
-            self.shape = Some(vec![num_elements]);
-        }
-        self
     }
 
     /// Stage a dataset that declares its shape and element type and allocates no

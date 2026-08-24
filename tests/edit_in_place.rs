@@ -6410,3 +6410,100 @@ fn replacing_staged_data_with_fewer_bytes_does_not_panic() {
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("d").unwrap().read_string().unwrap(), vec![""]);
 }
+
+/// The object-reference half of the same builder invariant (issue #321).
+///
+/// `with_path_references` stages placeholder element bytes and a list of
+/// targets to patch into them. Replacing the bytes must drop that list too:
+/// patching is gated on the list being present, never on the datatype, so a
+/// surviving list writes resolved object addresses over whatever the second
+/// call supplied. Here that is ordinary `u64` data, and the file came back
+/// holding the target's header address twice instead of the values asked for.
+///
+/// Its own crash half is quieter than the variable-length one's:
+/// `write_reference_address` only `debug_assert!`s that the slot fits, so a
+/// shorter replacement is a panic in a debug build and a silent skip in a
+/// release one.
+#[test]
+fn replacing_a_builders_data_drops_the_reference_targets_that_described_it() {
+    let path = temp_path("hdf5_pure_edit_raw_data_drops_reference_targets.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("target").with_i32_data(&[7]);
+    b.create_dataset("d")
+        .with_path_references(&["target", "target"])
+        .with_u64_data(&[0xAAAA_AAAA, 0xBBBB_BBBB]);
+    b.write(&path).unwrap();
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("d").unwrap().read_u64().unwrap(),
+        vec![0xAAAA_AAAAu64, 0xBBBB_BBBB],
+        "the dropped reference targets were patched over the staged values"
+    );
+}
+
+/// The provenance screen has two doors for raw element bytes, and this is the
+/// one reached by *overwriting* rather than creating (issue #321).
+///
+/// `invalidate_heap_provenance` screens `staged.writes` and `staged.datasets`
+/// alike, because either can carry element bytes the engine does not interpret.
+/// A dataset overwritten with references lifted out of another one aliases its
+/// collections just as a newly created one does, and the record has to be given
+/// up for both.
+#[test]
+fn a_raw_bytes_overwrite_stops_a_vlen_overwrite_from_reclaiming_its_collection() {
+    let path = temp_path("hdf5_pure_edit_raw_overwrite_blocks_reclaim.h5");
+    let generation =
+        |n: u32| -> Vec<String> { (0..2).map(|i| format!("gen-{n:02}-element-{i}")).collect() };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&generation(0).iter().map(String::as_str).collect::<Vec<_>>());
+    b.create_dataset("alias")
+        .with_vlen_strings(&["placeholder-x", "placeholder-y"]);
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let overwrite = |n: u32| {
+            let data = generation(n);
+            session
+                .dataset("labels")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>());
+                })
+                .unwrap();
+            session.commit().unwrap();
+        };
+
+        // Round one records the collections it places for "labels".
+        overwrite(1);
+
+        // Overwrite a *different* dataset with "labels"'s element references.
+        let (dt, raw) = {
+            let ds = session.dataset("labels").unwrap();
+            (ds.datatype().unwrap(), ds.read_raw().unwrap())
+        };
+        session
+            .dataset("alias")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_raw_data(dt, raw, 2);
+            })
+            .unwrap();
+        session.commit().unwrap();
+
+        for n in 2..8 {
+            overwrite(n);
+        }
+    }
+
+    let file = File::open(&path).unwrap();
+    let alias = file.dataset("alias").unwrap().read_string();
+    assert!(
+        alias.as_ref().is_ok_and(|got| *got == generation(1)),
+        "the aliased strings were freed out from under the overwritten dataset \
+         and written over: {alias:?}"
+    );
+}

@@ -3651,13 +3651,18 @@ impl WriteEngine {
         // that takes the full path below (any header/root change) clears the flag
         // as usual.
         //
-        // A staged variable-length overwrite is excluded for the same reason: it
-        // places a global heap collection, and an append moves end-of-file, which
-        // only the superblock this path leaves alone records. It is a same-length
-        // write to its *data block* — the element references keep their width —
-        // so nothing else here would have caught it (issue #321).
+        // A staged variable-length overwrite cannot reach here at all: it
+        // relocates, so `moving_writes` is non-empty for it. That is enforced
+        // where the plan is chosen (`prepare_write`) rather than re-tested here,
+        // and it has to hold for a second reason besides the one that made it
+        // relocate — such an overwrite places a global heap collection, and an
+        // append moves end-of-file, which only the superblock this path leaves
+        // untouched records (issue #321).
+        debug_assert!(
+            inplace_writes.iter().all(|(_, b)| b.vlen.is_none()),
+            "a staged variable-length overwrite must relocate, not write in place"
+        );
         if moving_writes.is_empty()
-            && inplace_writes.iter().all(|(_, b)| b.vlen.is_none())
             && staged.datasets.is_empty()
             && staged.groups.is_empty()
             && staged.group_attrs.is_empty()
@@ -4588,11 +4593,14 @@ impl WriteEngine {
                 .drain(..)
                 .map(|(addr, len)| (addr, len, PageType::Meta)),
         );
-        // Re-run the whole-commit invariant over the set these just joined. The
-        // pass above ran before the in-place writes resolved, so it never saw
-        // them — and a heap collection is the span that most needs the check,
-        // being the only one freed on the strength of a *record* rather than of
-        // a structure read back out of the file this commit is rewriting.
+        // Re-run the whole-commit invariant over the set these just joined, since
+        // the pass above ran before the in-place writes resolved and so never saw
+        // them. This is defensive and nothing reaches it: no test fails when it
+        // is deleted, and no sequence has been found that puts a superseded
+        // collection out of bounds or across another freed span. It is kept
+        // because a heap collection is freed on the strength of a *record*
+        // rather than of a structure read back out of the file, which is the one
+        // span where a stale answer would not be caught by anything else.
         retain_disjoint_in_bounds(&mut to_free, self.image.len());
 
         // A persisting file keeps its freed space recorded on disk rather than
@@ -5708,7 +5716,26 @@ impl WriteEngine {
                 // bytes straight in place. No header rewrite, no relink. The stored
                 // address is base-relative; the in-place write targets the absolute
                 // file offset `data_addr + base`.
-                if data_addr != UNDEF && data_size == fd.raw.len() as u64 {
+                //
+                // Never for a staged variable-length overwrite, which relocates
+                // instead. Its resolution *allocates* — a global heap collection,
+                // drawn from a freed region where one fits — and an in-place write
+                // is a live mutation of a block the current root already reaches.
+                // Together those put a reference to a just-allocated span inside
+                // bytes the live tree names, so a commit failing after the write
+                // and before its repoint hands the span back to the free list
+                // (`restore_free`) while the image still points into it. The next
+                // commit is then free to place something else there, and the
+                // dataset reads that object's bytes with every checksum intact.
+                //
+                // A relocating write has no such window: its new data block is
+                // reachable from nothing until the superblock repoint, so a
+                // failed attempt leaves the region genuinely dead and re-offering
+                // it is sound — which is the invariant `restore_free` states.
+                if fd.vl_string_staging.is_none()
+                    && data_addr != UNDEF
+                    && data_size == fd.raw.len() as u64
+                {
                     if let Some(start) = data_addr
                         .checked_add(base)
                         .and_then(|a| usize::try_from(a).ok())
@@ -12226,6 +12253,91 @@ mod tests {
             f.dataset("labels").unwrap().read_string().unwrap(),
             vec!["round-three-a".to_string(), "round-three-b".to_string()]
         );
+    }
+
+    /// A failed commit must not leave the free list offering a span the image
+    /// still points into (issue #321).
+    ///
+    /// Resolving a staged variable-length overwrite *allocates* — a global heap
+    /// collection, drawn from a freed region where one fits. If the overwrite
+    /// were applied in place, that allocation's address would be written into a
+    /// data block the current root already reaches; a commit failing after the
+    /// write and before its repoint then hands the span back to the free list,
+    /// while the image still names it. The next commit places something else
+    /// there and the dataset reads that object's heap bytes, with every checksum
+    /// in the file intact.
+    ///
+    /// A relocating overwrite has no such window — its new block is reachable
+    /// from nothing until the repoint — which is why `prepare_write` refuses to
+    /// plan a staged variable-length overwrite in place at all. This is that
+    /// rule's test.
+    ///
+    /// The freed hole has to exist *first*, or the failed commit's collection is
+    /// appended past end-of-file where nothing reuses it and the bug hides. The
+    /// filler datasets each need a metadata span of the size the rolled-back one
+    /// occupied, which is what draws on it.
+    #[test]
+    fn a_failed_commit_leaves_no_reusable_span_the_image_names() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("failed_commit_live_span.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("labels")
+            .with_vlen_strings(&["seed-one", "seed-two"]);
+        b.create_dataset("big").with_u8_data(&[0x5A; 40960]);
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+        b.write(&path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        // The hole the collections below are placed into by reuse.
+        s.delete("/big").unwrap();
+        s.commit().unwrap();
+
+        let round_one = ["round-one-aaaa", "round-one-bbbb"];
+        s.stage_dataset_write("/labels", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_vlen_strings(&round_one);
+            db
+        })
+        .unwrap();
+        s.commit().unwrap();
+
+        // Fail a second overwrite after its apply phase has placed a collection.
+        let good_ext = s.superblock.superblock_extension_address;
+        s.superblock.superblock_extension_address = Some(0);
+        s.stage_dataset_write("/labels", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_vlen_strings(&["round-two-aaaa", "round-two-bbbb"]);
+            db
+        })
+        .unwrap();
+        assert!(
+            s.commit().is_err(),
+            "a commit with an unreadable extension must fail"
+        );
+        s.superblock.superblock_extension_address = good_ext;
+
+        // Unrelated commits that each want a metadata span of the same size.
+        // Whatever the failed attempt gave back, these are what would draw on it.
+        for i in 0..4 {
+            s.stage_created_dataset(&format!("/filler{i}"), {
+                let mut db = crate::type_builders::DatasetBuilder::new("");
+                db.with_vlen_strings(&["XXXXXXXXXXXXXXXXXXXX", "YYYYYYYYYYYYYYYYYYYY"]);
+                db
+            })
+            .unwrap();
+            s.commit().unwrap();
+
+            let f = crate::reader::File::open(&path).unwrap();
+            let got = f.dataset("labels").unwrap().read_string();
+            assert!(
+                got.as_ref()
+                    .is_ok_and(|v| v.iter().map(String::as_str).eq(round_one)),
+                "after filler{i}, /labels reads another dataset's heap objects: {got:?}"
+            );
+        }
     }
 
     /// A commit that writes into reused free space and then dies must leave the
