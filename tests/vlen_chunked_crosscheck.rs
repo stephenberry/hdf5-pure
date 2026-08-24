@@ -387,7 +387,10 @@ fn c_library_reads_an_overwritten_filtered_chunked_vlen_string_dataset() {
     // supposed to preserve: this is a value overwrite, not a re-layout.
     let f = hdf5::File::open(&path).unwrap();
     let ds = f.dataset("labels").unwrap();
-    assert!(ds.is_chunked(), "the overwrite must keep the chunked layout");
+    assert!(
+        ds.is_chunked(),
+        "the overwrite must keep the chunked layout"
+    );
     assert!(
         !ds.filters().is_empty(),
         "the overwrite must keep the filter pipeline"

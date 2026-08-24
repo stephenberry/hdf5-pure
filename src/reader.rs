@@ -3442,15 +3442,21 @@ impl Dataset {
     /// This overwrites element bytes and nothing else, so a builder asking for
     /// more than that is refused by **this call**, before anything is staged:
     /// chunking, filters or an extensible shape; an attribute; a fill value; and
-    /// the two builders whose element bytes are placeholders only a newly created
-    /// dataset can resolve —
-    /// [`with_vlen_strings`](DatasetBuilder::with_vlen_strings) and
-    /// [`with_path_references`](DatasetBuilder::with_path_references). Set those
-    /// when the dataset is created.
+    /// [`with_path_references`](DatasetBuilder::with_path_references), whose
+    /// element bytes are placeholder addresses only a newly created dataset can
+    /// resolve. Set those when the dataset is created.
     ///
-    /// The refusal is on those builders, not on the datatypes they produce: a
-    /// dataset of either type can still be overwritten by supplying element bytes
-    /// that need no resolving, with
+    /// [`with_vlen_strings`](DatasetBuilder::with_vlen_strings) is **not**
+    /// refused: overwriting a variable-length-string dataset places a fresh
+    /// global heap collection for the new strings and resolves the staged
+    /// element references against it. The collections the previous strings
+    /// occupied are left behind rather than reclaimed — a collection can be
+    /// shared between objects — so
+    /// [`repack`](crate::repack) is what recovers that space.
+    ///
+    /// The reference refusal is on the builder, not on the datatype it produces:
+    /// such a dataset can still be overwritten by supplying element bytes that
+    /// need no resolving, with
     /// [`with_reference_data`](DatasetBuilder::with_reference_data) or
     /// [`with_raw_data`](DatasetBuilder::with_raw_data). An object reference
     /// supplied that way is screened at `commit` by *address*, against both what

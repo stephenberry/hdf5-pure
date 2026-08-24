@@ -4643,7 +4643,12 @@ fn overwriting_a_vlen_string_dataset_leaves_no_placeholder_address() {
     // address must have been patched away from the staged zero.
     let raw = ds.read_raw().unwrap();
     assert_eq!(raw.len(), 32, "two 16-byte element references");
-    for (i, element) in raw.chunks_exact(16).enumerate() {
+    let (elements, rest) = raw.as_chunks::<16>();
+    assert!(
+        rest.is_empty(),
+        "element references are a whole number of 16"
+    );
+    for (i, element) in elements.iter().enumerate() {
         let addr = u64::from_le_bytes(element[4..12].try_into().unwrap());
         assert_ne!(addr, 0, "element {i} kept its placeholder heap address");
     }
@@ -5932,11 +5937,7 @@ fn overwriting_a_vlen_string_dataset_replaces_its_strings() {
     let file = File::open(&path).unwrap();
     assert_eq!(
         file.dataset("labels").unwrap().read_string().unwrap(),
-        vec![
-            "alpha".to_string(),
-            "beta".to_string(),
-            "gamma".to_string()
-        ]
+        vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
     );
 }
 
@@ -6035,5 +6036,52 @@ fn a_refused_commit_places_no_collection_for_a_staged_vlen_overwrite() {
     assert_eq!(
         file.dataset("labels").unwrap().read_string().unwrap(),
         vec!["a".to_string(), "b".to_string()]
+    );
+}
+
+/// A chunked variable-length overwrite relocates its chunk storage
+/// (`MovingWrite::ChunkedStaged`), so the blocks it vacates must be reclaimed —
+/// exactly as the non-staged `MovingWrite::Chunked` relocation reclaims its own.
+///
+/// Asserted through the free list rather than through the file size, because
+/// the file grows either way: the *global heap collections* the old strings
+/// lived in are deliberately never reclaimed (a collection can be shared
+/// between objects), so a size trend cannot separate the chunk storage from
+/// them. `repack` is what recovers the heap.
+#[test]
+fn overwriting_a_chunked_vlen_string_dataset_reclaims_its_old_chunk_storage() {
+    let path = temp_path("hdf5_pure_edit_overwrite_vlen_reclaim.h5");
+    // 512 elements of 16-byte references is 8 KiB of chunk data, well clear of
+    // the object-header slack a commit also frees.
+    let before: Vec<String> = (0..512).map(|i| format!("before-{i}")).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&before.iter().map(String::as_str).collect::<Vec<_>>())
+        .with_chunks(&[64]);
+    b.write(&path).unwrap();
+
+    let after: Vec<String> = (0..512).map(|i| format!("after-{i}")).collect();
+    let session = File::open_rw(&path).unwrap();
+    session
+        .dataset("labels")
+        .unwrap()
+        .write_staged(|b| {
+            b.with_vlen_strings(&after.iter().map(String::as_str).collect::<Vec<_>>());
+        })
+        .unwrap();
+    session.commit().unwrap();
+
+    let free = session.space_accounting().unwrap().reusable_free_bytes;
+    assert!(
+        free >= 512 * 16,
+        "the vacated chunk storage was not reclaimed: {free} free bytes"
+    );
+
+    // Windows holds the file lock until the session is dropped.
+    drop(session);
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        after
     );
 }

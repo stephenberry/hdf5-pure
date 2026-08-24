@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - A `File::open_rw` commit accepts a delete and a create at the same path, so replacing an object is one commit and one linearization point instead of two commits with the object missing in between. A dataset may replace a group or the reverse, replacing a group discards its subtree, and a staged edit to the object being replaced is still refused ([#305](https://github.com/stephenberry/hdf5-pure/issues/305)).
+- `Dataset::write_staged` overwrites a variable-length-string dataset with `with_vlen_strings`, resolving its staged element references against a global heap collection it places. Contiguous, compact, and chunked (including filtered) layouts are all covered; the collections the previous strings occupied are left for `repack` to reclaim, and `with_path_references` is still refused ([#321](https://github.com/stephenberry/hdf5-pure/issues/321)).
 
 ### Changed
 
@@ -16,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The typed whole-dataset readers (`Dataset::read_f64` and its eight siblings) decode a row window at a time instead of the whole dataset at once, so peak memory is the values they return plus about a mebibyte rather than twice the dataset: an 8 MiB `f64` dataset peaked at 16.8 MB and now peaks at 10.1 MB ([#289](https://github.com/stephenberry/hdf5-pure/issues/289)).
 - An in-place append that is not write-gathered — an unbuffered session and every SWMR append — costs 8 writes where it cost 12, since each checksummed structure is now published in a single write ([#307](https://github.com/stephenberry/hdf5-pure/issues/307)).
 - A row window takes only its own chunks out of the cached chunk index rather than the whole index, so reading a dataset window by window costs a constant per chunk instead of one allocation per chunk of the dataset per window ([#289](https://github.com/stephenberry/hdf5-pure/issues/289)).
-- **Breaking:** A value overwrite asking for more than a value overwrite — chunking or filters, an extensible shape, an attribute, a fill value, or variable-length strings — is refused by `Dataset::write`/`Dataset::write_staged` as the write is staged rather than by the later `commit` ([#318](https://github.com/stephenberry/hdf5-pure/issues/318)).
+- **Breaking:** A value overwrite asking for more than a value overwrite — chunking or filters, an extensible shape, an attribute, or a fill value — is refused by `Dataset::write`/`Dataset::write_staged` as the write is staged rather than by the later `commit` ([#318](https://github.com/stephenberry/hdf5-pure/issues/318)).
 - **Breaking:** A dataset staged into a `File::open_rw` session is validated as it is staged, so a bad shape, a missing datatype, or a combination the engine cannot write is reported by the call that stages it — `Group::create_dataset`, `Dataset::write_staged`, or a `create_group_with` closure — rather than by the later `commit` ([#316](https://github.com/stephenberry/hdf5-pure/issues/316)).
 
 ### Fixed
