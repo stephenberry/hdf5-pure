@@ -216,8 +216,8 @@ use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
-    Datatype, DatatypeByteOrder, datatype_holds_object_address, embedded_reference_slots,
-    stored_object_references,
+    Datatype, DatatypeByteOrder, datatype_holds_file_address, datatype_holds_object_address,
+    embedded_reference_slots, stored_object_references,
 };
 use crate::error::{Error, FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::extensible_array::ExtensibleArrayHeader;
@@ -766,7 +766,7 @@ pub(crate) struct WriteEngine {
     /// reclaims a collection, and the reason is sound: a collection can be
     /// shared between objects, and **nothing in the format proves otherwise**.
     /// The per-object reference count does not: an in-file
-    /// [`copy`](Self::stage_copy) of a variable-length dataset re-emits its
+    /// [`copy`](Self::copy) of a variable-length dataset re-emits its
     /// element references verbatim, so two datasets name one collection with
     /// every object's count still 1 — and files with that shape are already in
     /// the wild.
@@ -3457,22 +3457,12 @@ impl WriteEngine {
             .map_err(|_| Error::EditUnsupported("nothing to overwrite at the given path"))?;
             let addr = usize::try_from(addr)
                 .map_err(|_| Error::EditUnsupported("dataset address exceeds this platform"))?;
-            // What a previous overwrite of this same path left behind, to be
-            // freed once this commit lands. Read rather than removed: a refused
-            // commit must leave the session exactly as it found it, and the
-            // record is replaced (not consumed) when the new collections land.
-            let superseded = self
-                .vl_overwrite_heaps
-                .get(full)
-                .filter(|_| fd.vl_string_staging.is_some())
-                .cloned()
-                .unwrap_or_default();
-            match Self::prepare_write(&self.image(), addr as u64, fd, base, full, superseded)? {
+            match Self::prepare_write(&self.image(), addr as u64, fd, base, full)? {
                 WritePlan::InPlace { data_addr, bytes } => {
                     inplace_writes.push((data_addr, bytes));
                 }
                 // A chunked in-place overwrite never carries staging — a staged
-                // one is `ChunkedStaged`, which relocates.
+                // one is a `ChunkPayload::Deferred`, which relocates.
                 WritePlan::InPlaceChunks { writes } => inplace_writes.extend(
                     writes
                         .into_iter()
@@ -3667,7 +3657,7 @@ impl WriteEngine {
         // write to its *data block* — the element references keep their width —
         // so nothing else here would have caught it (issue #321).
         if moving_writes.is_empty()
-            && inplace_writes.iter().all(|(_, b)| b.staging.is_none())
+            && inplace_writes.iter().all(|(_, b)| b.vlen.is_none())
             && staged.datasets.is_empty()
             && staged.groups.is_empty()
             && staged.group_attrs.is_empty()
@@ -3691,7 +3681,7 @@ impl WriteEngine {
             drop(std::mem::take(staged));
             for (data_addr, bytes) in &inplace_writes {
                 // Every entry here stages nothing (the guard above), so this
-                // resolves to the staged bytes unchanged.
+                // hands back the staged bytes unchanged and unallocated.
                 let raw = self.resolve_overwrite_bytes(bytes)?;
                 self.write_at(*data_addr, &raw)?;
             }
@@ -4295,11 +4285,7 @@ impl WriteEngine {
                     // anything it cannot enumerate exhaustively (leaving dead bytes
                     // rather than freeing a region still in use); the old header
                     // chunks are freed generically below.
-                    // `ChunkedStaged` relocates its storage exactly as `Chunked`
-                    // does — it only defers the split — so it vacates the same
-                    // blocks and is freed the same way.
-                    MovingWrite::Chunked { old_addr, .. }
-                    | MovingWrite::ChunkedStaged { old_addr, .. } => {
+                    MovingWrite::Chunked { old_addr, .. } => {
                         if let Ok(a) = usize::try_from(*old_addr) {
                             if let Some(spans) = self.chunked_storage_spans(a) {
                                 to_free.extend(spans);
@@ -4589,9 +4575,11 @@ impl WriteEngine {
         let new_root = path_addr[&PathKey::new()];
 
         // The heap collections this commit's value overwrites superseded. They
-        // join `to_free` rather than being freed here, so they are handed back
-        // after the superblock repoint like every other vacated region: until
-        // that lands, the prior root still reaches the elements that name them.
+        // join `to_free` rather than being handed to the free list here, which
+        // is what keeps them out of reach of this commit's own allocations:
+        // nothing draws on `to_free` until the commit has finished placing, so
+        // the elements naming them are still readable from the prior root for
+        // as long as that root is the live one.
         // Freed as metadata because that is the page type they were placed as
         // (`place_vl_collections`), which is the only claim about them this
         // session can make from its own record.
@@ -5600,7 +5588,6 @@ impl WriteEngine {
         fd: &FlatDataset,
         base: u64,
         path: &PathKey,
-        superseded: Vec<(u64, u64)>,
     ) -> Result<WritePlan, Error> {
         // Enforced by construction: `staged.writes` has one producer, and it
         // refuses there. Asserted rather than re-refused because a second caller
@@ -5706,7 +5693,7 @@ impl WriteEngine {
             // the new inline bytes (relocating it), patching the parent link.
             0 => Ok(WritePlan::Moving(MovingWrite::Compact {
                 region,
-                bytes: staged_bytes(fd, path, superseded),
+                bytes: staged_bytes(fd, path),
             })),
             1 => {
                 if le - lb < 18 {
@@ -5732,7 +5719,7 @@ impl WriteEngine {
                         {
                             return Ok(WritePlan::InPlace {
                                 data_addr: start,
-                                bytes: staged_bytes(fd, path, superseded),
+                                bytes: staged_bytes(fd, path),
                             });
                         }
                     }
@@ -5750,7 +5737,7 @@ impl WriteEngine {
                 Ok(WritePlan::Moving(MovingWrite::Contiguous {
                     region,
                     addr_off,
-                    bytes: staged_bytes(fd, path, superseded),
+                    bytes: staged_bytes(fd, path),
                     old_extent,
                 }))
             }
@@ -5828,18 +5815,20 @@ impl WriteEngine {
                 // references cannot be split here: a filtered chunk's compressed
                 // length depends on the heap addresses patched into it, so the
                 // split has to follow the patch, which follows a placement the
-                // preflight may not make. See `MovingWrite::ChunkedStaged`.
+                // preflight may not make. See `ChunkPayload::Deferred`.
                 if fd.vl_string_staging.is_some() {
-                    return Ok(WritePlan::Moving(MovingWrite::ChunkedStaged {
+                    return Ok(WritePlan::Moving(MovingWrite::Chunked {
                         region,
                         shape: disk_ds.dimensions.clone(),
                         chunk_dims: spatial,
                         element_size,
                         maxshape,
                         pipeline_message,
-                        padding,
-                        dt: fd.dt.clone(),
-                        bytes: staged_bytes(fd, path, superseded),
+                        payload: ChunkPayload::Deferred {
+                            bytes: staged_bytes(fd, path),
+                            padding,
+                            dt: fd.dt.clone(),
+                        },
                         old_addr: addr,
                     }));
                 }
@@ -5884,13 +5873,6 @@ impl WriteEngine {
                 // end-of-file (carrying the re-encoded chunk bytes and the source
                 // pipeline verbatim), swap the data-layout message in the verbatim
                 // header, and free the old chunk storage after the commit lands.
-                let meta = new_chunk_bytes
-                    .iter()
-                    .map(|c| ChunkMeta {
-                        compressed_size: c.len() as u64,
-                        filter_mask: 0,
-                    })
-                    .collect();
                 Ok(WritePlan::Moving(MovingWrite::Chunked {
                     region,
                     shape: disk_ds.dimensions.clone(),
@@ -5898,8 +5880,7 @@ impl WriteEngine {
                     element_size,
                     maxshape,
                     pipeline_message,
-                    meta,
-                    chunk_bytes: new_chunk_bytes,
+                    payload: ChunkPayload::Encoded(new_chunk_bytes),
                     old_addr: addr,
                 }))
             }
@@ -6949,46 +6930,30 @@ impl WriteEngine {
                 element_size,
                 maxshape,
                 pipeline_message,
-                meta,
-                chunk_bytes,
-                ..
-            } => self.write_chunked_relocatable(
-                region,
-                shape,
-                chunk_dims,
-                *element_size,
-                maxshape.as_deref(),
-                pipeline_message.as_deref(),
-                meta,
-                chunk_bytes,
-                &[],
-            ),
-            MovingWrite::ChunkedStaged {
-                region,
-                shape,
-                chunk_dims,
-                element_size,
-                maxshape,
-                pipeline_message,
-                padding,
-                dt,
-                bytes,
+                payload,
                 ..
             } => {
-                // Resolve before splitting: the heap collections have to be
-                // placed, and their addresses patched into the element
-                // references, before those references are cut into chunks and —
-                // on a filtered dataset — compressed over.
-                let raw = self.resolve_overwrite_bytes(bytes)?;
-                let chunk_bytes = split_and_encode_chunks(
-                    &raw,
-                    shape,
-                    chunk_dims,
-                    *element_size,
-                    padding,
-                    pipeline_message.as_deref(),
-                    dt,
-                )?;
+                let deferred;
+                let chunk_bytes = match payload {
+                    ChunkPayload::Encoded(chunk_bytes) => chunk_bytes,
+                    ChunkPayload::Deferred { bytes, padding, dt } => {
+                        // Resolve before splitting: the heap collections have to
+                        // be placed, and their addresses patched into the element
+                        // references, before those references are cut into chunks
+                        // and — on a filtered dataset — compressed over.
+                        let raw = self.resolve_overwrite_bytes(bytes)?;
+                        deferred = split_and_encode_chunks(
+                            &raw,
+                            shape,
+                            chunk_dims,
+                            *element_size,
+                            padding,
+                            pipeline_message.as_deref(),
+                            dt,
+                        )?;
+                        &deferred
+                    }
+                };
                 let meta: Vec<ChunkMeta> = chunk_bytes
                     .iter()
                     .map(|c| ChunkMeta {
@@ -7004,7 +6969,7 @@ impl WriteEngine {
                     maxshape.as_deref(),
                     pipeline_message.as_deref(),
                     &meta,
-                    &chunk_bytes,
+                    chunk_bytes,
                     &[],
                 )
             }
@@ -7332,7 +7297,9 @@ impl WriteEngine {
 
     /// Resolve a staged value overwrite's element bytes: place any global heap
     /// collections its variable-length references name, patch their addresses
-    /// in, and return the bytes ready to write (issue #321).
+    /// in, and return the bytes ready to write (issue #321). An overwrite that
+    /// stages nothing — every one but a `with_vlen_strings` one — is handed
+    /// back untouched.
     ///
     /// This allocates, so every caller is in the apply phase — the preflight
     /// that chose the plan only reads.
@@ -7345,40 +7312,45 @@ impl WriteEngine {
     /// nothing has been able to name them twice — see
     /// [`vl_overwrite_heaps`](Self::vl_overwrite_heaps) for why that provenance
     /// is the whole proof, and `repack` for the collections it cannot make.
-    fn resolve_overwrite_bytes<'a>(
+    fn resolve_overwrite_bytes<'b>(
         &mut self,
-        bytes: &'a OverwriteBytes,
-    ) -> Result<Cow<'a, [u8]>, Error> {
-        let Some(staging) = &bytes.staging else {
+        bytes: &'b OverwriteBytes,
+    ) -> Result<Cow<'b, [u8]>, Error> {
+        let Some(vlen) = &bytes.vlen else {
             // Nothing to resolve, and nothing to copy: every overwrite but a
             // variable-length one takes this path, and the in-place loop writes
-            // straight through the borrow as it did before any of this. Cloning
-            // here would charge each of them a second copy of its whole payload,
-            // which the bounded backing in particular is built not to pay.
+            // straight through the borrow. Cloning here would charge each of
+            // them a second copy of its whole payload, which the bounded
+            // backing in particular is built not to pay.
             return Ok(Cow::Borrowed(&bytes.raw));
         };
+        let staging = &vlen.staging;
+        // Read rather than removed: the record is replaced (not consumed) when
+        // the new collections land just below.
+        let superseded = self
+            .vl_overwrite_heaps
+            .get(&vlen.path)
+            .cloned()
+            .unwrap_or_default();
         let mut raw = bytes.raw.clone();
-        // An all-null (or empty) dataset stages no collection at all, and
-        // patching nothing is the correct answer for it: a null element's
-        // reference must keep the zero address that makes it read back null.
-        // Its predecessor's collections are still superseded, so the reclaim
-        // below is outside this branch.
-        if staging.collections.is_empty() {
-            self.vl_overwrite_heaps.remove(&bytes.path);
-        } else {
-            let base = self.superblock.base_address;
-            let addrs = self.place_vl_collections(&staging.collections)?;
-            patch_vl_refs_masked(&mut raw, &staging.patch_offsets, &addrs);
-            // `place_vl_collections` answers base-relative, since that is what
-            // an element reference stores; the free list is absolute.
-            let placed = addrs
-                .iter()
-                .zip(&staging.collections)
-                .map(|(&a, c)| (a + base, c.len() as u64))
-                .collect();
-            self.vl_overwrite_heaps.insert(bytes.path.clone(), placed);
-        }
-        self.superseded_heaps.extend_from_slice(&bytes.superseded);
+        let base = self.superblock.base_address;
+        // A staging with no collections patches nothing, which is the right
+        // answer for it: an element with no heap object keeps the zero address
+        // that reads back as null. It falls out of the general path rather than
+        // being a case of its own — `patch_vl_refs_masked` has one offset per
+        // object, so no offsets is no iterations — and it still records (an
+        // empty record) and still supersedes.
+        let addrs = self.place_vl_collections(&staging.collections)?;
+        patch_vl_refs_masked(&mut raw, &staging.patch_offsets, &addrs);
+        // `place_vl_collections` answers base-relative, since that is what an
+        // element reference stores; the free list is absolute.
+        let placed = addrs
+            .iter()
+            .zip(&staging.collections)
+            .map(|(&a, c)| (a + base, c.len() as u64))
+            .collect();
+        self.vl_overwrite_heaps.insert(vlen.path.clone(), placed);
+        self.superseded_heaps.extend(superseded);
         Ok(Cow::Owned(raw))
     }
 
@@ -7396,7 +7368,7 @@ impl WriteEngine {
     ///   variable-length dataset is exactly how two datasets come to name one
     ///   collection.
     /// - a **raw-bytes write** over a datatype that reaches a heap address
-    ///   ([`datatype_holds_heap_address`]). `with_raw_data` hands the engine
+    ///   ([`datatype_holds_file_address`]). `with_raw_data` hands the engine
     ///   element bytes it does not interpret, so a caller that read them from
     ///   one dataset and wrote them to another has aliased whatever they named —
     ///   the same unscreened door issue #317 recorded for object references.
@@ -7412,14 +7384,17 @@ impl WriteEngine {
         }
         let aliasing_edit = !staged.copies.is_empty()
             || !staged.cross_copies.is_empty()
-            || staged.writes.iter().any(|(_, fd)| {
-                fd.vl_string_staging.is_none()
-                    && crate::datatype::datatype_holds_heap_address(&fd.dt)
-            })
-            || staged.datasets.iter().any(|(_, fd)| {
-                fd.vl_string_staging.is_none()
-                    && crate::datatype::datatype_holds_heap_address(&fd.dt)
-            });
+            // A dataset staged with element bytes of its own (`with_raw_data`)
+            // rather than staging its strings here, whether it is being created
+            // or overwritten.
+            || staged
+                .writes
+                .iter()
+                .chain(&staged.datasets)
+                .any(|(_, fd)| {
+                    fd.vl_string_staging.is_none()
+                        && datatype_holds_file_address(&fd.dt)
+                });
         if aliasing_edit {
             self.vl_overwrite_heaps.clear();
             return;
@@ -8328,31 +8303,29 @@ struct GroupInfo {
 /// whatever string it names — which is what lets the plan be *chosen* from the
 /// unresolved bytes. The one place that is not enough is a filtered chunked
 /// dataset, whose compressed chunk sizes do depend on the addresses: see
-/// [`MovingWrite::ChunkedStaged`].
+/// [`ChunkPayload::Deferred`].
 struct OverwriteBytes {
     raw: Vec<u8>,
     /// `None` for every overwrite that stages no variable-length data, which is
     /// all of them but a `with_vlen_strings` one.
-    staging: Option<VlStringStaging>,
-    /// The overwritten dataset's path, under which the collections this
-    /// resolution places are recorded in
-    /// [`vl_overwrite_heaps`](WriteEngine::vl_overwrite_heaps). Empty when
-    /// nothing is staged, which is the only case where it goes unread.
+    vlen: Option<VlenOverwrite>,
+}
+
+/// The variable-length half of an [`OverwriteBytes`]: the staged collections to
+/// place, and the path they are recorded under once placed.
+struct VlenOverwrite {
+    staging: VlStringStaging,
+    /// The overwritten dataset's path, the key its collections are recorded
+    /// under in [`vl_overwrite_heaps`](WriteEngine::vl_overwrite_heaps) — and
+    /// the key the ones a previous overwrite left are read back from, to be
+    /// freed once this commit lands.
     path: PathKey,
-    /// The collections a *previous* overwrite of the same path placed, to be
-    /// freed once this commit lands. Empty unless this session made them.
-    superseded: Vec<(u64, u64)>,
 }
 
 impl OverwriteBytes {
     /// Bytes that need no resolving, and so name nothing to record or free.
     fn ready(raw: Vec<u8>) -> Self {
-        Self {
-            raw,
-            staging: None,
-            path: PathKey::new(),
-            superseded: Vec::new(),
-        }
+        Self { raw, vlen: None }
     }
 }
 
@@ -8361,7 +8334,12 @@ impl OverwriteBytes {
 enum WritePlan {
     /// A contiguous dataset whose new data is the same length as its existing,
     /// defined data block: overwrite the bytes straight in place at `data_addr`.
-    /// No object header is rewritten and the superblock root is not flipped.
+    /// No object header is rewritten.
+    ///
+    /// The superblock root is not flipped either — *unless* the bytes still
+    /// carry variable-length staging, which appends a heap collection and so
+    /// moves end-of-file, a figure only the superblock records. `commit`'s
+    /// fast path excludes exactly that case (issue #321).
     InPlace {
         data_addr: usize,
         bytes: OverwriteBytes,
@@ -8404,7 +8382,7 @@ enum MovingWrite {
     /// existing slots, so its whole storage is rebuilt and relocated. A fresh
     /// chunk-data blob and index are placed — in a freed region that fits, else at
     /// end-of-file (via the verbatim
-    /// layout path, carrying `chunk_bytes` and the source filter `pipeline_message`
+    /// layout path, carrying the chunk bytes and the source filter `pipeline_message`
     /// unchanged — no recompression and no filter-parameter reconstruction), the
     /// data-layout message in the verbatim header `region` is swapped for the new
     /// one (every other header message — datatype, dataspace, fill value, filter
@@ -8419,38 +8397,7 @@ enum MovingWrite {
         element_size: NonZeroUsize,
         maxshape: Option<Vec<u64>>,
         pipeline_message: Option<Vec<u8>>,
-        meta: Vec<ChunkMeta>,
-        chunk_bytes: Vec<Vec<u8>>,
-        old_addr: u64,
-    },
-    /// A chunked dataset overwritten with element bytes that still carry
-    /// unresolved variable-length references ([`OverwriteBytes::staging`]).
-    ///
-    /// Splitting into chunks — and re-encoding them through the dataset's
-    /// filter pipeline — has to wait for the patched bytes, so unlike
-    /// [`Chunked`](MovingWrite::Chunked) this variant carries the *whole*
-    /// element array and the geometry to split it, and does that work in
-    /// [`write_moving`](WriteEngine::write_moving). A filtered chunk's
-    /// compressed length depends on the heap addresses patched into it, which
-    /// is why the preflight cannot split first and patch after.
-    ///
-    /// It always relocates, which is what puts the single-hard-link refusal
-    /// (the one every [`Moving`](WritePlan::Moving) plan answers to) in the
-    /// preflight, where it belongs: whether a chunked overwrite could have
-    /// stayed in its slots is not knowable until those lengths exist.
-    ChunkedStaged {
-        region: Vec<u8>,
-        /// See [`CopyTree::DatasetChunked::shape`].
-        shape: Vec<u64>,
-        chunk_dims: Vec<u64>,
-        element_size: NonZeroUsize,
-        maxshape: Option<Vec<u64>>,
-        pipeline_message: Option<Vec<u8>>,
-        /// What the edge overhang of a partial chunk must hold (issue #296).
-        padding: crate::fill_value::PaddingFill,
-        /// The dataset's datatype, for the filter pipeline's [`ChunkContext`].
-        dt: crate::datatype::Datatype,
-        bytes: OverwriteBytes,
+        payload: ChunkPayload,
         old_addr: u64,
     },
     /// A relocating **append** to a chunked, unlimited, Extensible-Array-indexed
@@ -8502,6 +8449,31 @@ enum MovingWrite {
     AttrEdit {
         region: Vec<u8>,
         pending_vl_attrs: PendingVlAttrs,
+    },
+}
+
+/// The chunk data a relocating chunked overwrite ([`MovingWrite::Chunked`])
+/// will place, either already encoded or still to be.
+enum ChunkPayload {
+    /// Split and encoded by the preflight, which had to do that anyway to find
+    /// out whether the chunks still fit their slots.
+    Encoded(Vec<Vec<u8>>),
+    /// Element bytes that still carry unresolved variable-length references
+    /// ([`OverwriteBytes::vlen`]), so the split has to wait for the apply
+    /// phase: a filtered chunk's compressed length depends on the heap
+    /// addresses patched into it, which is why the preflight cannot split
+    /// first and patch after (issue #321).
+    ///
+    /// Such an overwrite therefore always relocates, which is what keeps the
+    /// single-hard-link refusal (the one every [`MovingWrite`] answers to) in
+    /// the preflight, where it belongs: whether it could have stayed in its
+    /// slots is not knowable until those lengths exist.
+    Deferred {
+        bytes: OverwriteBytes,
+        /// What the edge overhang of a partial chunk must hold (issue #296).
+        padding: crate::fill_value::PaddingFill,
+        /// The dataset's datatype, for the filter pipeline's [`ChunkContext`].
+        dt: crate::datatype::Datatype,
     },
 }
 
@@ -9343,27 +9315,18 @@ fn chunked_geometry(
 }
 
 /// The element bytes a staged value overwrite will write, paired with the
-/// variable-length staging that has still to be resolved into them, the `path`
-/// they belong to, and the collections a previous overwrite of that path left
-/// `superseded`.
+/// variable-length staging that has still to be resolved into them and the
+/// `path` they belong to.
 ///
 /// Cloned rather than moved because the staged set must survive a refused
 /// commit whole (issue #316), and this runs in the preflight that may refuse.
-fn staged_bytes(fd: &FlatDataset, path: &PathKey, superseded: Vec<(u64, u64)>) -> OverwriteBytes {
-    let staging = fd.vl_string_staging.clone();
+fn staged_bytes(fd: &FlatDataset, path: &PathKey) -> OverwriteBytes {
     OverwriteBytes {
         raw: fd.raw.clone(),
-        // Only a staged resolution reads the path or supersedes anything, and
-        // every *other* overwrite is the common case — cloning it for those
-        // would charge every value overwrite in the crate an allocation for a
-        // field nothing goes on to look at.
-        path: if staging.is_some() {
-            path.clone()
-        } else {
-            PathKey::new()
-        },
-        staging,
-        superseded,
+        vlen: fd.vl_string_staging.clone().map(|staging| VlenOverwrite {
+            staging,
+            path: path.clone(),
+        }),
     }
 }
 
@@ -10398,7 +10361,7 @@ fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
                     crate::datatype::Datatype::parse(&region[body..body_end]).map_err(|_| {
                         Error::EditUnsupported("a source datatype could not be parsed for copying")
                     })?;
-                if datatype_copies_foreign_address(&dt) {
+                if datatype_holds_file_address(&dt) {
                     return Err(Error::EditUnsupported(
                         "variable-length or reference datasets cannot be copied to another file yet",
                     ));
@@ -10423,7 +10386,7 @@ fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
                                 "a source attribute could not be parsed for copying",
                             )
                         })?;
-                if datatype_copies_foreign_address(&attr.datatype) {
+                if datatype_holds_file_address(&attr.datatype) {
                     return Err(Error::EditUnsupported(
                         "variable-length or reference attributes cannot be copied to another file yet",
                     ));
@@ -10446,30 +10409,13 @@ fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
 /// construction, so only the source datatypes matter.
 fn reject_foreign_dense_attrs(attrs: &[crate::attribute::AttributeMessage]) -> Result<(), Error> {
     for attr in attrs {
-        if datatype_copies_foreign_address(&attr.datatype) {
+        if datatype_holds_file_address(&attr.datatype) {
             return Err(Error::EditUnsupported(
                 "variable-length or reference dense (fractal-heap) attributes cannot be copied to another file yet",
             ));
         }
     }
     Ok(())
-}
-
-/// Whether `dt` stores, anywhere in its structure, a value that is a source-file
-/// absolute address: a variable-length (global-heap) or reference datatype, or a
-/// compound / array / enumeration built over one. See [`reject_foreign_addresses`].
-fn datatype_copies_foreign_address(dt: &crate::datatype::Datatype) -> bool {
-    use crate::datatype::Datatype;
-    match dt {
-        Datatype::VariableLength { .. } | Datatype::Reference { .. } => true,
-        Datatype::Compound { members, .. } => members
-            .iter()
-            .any(|m| datatype_copies_foreign_address(&m.datatype)),
-        Datatype::Array { base_type, .. } | Datatype::Enumeration { base_type, .. } => {
-            datatype_copies_foreign_address(base_type)
-        }
-        _ => false,
-    }
 }
 
 /// Refuse a staged dataset whose element bytes already hold *resolved* object

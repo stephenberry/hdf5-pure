@@ -440,3 +440,64 @@ fn a_c_written_vlen_string_dataset_can_be_overwritten() {
 
     assert_both_read(&path, "labels", &after);
 }
+
+/// A **compact** variable-length-string dataset, overwritten in place
+/// (issue #321).
+///
+/// The compact arm of `prepare_write` relocates the dataset and rebuilds its
+/// header with the element bytes inline, so the resolved references travel in
+/// the header rather than in a data block — the one plan where they do. Nothing
+/// this crate writes is compact, so the source has to come from the reference
+/// library, which is also what makes this a test of the arm rather than of the
+/// writer's own habits.
+#[test]
+fn c_library_reads_an_overwritten_compact_vlen_string_dataset() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("overwrite_compact.h5");
+
+    {
+        let f = hdf5::File::create(&path).unwrap();
+        let data: Vec<VarLenUnicode> = ["one", "two", "three"]
+            .iter()
+            .map(|s| s.parse::<VarLenUnicode>().unwrap())
+            .collect();
+        f.new_dataset::<VarLenUnicode>()
+            .layout(hdf5::dataset::Layout::Compact)
+            .shape([3])
+            .create("labels")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+    }
+    // The source really is compact, or this test proves nothing about that arm.
+    {
+        let f = hdf5::File::open(&path).unwrap();
+        assert!(
+            matches!(
+                f.dataset("labels").unwrap().layout(),
+                hdf5::dataset::Layout::Compact
+            ),
+            "expected a compact source layout"
+        );
+    }
+
+    let after = vec![
+        "replacement-one".to_string(),
+        "replacement-two".to_string(),
+        "replacement-three".to_string(),
+    ];
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&after.iter().map(String::as_str).collect::<Vec<_>>());
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    assert_both_read(&path, "labels", &after);
+}

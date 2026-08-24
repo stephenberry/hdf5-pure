@@ -1186,25 +1186,37 @@ pub(crate) fn datatype_holds_object_address(dt: &Datatype) -> bool {
     }
 }
 
-/// Whether `datatype`'s element bytes carry a **global heap** address at any
-/// depth — the counterpart of [`datatype_holds_object_address`] for the other
-/// address an element can hold.
+/// Whether `dt`'s element bytes carry a **file-absolute address** at any depth:
+/// a variable-length element (a global-heap collection address and index) or a
+/// reference (an object address, or for a dataset-region reference a heap id),
+/// directly or through a compound member, array entry, or enumeration base.
 ///
-/// A variable-length element is a reference into a heap collection. A
-/// *dataset-region* reference is a heap id too (see
-/// [`datatype_holds_object_address`] above); this does not separate it from a
-/// plain object reference, and answers `true` for both. That is deliberate: the
-/// one caller uses this to decide when it can no longer prove a collection is
-/// referenced from a single place, and answering `true` too often only costs it
-/// the proof, where answering `false` too often would cost correctness.
-pub(crate) fn datatype_holds_heap_address(dt: &Datatype) -> bool {
+/// The union of the two addresses an element can hold, and deliberately not a
+/// finer answer than that — both callers ask only whether an address is in
+/// there at all:
+///
+/// - a **cross-file copy** (`reject_foreign_addresses`) refuses such a
+///   datatype, since an address into the source file cannot be translated into
+///   another one;
+/// - the **heap-collection provenance** of a variable-length overwrite (issue
+///   #321) gives up its record when a raw-bytes write could name a collection a
+///   second time.
+///
+/// Both are one-sided: answering `true` too often costs a refusal or a reclaim,
+/// answering `false` too often would cost correctness.
+///
+/// Distinct from [`datatype_holds_object_address`], which asks specifically
+/// whether an *object header* address is reachable — so it answers `false` for
+/// a variable-length string and `true` for a variable length *of* references,
+/// where this one answers `true` for both.
+pub(crate) fn datatype_holds_file_address(dt: &Datatype) -> bool {
     match dt {
         Datatype::VariableLength { .. } | Datatype::Reference { .. } => true,
         Datatype::Compound { members, .. } => members
             .iter()
-            .any(|m| datatype_holds_heap_address(&m.datatype)),
+            .any(|m| datatype_holds_file_address(&m.datatype)),
         Datatype::Array { base_type, .. } | Datatype::Enumeration { base_type, .. } => {
-            datatype_holds_heap_address(base_type)
+            datatype_holds_file_address(base_type)
         }
         _ => false,
     }

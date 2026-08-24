@@ -1019,8 +1019,9 @@ pub(crate) const VL_REF_SIZE: usize = 16;
 /// `Clone` is for the overwrite path, whose plan is built from a *borrowed*
 /// staged edit: the staged set has to survive a refused commit intact (issue
 /// #316), so the plan cannot move the staging out of it. The copy is of the
-/// same payload the neighbouring `raw.clone()` already makes, and it is made
-/// once per commit, not per element.
+/// heap collections — the string bytes themselves, not the fixed-width element
+/// references beside them — and is made once per staged variable-length
+/// overwrite.
 #[derive(Clone)]
 pub(crate) struct VlStringStaging {
     /// The serialized global heap collections holding the non-null objects, in

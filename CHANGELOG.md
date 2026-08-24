@@ -9,8 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - A `File::open_rw` commit accepts a delete and a create at the same path, so replacing an object is one commit and one linearization point instead of two commits with the object missing in between. A dataset may replace a group or the reverse, replacing a group discards its subtree, and a staged edit to the object being replaced is still refused ([#305](https://github.com/stephenberry/hdf5-pure/issues/305)).
-- `Dataset::write_staged` overwrites a variable-length-string dataset with `with_vlen_strings`, resolving its staged element references against a global heap collection it places. Contiguous, compact, and chunked (including filtered) layouts are all covered, and `with_path_references` is still refused ([#321](https://github.com/stephenberry/hdf5-pure/issues/321)).
-- Overwriting the same variable-length dataset again reclaims the global heap collection the previous overwrite placed, so rotating its strings in a session no longer grows the file by the whole payload every commit. Only collections the session itself placed are reclaimed, and a `copy` or a raw-bytes write over a heap-addressed datatype gives that up for the session; `repack` recovers the rest ([#321](https://github.com/stephenberry/hdf5-pure/issues/321)).
+- `Dataset::write_staged` overwrites a variable-length-string dataset with `with_vlen_strings`, on a contiguous, compact, or chunked (including filtered) layout alike. `with_path_references` is still refused ([#321](https://github.com/stephenberry/hdf5-pure/issues/321)).
+- Overwriting the same variable-length dataset again reclaims the global heap collection the previous overwrite placed, so rotating its strings in a session no longer grows the file by the whole payload every commit. Only collections the session itself placed are reclaimed ([#321](https://github.com/stephenberry/hdf5-pure/issues/321)).
 
 ### Changed
 

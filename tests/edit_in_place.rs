@@ -5912,8 +5912,10 @@ fn a_zero_element_dataset_copies_as_the_storage_it_never_had() {
 ///
 /// The replacement strings are deliberately *longer* than the originals: the
 /// element bytes are fixed-width references either way, so the data block keeps
-/// its length and only the heap collection grows. That is what makes the
-/// contiguous same-length fast path the one this exercises.
+/// its length and only the heap collection grows. That is what makes this a
+/// `WritePlan::InPlace` — not to be confused with the *commit's* in-place fast
+/// path, which a staged variable-length overwrite is deliberately excluded
+/// from.
 #[test]
 fn overwriting_a_vlen_string_dataset_replaces_its_strings() {
     let path = temp_path("hdf5_pure_edit_overwrite_vlen_contiguous.h5");
@@ -6218,21 +6220,102 @@ fn a_copy_stops_a_vlen_overwrite_from_reclaiming_the_shared_collection() {
     );
 }
 
+/// The other way a second name for a recorded collection is made: a **raw-bytes
+/// write** (issue #321).
+///
+/// `with_raw_data` hands the engine element bytes it does not interpret, so a
+/// caller that reads one variable-length dataset's references and stages them as
+/// another dataset's data has aliased the collections they name — with every
+/// heap object's reference count still 1, exactly as an in-file `copy` does.
+/// This is the half of `invalidate_heap_provenance` that
+/// [`a_copy_stops_a_vlen_overwrite_from_reclaiming_the_shared_collection`] does
+/// not reach: the screen on the staged datatype rather than on the copy lists.
+///
+/// Built like that test, and for the same reason: the *aliasing* dataset's
+/// contents are the assertion, and the rounds after it are what make a bad free
+/// visible — every generation is the same length, so a wrongly reclaimed
+/// collection is exactly the right size for the next one to be placed in.
+#[test]
+fn a_raw_bytes_write_stops_a_vlen_overwrite_from_reclaiming_its_collection() {
+    let path = temp_path("hdf5_pure_edit_vlen_raw_blocks_reclaim.h5");
+    let generation = |n: u32| -> Vec<String> {
+        (0..2)
+            .map(|i| format!("generation-{n:02}-element-{i}"))
+            .collect()
+    };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&generation(0).iter().map(String::as_str).collect::<Vec<_>>());
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let overwrite = |n: u32| {
+            let data = generation(n);
+            session
+                .dataset("labels")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>());
+                })
+                .unwrap();
+            session.commit().unwrap();
+        };
+
+        // Round one records the collections it places for "labels".
+        overwrite(1);
+
+        // Read the element references out and stage them as a second dataset's
+        // data. Read before staging: re-entering the session inside the builder
+        // closure would deadlock (issue #200).
+        let (dt, raw) = {
+            let ds = session.dataset("labels").unwrap();
+            (ds.datatype().unwrap(), ds.read_raw().unwrap())
+        };
+        session
+            .root()
+            .create_dataset("alias", |b| {
+                b.with_raw_data(dt.clone(), raw.clone(), 2);
+            })
+            .unwrap();
+        session.commit().unwrap();
+
+        for n in 2..8 {
+            overwrite(n);
+        }
+    }
+
+    let file = File::open(&path).unwrap();
+    // Read fallibly: space handed back and reused stops being a heap collection
+    // at all, so the wrong answer here is as often an error as it is a string.
+    let alias = file.dataset("alias").unwrap().read_string();
+    assert!(
+        alias.as_ref().is_ok_and(|got| *got == generation(1)),
+        "the aliased strings were freed out from under the raw-bytes dataset \
+         and written over: {alias:?}"
+    );
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        generation(7)
+    );
+}
+
 /// A builder's variable-length staging describes the bytes in its `data` field,
 /// so replacing those bytes must drop it (issue #321).
 ///
-/// `with_raw_data` after `with_vlen_strings` used to leave a staging that owned
-/// one patch offset while `data` held a whole new array: the commit patched
-/// element 0 against a fresh collection and wrote the caller's bytes verbatim
-/// into the rest. Where those bytes were element references read out of another
-/// dataset — which is what `read_raw` hands back and what `with_raw_data`
-/// documents taking — two datasets ended up naming one global heap collection
-/// with nothing recording it, and the next overwrite of the first freed the
-/// collection the second reads.
+/// This is the door that made the screen in
+/// [`a_raw_bytes_write_stops_a_vlen_overwrite_from_reclaiming_its_collection`]
+/// skippable. `with_raw_data` used to leave `vl_string_staging` in place, so a
+/// builder could carry a staging that owned one patch offset while `data` held a
+/// whole new array: the commit patched element 0 against a fresh collection and
+/// wrote the caller's own bytes into the rest. Because the builder still had a
+/// staging, the screen's `vl_string_staging.is_none()` test skipped the entry
+/// and the reclaim went ahead over an alias it had not seen.
 ///
-/// The assertion is on the *aliased* dataset after later rounds have had the
-/// chance to reuse the freed space, for the same reason as the copy test above:
-/// a free alone leaves the bytes intact.
+/// Asserted on the *aliased* dataset after later rounds have had the chance to
+/// reuse the freed space, for the same reason as the tests above: a free alone
+/// leaves the bytes where they are.
 #[test]
 fn replacing_a_builders_data_drops_the_vlen_staging_that_described_it() {
     let path = temp_path("hdf5_pure_edit_raw_data_drops_staging.h5");
@@ -6246,8 +6329,10 @@ fn replacing_a_builders_data_drops_the_vlen_staging_that_described_it() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        let labels_dt = session.dataset("labels").unwrap().datatype().unwrap();
-        let labels_raw = session.dataset("labels").unwrap().read_raw().unwrap();
+        let (dt, raw) = {
+            let ds = session.dataset("labels").unwrap();
+            (ds.datatype().unwrap(), ds.read_raw().unwrap())
+        };
 
         // A builder carrying *both* a staging and raw bytes lifted from
         // "labels". Its element 1 is "labels"'s own element reference.
@@ -6256,14 +6341,11 @@ fn replacing_a_builders_data_drops_the_vlen_staging_that_described_it() {
             .create_dataset("alias", |b| {
                 b.with_shape(&[2]);
                 b.with_vlen_strings(&["only-one"]);
-                b.with_raw_data(labels_dt, labels_raw, 2);
+                b.with_raw_data(dt, raw, 2);
             })
             .unwrap();
         session.commit().unwrap();
 
-        // Rotate "labels". If the staging had survived the raw-bytes call, the
-        // provenance screen would have skipped this entry and these rounds
-        // would free and then overwrite what "alias" points at.
         for n in 2..10 {
             let data = generation(n);
             session
@@ -6278,13 +6360,13 @@ fn replacing_a_builders_data_drops_the_vlen_staging_that_described_it() {
     }
 
     let file = File::open(&path).unwrap();
-    // Whatever "alias" holds, it must still be readable and unchanged by the
-    // rotation of an unrelated dataset.
-    let alias = file.dataset("alias").unwrap().read_string().unwrap();
-    assert_eq!(
-        alias[1],
-        generation(1)[1],
-        "the aliased element was freed out from under it and written over"
+    // Fallible for the same reason as the sibling test: reused space stops
+    // being a heap collection at all, so the wrong answer is as often an error
+    // as a string.
+    let alias = file.dataset("alias").unwrap().read_string();
+    assert!(
+        alias.as_ref().is_ok_and(|got| got[1] == generation(1)[1]),
+        "the aliased element was freed out from under it and written over: {alias:?}"
     );
     assert_eq!(
         file.dataset("labels").unwrap().read_string().unwrap(),
