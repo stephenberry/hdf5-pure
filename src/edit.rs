@@ -3371,7 +3371,7 @@ impl WriteEngine {
         // in place (no header rewrite, no superblock flip), while a resize or
         // compact rewrite relocates the header and is staged against its parent
         // group so the commit below rebuilds it and patches the link. ---
-        let mut inplace_writes: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut inplace_writes: Vec<(usize, OverwriteBytes)> = Vec::new();
         let mut moving_writes: Vec<(PathKey, String, u64, MovingWrite)> = Vec::new();
         let mut write_targets: Vec<PathKey> = Vec::new();
         // The file-wide hard-link count, computed lazily the first time a commit
@@ -3405,8 +3405,16 @@ impl WriteEngine {
             let addr = usize::try_from(addr)
                 .map_err(|_| Error::EditUnsupported("dataset address exceeds this platform"))?;
             match Self::prepare_write(&self.image(), addr as u64, fd, base)? {
-                WritePlan::InPlace { data_addr, raw } => inplace_writes.push((data_addr, raw)),
-                WritePlan::InPlaceChunks { writes } => inplace_writes.extend(writes),
+                WritePlan::InPlace { data_addr, bytes } => {
+                    inplace_writes.push((data_addr, bytes));
+                }
+                // A chunked in-place overwrite never carries staging — a staged
+                // one is `ChunkedStaged`, which relocates.
+                WritePlan::InPlaceChunks { writes } => inplace_writes.extend(
+                    writes
+                        .into_iter()
+                        .map(|(at, raw)| (at, OverwriteBytes::ready(raw))),
+                ),
                 WritePlan::Moving(mw) => {
                     // A relocating overwrite rewrites the dataset's header and data
                     // address. Every variant is base-aware on a userblock file: the
@@ -3589,7 +3597,14 @@ impl WriteEngine {
         // not introduce any inconsistency, so it does not clear one either; an edit
         // that takes the full path below (any header/root change) clears the flag
         // as usual.
+        //
+        // A staged variable-length overwrite is excluded for the same reason: it
+        // places a global heap collection, and an append moves end-of-file, which
+        // only the superblock this path leaves alone records. It is a same-length
+        // write to its *data block* — the element references keep their width —
+        // so nothing else here would have caught it (issue #321).
         if moving_writes.is_empty()
+            && inplace_writes.iter().all(|(_, b)| b.staging.is_none())
             && staged.datasets.is_empty()
             && staged.groups.is_empty()
             && staged.group_attrs.is_empty()
@@ -3611,8 +3626,11 @@ impl WriteEngine {
             // enforces, and the only case that can tell the two apart is a
             // `write_at` that fails partway, which no test here can produce.
             drop(std::mem::take(staged));
-            for (data_addr, raw) in &inplace_writes {
-                self.write_at(*data_addr, raw)?;
+            for (data_addr, bytes) in &inplace_writes {
+                // Every entry here stages nothing (the guard above), so this
+                // resolves to the staged bytes unchanged.
+                let raw = self.resolve_overwrite_bytes(bytes)?;
+                self.write_at(*data_addr, &raw)?;
             }
             self.barrier()?;
             return Ok(());
@@ -4214,7 +4232,11 @@ impl WriteEngine {
                     // anything it cannot enumerate exhaustively (leaving dead bytes
                     // rather than freeing a region still in use); the old header
                     // chunks are freed generically below.
-                    MovingWrite::Chunked { old_addr, .. } => {
+                    // `ChunkedStaged` relocates its storage exactly as `Chunked`
+                    // does — it only defers the split — so it vacates the same
+                    // blocks and is freed the same way.
+                    MovingWrite::Chunked { old_addr, .. }
+                    | MovingWrite::ChunkedStaged { old_addr, .. } => {
                         if let Ok(a) = usize::try_from(*old_addr) {
                             if let Some(spans) = self.chunked_storage_spans(a) {
                                 to_free.extend(spans);
@@ -4470,8 +4492,14 @@ impl WriteEngine {
         // unchanged), so the write is independent of the superblock flip; it is
         // ordered before the barrier sync below so the new bytes are durable
         // alongside everything else this commit appended.
-        for (data_addr, raw) in &inplace_writes {
-            self.write_at(*data_addr, raw)?;
+        // A staged variable-length overwrite resolves here: its global heap
+        // collections are placed and their addresses patched into the element
+        // references before the data block is written (issue #321). The
+        // collections are appended, which the superblock this path rewrites
+        // below records.
+        for (data_addr, bytes) in &inplace_writes {
+            let raw = self.resolve_overwrite_bytes(bytes)?;
+            self.write_at(*data_addr, &raw)?;
         }
 
         // Every group's new header address is known now that the apply loop has
@@ -5446,19 +5474,10 @@ impl WriteEngine {
             ));
         }
 
-        // `with_vlen_strings` stages placeholder element references that only the
-        // add path knows how to resolve: place the global heap collection, then
-        // patch the placeholders once its address is known, before the data block
-        // itself is written. The overwrite path has no such step, and a
-        // same-length overwrite is flushed straight over the existing data block
-        // with no apply loop at all — so refuse rather than write unpatched (heap
-        // address 0) placeholders as if they were final.
-        if fd.vl_string_staging.is_some() {
-            return Err(Error::EditUnsupported(
-                "write_dataset cannot overwrite a variable-length-string dataset's \
-                 data in place yet",
-            ));
-        }
+        // `with_vlen_strings` stages placeholder element references, resolved by
+        // placing their global heap collections and patching the addresses in
+        // (issue #321). That happens where each plan is written, not here: see
+        // `OverwriteBytes`.
 
         // `reference_targets` holds elements only the add path resolves, in
         // `preflight_reference_targets` and the apply loop after it; the
@@ -5603,7 +5622,7 @@ impl WriteEngine {
             // the new inline bytes (relocating it), patching the parent link.
             0 => Ok(WritePlan::Moving(MovingWrite::Compact {
                 region,
-                raw: fd.raw.clone(),
+                bytes: staged_bytes(fd),
             })),
             1 => {
                 if le - lb < 18 {
@@ -5629,7 +5648,7 @@ impl WriteEngine {
                         {
                             return Ok(WritePlan::InPlace {
                                 data_addr: start,
-                                raw: fd.raw.clone(),
+                                bytes: staged_bytes(fd),
                             });
                         }
                     }
@@ -5647,7 +5666,7 @@ impl WriteEngine {
                 Ok(WritePlan::Moving(MovingWrite::Contiguous {
                     region,
                     addr_off,
-                    raw: fd.raw.clone(),
+                    bytes: staged_bytes(fd),
                     old_extent,
                 }))
             }
@@ -5701,18 +5720,15 @@ impl WriteEngine {
                     .map_or(crate::fill_value::PaddingFill::Zero, |(mt, b, e)| {
                         crate::fill_value::PaddingFill::from_message(mt, &region[b..e])
                     });
-                let split = split_into_chunks(
-                    &fd.raw,
-                    &disk_ds.dimensions,
-                    &spatial,
-                    element_size,
-                    padding.pattern(element_size),
-                )
-                .map_err(Error::Format)?;
                 let pipeline_message: Option<Vec<u8>> =
                     filter.map(|(fb, fe)| region[fb..fe].to_vec());
 
-                let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pm) = &pipeline_message {
+                // Refuse a pipeline this engine cannot re-encode before anything
+                // is split or encoded, so the refusal reaches the preflight on
+                // both branches below — including the staged one, which does its
+                // splitting in the apply phase and so has no other chance to make
+                // it.
+                if let Some(pm) = &pipeline_message {
                     let pipeline = FilterPipeline::parse(pm).map_err(|_| {
                         Error::EditUnsupported("dataset filter pipeline could not be parsed")
                     })?;
@@ -5722,17 +5738,37 @@ impl WriteEngine {
                              cannot be overwritten in place yet",
                         ));
                     }
-                    let ctx = ChunkContext::from_datatype(&spatial, &fd.dt)?;
-                    let mut encoded = Vec::with_capacity(split.len());
-                    // One encoder across the rewrite; see `FilterScratch`.
-                    let mut scratch = FilterScratch::new();
-                    for buf in &split {
-                        encoded.push(compress_chunk_with(&mut scratch, buf, &pipeline, ctx)?);
-                    }
-                    encoded
-                } else {
-                    split
-                };
+                }
+
+                // Element bytes still carrying unresolved variable-length
+                // references cannot be split here: a filtered chunk's compressed
+                // length depends on the heap addresses patched into it, so the
+                // split has to follow the patch, which follows a placement the
+                // preflight may not make. See `MovingWrite::ChunkedStaged`.
+                if fd.vl_string_staging.is_some() {
+                    return Ok(WritePlan::Moving(MovingWrite::ChunkedStaged {
+                        region,
+                        shape: disk_ds.dimensions.clone(),
+                        chunk_dims: spatial,
+                        element_size,
+                        maxshape,
+                        pipeline_message,
+                        padding,
+                        dt: fd.dt.clone(),
+                        bytes: staged_bytes(fd),
+                        old_addr: addr,
+                    }));
+                }
+
+                let new_chunk_bytes = split_and_encode_chunks(
+                    &fd.raw,
+                    &disk_ds.dimensions,
+                    &spatial,
+                    element_size,
+                    &padding,
+                    pipeline_message.as_deref(),
+                    &fd.dt,
+                )?;
 
                 // Fast path: overwrite each chunk straight in its slot when every
                 // new chunk fits. No header rewrite and no superblock flip — the
@@ -6798,9 +6834,10 @@ impl WriteEngine {
             MovingWrite::Contiguous {
                 region,
                 addr_off,
-                raw,
+                bytes,
                 ..
             } => {
+                let raw = &self.resolve_overwrite_bytes(bytes)?;
                 let new_data_addr = self.alloc_or_append_typed(raw, PageType::Raw)?;
                 let mut region = region.clone();
                 // The placement is an absolute file offset; the contiguous
@@ -6815,8 +6852,9 @@ impl WriteEngine {
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
-            MovingWrite::Compact { region, raw } => {
-                let region = rebuild_compact_layout_region(region, raw)?;
+            MovingWrite::Compact { region, bytes } => {
+                let raw = self.resolve_overwrite_bytes(bytes)?;
+                let region = rebuild_compact_layout_region(region, &raw)?;
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
@@ -6841,6 +6879,51 @@ impl WriteEngine {
                 chunk_bytes,
                 &[],
             ),
+            MovingWrite::ChunkedStaged {
+                region,
+                shape,
+                chunk_dims,
+                element_size,
+                maxshape,
+                pipeline_message,
+                padding,
+                dt,
+                bytes,
+                ..
+            } => {
+                // Resolve before splitting: the heap collections have to be
+                // placed, and their addresses patched into the element
+                // references, before those references are cut into chunks and —
+                // on a filtered dataset — compressed over.
+                let raw = self.resolve_overwrite_bytes(bytes)?;
+                let chunk_bytes = split_and_encode_chunks(
+                    &raw,
+                    shape,
+                    chunk_dims,
+                    *element_size,
+                    padding,
+                    pipeline_message.as_deref(),
+                    dt,
+                )?;
+                let meta: Vec<ChunkMeta> = chunk_bytes
+                    .iter()
+                    .map(|c| ChunkMeta {
+                        compressed_size: c.len() as u64,
+                        filter_mask: 0,
+                    })
+                    .collect();
+                self.write_chunked_relocatable(
+                    region,
+                    shape,
+                    chunk_dims,
+                    *element_size,
+                    maxshape.as_deref(),
+                    pipeline_message.as_deref(),
+                    &meta,
+                    &chunk_bytes,
+                    &[],
+                )
+            }
             MovingWrite::AppendedChunks {
                 region,
                 new_dataspace_body,
@@ -7161,6 +7244,30 @@ impl WriteEngine {
                 Ok(addr - self.superblock.base_address)
             })
             .collect()
+    }
+
+    /// Resolve a staged value overwrite's element bytes: place any global heap
+    /// collections its variable-length references name, patch their addresses
+    /// in, and return the bytes ready to write (issue #321).
+    ///
+    /// This allocates, so every caller is in the apply phase — the preflight
+    /// that chose the plan only reads. The bytes an overwrite *replaces* keep
+    /// whatever collections they named: a collection can be shared between
+    /// objects, so the ones the old strings lived in are left behind rather than
+    /// reclaimed, exactly as a deleted variable-length dataset's are. `repack`
+    /// is what recovers that space.
+    fn resolve_overwrite_bytes(&mut self, bytes: &OverwriteBytes) -> Result<Vec<u8>, Error> {
+        let mut raw = bytes.raw.clone();
+        if let Some(staging) = &bytes.staging {
+            // An all-null (or empty) dataset stages no collection at all, and
+            // patching nothing is the correct answer for it: a null element's
+            // reference must keep the zero address that makes it read back null.
+            if !staging.collections.is_empty() {
+                let addrs = self.place_vl_collections(&staging.collections)?;
+                patch_vl_refs_masked(&mut raw, &staging.patch_offsets, &addrs);
+            }
+        }
+        Ok(raw)
     }
 
     /// Resolve one object-reference element's target to the base-relative
@@ -8043,13 +8150,47 @@ struct GroupInfo {
     link_names: Vec<String>,
 }
 
+/// Element bytes staged for a value overwrite, together with the
+/// variable-length staging (if any) whose global heap collections must be
+/// placed — and whose addresses patched into the element references in `raw` —
+/// before those bytes reach the file.
+///
+/// The two halves travel together because resolving them is an **apply-phase**
+/// step while planning is a preflight one: placing a collection allocates, and
+/// [`commit`](WriteEngine::commit)'s preflight only reads. So a plan carries
+/// the bytes unresolved and every consumer resolves them where it writes, with
+/// [`resolve_overwrite_bytes`](WriteEngine::resolve_overwrite_bytes) (issue
+/// #321).
+///
+/// Patching never changes `raw`'s length — an element reference is fixed-width
+/// whatever string it names — which is what lets the plan be *chosen* from the
+/// unresolved bytes. The one place that is not enough is a filtered chunked
+/// dataset, whose compressed chunk sizes do depend on the addresses: see
+/// [`MovingWrite::ChunkedStaged`].
+struct OverwriteBytes {
+    raw: Vec<u8>,
+    /// `None` for every overwrite that stages no variable-length data, which is
+    /// all of them but a `with_vlen_strings` one.
+    staging: Option<VlStringStaging>,
+}
+
+impl OverwriteBytes {
+    /// Bytes that need no resolving.
+    fn ready(raw: Vec<u8>) -> Self {
+        Self { raw, staging: None }
+    }
+}
+
 /// How a staged value overwrite (`write_dataset`) will be applied, decided by
 /// [`WriteEngine::prepare_write`] during the all-or-nothing preflight.
 enum WritePlan {
     /// A contiguous dataset whose new data is the same length as its existing,
     /// defined data block: overwrite the bytes straight in place at `data_addr`.
     /// No object header is rewritten and the superblock root is not flipped.
-    InPlace { data_addr: usize, raw: Vec<u8> },
+    InPlace {
+        data_addr: usize,
+        bytes: OverwriteBytes,
+    },
     /// A chunked dataset overwritten chunk-by-chunk in place: each `(addr, bytes)`
     /// pair is written straight over an existing chunk slot. Used when every new
     /// (re-encoded) chunk is the same byte length as the slot it replaces — an
@@ -8076,11 +8217,14 @@ enum MovingWrite {
     Contiguous {
         region: Vec<u8>,
         addr_off: usize,
-        raw: Vec<u8>,
+        bytes: OverwriteBytes,
         old_extent: Option<(u64, u64)>,
     },
-    /// A compact dataset: rebuild the header `region` with `raw` inline.
-    Compact { region: Vec<u8>, raw: Vec<u8> },
+    /// A compact dataset: rebuild the header `region` with the bytes inline.
+    Compact {
+        region: Vec<u8>,
+        bytes: OverwriteBytes,
+    },
     /// A chunked dataset whose new (re-encoded) chunks do not all fit their
     /// existing slots, so its whole storage is rebuilt and relocated. A fresh
     /// chunk-data blob and index are placed — in a freed region that fits, else at
@@ -8102,6 +8246,36 @@ enum MovingWrite {
         pipeline_message: Option<Vec<u8>>,
         meta: Vec<ChunkMeta>,
         chunk_bytes: Vec<Vec<u8>>,
+        old_addr: u64,
+    },
+    /// A chunked dataset overwritten with element bytes that still carry
+    /// unresolved variable-length references ([`OverwriteBytes::staging`]).
+    ///
+    /// Splitting into chunks — and re-encoding them through the dataset's
+    /// filter pipeline — has to wait for the patched bytes, so unlike
+    /// [`Chunked`](MovingWrite::Chunked) this variant carries the *whole*
+    /// element array and the geometry to split it, and does that work in
+    /// [`write_moving`](WriteEngine::write_moving). A filtered chunk's
+    /// compressed length depends on the heap addresses patched into it, which
+    /// is why the preflight cannot split first and patch after.
+    ///
+    /// It always relocates, which is what puts the single-hard-link refusal
+    /// (the one every [`Moving`](WritePlan::Moving) plan answers to) in the
+    /// preflight, where it belongs: whether a chunked overwrite could have
+    /// stayed in its slots is not knowable until those lengths exist.
+    ChunkedStaged {
+        region: Vec<u8>,
+        /// See [`CopyTree::DatasetChunked::shape`].
+        shape: Vec<u64>,
+        chunk_dims: Vec<u64>,
+        element_size: NonZeroUsize,
+        maxshape: Option<Vec<u64>>,
+        pipeline_message: Option<Vec<u8>>,
+        /// What the edge overhang of a partial chunk must hold (issue #296).
+        padding: crate::fill_value::PaddingFill,
+        /// The dataset's datatype, for the filter pipeline's [`ChunkContext`].
+        dt: crate::datatype::Datatype,
+        bytes: OverwriteBytes,
         old_addr: u64,
     },
     /// A relocating **append** to a chunked, unlimited, Extensible-Array-indexed
@@ -8991,6 +9165,62 @@ fn chunked_geometry(
         raw_size,
         maxshape,
     })
+}
+
+/// The element bytes a staged value overwrite will write, paired with the
+/// variable-length staging that has still to be resolved into them.
+///
+/// Cloned rather than moved because the staged set must survive a refused
+/// commit whole (issue #316), and this runs in the preflight that may refuse.
+fn staged_bytes(fd: &FlatDataset) -> OverwriteBytes {
+    OverwriteBytes {
+        raw: fd.raw.clone(),
+        staging: fd.vl_string_staging.clone(),
+    }
+}
+
+/// Split `raw` into full-size chunk buffers in dense row-major grid order and
+/// re-encode each through `pipeline_message`, the dataset's on-disk filter
+/// pipeline.
+///
+/// The overhang past the dataset's edge holds the dataset's own fill value, not
+/// zeros: an allocated chunk is expected to carry it wherever nothing was
+/// written, and those slots are what a reader returns once the dataset is
+/// extended into them (issue #296).
+///
+/// The caller has already refused a pipeline
+/// [`pipeline_reencodable`] rejects, so the only errors here are a malformed
+/// pipeline message (unreachable for the same reason) and the encoder's own.
+fn split_and_encode_chunks(
+    raw: &[u8],
+    shape: &[u64],
+    chunk_dims: &[u64],
+    element_size: NonZeroUsize,
+    padding: &crate::fill_value::PaddingFill,
+    pipeline_message: Option<&[u8]>,
+    dt: &crate::datatype::Datatype,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let split = split_into_chunks(
+        raw,
+        shape,
+        chunk_dims,
+        element_size,
+        padding.pattern(element_size),
+    )
+    .map_err(Error::Format)?;
+    let Some(pm) = pipeline_message else {
+        return Ok(split);
+    };
+    let pipeline = FilterPipeline::parse(pm)
+        .map_err(|_| Error::EditUnsupported("dataset filter pipeline could not be parsed"))?;
+    let ctx = ChunkContext::from_datatype(chunk_dims, dt)?;
+    let mut encoded = Vec::with_capacity(split.len());
+    // One encoder across the rewrite; see `FilterScratch`.
+    let mut scratch = FilterScratch::new();
+    for buf in &split {
+        encoded.push(compress_chunk_with(&mut scratch, buf, &pipeline, ctx)?);
+    }
+    Ok(encoded)
 }
 
 /// Try to overwrite a chunked dataset's chunks in place. When the dataset's

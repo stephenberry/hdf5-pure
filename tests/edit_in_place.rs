@@ -4600,46 +4600,53 @@ fn add_zero_element_vlen_string_dataset_via_edit_session() {
     assert_eq!(ds.read_string().unwrap(), Vec::<String>::new());
 }
 
-/// Regression test: `write_dataset(...).with_vlen_strings(...)` must not
-/// silently corrupt the target (the overwrite path never patches the global
-/// heap collection this stages) — the same bug class issue #105 fixed for the
-/// *add* path, reached here through the sibling overwrite API instead. It is
-/// refused up front, and the refusal must not write anything.
+/// `write_dataset(...).with_vlen_strings(...)` resolves every staged element
+/// reference against a global heap collection it places (issue #321).
+///
+/// This was a refusal until then, and the refusal existed for a reason worth
+/// keeping under test: the staged references carry a **placeholder** heap
+/// address of zero, and writing them as if they were final is the bug class
+/// issue #105 fixed for the *add* path and issue #318 fixed for the reference
+/// one. Reading the strings back is one half of the check. The other is reading
+/// the element bytes and asserting no reference kept address zero — because a
+/// reader that resolves a zero address to "null" would report an empty string,
+/// and `read_string` alone cannot tell that from a string that is genuinely
+/// empty.
 #[test]
-fn write_dataset_rejects_vlen_strings_without_writing() {
-    let path = temp_path("hdf5_pure_edit_write_vlen_string_rejected.h5");
+fn overwriting_a_vlen_string_dataset_leaves_no_placeholder_address() {
+    let path = temp_path("hdf5_pure_edit_overwrite_vlen_no_placeholder.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("labels").with_vlen_strings(&["a", "b"]);
     b.write(&path).unwrap();
-    let before = std::fs::read(&path).unwrap();
 
     {
         let session = File::open_rw(&path).unwrap();
-        let err = session
+        session
             .dataset("labels")
             .unwrap()
             .write_staged(|b| {
                 b.with_vlen_strings(&["x", "y"]);
             })
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("variable-length-string"),
-            "got: {err}"
-        );
-        assert!(
-            !session.has_staged_edits(),
-            "a refused overwrite must not be left staged"
-        );
+            .unwrap();
+        session.commit().unwrap();
     }
 
-    // The refusal must not touch the file, and the original data must still
-    // read back correctly (not partially patched or corrupted).
-    assert_eq!(std::fs::read(&path).unwrap(), before);
     let file = File::open(&path).unwrap();
+    let ds = file.dataset("labels").unwrap();
     assert_eq!(
-        file.dataset("labels").unwrap().read_string().unwrap(),
-        vec!["a".to_string(), "b".to_string()]
+        ds.read_string().unwrap(),
+        vec!["x".to_string(), "y".to_string()]
     );
+
+    // A variable-length element reference is `[4-byte length][8-byte global
+    // heap address][4-byte object index]`. Neither string is null, so every
+    // address must have been patched away from the staged zero.
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 32, "two 16-byte element references");
+    for (i, element) in raw.chunks_exact(16).enumerate() {
+        let addr = u64::from_le_bytes(element[4..12].try_into().unwrap());
+        assert_ne!(addr, 0, "element {i} kept its placeholder heap address");
+    }
 }
 
 /// The object-reference counterpart of
@@ -5891,5 +5898,142 @@ fn a_zero_element_dataset_copies_as_the_storage_it_never_had() {
         f.dataset("full_copy").unwrap().read_i32().unwrap(),
         vec![1, 2, 3],
         "the dataset that does store data copied it"
+    );
+}
+
+/// Issue #321: `Dataset::write_staged` with `with_vlen_strings` overwrites a
+/// variable-length-string dataset's values, resolving the staged placeholder
+/// element references against a freshly placed global heap collection.
+///
+/// The replacement strings are deliberately *longer* than the originals: the
+/// element bytes are fixed-width references either way, so the data block keeps
+/// its length and only the heap collection grows. That is what makes the
+/// contiguous same-length fast path the one this exercises.
+#[test]
+fn overwriting_a_vlen_string_dataset_replaces_its_strings() {
+    let path = temp_path("hdf5_pure_edit_overwrite_vlen_contiguous.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&["a", "b", "c"]);
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&["alpha", "beta", "gamma"]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string()
+        ]
+    );
+}
+
+/// The chunked counterpart of
+/// [`overwriting_a_vlen_string_dataset_replaces_its_strings`]. A chunked
+/// variable-length-string dataset is what this crate writes for one created
+/// with chunks (issue #109), so refusing to overwrite it would leave a hole in a
+/// shape the crate itself produces.
+#[test]
+fn overwriting_a_chunked_vlen_string_dataset_replaces_its_strings() {
+    let path = temp_path("hdf5_pure_edit_overwrite_vlen_chunked.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&["a", "b", "c", "d"])
+        .with_chunks(&[2]);
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&["alpha", "beta", "gamma", "delta"]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+            "delta".to_string()
+        ]
+    );
+}
+
+/// A commit that refuses must not have placed the global heap collection a
+/// staged variable-length overwrite stages (issue #321).
+///
+/// Resolving those references allocates, and `commit`'s preflight only reads —
+/// that is what lets a refused commit restore the staged set whole (issue #316)
+/// and cost the session nothing. So the plan carries the bytes unresolved and
+/// the resolving happens in the apply phase. Staging a *second* overwrite that
+/// only the preflight can refuse — a shape the on-disk dataset does not have —
+/// is what puts a valid variable-length overwrite in front of a refusal.
+///
+/// The file bytes are the assertion. Placing the collection during the preflight
+/// would append it and grow the file, leaving the strings of an overwrite that
+/// never happened behind on every attempt.
+#[test]
+fn a_refused_commit_places_no_collection_for_a_staged_vlen_overwrite() {
+    let path = temp_path("hdf5_pure_edit_refused_vlen_overwrite.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels").with_vlen_strings(&["a", "b"]);
+    b.create_dataset("nums").with_i32_data(&[1, 2, 3]);
+    b.write(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&["much-longer-one", "much-longer-two"]);
+            })
+            .unwrap();
+        // Refused by the preflight, which reads the on-disk shape to find out.
+        session
+            .dataset("nums")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[1, 2, 3, 4, 5]);
+            })
+            .unwrap();
+
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("shape"), "got: {err}");
+        assert!(
+            session.has_staged_edits(),
+            "a refused commit must give the staged set back (issue #316)"
+        );
+    }
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a refused commit must not have placed the overwrite's heap collection"
+    );
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        vec!["a".to_string(), "b".to_string()]
     );
 }

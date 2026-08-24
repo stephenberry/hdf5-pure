@@ -1015,6 +1015,13 @@ pub(crate) const VL_REF_SIZE: usize = 16;
 /// here: they are the dataset's data, and the builder's `data` field is where
 /// they live. Carrying them in both places cost a copy of every reference in the
 /// dataset for a field nothing read afterwards (issue #228).
+///
+/// `Clone` is for the overwrite path, whose plan is built from a *borrowed*
+/// staged edit: the staged set has to survive a refused commit intact (issue
+/// #316), so the plan cannot move the staging out of it. The copy is of the
+/// same payload the neighbouring `raw.clone()` already makes, and it is made
+/// once per commit, not per element.
+#[derive(Clone)]
 pub(crate) struct VlStringStaging {
     /// The serialized global heap collections holding the non-null objects, in
     /// the order their objects appear. Empty when there are no such objects.
