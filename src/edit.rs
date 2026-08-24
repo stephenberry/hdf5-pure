@@ -8605,20 +8605,17 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         db.chunk_options
             .validate_geometry(&shape, db.maxshape.as_deref())
             .map_err(Error::EditUnsupported)?;
-        // Deflate is compiled out unless the `deflate` feature is on, but
-        // `build_pipeline` emits its descriptor regardless; catch a
-        // disabled-feature request here so it is refused up front rather than
+        // A filter this build cannot apply is refused up front rather than
         // failing mid-apply when a chunk is compressed.
-        #[cfg(not(feature = "deflate"))]
-        if db.chunk_options.deflate_level.is_some() {
-            return Err(Error::EditUnsupported(
-                "deflate compression requires the `deflate` crate feature",
-            ));
-        }
+        db.chunk_options
+            .refuse_unavailable_filters()
+            .map_err(Error::EditUnsupported)?;
         // Validate the requested filter pipeline now — before any file bytes are
         // written — so an unsupported filter, an incompatible datatype, or a
-        // disabled compression feature is refused up front; the chunk data
-        // itself is laid out in the commit's apply phase. Chunked/filtered
+        // fill value the filter cannot record is refused up front; the chunk
+        // data itself is laid out in the commit's apply phase. A filter the
+        // build compiled out is not among them: `build_pipeline` emits its
+        // descriptor regardless, which is why the check above exists. Chunked/filtered
         // storage flows through the very builder the normal writer uses
         // ([`compress_chunks`] + [`assemble_chunked_at`] + [`build_chunked_dataset_oh`]),
         // so the
@@ -8641,9 +8638,8 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
             .map_err(|_| {
                 Error::EditUnsupported(
                     "this dataset's filter pipeline cannot be added in place \
-                     (an unsupported filter, an incompatible datatype, a fill \
-                     value the filter cannot record, or a compression feature \
-                     that is not enabled)",
+                     (an unsupported filter, an incompatible datatype, or a \
+                     fill value the filter cannot record)",
                 )
             })?;
     }

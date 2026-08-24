@@ -166,11 +166,10 @@ fn order_code(order: &DatatypeByteOrder) -> Option<u32> {
 /// for one caller: [`repack`](crate::repack), reproducing a source file whose
 /// filter recorded `FILL_UNDEFINED`. The day the writer models an undefined
 /// fill value, this collapses back into the fill value itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillAvailability {
     /// `FILL_DEFINED`: the filter records the dataset's fill value, and encodes
     /// elements equal to it as the reserved sentinel.
-    #[default]
     Defined,
     /// `FILL_UNDEFINED`: the filter records no fill value, and every element is
     /// encoded as an ordinary offset.

@@ -20,6 +20,11 @@ pub const FILTER_LZF: u16 = 32000;
 #[cfg(feature = "zfp")]
 pub const FILTER_ZFP: u16 = 32013;
 
+/// `H5Z_FLAG_OPTIONAL`, bit 0 of a filter's flags word: a reader that cannot
+/// apply the filter may skip it. Named so the paths that read the bit and the
+/// path that writes it cannot read different values.
+pub const H5Z_FLAG_OPTIONAL: u16 = 1;
+
 /// Description of a single filter in a pipeline.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilterDescription {
@@ -31,6 +36,15 @@ pub struct FilterDescription {
     pub flags: u16,
     /// Client data values passed to the filter.
     pub client_data: Vec<u32>,
+}
+
+impl FilterDescription {
+    /// Whether a reader that cannot apply this filter may skip it
+    /// ([`H5Z_FLAG_OPTIONAL`]). A mandatory filter must be applied for the data
+    /// to decode, so a reader missing it has to fail.
+    pub fn is_optional(&self) -> bool {
+        self.flags & H5Z_FLAG_OPTIONAL != 0
+    }
 }
 
 /// A filter pipeline consisting of one or more filters.

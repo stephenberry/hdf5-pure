@@ -30,7 +30,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::chunked_write::ChunkOptions;
+use crate::chunked_write::{ChunkOptions, FilterKind};
 use crate::filter_pipeline::{FILTER_LZF, FILTER_SHUFFLE};
 use crate::lzf;
 
@@ -112,12 +112,14 @@ fn writer_pipeline_matches_h5py() {
             fix.name
         );
 
-        let options = ChunkOptions {
+        let mut options = ChunkOptions {
             chunk_dims: Some(fix.chunk_shape.clone()),
-            lzf: true,
-            shuffle: fix.filters.contains(&FILTER_SHUFFLE),
             ..ChunkOptions::default()
         };
+        if fix.filters.contains(&FILTER_SHUFFLE) {
+            options.set_filter(FilterKind::Shuffle);
+        }
+        options.set_filter(FilterKind::Lzf);
         let pipeline = options
             .build_pipeline(
                 &crate::filters::ChunkContext::basic(&fix.chunk_shape, fix.element_size()),
