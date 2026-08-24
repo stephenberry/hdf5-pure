@@ -14,12 +14,8 @@
 //! - The **on-disk flag** is just a byte; only userspace code at clean shutdown
 //!   can reset it, so a crash freezes it set. Recover it with
 //!   [`crate::File::clear_swmr_flag`] (the `h5clear -s` equivalent).
-//!
-//! A crash freezing the byte set is what makes it useful beyond SWMR: a session
-//! given a page buffer ([`crate::FileAccessProperties::with_page_buffer_size`])
-//! raises [`WRITE_ACCESS`] for its lifetime, so a writer that dies with pages
-//! still in memory leaves a file this crate, `H5Fopen` and h5py all refuse
-//! rather than one that reads clean and returns the wrong bytes (issue #308).
+//!   A crash freezing it set is also what makes it useful beyond SWMR — see
+//!   [`WRITE_ACCESS`], which a page-buffered session raises for its lifetime.
 //!
 //! Both are enforced here: [`acquire_exclusive`] takes the lock, and
 //! [`check_status_flags`] refuses an open the on-disk byte says is unsafe

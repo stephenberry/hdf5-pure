@@ -359,12 +359,13 @@ let file = File::open_rw_with_options(
 ).unwrap();
 ```
 
-Dirty pages then survive across barriers, commits and appends until the budget is spent, an `fsync` is issued, or the session closes. On that same session, that takes the 160 down to 10.
+Dirty pages then survive across barriers, commits and appends until the budget is spent, an `fsync` is issued, or the session closes. Measured on a paged file, 32 chunk appends into eight datasets followed by a commit: **188 writes with the default gathering, 4 with a page buffer** — two of which are the mark below going up and coming down. The appends issue nothing at all until the session ends.
 
-Five things are required, each refused rather than quietly ignored:
+Six things are required, each refused rather than quietly ignored:
 
 - **A paged file** created with `FileSpaceStrategy::Page`, and a budget of at least that file's page size.
-- **A budget of at least 1 MiB**, which is what a session already gathers between barriers. A smaller page buffer *replaces* that budget rather than extending it, and issues more writes than leaving the property unset: measured on a 4 KiB-paged file, one 4 MiB append cost 37 writes unset, 60 with a 64 KiB buffer, and 517 with a 4 KiB one.
+- **A budget of at least 1 MiB**, which is what a session already gathers between barriers. A smaller page buffer *replaces* that budget rather than extending it, and on a workload whose writes form one long run that is far worse than leaving the property unset: measured on a 4 KiB-paged file, one 4 MiB append cost 37 writes unset, 60 with a 64 KiB buffer, and 517 with a 4 KiB one. The floor is set to that worst case rather than to a crossover — a many-small-appends workload prefers the *smaller* budget (32 appends cost 184 writes unset, 23 at 4 KiB, 3 at 64 KiB) — because the number has to be chosen before the workload is known.
+- **Persisted free space**, since a paged file without it can neither be committed to nor appended to — the buffer would hold nothing while its mark blocked every reader.
 - **A version-3 superblock**, because the session marks the file while it holds it and nothing reads that byte back on an older one. See below.
 - **`SyncPolicy::OnClose`.** Under the default `Always` every barrier is an `fsync` that flushes the buffer, so it would hold nothing while still costing the mark.
 - **A session long enough to pay for the mark.** See below.
@@ -385,17 +386,19 @@ So a page-buffered session **marks the file for its lifetime**: superblock statu
 
 ### When it is worth it
 
-The mark costs two `fsync`s per session, at open and at close, whatever the session then does — so a page buffer pays off over a long session and costs on a short one. Measured on an Apple M1 Max (APFS), 256-byte appends into eight datasets:
+The mark costs two `fsync`s per session, at open and at close, whatever the session then does — so a page buffer pays off over a long session and costs on a short one. Measured on an Apple M1 Max (APFS), 256-byte appends into eight datasets, arms alternated and medians of seven:
 
 | appends | default | page buffer | ratio |
 |---:|---:|---:|---:|
-| 400 | 15.5 ms | 24.6 ms | 0.63 |
-| 800 | 28.8 ms | 29.2 ms | 0.99 |
-| 1,600 | 50.2 ms | 40.0 ms | 1.25 |
-| 3,200 | 92.5 ms | 59.2 ms | 1.56 |
-| 6,400 | 200.9 ms | 122.7 ms | 1.64 |
+| 400 | 14.5 ms | 19.3 ms | 0.75 |
+| 800 | 23.3 ms | 24.3 ms | 0.96 |
+| 1,600 | 41.0 ms | 33.3 ms | 1.23 |
+| 3,200 | 79.1 ms | 54.8 ms | 1.45 |
+| 6,400 | 152.9 ms | 93.5 ms | 1.64 |
 
-Break-even is near 800 appends here, and the ratio climbs past it because the same pages are re-dirtied more often the longer the session runs. It narrows to about 1.15 once 64 KiB payloads rather than metadata churn dominate. Both figures are one host's: `cargo bench --bench hot_paths -- page_buffer` runs both sides of the crossing on yours.
+Break-even is near 800 appends here, and the ratio climbs past it because the same pages are re-dirtied more often the longer the session runs. The 1,600-append session ran 1.64 with the mark removed against 1.23 with it, which is what the guarantee costs — a fixed price per session rather than a rate. The margin narrows to about 1.1 once 64 KiB payloads rather than metadata churn dominate.
+
+These are one host's numbers and the short end is noisy, since both of its arms are small enough for the fixed `fsync` cost to dominate. `cargo bench --bench hot_paths -- page_buffer` runs both sides of the crossing on yours.
 
 ## Supported targets and formats
 

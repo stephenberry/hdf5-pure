@@ -284,8 +284,10 @@ fn a_commit_in_a_page_buffered_session_leaves_the_mark_standing() {
         "a commit must publish the session's mark, not scrub it"
     );
 
-    // A second one, because the first commit and the ones after it take
-    // different tails on a file that persists its free space.
+    // A second one. Not because it takes a different tail — instrumenting the
+    // three superblock publish sites shows both commits go through the same one,
+    // the paged persisting tail — but because a mark republished once and then
+    // dropped would pass a single-commit test.
     file.root()
         .create_dataset("again", |b| {
             b.with_f64_data(&[3.5f64; 32]).with_shape(&[32]);

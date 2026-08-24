@@ -881,8 +881,9 @@ fn a_page_buffer_does_not_recopy_what_it_holds_across_operations() {
     );
 
     // Measured at 7.3x the raw bytes when a write inside a held run patches it in
-    // place, and at 516x when each one rebuilds the run it lands in — two orders
-    // of magnitude apart, so this bound need not be tight to separate them.
+    // place, and at 388x when each one rebuilds the run it lands in (7.7 MB
+    // against 407 MB, to write one megabyte) — nearly two orders of magnitude
+    // apart, so this bound need not be tight to separate them.
     assert!(
         measured.bytes < 64 * RAW_BYTES,
         "a page buffer must not recopy what it holds: measured {measured} against \

@@ -267,18 +267,21 @@ impl FileAccessProperties {
     /// still reaches the operating system in full before it returns. What this
     /// buys on top is letting a dirty page survive those barriers, which is where
     /// a workload of many small appends into a few pages does most of its
-    /// repeating: a session of 32 chunk appends cost 160 writes with the default
-    /// and 10 with a page buffer.
+    /// repeating. Measured on a paged file, 32 chunk appends into eight datasets
+    /// followed by a commit: **188 writes with the default gathering and 4 with a
+    /// page buffer**, of which two are the mark below going up and coming down.
+    /// The appends issue nothing at all until the session ends.
     ///
     /// **It pays off over a long session, and costs on a short one.** The crash
     /// mark below is two `fsync`s per session whatever the session then does, so
     /// there is a break-even: measured on an Apple M1 Max (APFS) with 256-byte
-    /// appends into eight datasets, 400 appends ran 0.63x — slower — 800 broke
+    /// appends into eight datasets, 400 appends ran 0.75x — slower — 800 broke
     /// even, and 6,400 ran 1.64x. The ratio climbs with session length, because
-    /// the same pages are re-dirtied more often, and narrows to about 1.15x once
-    /// 64 KiB payloads rather than metadata churn dominate. Re-measure on the
-    /// host that matters: `cargo bench --bench hot_paths -- page_buffer` runs
-    /// both sides of the crossing.
+    /// the same pages are re-dirtied more often, and narrows to about 1.1x once
+    /// 64 KiB payloads rather than metadata churn dominate. One host's numbers,
+    /// and the short end is noisy; re-measure on the one that matters with
+    /// `cargo bench --bench hot_paths -- page_buffer`, which runs both sides of
+    /// the crossing.
     ///
     /// # What it costs, and what pays for it
     ///
@@ -307,7 +310,7 @@ impl FileAccessProperties {
     ///
     /// # Refusals
     ///
-    /// Five, each refused with
+    /// Six, each refused with
     /// [`Error::EditUnsupported`](crate::Error::EditUnsupported) rather than
     /// quietly ignored:
     ///
@@ -316,8 +319,14 @@ impl FileAccessProperties {
     ///   page boundary to align to;
     /// - a budget below that file's file-space page size;
     /// - a budget below the 1 MiB a session already gathers under, since a page
-    ///   buffer *replaces* that budget and a smaller one issues more writes than
-    ///   leaving this unset;
+    ///   buffer *replaces* that budget rather than adding to it, and on a
+    ///   single-long-run workload a smaller one issues far more writes than
+    ///   leaving this unset (one 4 MiB append: 37 writes unset, 517 at 4 KiB).
+    ///   A floor set to the worst case — a small-append workload prefers the
+    ///   smaller budget — because the choice is made before the workload is known;
+    /// - a paged file whose free space is not persisted, which can be neither
+    ///   committed to nor appended to, so the buffer would hold nothing while its
+    ///   mark blocked every reader;
     /// - a superblock older than version 3, whose status-flags byte no library
     ///   reads back, so the mark above would announce nothing;
     /// - [`SyncPolicy::Always`](crate::SyncPolicy::Always), the default, where
@@ -541,16 +550,18 @@ impl Drop for FileInner {
         // not an option the caller still has. The barrier is therefore forced
         // rather than left to the session's `SyncPolicy` — see
         // [`SyncPolicy::OnClose`](crate::SyncPolicy::OnClose).
-        if self.swmr_write {
-            let _ = session.set_consistency_flags(0);
-            let _ = session.force_sync();
-            return;
+        // SWMR stages nothing and persists no free space, so it skips the
+        // re-homing; everything after that is the same teardown for both.
+        if !self.swmr_write {
+            let _ = session.finalize_persist();
         }
-        let _ = session.finalize_persist();
-        let _ = session.force_sync();
-        // After the sync, never before: the mark says this session's writes may
-        // still be in memory, and it stops being true only once they are not.
-        let _ = session.release_crash_mark();
+        // Only if the flush actually succeeded. The flags say this session's
+        // writes may still be in memory, and a failed `force_sync` is precisely
+        // the case where that is still true — taking them down there would
+        // publish the file as complete over a drain that did not finish.
+        if session.force_sync().is_ok() {
+            let _ = session.release_status_flags();
+        }
     }
 }
 
@@ -733,20 +744,9 @@ impl FileInner {
         // `WriteEngine::open_swmr_writer` says why.
         session.set_libver_bounds(properties.libver_bounds)?;
         session.set_sync_policy(properties.sync_policy);
-        // A page buffer holds dirty pages across ordering barriers, and under
-        // `Always` every barrier is an `fsync` that flushes it — so it would hold
-        // nothing, and the caller would have paid a real guarantee (see
-        // `with_page_buffer_size`) for nothing in return. Refused rather than
-        // quietly ignored, as the two refusals in `set_page_buffer_size` and the
-        // SWMR one are, and as this crate refuses `MemoryStrategy::Bounded` on a
-        // writer that cannot honor it (issue #288).
-        if properties.page_buffer_size != 0 && properties.sync_policy == SyncPolicy::Always {
-            return Err(Error::EditUnsupported(
-                "a page buffer does nothing under SyncPolicy::Always, whose every barrier is \
-                 an fsync that flushes it; pair with_page_buffer_size with \
-                 with_sync_policy(SyncPolicy::OnClose), or drop it",
-            ));
-        }
+        // Every page-buffer refusal lives in `set_page_buffer_size`, including the
+        // `SyncPolicy::Always` one — which is why `set_sync_policy` must precede
+        // this call rather than merely happening to.
         session.set_page_buffer_size(properties.page_buffer_size)?;
         // The engine parsed and normalized this at open; take it rather than
         // re-parsing, so the image need not be able to hand out a slice.
@@ -2199,38 +2199,30 @@ impl File {
     /// reads still work.
     pub fn close(self) -> Result<(), Error> {
         if matches!(self.inner.backend, Backend::Edit(_)) {
-            if self.inner.swmr_write {
-                // SWMR mode stages nothing (the staged surface is refused), so do
-                // not commit — clear the SWMR-write flag and flush, marking the
-                // file cleanly closed for any concurrent reader.
-                if let Backend::Edit(m) = &self.inner.backend {
-                    let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    session.set_consistency_flags(0)?;
-                    // Forced, not left to the policy: this call consumes the
-                    // handle, so nothing the caller still holds could order the
-                    // flag write. A file left flagged is refused by every later
-                    // open until `clear_swmr_flag`, which makes it the write
-                    // here whose loss costs availability rather than freshness.
-                    session.force_sync()?;
-                }
-            } else {
+            // SWMR mode stages nothing — the staged surface is refused — so there
+            // is nothing to commit, and it persists no free space, so there is
+            // nothing to re-home.
+            let swmr = self.inner.swmr_write;
+            if !swmr {
                 self.commit()?;
-                // Immediate appends grow the file past any persisted free-space
-                // managers without running a commit tail, so re-home them here.
-                // A no-op unless this session left them stale.
-                // The barrier covering both: the commit above, and the file
-                // length that finalize's manager rewrite changed. Forced under
-                // every policy — `close` consumes the handle, so this is the last
-                // point at which either write can be ordered at all.
-                self.with_mirror_session(false, |session| {
-                    session.finalize_persist()?;
-                    session.force_sync()?;
-                    // Last, and only after the sync: a page-buffered session's
-                    // crash mark stands for writes that were still in memory,
-                    // and this is the point at which none are.
-                    session.release_crash_mark()
-                })?;
             }
+            self.with_mirror_session(false, |session| {
+                // Immediate appends grow the file past any persisted free-space
+                // managers without running a commit tail, so re-home them here. A
+                // no-op unless this session left them stale.
+                if !swmr {
+                    session.finalize_persist()?;
+                }
+                // Forced under every policy, and covering everything above: this
+                // call consumes the handle, so it is the last point at which any
+                // of these writes can be ordered at all.
+                session.force_sync()?;
+                // Last, and only after that sync. A session's status flags stand
+                // for writes that may still have been in memory — a SWMR writer's
+                // pair, a page buffer's crash mark — and this is the point at
+                // which none are.
+                session.release_status_flags()
+            })?;
             self.inner.closed.store(true, Ordering::Release);
         }
         Ok(())
@@ -6457,8 +6449,9 @@ mod tests {
     /// Each refusal has a different reason and none stands in for the others: an
     /// unpaged file has no page boundary to align a page buffer to, a budget
     /// under one page is a buffer that drains on every page it touches, a budget
-    /// under the session's own gather budget issues *more* writes than leaving
-    /// the property unset, a pre-version-3 superblock carries a status-flags byte
+    /// under the session's own gather budget replaces it with something that can
+    /// be far worse, a session that persists no free space can neither commit nor
+    /// append, a pre-version-3 superblock carries a status-flags byte
     /// no library reads back so the crash mark would announce nothing, and the
     /// SWMR writer's readers observe the order its writes become visible in.
     /// The first two are where the C library refuses `H5Pset_page_buffer_size`
@@ -6577,6 +6570,39 @@ mod tests {
         );
         untouched("version-2 superblock", &old_format, &before);
 
+        // A paged file whose free space is not persisted, reached two ways: asked
+        // for outright, and produced by a userblock, for which persistence is
+        // declined however the creation properties were written. Such a session
+        // can neither commit nor append, so the buffer would hold nothing while
+        // its mark blocked every reader.
+        for (label, name, userblock) in [
+            ("paged, not persisting", "no_persist.h5", 0u64),
+            ("paged with a userblock", "ub_paged.h5", 4096),
+        ] {
+            let path = dir.path().join(name);
+            let mut b = FileBuilder::new();
+            if userblock != 0 {
+                b.with_userblock(userblock);
+            }
+            b.with_file_space_strategy(crate::FileSpaceStrategy::Page, userblock != 0, 1)
+                .with_file_space_page_size(4096);
+            b.create_dataset("d")
+                .with_i32_data(&[1, 2, 3, 4])
+                .with_shape(&[4]);
+            b.write(&path).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let refused = File::open_rw_with_options(
+                &path,
+                buffered(1 << 20).with_memory_strategy(MemoryStrategy::Mirrored),
+            );
+            assert!(
+                matches!(&refused, Err(Error::EditUnsupported(m)) if m.contains("persisted")),
+                "{label}: a page buffer on a session that cannot write must be refused, \
+                 got {refused:?}"
+            );
+            untouched(label, &path, &before);
+        }
+
         let swmr = fixture("swmr.h5", false);
         let before = std::fs::read(&swmr).unwrap();
         let refused = File::open_swmr_writer_with_options(&swmr, buffered(1 << 20));
@@ -6623,17 +6649,40 @@ mod tests {
         // 8192 clears the format's 4096 default and still falls short of this
         // file's 16 KiB page, so it fails only against the page size actually
         // read from the file.
-        let cases: [(&str, crate::FileCreateProperties, usize); 3] = [
-            ("unpaged file", crate::FileCreateProperties::new(), 1 << 20),
-            ("budget under one page", paged(16 * 1024), 8192),
+        //
+        // The last case is the one a caller reaches by doing nothing: `Always` is
+        // the default policy, and every other property in that pair is honorable.
+        // It is here because it was missing — the refusal used to sit at the fapl
+        // rather than with its siblings, so this function did not restate it and
+        // the file was written before the open failed.
+        let cases: [(&str, crate::FileCreateProperties, usize, SyncPolicy); 4] = [
+            (
+                "unpaged file",
+                crate::FileCreateProperties::new(),
+                1 << 20,
+                SyncPolicy::OnClose,
+            ),
+            (
+                "budget under one page",
+                paged(16 * 1024),
+                8192,
+                SyncPolicy::OnClose,
+            ),
             (
                 "budget under the gather budget",
                 paged(16 * 1024),
                 64 * 1024,
+                SyncPolicy::OnClose,
+            ),
+            (
+                "the default sync policy",
+                paged(16 * 1024),
+                1 << 20,
+                SyncPolicy::Always,
             ),
         ];
 
-        for (label, create, budget) in cases {
+        for (label, create, budget, policy) in cases {
             let path = dir
                 .path()
                 .join(std::format!("{}.h5", label.replace(' ', "_")));
@@ -6641,7 +6690,7 @@ mod tests {
                 &path,
                 create,
                 FileAccessProperties::new()
-                    .with_sync_policy(SyncPolicy::OnClose)
+                    .with_sync_policy(policy)
                     .with_page_buffer_size(budget),
             );
             assert!(

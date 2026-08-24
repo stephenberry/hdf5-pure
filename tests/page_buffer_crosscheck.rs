@@ -60,32 +60,20 @@ fn the_c_library_refuses_a_file_a_crashed_page_buffered_session_left_marked() {
         std::mem::forget(ds);
         std::mem::forget(file);
     }
-    assert_eq!(
-        File::from_bytes(std::fs::read(&path).unwrap())
-            .unwrap()
-            .superblock()
-            .consistency_flags,
-        0x01,
-        "the leaked session must leave the write bit alone, not the SWMR pair"
-    );
-
+    // Only what the C library can settle. That the byte is `0x01`, and that this
+    // crate refuses it and recovers from it, are `superblock_status_flags`'
+    // to assert — repeating them here costs a libhdf5 link to learn nothing.
     let c_err = hdf5::File::open(&path).expect_err("the C library refuses a marked file");
     assert!(
         c_err.to_string().contains("already open for write"),
         "the C library refused it for some other reason: {c_err}"
     );
-    assert!(
-        matches!(File::open(&path), Err(hdf5_pure::Error::FileMarkedInUse(_))),
-        "this crate must refuse what the C library refuses"
-    );
 
-    // The recovery reaches both, and is the only thing that does.
     File::clear_swmr_flag(&path).unwrap();
     hdf5::File::open(&path)
         .expect("clearing the mark recovers the file for the C library")
         .close()
         .unwrap();
-    File::open(&path).expect("and for this crate");
 }
 
 /// A session that closes cleanly leaves an ordinary paged file: the C library

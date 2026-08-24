@@ -216,29 +216,31 @@ fn bench_mat_roundtrip(_c: &mut Criterion) {}
 // above it, and the pair is the measurement — a single length would report
 // whichever answer it happened to sit on.
 //
-// Measured on an Apple M1 Max (APFS), 256-byte appends into eight datasets, over
-// three runs: `short` (400 appends) came out at 0.65-0.70x, and `long` (3,200
-// appends) at 1.26-2.24x. A controlled sweep of the same workload, alternating
-// the arms and taking medians, puts the crossing near 800 appends:
+// Measured on an Apple M1 Max (APFS), 256-byte appends into eight datasets. A
+// controlled sweep of the same workload — arms alternated, median of seven —
+// puts the crossing near 800 appends:
 //
 //   |  appends | off      | on       | ratio |
 //   |---------:|---------:|---------:|------:|
-//   |      400 |  15.5 ms |  24.6 ms |  0.63 |
-//   |      800 |  28.8 ms |  29.2 ms |  0.99 |
-//   |    1,600 |  50.2 ms |  40.0 ms |  1.25 |
-//   |    3,200 |  92.5 ms |  59.2 ms |  1.56 |
-//   |    6,400 | 200.9 ms | 122.7 ms |  1.64 |
+//   |      400 |  14.5 ms |  19.3 ms |  0.75 |
+//   |      800 |  23.3 ms |  24.3 ms |  0.96 |
+//   |    1,600 |  41.0 ms |  33.3 ms |  1.23 |
+//   |    3,200 |  79.1 ms |  54.8 ms |  1.45 |
+//   |    6,400 | 152.9 ms |  93.5 ms |  1.64 |
 //
 // Below the crossing the two `fsync`s cost more than the saved syscalls; above
 // it the ratio climbs, because the same pages are re-dirtied more often the
-// longer the session runs. The same 1,600-append session ran at 1.90x with the
-// crash mark removed, which is what the guarantee costs: a fixed price per
-// session rather than a rate. The margin also narrows to about 1.15x once 64 KiB
-// payloads rather than metadata churn dominate.
+// longer the session runs. The 1,600-append session ran 1.64x with the crash
+// mark removed against 1.23x with it — that gap is what the guarantee costs, a
+// fixed price per session rather than a rate. The margin also narrows to about
+// 1.1x once 64 KiB payloads rather than metadata churn dominate.
 //
-// Absolute times here are noisy — the `off` arm issues thousands of small writes
-// and is sensitive to background I/O — so read the ratio between a pair, and
-// re-measure rather than trusting these constants on another host.
+// **Read the ratio between a pair, not the absolute times, and re-measure rather
+// than trusting these constants.** The `off` arm issues thousands of small
+// writes and is sensitive to background I/O: across runs on an otherwise-busy
+// machine `short` ranged 0.65-1.11x and `long` 1.26-2.28x. The short arm is the
+// noisier of the two, because both of its arms are small enough for the fixed
+// `fsync` cost to dominate.
 
 fn bench_page_buffer(c: &mut Criterion) {
     use hdf5_pure::{FileAccessProperties, FileLocking, FileSpaceStrategy, SyncPolicy};

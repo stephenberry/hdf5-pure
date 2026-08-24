@@ -114,44 +114,27 @@ pub(crate) enum WriteBuffering {
     /// issued, or the session closes — spanning both operations and the ordering
     /// barriers inside them.
     ///
-    /// This is the `H5Pset_page_buffer_size` analogue, and it is opt-in because of
-    /// what crossing those barriers costs. Gathered writes are issued in address
-    /// order, and **every** publish point of an operation sits at a lower address
-    /// than the content it reaches — a commit's superblock and root at address 0,
-    /// an append's dataspace dimension and array-header element count in the
-    /// object header near the front, the chunk bytes and index blocks they name at
-    /// end-of-file. Held across their barriers, they are all issued first.
+    /// This is the `H5Pset_page_buffer_size` analogue, and the one mode that does
+    /// nothing at [`ordering_barrier`](FileImage::ordering_barrier). That is the
+    /// whole of what this layer decides. What it costs is a file-format question
+    /// rather than a byte-image one — held across a barrier, an operation's
+    /// publish points are issued ahead of the content they name, and the file a
+    /// crash then leaves can read *clean* and return the wrong bytes — so it is
+    /// stated where the format lives, on
+    /// [`WriteEngine::set_page_buffer_size`](crate::edit::WriteEngine::set_page_buffer_size)
+    /// and on the public
+    /// [`with_page_buffer_size`](crate::FileAccessProperties::with_page_buffer_size).
     ///
-    /// So a write that fails, or a process that dies, mid-flush can leave:
+    /// Installing this mode is not the whole feature: the engine raises the
+    /// superblock's write-access flag for the life of such a session, so those
+    /// files are refused rather than read. The C library ships its page buffer
+    /// without one; this mode is not offered without it (issue #308).
     ///
-    /// - a root or an end-of-file naming bytes that never arrived — a file that
-    ///   fails to read, which is the *benign* case;
-    /// - a dataset whose length was published but whose rows were not, which reads
-    ///   back **clean**, as fill values;
-    /// - a dataset header published over a region a previous commit freed, which
-    ///   reads back **clean**, as the deleted object's bytes.
-    ///
-    /// The last two are silent: every checksum verifies and the reader has no
-    /// signal. Measured, not reasoned — each was produced by failing one write of
-    /// a two-write drain.
-    ///
-    /// This is what a write-back page buffer is, rather than a defect in this one:
-    /// `H5Pset_page_buffer_size` makes no crash-consistency claim either, and the
-    /// C library's page buffer reorders the same way. What is given up is a
-    /// guarantee this crate adds *on top of* HDF5, not one an HDF5 user brings
-    /// with them. A completed commit's bytes may also still be in this process's
-    /// memory when it returns.
-    ///
-    /// Which is why installing this mode is not the whole feature: the engine
-    /// raises the superblock's write-access flag for the life of the session
-    /// (`WriteEngine::raise_crash_mark`), so the files described above are
-    /// refused rather than read. The C library ships its page buffer without one;
-    /// this mode is not offered without it (issue #308).
-    ///
-    /// Under [`SyncPolicy::Always`](crate::SyncPolicy::Always) this mode holds
-    /// nothing in practice, since every barrier is an `fsync` and flushes on its
-    /// way out. It is a setting for a session that has already moved the `fsync`
-    /// cadence to the application.
+    /// A completed commit's bytes may still be in this process's memory when it
+    /// returns. The engine refuses to pair this with
+    /// [`SyncPolicy::Always`](crate::SyncPolicy::Always), where every barrier is
+    /// an `fsync` that would flush it: the caller would pay the mark and hold
+    /// nothing.
     Session { page_size: u64, max_bytes: usize },
 }
 
