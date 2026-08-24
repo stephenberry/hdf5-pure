@@ -1186,6 +1186,30 @@ pub(crate) fn datatype_holds_object_address(dt: &Datatype) -> bool {
     }
 }
 
+/// Whether `datatype`'s element bytes carry a **global heap** address at any
+/// depth — the counterpart of [`datatype_holds_object_address`] for the other
+/// address an element can hold.
+///
+/// A variable-length element is a reference into a heap collection. A
+/// *dataset-region* reference is a heap id too (see
+/// [`datatype_holds_object_address`] above); this does not separate it from a
+/// plain object reference, and answers `true` for both. That is deliberate: the
+/// one caller uses this to decide when it can no longer prove a collection is
+/// referenced from a single place, and answering `true` too often only costs it
+/// the proof, where answering `false` too often would cost correctness.
+pub(crate) fn datatype_holds_heap_address(dt: &Datatype) -> bool {
+    match dt {
+        Datatype::VariableLength { .. } | Datatype::Reference { .. } => true,
+        Datatype::Compound { members, .. } => members
+            .iter()
+            .any(|m| datatype_holds_heap_address(&m.datatype)),
+        Datatype::Array { base_type, .. } | Datatype::Enumeration { base_type, .. } => {
+            datatype_holds_heap_address(base_type)
+        }
+        _ => false,
+    }
+}
+
 /// Every 8-byte object reference `datatype` reaches through a compound member or
 /// array entry, as byte offsets within one element, in declaration order.
 ///

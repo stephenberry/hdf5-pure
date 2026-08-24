@@ -755,6 +755,37 @@ pub(crate) struct WriteEngine {
     /// [`commit`](Self::commit), since a commit can relocate a cached header or
     /// free the region it points into (see `commit`).
     located: HashMap<u64, LocatedState>,
+    /// Global heap collections **this session placed** for a variable-length
+    /// value overwrite, by the overwritten dataset's path, as absolute
+    /// `(address, length)` extents.
+    ///
+    /// This is what lets the *next* overwrite of the same dataset reclaim the
+    /// strings the previous one left, instead of growing the file by its whole
+    /// payload on every commit forever (issue #321). Nothing else in the editor
+    /// reclaims a collection, and the reason is sound: a collection can be
+    /// shared between objects, and **nothing in the format proves otherwise**.
+    /// The per-object reference count does not: an in-file
+    /// [`copy`](Self::stage_copy) of a variable-length dataset re-emits its
+    /// element references verbatim, so two datasets name one collection with
+    /// every object's count still 1 — and files with that shape are already in
+    /// the wild.
+    ///
+    /// Provenance is therefore the whole proof: these collections were placed by
+    /// this session, for this dataset, and were named by nothing else at the
+    /// moment they were written. `invalidate_heap_provenance` is what keeps that
+    /// true afterwards — every entry is dropped as soon as this session does
+    /// anything that could name one of them a second time.
+    ///
+    /// The collections a dataset held when the session *opened* are never in
+    /// here and are never reclaimed: their provenance is whatever wrote the
+    /// file. `repack` is what recovers those.
+    vl_overwrite_heaps: HashMap<PathKey, Vec<(u64, u64)>>,
+    /// Heap collections superseded by a value overwrite this commit is applying,
+    /// freed once the commit's superblock repoint has landed — never before, so
+    /// a mid-commit crash leaves the prior root reaching bytes that are still
+    /// there. Drained into the commit's `to_free` list; cleared at commit entry,
+    /// so an attempt that fails partway frees nothing on the next one.
+    superseded_heaps: Vec<(u64, u64)>,
     /// True when this engine was opened for SWMR writing
     /// ([`open_swmr_writer`](Self::open_swmr_writer)): the append engine then
     /// enforces the SWMR subset (unfiltered, chunk-aligned) so a concurrent
@@ -1806,6 +1837,8 @@ impl WriteEngine {
             proved_free_of_references: false,
             persist: None,
             located: HashMap::new(),
+            vl_overwrite_heaps: HashMap::new(),
+            superseded_heaps: Vec::new(),
             swmr_mode: false,
             paged: None,
             committed: false,
@@ -3324,6 +3357,14 @@ impl WriteEngine {
             return Ok(());
         }
 
+        // An attempt that failed partway may have recorded superseded collections
+        // it never freed; this one must not free them on its behalf, since it is
+        // not the commit that replaced what they hold.
+        self.superseded_heaps.clear();
+        // Drop every heap-collection provenance record this batch could falsify,
+        // before any of them is read below.
+        self.invalidate_heap_provenance(staged);
+
         // A paged file (`H5F_FSPACE_STRATEGY_PAGE`) that does not persist its free
         // space has no on-disk record of which pages hold metadata and which hold
         // raw data, so this commit could not keep the two segregated and would
@@ -3404,7 +3445,17 @@ impl WriteEngine {
             .map_err(|_| Error::EditUnsupported("nothing to overwrite at the given path"))?;
             let addr = usize::try_from(addr)
                 .map_err(|_| Error::EditUnsupported("dataset address exceeds this platform"))?;
-            match Self::prepare_write(&self.image(), addr as u64, fd, base)? {
+            // What a previous overwrite of this same path left behind, to be
+            // freed once this commit lands. Read rather than removed: a refused
+            // commit must leave the session exactly as it found it, and the
+            // record is replaced (not consumed) when the new collections land.
+            let superseded = self
+                .vl_overwrite_heaps
+                .get(full)
+                .filter(|_| fd.vl_string_staging.is_some())
+                .cloned()
+                .unwrap_or_default();
+            match Self::prepare_write(&self.image(), addr as u64, fd, base, full, superseded)? {
                 WritePlan::InPlace { data_addr, bytes } => {
                     inplace_writes.push((data_addr, bytes));
                 }
@@ -4525,6 +4576,19 @@ impl WriteEngine {
         // (the barrier), then flip the pointer, then sync the flip.
         let new_root = path_addr[&PathKey::new()];
 
+        // The heap collections this commit's value overwrites superseded. They
+        // join `to_free` rather than being freed here, so they are handed back
+        // after the superblock repoint like every other vacated region: until
+        // that lands, the prior root still reaches the elements that name them.
+        // Freed as metadata because that is the page type they were placed as
+        // (`place_vl_collections`), which is the only claim about them this
+        // session can make from its own record.
+        to_free.extend(
+            self.superseded_heaps
+                .drain(..)
+                .map(|(addr, len)| (addr, len, PageType::Meta)),
+        );
+
         // A persisting file keeps its freed space recorded on disk rather than
         // truncating it away, so its commit takes a different, append-only tail.
         if self.persist.is_some() {
@@ -5517,6 +5581,8 @@ impl WriteEngine {
         addr: u64,
         fd: &FlatDataset,
         base: u64,
+        path: &PathKey,
+        superseded: Vec<(u64, u64)>,
     ) -> Result<WritePlan, Error> {
         // Enforced by construction: `staged.writes` has one producer, and it
         // refuses there. Asserted rather than re-refused because a second caller
@@ -5622,7 +5688,7 @@ impl WriteEngine {
             // the new inline bytes (relocating it), patching the parent link.
             0 => Ok(WritePlan::Moving(MovingWrite::Compact {
                 region,
-                bytes: staged_bytes(fd),
+                bytes: staged_bytes(fd, path, superseded),
             })),
             1 => {
                 if le - lb < 18 {
@@ -5648,7 +5714,7 @@ impl WriteEngine {
                         {
                             return Ok(WritePlan::InPlace {
                                 data_addr: start,
-                                bytes: staged_bytes(fd),
+                                bytes: staged_bytes(fd, path, superseded),
                             });
                         }
                     }
@@ -5666,7 +5732,7 @@ impl WriteEngine {
                 Ok(WritePlan::Moving(MovingWrite::Contiguous {
                     region,
                     addr_off,
-                    bytes: staged_bytes(fd),
+                    bytes: staged_bytes(fd, path, superseded),
                     old_extent,
                 }))
             }
@@ -5755,7 +5821,7 @@ impl WriteEngine {
                         pipeline_message,
                         padding,
                         dt: fd.dt.clone(),
-                        bytes: staged_bytes(fd),
+                        bytes: staged_bytes(fd, path, superseded),
                         old_addr: addr,
                     }));
                 }
@@ -7251,23 +7317,93 @@ impl WriteEngine {
     /// in, and return the bytes ready to write (issue #321).
     ///
     /// This allocates, so every caller is in the apply phase — the preflight
-    /// that chose the plan only reads. The bytes an overwrite *replaces* keep
-    /// whatever collections they named: a collection can be shared between
-    /// objects, so the ones the old strings lived in are left behind rather than
-    /// reclaimed, exactly as a deleted variable-length dataset's are. `repack`
-    /// is what recovers that space.
+    /// that chose the plan only reads.
+    ///
+    /// It also carries the reclaim. The collections a *previous* overwrite of
+    /// this same path placed are handed to the commit's free list, and the ones
+    /// placed here are recorded in their stead, so rotating a dataset's strings
+    /// reaches a steady state instead of leaking a generation per commit. Only
+    /// collections this session placed are ever reclaimed, and only while
+    /// nothing has been able to name them twice — see
+    /// [`vl_overwrite_heaps`](Self::vl_overwrite_heaps) for why that provenance
+    /// is the whole proof, and `repack` for the collections it cannot make.
     fn resolve_overwrite_bytes(&mut self, bytes: &OverwriteBytes) -> Result<Vec<u8>, Error> {
         let mut raw = bytes.raw.clone();
-        if let Some(staging) = &bytes.staging {
-            // An all-null (or empty) dataset stages no collection at all, and
-            // patching nothing is the correct answer for it: a null element's
-            // reference must keep the zero address that makes it read back null.
-            if !staging.collections.is_empty() {
-                let addrs = self.place_vl_collections(&staging.collections)?;
-                patch_vl_refs_masked(&mut raw, &staging.patch_offsets, &addrs);
-            }
+        let Some(staging) = &bytes.staging else {
+            return Ok(raw);
+        };
+        // An all-null (or empty) dataset stages no collection at all, and
+        // patching nothing is the correct answer for it: a null element's
+        // reference must keep the zero address that makes it read back null.
+        // Its predecessor's collections are still superseded, so the reclaim
+        // below is outside this branch.
+        if staging.collections.is_empty() {
+            self.vl_overwrite_heaps.remove(&bytes.path);
+        } else {
+            let base = self.superblock.base_address;
+            let addrs = self.place_vl_collections(&staging.collections)?;
+            patch_vl_refs_masked(&mut raw, &staging.patch_offsets, &addrs);
+            // `place_vl_collections` answers base-relative, since that is what
+            // an element reference stores; the free list is absolute.
+            let placed = addrs
+                .iter()
+                .zip(&staging.collections)
+                .map(|(&a, c)| (a + base, c.len() as u64))
+                .collect();
+            self.vl_overwrite_heaps.insert(bytes.path.clone(), placed);
         }
+        self.superseded_heaps.extend_from_slice(&bytes.superseded);
         Ok(raw)
+    }
+
+    /// Forget every heap collection this session recorded as exclusively one
+    /// dataset's, because `staged` contains an edit that could name one of them
+    /// a second time (issue #321).
+    ///
+    /// The provenance in [`vl_overwrite_heaps`](Self::vl_overwrite_heaps) says a
+    /// collection was named once *when it was placed*. Two staged edits can
+    /// falsify that afterwards, and both do it by re-emitting element bytes
+    /// somebody else's references live in:
+    ///
+    /// - a **copy**, in-file or cross-file, which duplicates a dataset's element
+    ///   references verbatim. This is not hypothetical: an in-file copy of a
+    ///   variable-length dataset is exactly how two datasets come to name one
+    ///   collection.
+    /// - a **raw-bytes write** over a datatype that reaches a heap address
+    ///   ([`datatype_holds_heap_address`]). `with_raw_data` hands the engine
+    ///   element bytes it does not interpret, so a caller that read them from
+    ///   one dataset and wrote them to another has aliased whatever they named —
+    ///   the same unscreened door issue #317 recorded for object references.
+    ///
+    /// Wholesale rather than per-path: what a copy's source references is not
+    /// known without decoding it, and a proof that has to be argued per edit is
+    /// the kind that goes stale. Reclaim is an optimization, and giving all of
+    /// it up on a rare edit costs a leak, where keeping one entry too long costs
+    /// a freed collection somebody still reads.
+    fn invalidate_heap_provenance(&mut self, staged: &StagedEdits) {
+        if self.vl_overwrite_heaps.is_empty() {
+            return;
+        }
+        let aliasing_edit = !staged.copies.is_empty()
+            || !staged.cross_copies.is_empty()
+            || staged.writes.iter().any(|(_, fd)| {
+                fd.vl_string_staging.is_none()
+                    && crate::datatype::datatype_holds_heap_address(&fd.dt)
+            })
+            || staged.datasets.iter().any(|(_, fd)| {
+                fd.vl_string_staging.is_none()
+                    && crate::datatype::datatype_holds_heap_address(&fd.dt)
+            });
+        if aliasing_edit {
+            self.vl_overwrite_heaps.clear();
+            return;
+        }
+        // A deleted dataset's record would otherwise outlive it and be applied
+        // to whatever later takes its path.
+        for path in &staged.deletes {
+            self.vl_overwrite_heaps
+                .retain(|recorded, _| !paths_overlap(recorded, path));
+        }
     }
 
     /// Resolve one object-reference element's target to the base-relative
@@ -8172,12 +8308,25 @@ struct OverwriteBytes {
     /// `None` for every overwrite that stages no variable-length data, which is
     /// all of them but a `with_vlen_strings` one.
     staging: Option<VlStringStaging>,
+    /// The overwritten dataset's path, under which the collections this
+    /// resolution places are recorded in
+    /// [`vl_overwrite_heaps`](WriteEngine::vl_overwrite_heaps). Empty when
+    /// nothing is staged, which is the only case where it goes unread.
+    path: PathKey,
+    /// The collections a *previous* overwrite of the same path placed, to be
+    /// freed once this commit lands. Empty unless this session made them.
+    superseded: Vec<(u64, u64)>,
 }
 
 impl OverwriteBytes {
-    /// Bytes that need no resolving.
+    /// Bytes that need no resolving, and so name nothing to record or free.
     fn ready(raw: Vec<u8>) -> Self {
-        Self { raw, staging: None }
+        Self {
+            raw,
+            staging: None,
+            path: PathKey::new(),
+            superseded: Vec::new(),
+        }
     }
 }
 
@@ -9168,14 +9317,27 @@ fn chunked_geometry(
 }
 
 /// The element bytes a staged value overwrite will write, paired with the
-/// variable-length staging that has still to be resolved into them.
+/// variable-length staging that has still to be resolved into them, the `path`
+/// they belong to, and the collections a previous overwrite of that path left
+/// `superseded`.
 ///
 /// Cloned rather than moved because the staged set must survive a refused
 /// commit whole (issue #316), and this runs in the preflight that may refuse.
-fn staged_bytes(fd: &FlatDataset) -> OverwriteBytes {
+fn staged_bytes(fd: &FlatDataset, path: &PathKey, superseded: Vec<(u64, u64)>) -> OverwriteBytes {
+    let staging = fd.vl_string_staging.clone();
     OverwriteBytes {
         raw: fd.raw.clone(),
-        staging: fd.vl_string_staging.clone(),
+        // Only a staged resolution reads the path or supersedes anything, and
+        // every *other* overwrite is the common case — cloning it for those
+        // would charge every value overwrite in the crate an allocation for a
+        // field nothing goes on to look at.
+        path: if staging.is_some() {
+            path.clone()
+        } else {
+            PathKey::new()
+        },
+        staging,
+        superseded,
     }
 }
 

@@ -6085,3 +6085,135 @@ fn overwriting_a_chunked_vlen_string_dataset_reclaims_its_old_chunk_storage() {
         after
     );
 }
+
+/// Rotating a variable-length dataset's strings in one session reaches a steady
+/// state instead of growing the file by the whole payload every commit
+/// (issue #321).
+///
+/// Each overwrite places a fresh global heap collection for the new strings.
+/// Nothing else in the editor reclaims a collection, and for good reason — one
+/// can be shared between objects — so before this the old strings were simply
+/// left behind and only `repack` recovered them. What makes these reclaimable
+/// is provenance: this session placed them, for this dataset, and
+/// `invalidate_heap_provenance` drops the record the moment anything could name
+/// them twice.
+///
+/// Judged from the second round, like the fixed-size rotation test above: the
+/// first has nothing freed to draw on yet.
+#[test]
+fn rotating_a_vlen_dataset_in_a_session_stops_growing_the_file() {
+    let path = temp_path("hdf5_pure_edit_vlen_rotation_bounded.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&["seed-a", "seed-b", "seed-c", "seed-d"]);
+    b.write(&path).unwrap();
+
+    let mut sizes = Vec::new();
+    {
+        let session = File::open_rw(&path).unwrap();
+        for round in 0..12u32 {
+            // Long enough that a leaked generation is unmistakable against the
+            // object-header slack a commit also churns.
+            let data: Vec<String> = (0..4)
+                .map(|i| format!("round-{round}-element-{i}-{}", "x".repeat(64)))
+                .collect();
+            session
+                .dataset("labels")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>());
+                })
+                .unwrap();
+            session.commit().unwrap();
+            sizes.push(session.file_size());
+        }
+    }
+
+    let ceiling = sizes[1];
+    assert!(
+        sizes[2..].iter().all(|&s| s <= ceiling),
+        "the file grew past its second-round size under rotation: {sizes:?}"
+    );
+
+    let file = File::open(&path).unwrap();
+    let last = file.dataset("labels").unwrap().read_string().unwrap();
+    assert!(
+        last[0].starts_with("round-11-element-0"),
+        "got: {}",
+        last[0]
+    );
+}
+
+/// The reclaim must not fire when the session has done something that could name
+/// a recorded collection a second time (issue #321).
+///
+/// An in-file `copy` of a variable-length dataset re-emits its element
+/// references **verbatim**, so the copy names the very collections the source
+/// does — with every heap object's reference count still 1, which is why the
+/// format cannot be asked. Freeing them on the next overwrite of the source
+/// would hand out space the copy still reads, and every checksum in the file
+/// would still verify.
+///
+/// This is the test that a provenance record outliving its proof corrupts data,
+/// so it asserts the *copy's* contents, not the source's.
+///
+/// Freeing alone would not show it: a freed region keeps its bytes until
+/// something draws on it, so reading the copy straight after the bad free still
+/// answers correctly. The rounds after the copy are what make the failure
+/// visible — every string is the same length, so a reclaimed collection is
+/// exactly the right size for the next one to be placed in, and the copy's
+/// strings are overwritten by a later generation's.
+#[test]
+fn a_copy_stops_a_vlen_overwrite_from_reclaiming_the_shared_collection() {
+    let path = temp_path("hdf5_pure_edit_vlen_copy_blocks_reclaim.h5");
+    let generation = |n: u32| -> Vec<String> {
+        (0..2)
+            .map(|i| format!("generation-{n:02}-element-{i}"))
+            .collect()
+    };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&generation(0).iter().map(String::as_str).collect::<Vec<_>>());
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let overwrite = |n: u32| {
+            let data = generation(n);
+            session
+                .dataset("labels")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>());
+                })
+                .unwrap();
+            session.commit().unwrap();
+        };
+
+        // Round one records the collections it places for "labels".
+        overwrite(1);
+
+        // The copy now names those same collections.
+        session.copy("labels", "clone").unwrap();
+        session.commit().unwrap();
+
+        // Every later round places a collection of exactly the size the
+        // generation-1 one occupies. If the copy did not drop the record, round
+        // two frees it and one of these is placed on top of the copy's strings.
+        for n in 2..8 {
+            overwrite(n);
+        }
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("clone").unwrap().read_string().unwrap(),
+        generation(1),
+        "the copy's strings were freed out from under it and then written over"
+    );
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        generation(7)
+    );
+}

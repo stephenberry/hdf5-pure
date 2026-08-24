@@ -3449,10 +3449,13 @@ impl Dataset {
     /// [`with_vlen_strings`](DatasetBuilder::with_vlen_strings) is **not**
     /// refused: overwriting a variable-length-string dataset places a fresh
     /// global heap collection for the new strings and resolves the staged
-    /// element references against it. The collections the previous strings
-    /// occupied are left behind rather than reclaimed — a collection can be
-    /// shared between objects — so
-    /// [`repack`](crate::repack) is what recovers that space.
+    /// element references against it. Overwriting the same dataset again
+    /// reclaims the collection the previous overwrite placed, so rotating its
+    /// strings in a session does not grow the file without bound. The
+    /// collections it held when the session *opened* are not reclaimed — a
+    /// collection can be shared between objects, and only this session's own
+    /// placements are known not to be — so [`repack`](crate::repack) is what
+    /// recovers those.
     ///
     /// The reference refusal is on the builder, not on the datatype it produces:
     /// such a dataset can still be overwritten by supplying element bytes that
