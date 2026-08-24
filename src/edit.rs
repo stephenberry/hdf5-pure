@@ -193,6 +193,7 @@
 //! repoint leaves the prior file wholly intact. Whole-file compaction that
 //! reclaims every hole at once is still the separate repack path.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -215,8 +216,8 @@ use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
-    Datatype, DatatypeByteOrder, datatype_holds_object_address, embedded_reference_slots,
-    stored_object_references,
+    Datatype, DatatypeByteOrder, datatype_holds_file_address, datatype_holds_object_address,
+    embedded_reference_slots, stored_object_references,
 };
 use crate::error::{Error, FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::extensible_array::ExtensibleArrayHeader;
@@ -755,6 +756,37 @@ pub(crate) struct WriteEngine {
     /// [`commit`](Self::commit), since a commit can relocate a cached header or
     /// free the region it points into (see `commit`).
     located: HashMap<u64, LocatedState>,
+    /// Global heap collections **this session placed** for a variable-length
+    /// value overwrite, by the overwritten dataset's path, as absolute
+    /// `(address, length)` extents.
+    ///
+    /// This is what lets the *next* overwrite of the same dataset reclaim the
+    /// strings the previous one left, instead of growing the file by its whole
+    /// payload on every commit forever (issue #321). Nothing else in the editor
+    /// reclaims a collection, and the reason is sound: a collection can be
+    /// shared between objects, and **nothing in the format proves otherwise**.
+    /// The per-object reference count does not: an in-file
+    /// [`copy`](Self::copy) of a variable-length dataset re-emits its
+    /// element references verbatim, so two datasets name one collection with
+    /// every object's count still 1 — and files with that shape are already in
+    /// the wild.
+    ///
+    /// Provenance is therefore the whole proof: these collections were placed by
+    /// this session, for this dataset, and were named by nothing else at the
+    /// moment they were written. `invalidate_heap_provenance` is what keeps that
+    /// true afterwards — every entry is dropped as soon as this session does
+    /// anything that could name one of them a second time.
+    ///
+    /// The collections a dataset held when the session *opened* are never in
+    /// here and are never reclaimed: their provenance is whatever wrote the
+    /// file. `repack` is what recovers those.
+    vl_overwrite_heaps: HashMap<PathKey, Vec<(u64, u64)>>,
+    /// Heap collections superseded by a value overwrite this commit is applying,
+    /// freed once the commit's superblock repoint has landed — never before, so
+    /// a mid-commit crash leaves the prior root reaching bytes that are still
+    /// there. Drained into the commit's `to_free` list; cleared at commit entry,
+    /// so an attempt that fails partway frees nothing on the next one.
+    superseded_heaps: Vec<(u64, u64)>,
     /// True when this engine was opened for SWMR writing
     /// ([`open_swmr_writer`](Self::open_swmr_writer)): the append engine then
     /// enforces the SWMR subset (unfiltered, chunk-aligned) so a concurrent
@@ -855,6 +887,15 @@ pub(crate) struct WriteEngine {
 struct FreeSnapshot {
     free: FreeList,
     paged: Option<(FreeList, FreeList)>,
+    /// The heap-collection provenance, rolled back with the free lists.
+    ///
+    /// [`resolve_overwrite_bytes`](WriteEngine::resolve_overwrite_bytes) records
+    /// a placement in the *apply* phase, so a commit that fails after that and
+    /// before its repoint hands the space back to the free list while leaving a
+    /// record naming it. The next overwrite of that path would then free a
+    /// region already handed out — the one piece of engine state naming file
+    /// addresses that this rollback used to miss (issue #321).
+    vl_overwrite_heaps: HashMap<PathKey, Vec<(u64, u64)>>,
 }
 
 /// How much memory a read-write open may use to hold the file being edited.
@@ -1806,6 +1847,8 @@ impl WriteEngine {
             proved_free_of_references: false,
             persist: None,
             located: HashMap::new(),
+            vl_overwrite_heaps: HashMap::new(),
+            superseded_heaps: Vec::new(),
             swmr_mode: false,
             paged: None,
             committed: false,
@@ -3305,6 +3348,7 @@ impl WriteEngine {
                 .paged
                 .as_ref()
                 .map(|pg| (pg.meta.clone(), pg.raw.clone())),
+            vl_overwrite_heaps: self.vl_overwrite_heaps.clone(),
         }
     }
 
@@ -3312,6 +3356,7 @@ impl WriteEngine {
     /// them. Called only for a commit that failed before publishing anything, so
     /// every region it restores is dead again.
     fn restore_free(&mut self, snapshot: FreeSnapshot) {
+        self.vl_overwrite_heaps = snapshot.vl_overwrite_heaps;
         self.free = snapshot.free;
         if let (Some(pg), Some((meta, raw))) = (self.paged.as_mut(), snapshot.paged) {
             pg.meta = meta;
@@ -3323,6 +3368,14 @@ impl WriteEngine {
         if staged.is_empty() {
             return Ok(());
         }
+
+        // An attempt that failed partway may have recorded superseded collections
+        // it never freed; this one must not free them on its behalf, since it is
+        // not the commit that replaced what they hold.
+        self.superseded_heaps.clear();
+        // Drop every heap-collection provenance record this batch could falsify,
+        // before any of them is read below.
+        self.invalidate_heap_provenance(staged);
 
         // A paged file (`H5F_FSPACE_STRATEGY_PAGE`) that does not persist its free
         // space has no on-disk record of which pages hold metadata and which hold
@@ -3371,7 +3424,7 @@ impl WriteEngine {
         // in place (no header rewrite, no superblock flip), while a resize or
         // compact rewrite relocates the header and is staged against its parent
         // group so the commit below rebuilds it and patches the link. ---
-        let mut inplace_writes: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut inplace_writes: Vec<(usize, OverwriteBytes)> = Vec::new();
         let mut moving_writes: Vec<(PathKey, String, u64, MovingWrite)> = Vec::new();
         let mut write_targets: Vec<PathKey> = Vec::new();
         // The file-wide hard-link count, computed lazily the first time a commit
@@ -3404,9 +3457,17 @@ impl WriteEngine {
             .map_err(|_| Error::EditUnsupported("nothing to overwrite at the given path"))?;
             let addr = usize::try_from(addr)
                 .map_err(|_| Error::EditUnsupported("dataset address exceeds this platform"))?;
-            match Self::prepare_write(&self.image(), addr as u64, fd, base)? {
-                WritePlan::InPlace { data_addr, raw } => inplace_writes.push((data_addr, raw)),
-                WritePlan::InPlaceChunks { writes } => inplace_writes.extend(writes),
+            match Self::prepare_write(&self.image(), addr as u64, fd, base, full)? {
+                WritePlan::InPlace { data_addr, bytes } => {
+                    inplace_writes.push((data_addr, bytes));
+                }
+                // A chunked in-place overwrite never carries staging — a staged
+                // one is a `ChunkPayload::Deferred`, which relocates.
+                WritePlan::InPlaceChunks { writes } => inplace_writes.extend(
+                    writes
+                        .into_iter()
+                        .map(|(at, raw)| (at, OverwriteBytes::ready(raw))),
+                ),
                 WritePlan::Moving(mw) => {
                     // A relocating overwrite rewrites the dataset's header and data
                     // address. Every variant is base-aware on a userblock file: the
@@ -3589,6 +3650,18 @@ impl WriteEngine {
         // not introduce any inconsistency, so it does not clear one either; an edit
         // that takes the full path below (any header/root change) clears the flag
         // as usual.
+        //
+        // A staged variable-length overwrite cannot reach here at all: it
+        // relocates, so `moving_writes` is non-empty for it. That is enforced
+        // where the plan is chosen (`prepare_write`) rather than re-tested here,
+        // and it has to hold for a second reason besides the one that made it
+        // relocate — such an overwrite places a global heap collection, and an
+        // append moves end-of-file, which only the superblock this path leaves
+        // untouched records (issue #321).
+        debug_assert!(
+            inplace_writes.iter().all(|(_, b)| b.vlen.is_none()),
+            "a staged variable-length overwrite must relocate, not write in place"
+        );
         if moving_writes.is_empty()
             && staged.datasets.is_empty()
             && staged.groups.is_empty()
@@ -3611,8 +3684,11 @@ impl WriteEngine {
             // enforces, and the only case that can tell the two apart is a
             // `write_at` that fails partway, which no test here can produce.
             drop(std::mem::take(staged));
-            for (data_addr, raw) in &inplace_writes {
-                self.write_at(*data_addr, raw)?;
+            for (data_addr, bytes) in &inplace_writes {
+                // Every entry here stages nothing (the guard above), so this
+                // hands back the staged bytes unchanged and unallocated.
+                let raw = self.resolve_overwrite_bytes(bytes)?;
+                self.write_at(*data_addr, &raw)?;
             }
             self.barrier()?;
             return Ok(());
@@ -4470,8 +4546,14 @@ impl WriteEngine {
         // unchanged), so the write is independent of the superblock flip; it is
         // ordered before the barrier sync below so the new bytes are durable
         // alongside everything else this commit appended.
-        for (data_addr, raw) in &inplace_writes {
-            self.write_at(*data_addr, raw)?;
+        // A staged variable-length overwrite resolves here: its global heap
+        // collections are placed and their addresses patched into the element
+        // references before the data block is written (issue #321). The
+        // collections are appended, which the superblock this path rewrites
+        // below records.
+        for (data_addr, bytes) in &inplace_writes {
+            let raw = self.resolve_overwrite_bytes(bytes)?;
+            self.write_at(*data_addr, &raw)?;
         }
 
         // Every group's new header address is known now that the apply loop has
@@ -4496,6 +4578,30 @@ impl WriteEngine {
         // does not force a write-back, so sync the appended bytes to disk first
         // (the barrier), then flip the pointer, then sync the flip.
         let new_root = path_addr[&PathKey::new()];
+
+        // The heap collections this commit's value overwrites superseded. They
+        // join `to_free` rather than being handed to the free list here, which
+        // is what keeps them out of reach of this commit's own allocations:
+        // nothing draws on `to_free` until the commit has finished placing, so
+        // the elements naming them are still readable from the prior root for
+        // as long as that root is the live one.
+        // Freed as metadata because that is the page type they were placed as
+        // (`place_vl_collections`), which is the only claim about them this
+        // session can make from its own record.
+        to_free.extend(
+            self.superseded_heaps
+                .drain(..)
+                .map(|(addr, len)| (addr, len, PageType::Meta)),
+        );
+        // Re-run the whole-commit invariant over the set these just joined, since
+        // the pass above ran before the in-place writes resolved and so never saw
+        // them. This is defensive and nothing reaches it: no test fails when it
+        // is deleted, and no sequence has been found that puts a superseded
+        // collection out of bounds or across another freed span. It is kept
+        // because a heap collection is freed on the strength of a *record*
+        // rather than of a structure read back out of the file, which is the one
+        // span where a stale answer would not be caught by anything else.
+        retain_disjoint_in_bounds(&mut to_free, self.image.len());
 
         // A persisting file keeps its freed space recorded on disk rather than
         // truncating it away, so its commit takes a different, append-only tail.
@@ -5446,19 +5552,10 @@ impl WriteEngine {
             ));
         }
 
-        // `with_vlen_strings` stages placeholder element references that only the
-        // add path knows how to resolve: place the global heap collection, then
-        // patch the placeholders once its address is known, before the data block
-        // itself is written. The overwrite path has no such step, and a
-        // same-length overwrite is flushed straight over the existing data block
-        // with no apply loop at all — so refuse rather than write unpatched (heap
-        // address 0) placeholders as if they were final.
-        if fd.vl_string_staging.is_some() {
-            return Err(Error::EditUnsupported(
-                "write_dataset cannot overwrite a variable-length-string dataset's \
-                 data in place yet",
-            ));
-        }
+        // `with_vlen_strings` stages placeholder element references, resolved by
+        // placing their global heap collections and patching the addresses in
+        // (issue #321). That happens where each plan is written, not here: see
+        // `OverwriteBytes`.
 
         // `reference_targets` holds elements only the add path resolves, in
         // `preflight_reference_targets` and the apply loop after it; the
@@ -5498,6 +5595,7 @@ impl WriteEngine {
         addr: u64,
         fd: &FlatDataset,
         base: u64,
+        path: &PathKey,
     ) -> Result<WritePlan, Error> {
         // Enforced by construction: `staged.writes` has one producer, and it
         // refuses there. Asserted rather than re-refused because a second caller
@@ -5603,7 +5701,7 @@ impl WriteEngine {
             // the new inline bytes (relocating it), patching the parent link.
             0 => Ok(WritePlan::Moving(MovingWrite::Compact {
                 region,
-                raw: fd.raw.clone(),
+                bytes: staged_bytes(fd, path),
             })),
             1 => {
                 if le - lb < 18 {
@@ -5618,7 +5716,26 @@ impl WriteEngine {
                 // bytes straight in place. No header rewrite, no relink. The stored
                 // address is base-relative; the in-place write targets the absolute
                 // file offset `data_addr + base`.
-                if data_addr != UNDEF && data_size == fd.raw.len() as u64 {
+                //
+                // Never for a staged variable-length overwrite, which relocates
+                // instead. Its resolution *allocates* — a global heap collection,
+                // drawn from a freed region where one fits — and an in-place write
+                // is a live mutation of a block the current root already reaches.
+                // Together those put a reference to a just-allocated span inside
+                // bytes the live tree names, so a commit failing after the write
+                // and before its repoint hands the span back to the free list
+                // (`restore_free`) while the image still points into it. The next
+                // commit is then free to place something else there, and the
+                // dataset reads that object's bytes with every checksum intact.
+                //
+                // A relocating write has no such window: its new data block is
+                // reachable from nothing until the superblock repoint, so a
+                // failed attempt leaves the region genuinely dead and re-offering
+                // it is sound — which is the invariant `restore_free` states.
+                if fd.vl_string_staging.is_none()
+                    && data_addr != UNDEF
+                    && data_size == fd.raw.len() as u64
+                {
                     if let Some(start) = data_addr
                         .checked_add(base)
                         .and_then(|a| usize::try_from(a).ok())
@@ -5629,7 +5746,7 @@ impl WriteEngine {
                         {
                             return Ok(WritePlan::InPlace {
                                 data_addr: start,
-                                raw: fd.raw.clone(),
+                                bytes: staged_bytes(fd, path),
                             });
                         }
                     }
@@ -5647,7 +5764,7 @@ impl WriteEngine {
                 Ok(WritePlan::Moving(MovingWrite::Contiguous {
                     region,
                     addr_off,
-                    raw: fd.raw.clone(),
+                    bytes: staged_bytes(fd, path),
                     old_extent,
                 }))
             }
@@ -5701,18 +5818,15 @@ impl WriteEngine {
                     .map_or(crate::fill_value::PaddingFill::Zero, |(mt, b, e)| {
                         crate::fill_value::PaddingFill::from_message(mt, &region[b..e])
                     });
-                let split = split_into_chunks(
-                    &fd.raw,
-                    &disk_ds.dimensions,
-                    &spatial,
-                    element_size,
-                    padding.pattern(element_size),
-                )
-                .map_err(Error::Format)?;
                 let pipeline_message: Option<Vec<u8>> =
                     filter.map(|(fb, fe)| region[fb..fe].to_vec());
 
-                let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pm) = &pipeline_message {
+                // Refuse a pipeline this engine cannot re-encode before anything
+                // is split or encoded, so the refusal reaches the preflight on
+                // both branches below — including the staged one, which does its
+                // splitting in the apply phase and so has no other chance to make
+                // it.
+                if let Some(pm) = &pipeline_message {
                     let pipeline = FilterPipeline::parse(pm).map_err(|_| {
                         Error::EditUnsupported("dataset filter pipeline could not be parsed")
                     })?;
@@ -5722,17 +5836,39 @@ impl WriteEngine {
                              cannot be overwritten in place yet",
                         ));
                     }
-                    let ctx = ChunkContext::from_datatype(&spatial, &fd.dt)?;
-                    let mut encoded = Vec::with_capacity(split.len());
-                    // One encoder across the rewrite; see `FilterScratch`.
-                    let mut scratch = FilterScratch::new();
-                    for buf in &split {
-                        encoded.push(compress_chunk_with(&mut scratch, buf, &pipeline, ctx)?);
-                    }
-                    encoded
-                } else {
-                    split
-                };
+                }
+
+                // Element bytes still carrying unresolved variable-length
+                // references cannot be split here: a filtered chunk's compressed
+                // length depends on the heap addresses patched into it, so the
+                // split has to follow the patch, which follows a placement the
+                // preflight may not make. See `ChunkPayload::Deferred`.
+                if fd.vl_string_staging.is_some() {
+                    return Ok(WritePlan::Moving(MovingWrite::Chunked {
+                        region,
+                        shape: disk_ds.dimensions.clone(),
+                        chunk_dims: spatial,
+                        element_size,
+                        maxshape,
+                        pipeline_message,
+                        payload: ChunkPayload::Deferred {
+                            bytes: staged_bytes(fd, path),
+                            padding,
+                            dt: fd.dt.clone(),
+                        },
+                        old_addr: addr,
+                    }));
+                }
+
+                let new_chunk_bytes = split_and_encode_chunks(
+                    &fd.raw,
+                    &disk_ds.dimensions,
+                    &spatial,
+                    element_size,
+                    &padding,
+                    pipeline_message.as_deref(),
+                    &fd.dt,
+                )?;
 
                 // Fast path: overwrite each chunk straight in its slot when every
                 // new chunk fits. No header rewrite and no superblock flip — the
@@ -5764,13 +5900,6 @@ impl WriteEngine {
                 // end-of-file (carrying the re-encoded chunk bytes and the source
                 // pipeline verbatim), swap the data-layout message in the verbatim
                 // header, and free the old chunk storage after the commit lands.
-                let meta = new_chunk_bytes
-                    .iter()
-                    .map(|c| ChunkMeta {
-                        compressed_size: c.len() as u64,
-                        filter_mask: 0,
-                    })
-                    .collect();
                 Ok(WritePlan::Moving(MovingWrite::Chunked {
                     region,
                     shape: disk_ds.dimensions.clone(),
@@ -5778,8 +5907,7 @@ impl WriteEngine {
                     element_size,
                     maxshape,
                     pipeline_message,
-                    meta,
-                    chunk_bytes: new_chunk_bytes,
+                    payload: ChunkPayload::Encoded(new_chunk_bytes),
                     old_addr: addr,
                 }))
             }
@@ -6798,10 +6926,11 @@ impl WriteEngine {
             MovingWrite::Contiguous {
                 region,
                 addr_off,
-                raw,
+                bytes,
                 ..
             } => {
-                let new_data_addr = self.alloc_or_append_typed(raw, PageType::Raw)?;
+                let raw = self.resolve_overwrite_bytes(bytes)?;
+                let new_data_addr = self.alloc_or_append_typed(&raw, PageType::Raw)?;
                 let mut region = region.clone();
                 // The placement is an absolute file offset; the contiguous
                 // data-layout field stores it relative to the userblock base (`-
@@ -6815,8 +6944,9 @@ impl WriteEngine {
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
-            MovingWrite::Compact { region, raw } => {
-                let region = rebuild_compact_layout_region(region, raw)?;
+            MovingWrite::Compact { region, bytes } => {
+                let raw = self.resolve_overwrite_bytes(bytes)?;
+                let region = rebuild_compact_layout_region(region, &raw)?;
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
@@ -6827,20 +6957,49 @@ impl WriteEngine {
                 element_size,
                 maxshape,
                 pipeline_message,
-                meta,
-                chunk_bytes,
+                payload,
                 ..
-            } => self.write_chunked_relocatable(
-                region,
-                shape,
-                chunk_dims,
-                *element_size,
-                maxshape.as_deref(),
-                pipeline_message.as_deref(),
-                meta,
-                chunk_bytes,
-                &[],
-            ),
+            } => {
+                let deferred;
+                let chunk_bytes = match payload {
+                    ChunkPayload::Encoded(chunk_bytes) => chunk_bytes,
+                    ChunkPayload::Deferred { bytes, padding, dt } => {
+                        // Resolve before splitting: the heap collections have to
+                        // be placed, and their addresses patched into the element
+                        // references, before those references are cut into chunks
+                        // and — on a filtered dataset — compressed over.
+                        let raw = self.resolve_overwrite_bytes(bytes)?;
+                        deferred = split_and_encode_chunks(
+                            &raw,
+                            shape,
+                            chunk_dims,
+                            *element_size,
+                            padding,
+                            pipeline_message.as_deref(),
+                            dt,
+                        )?;
+                        &deferred
+                    }
+                };
+                let meta: Vec<ChunkMeta> = chunk_bytes
+                    .iter()
+                    .map(|c| ChunkMeta {
+                        compressed_size: c.len() as u64,
+                        filter_mask: 0,
+                    })
+                    .collect();
+                self.write_chunked_relocatable(
+                    region,
+                    shape,
+                    chunk_dims,
+                    *element_size,
+                    maxshape.as_deref(),
+                    pipeline_message.as_deref(),
+                    &meta,
+                    chunk_bytes,
+                    &[],
+                )
+            }
             MovingWrite::AppendedChunks {
                 region,
                 new_dataspace_body,
@@ -7161,6 +7320,118 @@ impl WriteEngine {
                 Ok(addr - self.superblock.base_address)
             })
             .collect()
+    }
+
+    /// Resolve a staged value overwrite's element bytes: place any global heap
+    /// collections its variable-length references name, patch their addresses
+    /// in, and return the bytes ready to write (issue #321). An overwrite that
+    /// stages nothing — every one but a `with_vlen_strings` one — is handed
+    /// back untouched.
+    ///
+    /// This allocates, so every caller is in the apply phase — the preflight
+    /// that chose the plan only reads.
+    ///
+    /// It also carries the reclaim. The collections a *previous* overwrite of
+    /// this same path placed are handed to the commit's free list, and the ones
+    /// placed here are recorded in their stead, so rotating a dataset's strings
+    /// reaches a steady state instead of leaking a generation per commit. Only
+    /// collections this session placed are ever reclaimed, and only while
+    /// nothing has been able to name them twice — see
+    /// [`vl_overwrite_heaps`](Self::vl_overwrite_heaps) for why that provenance
+    /// is the whole proof, and `repack` for the collections it cannot make.
+    fn resolve_overwrite_bytes<'b>(
+        &mut self,
+        bytes: &'b OverwriteBytes,
+    ) -> Result<Cow<'b, [u8]>, Error> {
+        let Some(vlen) = &bytes.vlen else {
+            // Nothing to resolve, and nothing to copy: every overwrite but a
+            // variable-length one takes this path, and the in-place loop writes
+            // straight through the borrow. Cloning here would charge each of
+            // them a second copy of its whole payload, which the bounded
+            // backing in particular is built not to pay.
+            return Ok(Cow::Borrowed(&bytes.raw));
+        };
+        let staging = &vlen.staging;
+        // Read rather than removed: the record is replaced (not consumed) when
+        // the new collections land just below.
+        let superseded = self
+            .vl_overwrite_heaps
+            .get(&vlen.path)
+            .cloned()
+            .unwrap_or_default();
+        let mut raw = bytes.raw.clone();
+        let base = self.superblock.base_address;
+        // A staging with no collections patches nothing, which is the right
+        // answer for it: an element with no heap object keeps the zero address
+        // that reads back as null. It falls out of the general path rather than
+        // being a case of its own — `patch_vl_refs_masked` has one offset per
+        // object, so no offsets is no iterations — and it still records (an
+        // empty record) and still supersedes.
+        let addrs = self.place_vl_collections(&staging.collections)?;
+        patch_vl_refs_masked(&mut raw, &staging.patch_offsets, &addrs);
+        // `place_vl_collections` answers base-relative, since that is what an
+        // element reference stores; the free list is absolute.
+        let placed = addrs
+            .iter()
+            .zip(&staging.collections)
+            .map(|(&a, c)| (a + base, c.len() as u64))
+            .collect();
+        self.vl_overwrite_heaps.insert(vlen.path.clone(), placed);
+        self.superseded_heaps.extend(superseded);
+        Ok(Cow::Owned(raw))
+    }
+
+    /// Forget every heap collection this session recorded as exclusively one
+    /// dataset's, because `staged` contains an edit that could name one of them
+    /// a second time (issue #321).
+    ///
+    /// The provenance in [`vl_overwrite_heaps`](Self::vl_overwrite_heaps) says a
+    /// collection was named once *when it was placed*. Two staged edits can
+    /// falsify that afterwards, and both do it by re-emitting element bytes
+    /// somebody else's references live in:
+    ///
+    /// - a **copy**, in-file or cross-file, which duplicates a dataset's element
+    ///   references verbatim. This is not hypothetical: an in-file copy of a
+    ///   variable-length dataset is exactly how two datasets come to name one
+    ///   collection.
+    /// - a **raw-bytes write** over a datatype that reaches a heap address
+    ///   ([`datatype_holds_file_address`]). `with_raw_data` hands the engine
+    ///   element bytes it does not interpret, so a caller that read them from
+    ///   one dataset and wrote them to another has aliased whatever they named —
+    ///   the same unscreened door issue #317 recorded for object references.
+    ///
+    /// Wholesale rather than per-path: what a copy's source references is not
+    /// known without decoding it, and a proof that has to be argued per edit is
+    /// the kind that goes stale. Reclaim is an optimization, and giving all of
+    /// it up on a rare edit costs a leak, where keeping one entry too long costs
+    /// a freed collection somebody still reads.
+    fn invalidate_heap_provenance(&mut self, staged: &StagedEdits) {
+        if self.vl_overwrite_heaps.is_empty() {
+            return;
+        }
+        let aliasing_edit = !staged.copies.is_empty()
+            || !staged.cross_copies.is_empty()
+            // A dataset staged with element bytes of its own (`with_raw_data`)
+            // rather than staging its strings here, whether it is being created
+            // or overwritten.
+            || staged
+                .writes
+                .iter()
+                .chain(&staged.datasets)
+                .any(|(_, fd)| {
+                    fd.vl_string_staging.is_none()
+                        && datatype_holds_file_address(&fd.dt)
+                });
+        if aliasing_edit {
+            self.vl_overwrite_heaps.clear();
+            return;
+        }
+        // A deleted dataset's record would otherwise outlive it and be applied
+        // to whatever later takes its path.
+        for path in &staged.deletes {
+            self.vl_overwrite_heaps
+                .retain(|recorded, _| !paths_overlap(recorded, path));
+        }
     }
 
     /// Resolve one object-reference element's target to the base-relative
@@ -8043,13 +8314,63 @@ struct GroupInfo {
     link_names: Vec<String>,
 }
 
+/// Element bytes staged for a value overwrite, together with the
+/// variable-length staging (if any) whose global heap collections must be
+/// placed — and whose addresses patched into the element references in `raw` —
+/// before those bytes reach the file.
+///
+/// The two halves travel together because resolving them is an **apply-phase**
+/// step while planning is a preflight one: placing a collection allocates, and
+/// [`commit`](WriteEngine::commit)'s preflight only reads. So a plan carries
+/// the bytes unresolved and every consumer resolves them where it writes, with
+/// [`resolve_overwrite_bytes`](WriteEngine::resolve_overwrite_bytes) (issue
+/// #321).
+///
+/// Patching never changes `raw`'s length — an element reference is fixed-width
+/// whatever string it names — which is what lets the plan be *chosen* from the
+/// unresolved bytes. The one place that is not enough is a filtered chunked
+/// dataset, whose compressed chunk sizes do depend on the addresses: see
+/// [`ChunkPayload::Deferred`].
+struct OverwriteBytes {
+    raw: Vec<u8>,
+    /// `None` for every overwrite that stages no variable-length data, which is
+    /// all of them but a `with_vlen_strings` one.
+    vlen: Option<VlenOverwrite>,
+}
+
+/// The variable-length half of an [`OverwriteBytes`]: the staged collections to
+/// place, and the path they are recorded under once placed.
+struct VlenOverwrite {
+    staging: VlStringStaging,
+    /// The overwritten dataset's path, the key its collections are recorded
+    /// under in [`vl_overwrite_heaps`](WriteEngine::vl_overwrite_heaps) — and
+    /// the key the ones a previous overwrite left are read back from, to be
+    /// freed once this commit lands.
+    path: PathKey,
+}
+
+impl OverwriteBytes {
+    /// Bytes that need no resolving, and so name nothing to record or free.
+    fn ready(raw: Vec<u8>) -> Self {
+        Self { raw, vlen: None }
+    }
+}
+
 /// How a staged value overwrite (`write_dataset`) will be applied, decided by
 /// [`WriteEngine::prepare_write`] during the all-or-nothing preflight.
 enum WritePlan {
     /// A contiguous dataset whose new data is the same length as its existing,
     /// defined data block: overwrite the bytes straight in place at `data_addr`.
-    /// No object header is rewritten and the superblock root is not flipped.
-    InPlace { data_addr: usize, raw: Vec<u8> },
+    /// No object header is rewritten.
+    ///
+    /// The superblock root is not flipped either — *unless* the bytes still
+    /// carry variable-length staging, which appends a heap collection and so
+    /// moves end-of-file, a figure only the superblock records. `commit`'s
+    /// fast path excludes exactly that case (issue #321).
+    InPlace {
+        data_addr: usize,
+        bytes: OverwriteBytes,
+    },
     /// A chunked dataset overwritten chunk-by-chunk in place: each `(addr, bytes)`
     /// pair is written straight over an existing chunk slot. Used when every new
     /// (re-encoded) chunk is the same byte length as the slot it replaces — an
@@ -8076,16 +8397,19 @@ enum MovingWrite {
     Contiguous {
         region: Vec<u8>,
         addr_off: usize,
-        raw: Vec<u8>,
+        bytes: OverwriteBytes,
         old_extent: Option<(u64, u64)>,
     },
-    /// A compact dataset: rebuild the header `region` with `raw` inline.
-    Compact { region: Vec<u8>, raw: Vec<u8> },
+    /// A compact dataset: rebuild the header `region` with the bytes inline.
+    Compact {
+        region: Vec<u8>,
+        bytes: OverwriteBytes,
+    },
     /// A chunked dataset whose new (re-encoded) chunks do not all fit their
     /// existing slots, so its whole storage is rebuilt and relocated. A fresh
     /// chunk-data blob and index are placed — in a freed region that fits, else at
     /// end-of-file (via the verbatim
-    /// layout path, carrying `chunk_bytes` and the source filter `pipeline_message`
+    /// layout path, carrying the chunk bytes and the source filter `pipeline_message`
     /// unchanged — no recompression and no filter-parameter reconstruction), the
     /// data-layout message in the verbatim header `region` is swapped for the new
     /// one (every other header message — datatype, dataspace, fill value, filter
@@ -8100,8 +8424,7 @@ enum MovingWrite {
         element_size: NonZeroUsize,
         maxshape: Option<Vec<u64>>,
         pipeline_message: Option<Vec<u8>>,
-        meta: Vec<ChunkMeta>,
-        chunk_bytes: Vec<Vec<u8>>,
+        payload: ChunkPayload,
         old_addr: u64,
     },
     /// A relocating **append** to a chunked, unlimited, Extensible-Array-indexed
@@ -8153,6 +8476,31 @@ enum MovingWrite {
     AttrEdit {
         region: Vec<u8>,
         pending_vl_attrs: PendingVlAttrs,
+    },
+}
+
+/// The chunk data a relocating chunked overwrite ([`MovingWrite::Chunked`])
+/// will place, either already encoded or still to be.
+enum ChunkPayload {
+    /// Split and encoded by the preflight, which had to do that anyway to find
+    /// out whether the chunks still fit their slots.
+    Encoded(Vec<Vec<u8>>),
+    /// Element bytes that still carry unresolved variable-length references
+    /// ([`OverwriteBytes::vlen`]), so the split has to wait for the apply
+    /// phase: a filtered chunk's compressed length depends on the heap
+    /// addresses patched into it, which is why the preflight cannot split
+    /// first and patch after (issue #321).
+    ///
+    /// Such an overwrite therefore always relocates, which is what keeps the
+    /// single-hard-link refusal (the one every [`MovingWrite`] answers to) in
+    /// the preflight, where it belongs: whether it could have stayed in its
+    /// slots is not knowable until those lengths exist.
+    Deferred {
+        bytes: OverwriteBytes,
+        /// What the edge overhang of a partial chunk must hold (issue #296).
+        padding: crate::fill_value::PaddingFill,
+        /// The dataset's datatype, for the filter pipeline's [`ChunkContext`].
+        dt: crate::datatype::Datatype,
     },
 }
 
@@ -8991,6 +9339,66 @@ fn chunked_geometry(
         raw_size,
         maxshape,
     })
+}
+
+/// The element bytes a staged value overwrite will write, paired with the
+/// variable-length staging that has still to be resolved into them and the
+/// `path` they belong to.
+///
+/// Cloned rather than moved because the staged set must survive a refused
+/// commit whole (issue #316), and this runs in the preflight that may refuse.
+fn staged_bytes(fd: &FlatDataset, path: &PathKey) -> OverwriteBytes {
+    OverwriteBytes {
+        raw: fd.raw.clone(),
+        vlen: fd.vl_string_staging.clone().map(|staging| VlenOverwrite {
+            staging,
+            path: path.clone(),
+        }),
+    }
+}
+
+/// Split `raw` into full-size chunk buffers in dense row-major grid order and
+/// re-encode each through `pipeline_message`, the dataset's on-disk filter
+/// pipeline.
+///
+/// The overhang past the dataset's edge holds the dataset's own fill value, not
+/// zeros: an allocated chunk is expected to carry it wherever nothing was
+/// written, and those slots are what a reader returns once the dataset is
+/// extended into them (issue #296).
+///
+/// The caller has already refused a pipeline
+/// [`pipeline_reencodable`] rejects, so the only errors here are a malformed
+/// pipeline message (unreachable for the same reason) and the encoder's own.
+fn split_and_encode_chunks(
+    raw: &[u8],
+    shape: &[u64],
+    chunk_dims: &[u64],
+    element_size: NonZeroUsize,
+    padding: &crate::fill_value::PaddingFill,
+    pipeline_message: Option<&[u8]>,
+    dt: &crate::datatype::Datatype,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let split = split_into_chunks(
+        raw,
+        shape,
+        chunk_dims,
+        element_size,
+        padding.pattern(element_size),
+    )
+    .map_err(Error::Format)?;
+    let Some(pm) = pipeline_message else {
+        return Ok(split);
+    };
+    let pipeline = FilterPipeline::parse(pm)
+        .map_err(|_| Error::EditUnsupported("dataset filter pipeline could not be parsed"))?;
+    let ctx = ChunkContext::from_datatype(chunk_dims, dt)?;
+    let mut encoded = Vec::with_capacity(split.len());
+    // One encoder across the rewrite; see `FilterScratch`.
+    let mut scratch = FilterScratch::new();
+    for buf in &split {
+        encoded.push(compress_chunk_with(&mut scratch, buf, &pipeline, ctx)?);
+    }
+    Ok(encoded)
 }
 
 /// Try to overwrite a chunked dataset's chunks in place. When the dataset's
@@ -9980,7 +10388,7 @@ fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
                     crate::datatype::Datatype::parse(&region[body..body_end]).map_err(|_| {
                         Error::EditUnsupported("a source datatype could not be parsed for copying")
                     })?;
-                if datatype_copies_foreign_address(&dt) {
+                if datatype_holds_file_address(&dt) {
                     return Err(Error::EditUnsupported(
                         "variable-length or reference datasets cannot be copied to another file yet",
                     ));
@@ -10005,7 +10413,7 @@ fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
                                 "a source attribute could not be parsed for copying",
                             )
                         })?;
-                if datatype_copies_foreign_address(&attr.datatype) {
+                if datatype_holds_file_address(&attr.datatype) {
                     return Err(Error::EditUnsupported(
                         "variable-length or reference attributes cannot be copied to another file yet",
                     ));
@@ -10028,30 +10436,13 @@ fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
 /// construction, so only the source datatypes matter.
 fn reject_foreign_dense_attrs(attrs: &[crate::attribute::AttributeMessage]) -> Result<(), Error> {
     for attr in attrs {
-        if datatype_copies_foreign_address(&attr.datatype) {
+        if datatype_holds_file_address(&attr.datatype) {
             return Err(Error::EditUnsupported(
                 "variable-length or reference dense (fractal-heap) attributes cannot be copied to another file yet",
             ));
         }
     }
     Ok(())
-}
-
-/// Whether `dt` stores, anywhere in its structure, a value that is a source-file
-/// absolute address: a variable-length (global-heap) or reference datatype, or a
-/// compound / array / enumeration built over one. See [`reject_foreign_addresses`].
-fn datatype_copies_foreign_address(dt: &crate::datatype::Datatype) -> bool {
-    use crate::datatype::Datatype;
-    match dt {
-        Datatype::VariableLength { .. } | Datatype::Reference { .. } => true,
-        Datatype::Compound { members, .. } => members
-            .iter()
-            .any(|m| datatype_copies_foreign_address(&m.datatype)),
-        Datatype::Array { base_type, .. } | Datatype::Enumeration { base_type, .. } => {
-            datatype_copies_foreign_address(base_type)
-        }
-        _ => false,
-    }
 }
 
 /// Refuse a staged dataset whose element bytes already hold *resolved* object
@@ -11781,6 +12172,176 @@ mod tests {
         assert!(
             freed < live_end,
             "the recorded free space cannot cover the whole file"
+        );
+    }
+
+    /// A commit that fails partway must roll back the heap-collection
+    /// provenance along with the free lists (issue #321).
+    ///
+    /// `resolve_overwrite_bytes` places a collection and records it in the
+    /// *apply* phase. A commit that then fails before its repoint gives that
+    /// space back to the free list — and used to keep the record, which is the
+    /// one piece of engine state naming file addresses that the rollback missed.
+    /// The next overwrite of that path would free the region a *later* commit
+    /// had since been handed, so the file's live variable-length data would sit
+    /// in space the allocator considers free, and the next unrelated write would
+    /// land on it.
+    ///
+    /// Induced the same way as
+    /// [`failed_paged_commit_leaves_the_free_lists_untouched`]: an unreadable
+    /// superblock extension fails the commit after the apply phase has run.
+    #[test]
+    fn a_failed_commit_rolls_back_the_heap_collection_provenance() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("failed_commit_vl_provenance.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("labels")
+            .with_vlen_strings(&["seed-one", "seed-two"]);
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+        b.write(&path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+
+        // One good round, so there is a record to roll back.
+        s.stage_dataset_write("/labels", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_vlen_strings(&["round-one-aaaa", "round-one-bbbb"]);
+            db
+        })
+        .unwrap();
+        s.commit().unwrap();
+        let recorded = s.vl_overwrite_heaps.clone();
+        assert!(!recorded.is_empty(), "the good round recorded nothing");
+
+        // Break the extension so the next commit fails after the apply phase.
+        let good_ext = s.superblock.superblock_extension_address;
+        s.superblock.superblock_extension_address = Some(0);
+        s.stage_dataset_write("/labels", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_vlen_strings(&["round-two-aaaa", "round-two-bbbb"]);
+            db
+        })
+        .unwrap();
+        assert!(
+            s.commit().is_err(),
+            "a commit with an unreadable extension must fail"
+        );
+
+        assert_eq!(
+            s.vl_overwrite_heaps, recorded,
+            "a failed commit must not leave a record naming space it gave back"
+        );
+
+        // The session stays usable, and the collections the rolled-back record
+        // names are still the live ones.
+        s.superblock.superblock_extension_address = good_ext;
+        s.stage_dataset_write("/labels", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_vlen_strings(&["round-three-a", "round-three-b"]);
+            db
+        })
+        .unwrap();
+        s.commit()
+            .expect("the session is usable after a failed commit");
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("labels").unwrap().read_string().unwrap(),
+            vec!["round-three-a".to_string(), "round-three-b".to_string()]
+        );
+    }
+
+    /// A failed commit must not leave the free list offering a span the image
+    /// still points into (issue #321).
+    ///
+    /// Resolving a staged variable-length overwrite *allocates* — a global heap
+    /// collection, drawn from a freed region where one fits. If the overwrite
+    /// were applied in place, that allocation's address would be written into a
+    /// data block the current root already reaches; a commit failing after the
+    /// write and before its repoint then hands the span back to the free list,
+    /// while the image still names it. The next commit places something else
+    /// there and the dataset reads that object's heap bytes, with every checksum
+    /// in the file intact.
+    ///
+    /// A relocating overwrite has no such window — its new block is reachable
+    /// from nothing until the repoint — which is why `prepare_write` refuses to
+    /// plan a staged variable-length overwrite in place at all. This is that
+    /// rule's test.
+    ///
+    /// The freed hole has to exist *first*, or the failed commit's collection is
+    /// appended past end-of-file where nothing reuses it and the bug hides. The
+    /// filler datasets each need a metadata span of the size the rolled-back one
+    /// occupied, which is what draws on it.
+    #[test]
+    fn a_failed_commit_leaves_no_reusable_span_the_image_names() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("failed_commit_live_span.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("labels")
+            .with_vlen_strings(&["seed-one", "seed-two"]);
+        b.create_dataset("big").with_u8_data(&[0x5A; 40960]);
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+        b.write(&path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        // The hole the collections below are placed into by reuse.
+        s.delete("/big").unwrap();
+        s.commit().unwrap();
+
+        let round_one = ["round-one-aaaa", "round-one-bbbb"];
+        s.stage_dataset_write("/labels", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_vlen_strings(&round_one);
+            db
+        })
+        .unwrap();
+        s.commit().unwrap();
+
+        // Fail a second overwrite after its apply phase has placed a collection.
+        let good_ext = s.superblock.superblock_extension_address;
+        s.superblock.superblock_extension_address = Some(0);
+        s.stage_dataset_write("/labels", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_vlen_strings(&["round-two-aaaa", "round-two-bbbb"]);
+            db
+        })
+        .unwrap();
+        assert!(
+            s.commit().is_err(),
+            "a commit with an unreadable extension must fail"
+        );
+        s.superblock.superblock_extension_address = good_ext;
+
+        // Unrelated commits that each want a metadata span of the same size.
+        // Whatever the failed attempt gave back, these are what would draw on it.
+        for i in 0..4 {
+            s.stage_created_dataset(&format!("/filler{i}"), {
+                let mut db = crate::type_builders::DatasetBuilder::new("");
+                db.with_vlen_strings(&["XXXXXXXXXXXXXXXXXXXX", "YYYYYYYYYYYYYYYYYYYY"]);
+                db
+            })
+            .unwrap();
+            s.commit().unwrap();
+        }
+
+        // Read only once the session has released its lock on the file: those
+        // locks are mandatory on Windows, so a `File::open` overlapping the
+        // session fails outright there where advisory locks elsewhere allow it.
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        let got = f.dataset("labels").unwrap().read_string();
+        assert!(
+            got.as_ref()
+                .is_ok_and(|v| v.iter().map(String::as_str).eq(round_one)),
+            "/labels reads another dataset's heap objects: {got:?}"
         );
     }
 

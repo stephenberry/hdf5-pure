@@ -4600,46 +4600,58 @@ fn add_zero_element_vlen_string_dataset_via_edit_session() {
     assert_eq!(ds.read_string().unwrap(), Vec::<String>::new());
 }
 
-/// Regression test: `write_dataset(...).with_vlen_strings(...)` must not
-/// silently corrupt the target (the overwrite path never patches the global
-/// heap collection this stages) — the same bug class issue #105 fixed for the
-/// *add* path, reached here through the sibling overwrite API instead. It is
-/// refused up front, and the refusal must not write anything.
+/// `write_dataset(...).with_vlen_strings(...)` resolves every staged element
+/// reference against a global heap collection it places (issue #321).
+///
+/// This was a refusal until then, and the refusal existed for a reason worth
+/// keeping under test: the staged references carry a **placeholder** heap
+/// address of zero, and writing them as if they were final is the bug class
+/// issue #105 fixed for the *add* path and issue #318 fixed for the reference
+/// one. Reading the strings back is one half of the check. The other is reading
+/// the element bytes and asserting no reference kept address zero — because a
+/// reader that resolves a zero address to "null" would report an empty string,
+/// and `read_string` alone cannot tell that from a string that is genuinely
+/// empty.
 #[test]
-fn write_dataset_rejects_vlen_strings_without_writing() {
-    let path = temp_path("hdf5_pure_edit_write_vlen_string_rejected.h5");
+fn overwriting_a_vlen_string_dataset_leaves_no_placeholder_address() {
+    let path = temp_path("hdf5_pure_edit_overwrite_vlen_no_placeholder.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("labels").with_vlen_strings(&["a", "b"]);
     b.write(&path).unwrap();
-    let before = std::fs::read(&path).unwrap();
 
     {
         let session = File::open_rw(&path).unwrap();
-        let err = session
+        session
             .dataset("labels")
             .unwrap()
             .write_staged(|b| {
                 b.with_vlen_strings(&["x", "y"]);
             })
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("variable-length-string"),
-            "got: {err}"
-        );
-        assert!(
-            !session.has_staged_edits(),
-            "a refused overwrite must not be left staged"
-        );
+            .unwrap();
+        session.commit().unwrap();
     }
 
-    // The refusal must not touch the file, and the original data must still
-    // read back correctly (not partially patched or corrupted).
-    assert_eq!(std::fs::read(&path).unwrap(), before);
     let file = File::open(&path).unwrap();
+    let ds = file.dataset("labels").unwrap();
     assert_eq!(
-        file.dataset("labels").unwrap().read_string().unwrap(),
-        vec!["a".to_string(), "b".to_string()]
+        ds.read_string().unwrap(),
+        vec!["x".to_string(), "y".to_string()]
     );
+
+    // A variable-length element reference is `[4-byte length][8-byte global
+    // heap address][4-byte object index]`. Neither string is null, so every
+    // address must have been patched away from the staged zero.
+    let raw = ds.read_raw().unwrap();
+    assert_eq!(raw.len(), 32, "two 16-byte element references");
+    let (elements, rest) = raw.as_chunks::<16>();
+    assert!(
+        rest.is_empty(),
+        "element references are a whole number of 16"
+    );
+    for (i, element) in elements.iter().enumerate() {
+        let addr = u64::from_le_bytes(element[4..12].try_into().unwrap());
+        assert_ne!(addr, 0, "element {i} kept its placeholder heap address");
+    }
 }
 
 /// The object-reference counterpart of
@@ -5891,5 +5903,607 @@ fn a_zero_element_dataset_copies_as_the_storage_it_never_had() {
         f.dataset("full_copy").unwrap().read_i32().unwrap(),
         vec![1, 2, 3],
         "the dataset that does store data copied it"
+    );
+}
+
+/// Issue #321: `Dataset::write_staged` with `with_vlen_strings` overwrites a
+/// variable-length-string dataset's values, resolving the staged placeholder
+/// element references against a freshly placed global heap collection.
+///
+/// The replacement strings are deliberately *longer* than the originals: the
+/// element bytes are fixed-width references either way, so the data block keeps
+/// its length and only the heap collection grows. That is what makes this a
+/// `WritePlan::InPlace` — not to be confused with the *commit's* in-place fast
+/// path, which a staged variable-length overwrite is deliberately excluded
+/// from.
+#[test]
+fn overwriting_a_vlen_string_dataset_replaces_its_strings() {
+    let path = temp_path("hdf5_pure_edit_overwrite_vlen_contiguous.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&["a", "b", "c"]);
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&["alpha", "beta", "gamma"]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+    );
+}
+
+/// The chunked counterpart of
+/// [`overwriting_a_vlen_string_dataset_replaces_its_strings`]. A chunked
+/// variable-length-string dataset is what this crate writes for one created
+/// with chunks (issue #109), so refusing to overwrite it would leave a hole in a
+/// shape the crate itself produces.
+#[test]
+fn overwriting_a_chunked_vlen_string_dataset_replaces_its_strings() {
+    let path = temp_path("hdf5_pure_edit_overwrite_vlen_chunked.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&["a", "b", "c", "d"])
+        .with_chunks(&[2]);
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&["alpha", "beta", "gamma", "delta"]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+            "delta".to_string()
+        ]
+    );
+}
+
+/// A commit that refuses must not have placed the global heap collection a
+/// staged variable-length overwrite stages (issue #321).
+///
+/// Resolving those references allocates, and `commit`'s preflight only reads —
+/// that is what lets a refused commit restore the staged set whole (issue #316)
+/// and cost the session nothing. So the plan carries the bytes unresolved and
+/// the resolving happens in the apply phase. Staging a *second* overwrite that
+/// only the preflight can refuse — a shape the on-disk dataset does not have —
+/// is what puts a valid variable-length overwrite in front of a refusal.
+///
+/// The file bytes are the assertion. Placing the collection during the preflight
+/// would append it and grow the file, leaving the strings of an overwrite that
+/// never happened behind on every attempt.
+#[test]
+fn a_refused_commit_places_no_collection_for_a_staged_vlen_overwrite() {
+    let path = temp_path("hdf5_pure_edit_refused_vlen_overwrite.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels").with_vlen_strings(&["a", "b"]);
+    b.create_dataset("nums").with_i32_data(&[1, 2, 3]);
+    b.write(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&["much-longer-one", "much-longer-two"]);
+            })
+            .unwrap();
+        // Refused by the preflight, which reads the on-disk shape to find out.
+        session
+            .dataset("nums")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[1, 2, 3, 4, 5]);
+            })
+            .unwrap();
+
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("shape"), "got: {err}");
+        assert!(
+            session.has_staged_edits(),
+            "a refused commit must give the staged set back (issue #316)"
+        );
+    }
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a refused commit must not have placed the overwrite's heap collection"
+    );
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        vec!["a".to_string(), "b".to_string()]
+    );
+}
+
+/// A chunked variable-length overwrite relocates its chunk storage
+/// (`MovingWrite::ChunkedStaged`), so the blocks it vacates must be reclaimed —
+/// exactly as the non-staged `MovingWrite::Chunked` relocation reclaims its own.
+///
+/// Asserted through the free list rather than through the file size, because
+/// the file grows either way: the *global heap collections* the old strings
+/// lived in are deliberately never reclaimed (a collection can be shared
+/// between objects), so a size trend cannot separate the chunk storage from
+/// them. `repack` is what recovers the heap.
+#[test]
+fn overwriting_a_chunked_vlen_string_dataset_reclaims_its_old_chunk_storage() {
+    let path = temp_path("hdf5_pure_edit_overwrite_vlen_reclaim.h5");
+    // 512 elements of 16-byte references is 8 KiB of chunk data, well clear of
+    // the object-header slack a commit also frees.
+    let before: Vec<String> = (0..512).map(|i| format!("before-{i}")).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&before.iter().map(String::as_str).collect::<Vec<_>>())
+        .with_chunks(&[64]);
+    b.write(&path).unwrap();
+
+    let after: Vec<String> = (0..512).map(|i| format!("after-{i}")).collect();
+    let session = File::open_rw(&path).unwrap();
+    session
+        .dataset("labels")
+        .unwrap()
+        .write_staged(|b| {
+            b.with_vlen_strings(&after.iter().map(String::as_str).collect::<Vec<_>>());
+        })
+        .unwrap();
+    session.commit().unwrap();
+
+    let free = session.space_accounting().unwrap().reusable_free_bytes;
+    assert!(
+        free >= 512 * 16,
+        "the vacated chunk storage was not reclaimed: {free} free bytes"
+    );
+
+    // Windows holds the file lock until the session is dropped.
+    drop(session);
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        after
+    );
+}
+
+/// Rotating a variable-length dataset's strings in one session reaches a steady
+/// state instead of growing the file by the whole payload every commit
+/// (issue #321).
+///
+/// Each overwrite places a fresh global heap collection for the new strings.
+/// Nothing else in the editor reclaims a collection, and for good reason — one
+/// can be shared between objects — so before this the old strings were simply
+/// left behind and only `repack` recovered them. What makes these reclaimable
+/// is provenance: this session placed them, for this dataset, and
+/// `invalidate_heap_provenance` drops the record the moment anything could name
+/// them twice.
+///
+/// Judged from the second round, like the fixed-size rotation test above: the
+/// first has nothing freed to draw on yet.
+#[test]
+fn rotating_a_vlen_dataset_in_a_session_stops_growing_the_file() {
+    let path = temp_path("hdf5_pure_edit_vlen_rotation_bounded.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&["seed-a", "seed-b", "seed-c", "seed-d"]);
+    b.write(&path).unwrap();
+
+    let mut sizes = Vec::new();
+    {
+        let session = File::open_rw(&path).unwrap();
+        for round in 0..12u32 {
+            // Long enough that a leaked generation is unmistakable against the
+            // object-header slack a commit also churns.
+            let data: Vec<String> = (0..4)
+                .map(|i| format!("round-{round}-element-{i}-{}", "x".repeat(64)))
+                .collect();
+            session
+                .dataset("labels")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>());
+                })
+                .unwrap();
+            session.commit().unwrap();
+            sizes.push(session.file_size());
+        }
+    }
+
+    let ceiling = sizes[1];
+    assert!(
+        sizes[2..].iter().all(|&s| s <= ceiling),
+        "the file grew past its second-round size under rotation: {sizes:?}"
+    );
+
+    let file = File::open(&path).unwrap();
+    let last = file.dataset("labels").unwrap().read_string().unwrap();
+    assert!(
+        last[0].starts_with("round-11-element-0"),
+        "got: {}",
+        last[0]
+    );
+}
+
+/// The reclaim must not fire when the session has done something that could name
+/// a recorded collection a second time (issue #321).
+///
+/// An in-file `copy` of a variable-length dataset re-emits its element
+/// references **verbatim**, so the copy names the very collections the source
+/// does — with every heap object's reference count still 1, which is why the
+/// format cannot be asked. Freeing them on the next overwrite of the source
+/// would hand out space the copy still reads, and every checksum in the file
+/// would still verify.
+///
+/// This is the test that a provenance record outliving its proof corrupts data,
+/// so it asserts the *copy's* contents, not the source's.
+///
+/// Freeing alone would not show it: a freed region keeps its bytes until
+/// something draws on it, so reading the copy straight after the bad free still
+/// answers correctly. The rounds after the copy are what make the failure
+/// visible — every string is the same length, so a reclaimed collection is
+/// exactly the right size for the next one to be placed in, and the copy's
+/// strings are overwritten by a later generation's.
+#[test]
+fn a_copy_stops_a_vlen_overwrite_from_reclaiming_the_shared_collection() {
+    let path = temp_path("hdf5_pure_edit_vlen_copy_blocks_reclaim.h5");
+    let generation = |n: u32| -> Vec<String> {
+        (0..2)
+            .map(|i| format!("generation-{n:02}-element-{i}"))
+            .collect()
+    };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&generation(0).iter().map(String::as_str).collect::<Vec<_>>());
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let overwrite = |n: u32| {
+            let data = generation(n);
+            session
+                .dataset("labels")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>());
+                })
+                .unwrap();
+            session.commit().unwrap();
+        };
+
+        // Round one records the collections it places for "labels".
+        overwrite(1);
+
+        // The copy now names those same collections.
+        session.copy("labels", "clone").unwrap();
+        session.commit().unwrap();
+
+        // Every later round places a collection of exactly the size the
+        // generation-1 one occupies. If the copy did not drop the record, round
+        // two frees it and one of these is placed on top of the copy's strings.
+        for n in 2..8 {
+            overwrite(n);
+        }
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("clone").unwrap().read_string().unwrap(),
+        generation(1),
+        "the copy's strings were freed out from under it and then written over"
+    );
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        generation(7)
+    );
+}
+
+/// The other way a second name for a recorded collection is made: a **raw-bytes
+/// write** (issue #321).
+///
+/// `with_raw_data` hands the engine element bytes it does not interpret, so a
+/// caller that reads one variable-length dataset's references and stages them as
+/// another dataset's data has aliased the collections they name — with every
+/// heap object's reference count still 1, exactly as an in-file `copy` does.
+/// This is the half of `invalidate_heap_provenance` that
+/// [`a_copy_stops_a_vlen_overwrite_from_reclaiming_the_shared_collection`] does
+/// not reach: the screen on the staged datatype rather than on the copy lists.
+///
+/// Built like that test, and for the same reason: the *aliasing* dataset's
+/// contents are the assertion, and the rounds after it are what make a bad free
+/// visible — every generation is the same length, so a wrongly reclaimed
+/// collection is exactly the right size for the next one to be placed in.
+#[test]
+fn a_raw_bytes_write_stops_a_vlen_overwrite_from_reclaiming_its_collection() {
+    let path = temp_path("hdf5_pure_edit_vlen_raw_blocks_reclaim.h5");
+    let generation = |n: u32| -> Vec<String> {
+        (0..2)
+            .map(|i| format!("generation-{n:02}-element-{i}"))
+            .collect()
+    };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&generation(0).iter().map(String::as_str).collect::<Vec<_>>());
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let overwrite = |n: u32| {
+            let data = generation(n);
+            session
+                .dataset("labels")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>());
+                })
+                .unwrap();
+            session.commit().unwrap();
+        };
+
+        // Round one records the collections it places for "labels".
+        overwrite(1);
+
+        // Read the element references out and stage them as a second dataset's
+        // data. Read before staging: re-entering the session inside the builder
+        // closure would deadlock (issue #200).
+        let (dt, raw) = {
+            let ds = session.dataset("labels").unwrap();
+            (ds.datatype().unwrap(), ds.read_raw().unwrap())
+        };
+        session
+            .root()
+            .create_dataset("alias", |b| {
+                b.with_raw_data(dt.clone(), raw.clone(), 2);
+            })
+            .unwrap();
+        session.commit().unwrap();
+
+        for n in 2..8 {
+            overwrite(n);
+        }
+    }
+
+    let file = File::open(&path).unwrap();
+    // Read fallibly: space handed back and reused stops being a heap collection
+    // at all, so the wrong answer here is as often an error as it is a string.
+    let alias = file.dataset("alias").unwrap().read_string();
+    assert!(
+        alias.as_ref().is_ok_and(|got| *got == generation(1)),
+        "the aliased strings were freed out from under the raw-bytes dataset \
+         and written over: {alias:?}"
+    );
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        generation(7)
+    );
+}
+
+/// A builder's variable-length staging describes the bytes in its `data` field,
+/// so replacing those bytes must drop it (issue #321).
+///
+/// This is the door that made the screen in
+/// [`a_raw_bytes_write_stops_a_vlen_overwrite_from_reclaiming_its_collection`]
+/// skippable. `with_raw_data` used to leave `vl_string_staging` in place, so a
+/// builder could carry a staging that owned one patch offset while `data` held a
+/// whole new array: the commit patched element 0 against a fresh collection and
+/// wrote the caller's own bytes into the rest. Because the builder still had a
+/// staging, the screen's `vl_string_staging.is_none()` test skipped the entry
+/// and the reclaim went ahead over an alias it had not seen.
+///
+/// Asserted on the *aliased* dataset after later rounds have had the chance to
+/// reuse the freed space, for the same reason as the tests above: a free alone
+/// leaves the bytes where they are.
+#[test]
+fn replacing_a_builders_data_drops_the_vlen_staging_that_described_it() {
+    let path = temp_path("hdf5_pure_edit_raw_data_drops_staging.h5");
+    let generation =
+        |n: u32| -> Vec<String> { (0..2).map(|i| format!("gen-{n:02}-element-{i}")).collect() };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&generation(1).iter().map(String::as_str).collect::<Vec<_>>());
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let (dt, raw) = {
+            let ds = session.dataset("labels").unwrap();
+            (ds.datatype().unwrap(), ds.read_raw().unwrap())
+        };
+
+        // A builder carrying *both* a staging and raw bytes lifted from
+        // "labels". Its element 1 is "labels"'s own element reference.
+        session
+            .root()
+            .create_dataset("alias", |b| {
+                b.with_shape(&[2]);
+                b.with_vlen_strings(&["only-one"]);
+                b.with_raw_data(dt, raw, 2);
+            })
+            .unwrap();
+        session.commit().unwrap();
+
+        for n in 2..10 {
+            let data = generation(n);
+            session
+                .dataset("labels")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>());
+                })
+                .unwrap();
+            session.commit().unwrap();
+        }
+    }
+
+    let file = File::open(&path).unwrap();
+    // Fallible for the same reason as the sibling test: reused space stops
+    // being a heap collection at all, so the wrong answer is as often an error
+    // as a string.
+    let alias = file.dataset("alias").unwrap().read_string();
+    assert!(
+        alias.as_ref().is_ok_and(|got| got[1] == generation(1)[1]),
+        "the aliased element was freed out from under it and written over: {alias:?}"
+    );
+    assert_eq!(
+        file.dataset("labels").unwrap().read_string().unwrap(),
+        generation(9)
+    );
+}
+
+/// The crash half of the same defect: a builder whose staged element data is
+/// replaced by *fewer* bytes than the staging describes (issue #321).
+///
+/// `patch_vl_refs_masked` writes eight bytes at each staged offset without
+/// checking them against the buffer, so a surviving staging over a shorter
+/// replacement indexed out of bounds. On the whole-file writer that was a panic
+/// out of `FileBuilder::write` in every released version, reachable from a
+/// public builder with no unsafe and no malformed file involved.
+///
+/// Dropping the staging with the bytes it described removes the crash and the
+/// silent half together, which is why this asserts a plain successful write.
+#[test]
+fn replacing_staged_data_with_fewer_bytes_does_not_panic() {
+    let path = temp_path("hdf5_pure_edit_short_raw_after_staging.h5");
+    let dt = {
+        let seed = temp_path("hdf5_pure_edit_short_raw_seed.h5");
+        let mut t = FileBuilder::new();
+        t.create_dataset("x").with_vlen_strings(&["a", "b"]);
+        t.write(&seed).unwrap();
+        let f = File::open(&seed).unwrap();
+        f.dataset("x").unwrap().datatype().unwrap()
+    };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("d")
+        .with_shape(&[1])
+        .with_vlen_strings(&["aa", "bb"])
+        .with_raw_data(dt, vec![0u8; 16], 1);
+    b.write(&path)
+        .expect("a shorter replacement must not panic");
+
+    // One element, and it is the raw bytes as given: an all-zero reference,
+    // which is the null every reader answers for it.
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("d").unwrap().read_string().unwrap(), vec![""]);
+}
+
+/// The object-reference half of the same builder invariant (issue #321).
+///
+/// `with_path_references` stages placeholder element bytes and a list of
+/// targets to patch into them. Replacing the bytes must drop that list too:
+/// patching is gated on the list being present, never on the datatype, so a
+/// surviving list writes resolved object addresses over whatever the second
+/// call supplied. Here that is ordinary `u64` data, and the file came back
+/// holding the target's header address twice instead of the values asked for.
+///
+/// Its own crash half is quieter than the variable-length one's:
+/// `write_reference_address` only `debug_assert!`s that the slot fits, so a
+/// shorter replacement is a panic in a debug build and a silent skip in a
+/// release one.
+#[test]
+fn replacing_a_builders_data_drops_the_reference_targets_that_described_it() {
+    let path = temp_path("hdf5_pure_edit_raw_data_drops_reference_targets.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("target").with_i32_data(&[7]);
+    b.create_dataset("d")
+        .with_path_references(&["target", "target"])
+        .with_u64_data(&[0xAAAA_AAAA, 0xBBBB_BBBB]);
+    b.write(&path).unwrap();
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("d").unwrap().read_u64().unwrap(),
+        vec![0xAAAA_AAAAu64, 0xBBBB_BBBB],
+        "the dropped reference targets were patched over the staged values"
+    );
+}
+
+/// The provenance screen has two doors for raw element bytes, and this is the
+/// one reached by *overwriting* rather than creating (issue #321).
+///
+/// `invalidate_heap_provenance` screens `staged.writes` and `staged.datasets`
+/// alike, because either can carry element bytes the engine does not interpret.
+/// A dataset overwritten with references lifted out of another one aliases its
+/// collections just as a newly created one does, and the record has to be given
+/// up for both.
+#[test]
+fn a_raw_bytes_overwrite_stops_a_vlen_overwrite_from_reclaiming_its_collection() {
+    let path = temp_path("hdf5_pure_edit_raw_overwrite_blocks_reclaim.h5");
+    let generation =
+        |n: u32| -> Vec<String> { (0..2).map(|i| format!("gen-{n:02}-element-{i}")).collect() };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&generation(0).iter().map(String::as_str).collect::<Vec<_>>());
+    b.create_dataset("alias")
+        .with_vlen_strings(&["placeholder-x", "placeholder-y"]);
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let overwrite = |n: u32| {
+            let data = generation(n);
+            session
+                .dataset("labels")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>());
+                })
+                .unwrap();
+            session.commit().unwrap();
+        };
+
+        // Round one records the collections it places for "labels".
+        overwrite(1);
+
+        // Overwrite a *different* dataset with "labels"'s element references.
+        let (dt, raw) = {
+            let ds = session.dataset("labels").unwrap();
+            (ds.datatype().unwrap(), ds.read_raw().unwrap())
+        };
+        session
+            .dataset("alias")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_raw_data(dt, raw, 2);
+            })
+            .unwrap();
+        session.commit().unwrap();
+
+        for n in 2..8 {
+            overwrite(n);
+        }
+    }
+
+    let file = File::open(&path).unwrap();
+    let alias = file.dataset("alias").unwrap().read_string();
+    assert!(
+        alias.as_ref().is_ok_and(|got| *got == generation(1)),
+        "the aliased strings were freed out from under the overwritten dataset \
+         and written over: {alias:?}"
     );
 }

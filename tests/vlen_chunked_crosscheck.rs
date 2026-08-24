@@ -304,3 +304,200 @@ fn c_library_reads_many_chunked_vlen_string_datasets() {
     }
     assert_both_read(&path, "contiguous", &contiguous);
 }
+
+/// Overwriting a variable-length-string dataset in place (issue #321): the
+/// staged element references are patched against a heap collection the *edit*
+/// engine places, in a file that already has a layout around it.
+///
+/// The contiguous case, which is the one whose data block keeps its length and
+/// so would otherwise take the commit's in-place fast path. That path never
+/// rewrites the superblock, and placing a collection moves end-of-file — so
+/// this is also the test that a file whose recorded end-of-file went stale
+/// would fail, since the C library validates it where the pure reader, indexing
+/// by offset, does not.
+#[test]
+fn c_library_reads_an_overwritten_contiguous_vlen_string_dataset() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("overwrite_contiguous.h5");
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&["a", "bb", "ccc"]);
+    b.write(&path).unwrap();
+
+    // Deliberately longer than the originals: the element references keep their
+    // width, so the data block does not move and only the heap collection grows.
+    let after = vec![
+        "replacement-one".to_string(),
+        "replacement-two".to_string(),
+        "replacement-three".to_string(),
+    ];
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&after.iter().map(String::as_str).collect::<Vec<_>>());
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    assert_both_read(&path, "labels", &after);
+}
+
+/// The filtered chunked counterpart. A deflated chunk's compressed length
+/// depends on the heap addresses patched into it, so the overwrite cannot split
+/// and encode before it resolves — which is what `MovingWrite::ChunkedStaged`
+/// exists for. Nothing about that ordering is visible to a reader that only
+/// checks the strings come back, so the C library reading the file it did not
+/// write is the assertion that matters.
+#[test]
+fn c_library_reads_an_overwritten_filtered_chunked_vlen_string_dataset() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("overwrite_filtered.h5");
+    let before = words(64);
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("labels")
+        .with_vlen_strings(&before.iter().map(String::as_str).collect::<Vec<_>>())
+        .with_chunks(&[8])
+        .with_deflate(6);
+    b.write(&path).unwrap();
+
+    let after: Vec<String> = (0..64).map(|i| format!("overwritten-value-{i}")).collect();
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&after.iter().map(String::as_str).collect::<Vec<_>>());
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    assert_both_read(&path, "labels", &after);
+
+    // The overwrite must not have quietly dropped the storage properties it was
+    // supposed to preserve: this is a value overwrite, not a re-layout.
+    let f = hdf5::File::open(&path).unwrap();
+    let ds = f.dataset("labels").unwrap();
+    assert!(
+        ds.is_chunked(),
+        "the overwrite must keep the chunked layout"
+    );
+    assert!(
+        !ds.filters().is_empty(),
+        "the overwrite must keep the filter pipeline"
+    );
+}
+
+/// A file the **C library wrote**, overwritten by this crate. The layout, the
+/// heap collections, and the object header are all the reference library's, so
+/// this is the case where an assumption about how *this* crate lays a
+/// variable-length dataset out would show up.
+#[test]
+fn a_c_written_vlen_string_dataset_can_be_overwritten() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_written.h5");
+
+    {
+        let f = hdf5::File::create(&path).unwrap();
+        let data: Vec<VarLenUnicode> = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|s| s.parse::<VarLenUnicode>().unwrap())
+            .collect();
+        f.new_dataset::<VarLenUnicode>()
+            .shape([3])
+            .create("labels")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+    }
+
+    let after = vec![
+        "delta".to_string(),
+        "epsilon".to_string(),
+        "zeta".to_string(),
+    ];
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&after.iter().map(String::as_str).collect::<Vec<_>>());
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    assert_both_read(&path, "labels", &after);
+}
+
+/// A **compact** variable-length-string dataset, overwritten in place
+/// (issue #321).
+///
+/// The compact arm of `prepare_write` relocates the dataset and rebuilds its
+/// header with the element bytes inline, so the resolved references travel in
+/// the header rather than in a data block — the one plan where they do. Nothing
+/// this crate writes is compact, so the source has to come from the reference
+/// library, which is also what makes this a test of the arm rather than of the
+/// writer's own habits.
+#[test]
+fn c_library_reads_an_overwritten_compact_vlen_string_dataset() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("overwrite_compact.h5");
+
+    {
+        let f = hdf5::File::create(&path).unwrap();
+        let data: Vec<VarLenUnicode> = ["one", "two", "three"]
+            .iter()
+            .map(|s| s.parse::<VarLenUnicode>().unwrap())
+            .collect();
+        f.new_dataset::<VarLenUnicode>()
+            .layout(hdf5::dataset::Layout::Compact)
+            .shape([3])
+            .create("labels")
+            .unwrap()
+            .write(&data)
+            .unwrap();
+    }
+    // The source really is compact, or this test proves nothing about that arm.
+    {
+        let f = hdf5::File::open(&path).unwrap();
+        assert!(
+            matches!(
+                f.dataset("labels").unwrap().layout(),
+                hdf5::dataset::Layout::Compact
+            ),
+            "expected a compact source layout"
+        );
+    }
+
+    let after = vec![
+        "replacement-one".to_string(),
+        "replacement-two".to_string(),
+        "replacement-three".to_string(),
+    ];
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&after.iter().map(String::as_str).collect::<Vec<_>>());
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    assert_both_read(&path, "labels", &after);
+}

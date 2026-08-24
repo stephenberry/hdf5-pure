@@ -1015,6 +1015,14 @@ pub(crate) const VL_REF_SIZE: usize = 16;
 /// here: they are the dataset's data, and the builder's `data` field is where
 /// they live. Carrying them in both places cost a copy of every reference in the
 /// dataset for a field nothing read afterwards (issue #228).
+///
+/// `Clone` is for the overwrite path, whose plan is built from a *borrowed*
+/// staged edit: the staged set has to survive a refused commit intact (issue
+/// #316), so the plan cannot move the staging out of it. The copy is of the
+/// heap collections — the string bytes themselves, not the fixed-width element
+/// references beside them — and is made once per staged variable-length
+/// overwrite.
+#[derive(Clone)]
 pub(crate) struct VlStringStaging {
     /// The serialized global heap collections holding the non-null objects, in
     /// the order their objects appear. Empty when there are no such objects.
@@ -1687,7 +1695,7 @@ impl DatasetBuilder {
         for &v in data {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        self.data = Some(b);
+        self.set_element_bytes(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
@@ -1700,7 +1708,7 @@ impl DatasetBuilder {
         for &v in data {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        self.data = Some(b);
+        self.set_element_bytes(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
@@ -1713,7 +1721,7 @@ impl DatasetBuilder {
         for &v in data {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        self.data = Some(b);
+        self.set_element_bytes(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
@@ -1726,7 +1734,7 @@ impl DatasetBuilder {
         for &v in data {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        self.data = Some(b);
+        self.set_element_bytes(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
@@ -1735,7 +1743,7 @@ impl DatasetBuilder {
 
     pub fn with_u8_data(&mut self, data: &[u8]) -> &mut Self {
         self.datatype = Some(make_u8_type());
-        self.data = Some(data.to_vec());
+        self.set_element_bytes(data.to_vec());
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
@@ -1748,7 +1756,7 @@ impl DatasetBuilder {
         for &v in data {
             b.push(v as u8);
         }
-        self.data = Some(b);
+        self.set_element_bytes(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
@@ -1761,7 +1769,7 @@ impl DatasetBuilder {
         for &v in data {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        self.data = Some(b);
+        self.set_element_bytes(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
@@ -1774,7 +1782,7 @@ impl DatasetBuilder {
         for &v in data {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        self.data = Some(b);
+        self.set_element_bytes(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
@@ -1787,7 +1795,7 @@ impl DatasetBuilder {
         for &v in data {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        self.data = Some(b);
+        self.set_element_bytes(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
@@ -1800,7 +1808,7 @@ impl DatasetBuilder {
         for &v in data {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        self.data = Some(b);
+        self.set_element_bytes(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
@@ -1829,7 +1837,7 @@ impl DatasetBuilder {
         for &addr in addresses {
             b.extend_from_slice(&addr.to_le_bytes());
         }
-        self.data = Some(b);
+        self.set_element_bytes(b);
         if self.shape.is_none() {
             self.shape = Some(vec![addresses.len() as u64]);
         }
@@ -1857,7 +1865,7 @@ impl DatasetBuilder {
     pub(crate) fn with_object_references(&mut self, targets: Vec<ObjectRefTarget>) -> &mut Self {
         self.datatype = Some(make_object_reference_type());
         // Placeholder zeros — patched once all destination addresses are known.
-        self.data = Some(vec![0u8; targets.len() * 8]);
+        self.set_element_bytes(vec![0u8; targets.len() * 8]);
         if self.shape.is_none() {
             self.shape = Some(vec![targets.len() as u64]);
         }
@@ -1890,7 +1898,7 @@ impl DatasetBuilder {
         patches: Vec<ObjectRefPatch>,
     ) -> &mut Self {
         self.datatype = Some(datatype);
-        self.data = Some(raw);
+        self.set_element_bytes(raw);
         if self.shape.is_none() {
             self.shape = Some(vec![num_elements]);
         }
@@ -1955,11 +1963,40 @@ impl DatasetBuilder {
         num_elements: u64,
     ) -> &mut Self {
         self.datatype = Some(datatype);
-        self.data = Some(raw_data);
+        self.set_element_bytes(raw_data);
         if self.shape.is_none() {
             self.shape = Some(vec![num_elements]);
         }
         self
+    }
+
+    /// Replace the staged element bytes, dropping any staging that described the
+    /// *previous* ones.
+    ///
+    /// [`vl_string_staging`](Self::vl_string_staging) and
+    /// [`reference_targets`](Self::reference_targets) are both descriptions of
+    /// what is in `data`: which element references still hold a placeholder, and
+    /// at which byte offsets. Replacing the bytes invalidates both, so every
+    /// entry point that sets element data goes through here rather than
+    /// assigning the field — the invariant is "the staging describes `data`",
+    /// and it is one a new setter would otherwise have to know to uphold.
+    ///
+    /// Leaving one behind was reachable and silent: `with_raw_data` after
+    /// `with_vlen_strings` kept a staging that owned one patch offset while
+    /// `data` held a whole new array, so the commit patched element 0 and wrote
+    /// the caller's own bytes into the rest. Where those bytes were element
+    /// references read out of another dataset, two datasets ended up naming one
+    /// global heap collection with nothing recording it (issue #321). A shorter
+    /// replacement was worse than silent: `patch_vl_refs_masked` indexes at the
+    /// staged offsets unguarded, so it panicked out of `commit`.
+    ///
+    /// The four setters that *do* establish a staging assign it immediately
+    /// after their call to this, which is why clearing here does not defeat
+    /// them.
+    fn set_element_bytes(&mut self, data: Vec<u8>) {
+        self.data = Some(data);
+        self.vl_string_staging = None;
+        self.reference_targets = None;
     }
 
     /// Stage a dataset that declares its shape and element type and allocates no
@@ -2130,7 +2167,7 @@ impl DatasetBuilder {
         for &v in values {
             raw.extend_from_slice(&v.to_le_bytes());
         }
-        self.data = Some(raw);
+        self.set_element_bytes(raw);
         if self.shape.is_none() {
             self.shape = Some(vec![values.len() as u64]);
         }
@@ -2140,7 +2177,7 @@ impl DatasetBuilder {
     /// Write an enum dataset with u8 values.
     pub fn with_enum_u8_data(&mut self, datatype: Datatype, values: &[u8]) -> &mut Self {
         self.datatype = Some(datatype);
-        self.data = Some(values.to_vec());
+        self.set_element_bytes(values.to_vec());
         if self.shape.is_none() {
             self.shape = Some(vec![values.len() as u64]);
         }
@@ -2265,7 +2302,7 @@ impl DatasetBuilder {
     ) -> &mut Self {
         let (element_bytes, staging) = stage_embedded_vl_elements(raw, offsets, elements);
         self.datatype = Some(datatype);
-        self.data = Some(element_bytes);
+        self.set_element_bytes(element_bytes);
         self.vl_string_staging = Some(staging);
         if self.shape.is_none() {
             self.shape = Some(vec![num_elements]);
@@ -2294,7 +2331,7 @@ impl DatasetBuilder {
         (element_bytes, staging): (Vec<u8>, VlStringStaging),
     ) {
         self.datatype = Some(datatype);
-        self.data = Some(element_bytes);
+        self.set_element_bytes(element_bytes);
         self.vl_string_staging = Some(staging);
         if self.shape.is_none() {
             self.shape = Some(vec![num_elements]);
@@ -2313,7 +2350,7 @@ impl DatasetBuilder {
             base_type: Box::new(base_type),
             dimensions: array_dims.to_vec(),
         });
-        self.data = Some(raw_data);
+        self.set_element_bytes(raw_data);
         if self.shape.is_none() {
             self.shape = Some(vec![num_elements]);
         }
