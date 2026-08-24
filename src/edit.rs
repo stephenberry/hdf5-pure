@@ -12329,15 +12329,20 @@ mod tests {
             })
             .unwrap();
             s.commit().unwrap();
-
-            let f = crate::reader::File::open(&path).unwrap();
-            let got = f.dataset("labels").unwrap().read_string();
-            assert!(
-                got.as_ref()
-                    .is_ok_and(|v| v.iter().map(String::as_str).eq(round_one)),
-                "after filler{i}, /labels reads another dataset's heap objects: {got:?}"
-            );
         }
+
+        // Read only once the session has released its lock on the file: those
+        // locks are mandatory on Windows, so a `File::open` overlapping the
+        // session fails outright there where advisory locks elsewhere allow it.
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        let got = f.dataset("labels").unwrap().read_string();
+        assert!(
+            got.as_ref()
+                .is_ok_and(|v| v.iter().map(String::as_str).eq(round_one)),
+            "/labels reads another dataset's heap objects: {got:?}"
+        );
     }
 
     /// A commit that writes into reused free space and then dies must leave the
