@@ -6,7 +6,10 @@
 //! SWMR writer — which follow it — a SWMR reader — and that
 //! `File::clear_swmr_flag` restores all of them.
 
-use hdf5_pure::{Error, File, FileBuilder, MemoryStrategy};
+use hdf5_pure::{
+    Error, File, FileAccessProperties, FileBuilder, FileLocking, FileSpaceStrategy, MemoryStrategy,
+    SyncPolicy,
+};
 use tempfile::tempdir;
 
 /// An appendable file: rank-1, unlimited, Extensible-Array indexed, unfiltered —
@@ -160,5 +163,244 @@ fn from_bytes_reads_a_flagged_file() {
     assert_eq!(
         file.dataset("d").unwrap().read_i32().unwrap(),
         (0..4).collect::<Vec<_>>()
+    );
+}
+
+// --- The page buffer's crash mark (issue #308) ---------------------------------
+//
+// A SWMR writer is not the only session that raises this byte. A session given
+// `FileAccessProperties::with_page_buffer_size` holds dirty pages across the
+// write engine's ordering barriers, which issues every publish point ahead of
+// the content it names — so a session that dies mid-flush can leave a dataset
+// that reads *clean* and returns fill values or a deleted object's bytes, with
+// every checksum verifying. The mark is what makes that file refuse to open
+// instead, here and in the C library alike.
+//
+// It raises bit 0 alone, where a SWMR writer raises bits 0 and 2, so `flags`
+// below distinguishes the two rather than only reporting "marked".
+
+/// A paged file with an appendable dataset: what a page buffer requires.
+fn build_paged(path: &std::path::Path) {
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
+        .with_file_space_page_size(4096);
+    b.create_dataset("d")
+        .with_i32_data(&[0i32; 64])
+        .with_shape(&[64])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[64]);
+    b.write(path).unwrap();
+}
+
+/// Access properties for a page-buffered session.
+///
+/// Locking is disabled deliberately, and it is not incidental to the tests: OS
+/// locks are **mandatory** on Windows, so a held `open_rw` lock blocks the very
+/// `std::fs::read` these tests use to observe the byte mid-session. What is under
+/// test is the superblock flag, not the lock.
+fn page_buffered() -> FileAccessProperties {
+    FileAccessProperties::new()
+        .with_sync_policy(SyncPolicy::OnClose)
+        .with_locking(FileLocking::Disabled)
+        .with_page_buffer_size(1 << 20)
+}
+
+/// The mark stands from the moment the buffer is installed until the session
+/// closes, and a clean close takes it back down.
+///
+/// The `while open` half is the one that matters: a mark raised at close would
+/// be useless, since a crashed session never reaches close. The `after close`
+/// half is what keeps the property usable at all — a file left flagged is
+/// refused by every later open.
+#[test]
+fn a_page_buffered_session_marks_the_file_for_its_lifetime() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("buffered.h5");
+    build_paged(&path);
+    assert_eq!(flags(&path), 0x00, "a fresh file carries no mark");
+
+    let file = File::open_rw_with_options(&path, page_buffered()).unwrap();
+    assert_eq!(
+        flags(&path),
+        0x01,
+        "the mark must be on the disk before the first buffered write, not at close"
+    );
+    assert_marked_in_use(
+        File::open(&path).unwrap_err(),
+        "a read of a page-buffered file",
+    );
+
+    let mut ds = file.dataset("d").unwrap();
+    ds.append(&[1i32; 64]).unwrap();
+    drop(ds);
+    file.close().unwrap();
+
+    assert_eq!(flags(&path), 0x00, "a clean close must take the mark down");
+    assert_eq!(
+        File::open(&path)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_i32()
+            .unwrap()
+            .len(),
+        128,
+        "and leave a file that reads"
+    );
+}
+
+/// A commit inside the epoch rewrites the superblock, and must publish the mark
+/// rather than the zero every other clean commit publishes.
+///
+/// This is the sharp edge of the feature: the commit's zero is deliberate — it
+/// scrubs a flag the file arrived carrying — so a page-buffered session's very
+/// first commit would take its own mark down and leave the rest of the session
+/// unguarded, with nothing failing to say so.
+///
+/// The `sync` is load-bearing, not tidying. The commit's superblock write lands
+/// in the page buffer like any other, so reading the disk straight after it sees
+/// the byte the *open* wrote and passes whatever the commit put there. Forcing
+/// the flush is what puts the commit's own superblock on the disk to be read —
+/// and it is not a contrivance either: `File::sync` is how an application on
+/// `SyncPolicy::OnClose` names its own cadence, and a commit exceeding the byte
+/// budget flushes on its own.
+#[test]
+fn a_commit_in_a_page_buffered_session_leaves_the_mark_standing() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("committed.h5");
+    build_paged(&path);
+
+    let file = File::open_rw_with_options(&path, page_buffered()).unwrap();
+    file.root()
+        .create_dataset("added", |b| {
+            b.with_f64_data(&[2.5f64; 32]).with_shape(&[32]);
+        })
+        .unwrap();
+    file.commit().unwrap();
+    file.sync().unwrap();
+    assert_eq!(
+        flags(&path),
+        0x01,
+        "a commit must publish the session's mark, not scrub it"
+    );
+
+    // A second one. Not because it takes a different tail — instrumenting the
+    // three superblock publish sites shows both commits go through the same one,
+    // the paged persisting tail — but because a mark republished once and then
+    // dropped would pass a single-commit test.
+    file.root()
+        .create_dataset("again", |b| {
+            b.with_f64_data(&[3.5f64; 32]).with_shape(&[32]);
+        })
+        .unwrap();
+    file.commit().unwrap();
+    file.sync().unwrap();
+    assert_eq!(flags(&path), 0x01, "and so must every later commit");
+
+    file.close().unwrap();
+    assert_eq!(flags(&path), 0x00);
+    assert!(File::open(&path).is_ok(), "and the file must open again");
+}
+
+/// The case the mark exists for: a page-buffered session that never closes.
+///
+/// Leaked rather than crashed, which is the same thing as far as the file is
+/// concerned — neither `close` nor `Drop` runs, so nothing clears the byte. Every
+/// open that would hand back the file's contents is then refused, which is the
+/// whole trade: without the mark this file opens and reads clean.
+#[test]
+fn a_crashed_page_buffered_session_leaves_a_file_every_open_refuses() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("crashed.h5");
+    build_paged(&path);
+
+    let file = File::open_rw_with_options(&path, page_buffered()).unwrap();
+    let mut ds = file.dataset("d").unwrap();
+    ds.append(&[7i32; 64]).unwrap();
+    std::mem::forget(ds);
+    std::mem::forget(file);
+    assert_eq!(
+        flags(&path),
+        0x01,
+        "the leaked session left the file marked"
+    );
+
+    assert_marked_in_use(File::open(&path).unwrap_err(), "a buffered read");
+    assert_marked_in_use(File::open_streaming(&path).unwrap_err(), "a streaming read");
+    assert_marked_in_use(File::open_rw(&path).unwrap_err(), "an editor");
+    assert_marked_in_use(
+        File::open_swmr(&path).unwrap_err(),
+        "a SWMR reader, whose pair is half-set",
+    );
+
+    // And the documented recovery reaches this mark too, since it clears the
+    // byte whole. What comes back is access, not a promise about the contents.
+    File::clear_swmr_flag(&path).unwrap();
+    assert_eq!(flags(&path), 0x00);
+    File::open(&path).unwrap();
+}
+
+/// An ordinary editor raises nothing. The crate's divergence from the C library
+/// — which marks the file for *any* writer — is deliberate, and it is what makes
+/// the mark above mean "a page buffer held this file" rather than "someone
+/// opened it".
+///
+/// Locking is off for the same reason as everywhere else here, and it changes
+/// nothing about what is under test: the lock and the flag are separate guards,
+/// and this one is about the flag. The default `open_rw` takes an exclusive lock,
+/// which on Windows is *mandatory* and would block the read below.
+#[test]
+fn an_unbuffered_editor_raises_no_mark() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("plain.h5");
+    build_paged(&path);
+
+    let file = File::open_rw_with_options(
+        &path,
+        FileAccessProperties::new().with_locking(FileLocking::Disabled),
+    )
+    .unwrap();
+    let mut ds = file.dataset("d").unwrap();
+    ds.append(&[1i32; 64]).unwrap();
+    drop(ds);
+    assert_eq!(
+        flags(&path),
+        0x00,
+        "an open_rw session without a page buffer marks nothing"
+    );
+    file.close().unwrap();
+    assert_eq!(flags(&path), 0x00);
+}
+
+/// Dropping the handle without `close` takes the mark down too.
+///
+/// `close` is the documented ending, but `drop` is the one a `?` on an unrelated
+/// error takes, and a session that left the mark standing there would leave a
+/// file nothing can open until `clear_swmr_flag` — an availability failure with
+/// no crash behind it. Both teardowns write, and both must finish the job.
+#[test]
+fn dropping_a_page_buffered_session_takes_the_mark_down() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dropped.h5");
+    build_paged(&path);
+
+    {
+        let file = File::open_rw_with_options(&path, page_buffered()).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        ds.append(&[4i32; 64]).unwrap();
+        assert_eq!(flags(&path), 0x01, "the mark stands while the session does");
+    }
+
+    assert_eq!(flags(&path), 0x00, "drop must take the mark down");
+    assert_eq!(
+        File::open(&path)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_i32()
+            .unwrap()
+            .len(),
+        128,
+        "and the append must be in the file it leaves"
     );
 }

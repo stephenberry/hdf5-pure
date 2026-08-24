@@ -196,11 +196,128 @@ fn bench_mat_roundtrip(c: &mut Criterion) {
 #[cfg(not(feature = "serde"))]
 fn bench_mat_roundtrip(_c: &mut Criterion) {}
 
+// ---------------------------------------------------------------------------
+// The write-back page buffer (issue #308)
+// ---------------------------------------------------------------------------
+//
+// Everything else recorded for that feature is a write *count*, and a count is
+// not the axis it is sold on. Two doubts are worth measuring, and they pull in
+// opposite directions:
+//
+//   - The buffer requires `SyncPolicy::OnClose`, which issues no `fsync` between
+//     the repeat dirtyings of a page — so the kernel page cache already
+//     coalesces them into one device write, and what the buffer removes is a few
+//     hundred `pwrite` syscalls into an already-cached file.
+//   - The crash mark it must be paired with costs two `fsync`s per *session*,
+//     one at open and one at close, whatever the session then does.
+//
+// So the buffer has a break-even session length, which is what these four
+// benchmarks bracket rather than average away: `short` sits below it and `long`
+// above it, and the pair is the measurement — a single length would report
+// whichever answer it happened to sit on.
+//
+// Measured on an Apple M1 Max (APFS), 256-byte appends into eight datasets. A
+// controlled sweep of the same workload — arms alternated, median of seven —
+// puts the crossing near 800 appends:
+//
+//   |  appends | off      | on       | ratio |
+//   |---------:|---------:|---------:|------:|
+//   |      400 |  14.5 ms |  19.3 ms |  0.75 |
+//   |      800 |  23.3 ms |  24.3 ms |  0.96 |
+//   |    1,600 |  41.0 ms |  33.3 ms |  1.23 |
+//   |    3,200 |  79.1 ms |  54.8 ms |  1.45 |
+//   |    6,400 | 152.9 ms |  93.5 ms |  1.64 |
+//
+// Below the crossing the two `fsync`s cost more than the saved syscalls; above
+// it the ratio climbs, because the same pages are re-dirtied more often the
+// longer the session runs. The 1,600-append session ran 1.64x with the crash
+// mark removed against 1.23x with it — that gap is what the guarantee costs, a
+// fixed price per session rather than a rate. The margin also narrows to about
+// 1.1x once 64 KiB payloads rather than metadata churn dominate.
+//
+// **Read the ratio between a pair, not the absolute times, and re-measure rather
+// than trusting these constants.** The `off` arm issues thousands of small
+// writes and is sensitive to background I/O: across runs on an otherwise-busy
+// machine `short` ranged 0.65-1.11x and `long` 1.26-2.28x. The short arm is the
+// noisier of the two, because both of its arms are small enough for the fixed
+// `fsync` cost to dominate.
+
+fn bench_page_buffer(c: &mut Criterion) {
+    use hdf5_pure::{FileAccessProperties, FileLocking, FileSpaceStrategy, SyncPolicy};
+
+    const DATASETS: usize = 8;
+    const CHUNK: usize = 64;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let names: Vec<String> = (0..DATASETS).map(|t| format!("t{t}")).collect();
+    let batch = vec![0i32; CHUNK];
+
+    let fixture = |path: &std::path::Path| {
+        let mut b = FileBuilder::new();
+        b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
+            .with_file_space_page_size(4096);
+        for name in &names {
+            b.create_dataset(name)
+                .with_i32_data(&vec![0i32; CHUNK])
+                .with_shape(&[CHUNK as u64])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[CHUNK as u64]);
+        }
+        b.write(path).expect("fixture");
+    };
+
+    // Built once and copied per iteration, then forced to disk: rebuilding it
+    // each time leaves the setup's own writes dirty when the timed region
+    // starts, and the arm under test then pays to flush them — which lands
+    // entirely on the arm that issues more `fsync`s, and is exactly the arm
+    // being judged.
+    let template = dir.path().join("template.h5");
+    fixture(&template);
+
+    let mut g = c.benchmark_group("page_buffer");
+    // Locking is disabled so the measurement is of the buffer rather than of
+    // `flock`; every arm pays the same either way.
+    for (length, rounds) in [("short", 50usize), ("long", 400)] {
+        for (label, budget) in [("off", 0usize), ("on", 4 << 20)] {
+            g.bench_function(format!("{length}/{label}"), |b| {
+                b.iter_batched(
+                    || {
+                        let path = dir.path().join(format!("{length}_{label}.h5"));
+                        let _ = std::fs::remove_file(&path);
+                        std::fs::copy(&template, &path).expect("fixture copy");
+                        std::fs::File::open(&path)
+                            .and_then(|f| f.sync_all())
+                            .expect("settle the fixture");
+                        path
+                    },
+                    |path| {
+                        let props = FileAccessProperties::new()
+                            .with_sync_policy(SyncPolicy::OnClose)
+                            .with_locking(FileLocking::Disabled)
+                            .with_page_buffer_size(budget);
+                        let file = File::open_rw_with_options(&path, props).unwrap();
+                        for _ in 0..rounds {
+                            for name in &names {
+                                let mut ds = file.dataset(name).unwrap();
+                                ds.append(black_box(&batch)).unwrap();
+                            }
+                        }
+                        file.close().unwrap();
+                    },
+                    criterion::BatchSize::PerIteration,
+                );
+            });
+        }
+    }
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_contiguous_decode,
     bench_chunked_assembly,
     bench_write,
-    bench_mat_roundtrip
+    bench_mat_roundtrip,
+    bench_page_buffer
 );
 criterion_main!(benches);

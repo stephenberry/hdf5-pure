@@ -368,6 +368,30 @@ fn create_refuses_a_pair_it_could_not_reopen_before_writing_anything() {
     );
     assert!(!ub.exists(), "nothing may be written for a refused pair");
 
+    // A userblock on a *paged* file reaches the first refusal by a different
+    // route, and it was the one pair this function did not screen: free space is
+    // never persisted for a non-zero base address, so the creation properties can
+    // ask for `persist = true` and still produce a file no read-write open
+    // accepts. The pair is the defect, not either half.
+    let ub_paged = dir.path().join("ub_paged.h5");
+    let err = File::create_with_options(
+        &ub_paged,
+        FileCreateProperties::new()
+            .with_userblock(4096)
+            .with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
+            .with_file_space_page_size(4096),
+        FileAccessProperties::new(),
+    )
+    .expect_err("a userblock and a paged file cannot both hold");
+    assert!(
+        err.to_string().contains("userblock") && err.to_string().contains("Page"),
+        "the refusal must name both halves of the contradiction: {err}"
+    );
+    assert!(
+        !ub_paged.exists(),
+        "nothing may be written for a refused pair"
+    );
+
     // And the same userblock creates fine when nothing demands the bounded
     // engine, so the check is on the pair and not on the userblock alone.
     let ok = dir.path().join("ok.h5");
