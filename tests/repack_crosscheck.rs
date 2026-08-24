@@ -1887,3 +1887,204 @@ fn repack_still_refuses_a_never_written_dataset_with_a_lossy_filter() {
     }
     assert!(!dst.exists(), "dst must not be created when repack refuses");
 }
+
+/// Filter ids, so a pipeline assertion reads as filters rather than as numbers.
+const FILTER_DEFLATE: u16 = 1;
+const FILTER_SHUFFLE: u16 = 2;
+const FILTER_FLETCHER32: u16 = 3;
+
+/// A dataset's pipeline as `(filter id, is_optional)`, in stored order — the
+/// two properties issue #333 is about, and the pair `h5dump` and `H5Pget_filter2`
+/// report.
+fn pipeline_of(path: &std::path::Path, dataset: &str) -> Vec<(u16, bool)> {
+    File::open(path)
+        .unwrap()
+        .dataset(dataset)
+        .unwrap()
+        .filter_pipeline()
+        .iter()
+        .map(|f| (f.id, f.is_optional))
+        .collect()
+}
+
+/// A source pipeline's filter *order* and per-filter *optional* flags survive a
+/// re-encoding repack (issue #333).
+///
+/// The order is not cosmetic. `shuffle -> fletcher32 -> deflate` checksums the
+/// shuffled bytes; moving fletcher32 last checksums the deflated bytes instead,
+/// so the destination verifies a different thing on read than the source did.
+/// And a filter that loses its optional flag becomes mandatory, so a reader that
+/// cannot apply it must now fail where it was previously allowed to skip.
+///
+/// Driven through the *sparse* chunked source that forces the re-encode
+/// fallback: the dense verbatim chunk-copy path copies the source's pipeline
+/// message byte-exact and never had this defect.
+#[test]
+fn c_pipeline_order_and_optional_flags_survive_re_encoding_repack() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_order.h5");
+    let dst = dir.path().join("c_order_repacked.h5");
+
+    let n = 2000usize; // chunk 512 -> 4 chunks; only the first 1000 written
+    let written = 1000usize;
+    let head: Vec<i32> = (1..=written as i32).collect();
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([n])
+            .chunk([512])
+            .shuffle()
+            .fletcher32()
+            .deflate(4)
+            .create("data")
+            .unwrap();
+        ds.write_slice(head.as_slice(), 0..written).unwrap();
+        file.close().unwrap();
+    }
+
+    let source_pipeline = pipeline_of(&src, "data");
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    assert_eq!(
+        pipeline_of(&dst, "data"),
+        source_pipeline,
+        "repack must reproduce the source's filter order and optional flags"
+    );
+
+    // The data still round-trips, through both readers.
+    let f = File::open(&dst).unwrap();
+    let ds = f.dataset("data").unwrap();
+    let vals = ds.read_i32().unwrap();
+    assert_eq!(&vals[..written], head.as_slice());
+    assert!(vals[written..].iter().all(|&v| v == 0));
+
+    let c = hdf5::File::open(&dst).unwrap();
+    let c_vals = c.dataset("data").unwrap().read_raw::<i32>().unwrap();
+    assert_eq!(&c_vals[..written], head.as_slice());
+}
+
+/// The same, through a re-encoding path that writes no chunks at all: a dataset
+/// the C library created and never wrote to (issue #293), whose storage repack
+/// reproduces as storage rather than materializing.
+///
+/// The pipeline is decoded and re-applied by the same `check_pipeline` +
+/// `carry_shape_and_pipeline` pair as every other re-encoding path, so this is
+/// not separate coverage of *that*. What it covers is the emit path afterwards:
+/// the message has to survive `with_unallocated_storage`, a writer that encodes
+/// nothing for it to describe. It is also the one test here that pins the C
+/// library's pipeline as a literal rather than comparing destination to source.
+#[test]
+fn a_never_written_dataset_keeps_its_pipeline_order_and_optional_flags() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_unwritten.h5");
+    let dst = dir.path().join("c_unwritten_repacked.h5");
+
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        file.new_dataset::<i32>()
+            .shape([2000])
+            .chunk([512])
+            .shuffle()
+            .fletcher32()
+            .deflate(4)
+            .create("data")
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let source = pipeline_of(&src, "data");
+    assert_eq!(
+        source,
+        [
+            (FILTER_SHUFFLE, true),
+            (FILTER_FLETCHER32, false),
+            (FILTER_DEFLATE, true)
+        ],
+        "the C library did not write the pipeline this test is about"
+    );
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    assert_eq!(
+        pipeline_of(&dst, "data"),
+        source,
+        "repack must reproduce the source's filter order and optional flags"
+    );
+}
+
+/// And through `emit_vlen_string_dataset`, the third kind of re-encoding path.
+///
+/// A variable-length string dataset is never chunk-copied verbatim — its
+/// elements are heap references that go stale on rewrite, so every one is
+/// re-staged and re-encoded, whatever its layout. That routes it through the
+/// same `check_pipeline` + `carry_shape_and_pipeline` pair, so it lost its
+/// source's filter order and optional flags exactly as the fixed-size paths did
+/// (issue #333). The existing variable-length repack tests could not see it:
+/// they build their sources through this crate's own writer, which emits one
+/// canonically ordered, all-mandatory pipeline.
+#[test]
+fn a_vlen_string_dataset_keeps_its_pipeline_order_and_optional_flags() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_vlen_order.h5");
+    let dst = dir.path().join("c_vlen_order_repacked.h5");
+
+    let words: Vec<hdf5::types::VarLenUnicode> = (0..64)
+        .map(|i| format!("value-{i}").parse().unwrap())
+        .collect();
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        file.new_dataset::<hdf5::types::VarLenUnicode>()
+            .shape([words.len()])
+            .chunk([8])
+            .shuffle()
+            .fletcher32()
+            .deflate(4)
+            .create("data")
+            .unwrap()
+            .write(&words)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let source = pipeline_of(&src, "data");
+    assert_eq!(
+        source,
+        [
+            (FILTER_SHUFFLE, true),
+            (FILTER_FLETCHER32, false),
+            (FILTER_DEFLATE, true)
+        ],
+        "the C library did not write the pipeline this test is about"
+    );
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    assert_eq!(
+        pipeline_of(&dst, "data"),
+        source,
+        "repack must reproduce the source's filter order and optional flags"
+    );
+
+    // And the strings themselves survive the re-staging, through both readers.
+    let f = File::open(&dst).unwrap();
+    let read: Vec<String> = f
+        .dataset("data")
+        .unwrap()
+        .read_vlen_strings(Default::default())
+        .unwrap();
+    let expected: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+    assert_eq!(read, expected);
+
+    let c = hdf5::File::open(&dst).unwrap();
+    let c_read = c
+        .dataset("data")
+        .unwrap()
+        .read_raw::<hdf5::types::VarLenUnicode>()
+        .unwrap();
+    assert_eq!(
+        c_read.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+        expected
+    );
+}

@@ -10,7 +10,7 @@ use core::fmt;
 use core::num::NonZeroUsize;
 
 use crate::attribute::AttributeMessage;
-use crate::chunked_write::{ChunkMeta, ChunkOptions, ChunkProvider, StorageAllocation};
+use crate::chunked_write::{ChunkMeta, ChunkOptions, ChunkProvider, FilterKind, StorageAllocation};
 use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
@@ -19,7 +19,7 @@ use crate::datatype::{
 };
 use crate::display::write_elided;
 use crate::error::FormatError;
-use crate::scaleoffset::ScaleOffset;
+use crate::scaleoffset::{FillAvailability, ScaleOffset};
 use crate::shared_message::DatatypeLocation;
 
 // ---- Datatype constructors ----
@@ -2392,7 +2392,7 @@ impl DatasetBuilder {
     /// filter error. May follow [`with_shuffle`](Self::with_shuffle) or
     /// [`with_scale_offset`](Self::with_scale_offset).
     pub fn with_deflate(&mut self, level: u32) -> &mut Self {
-        self.chunk_options.deflate_level = Some(level);
+        self.chunk_options.set_filter(FilterKind::Deflate(level));
         self
     }
 
@@ -2403,7 +2403,7 @@ impl DatasetBuilder {
     /// [`with_zfp`](Self::with_zfp): requesting shuffle alongside either makes
     /// the write fail with a filter error rather than dropping it.
     pub fn with_shuffle(&mut self) -> &mut Self {
-        self.chunk_options.shuffle = true;
+        self.chunk_options.set_filter(FilterKind::Shuffle);
         self
     }
 
@@ -2418,13 +2418,13 @@ impl DatasetBuilder {
     /// replaces it — requesting either combination makes the write fail with a
     /// filter error.
     pub fn with_lzf(&mut self) -> &mut Self {
-        self.chunk_options.lzf = true;
+        self.chunk_options.set_filter(FilterKind::Lzf);
         self
     }
 
     /// Enable fletcher32 checksum.
     pub fn with_fletcher32(&mut self) -> &mut Self {
-        self.chunk_options.fletcher32 = true;
+        self.chunk_options.set_filter(FilterKind::Fletcher32);
         self
     }
 
@@ -2451,7 +2451,13 @@ impl DatasetBuilder {
     /// [`with_lzf`](Self::with_lzf). Files are readable by the reference HDF5
     /// library (filter id 6) and vice versa.
     pub fn with_scale_offset(&mut self, mode: ScaleOffset) -> &mut Self {
-        self.chunk_options.scale_offset = Some(mode);
+        self.chunk_options
+            // `Defined` named rather than defaulted: it is this builder that
+            // chooses it on the caller's behalf, matching what the reference
+            // library records for every dataset whose fill value is not
+            // explicitly undefined, and `with_scale_offset` is where a reader
+            // looks for that choice.
+            .set_filter(FilterKind::ScaleOffset(mode, FillAvailability::Defined));
         self
     }
 
@@ -2478,7 +2484,7 @@ impl DatasetBuilder {
     /// will read and decompress it, and vice versa.
     #[cfg(feature = "zfp")]
     pub fn with_zfp(&mut self, rate: f64) -> &mut Self {
-        self.chunk_options.zfp_rate = Some(rate);
+        self.chunk_options.set_filter(FilterKind::Zfp(rate));
         self
     }
 

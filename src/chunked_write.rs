@@ -22,7 +22,7 @@ use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FILTER_ZFP;
 use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
-    FilterDescription, FilterPipeline,
+    FilterDescription, FilterPipeline, H5Z_FLAG_OPTIONAL,
 };
 use crate::filters::{ChunkContext, compress_chunk_with};
 use crate::scaleoffset::{FillAvailability, ScaleOffset, build_cd_values};
@@ -50,53 +50,210 @@ pub(crate) const FIXED_ARRAY_PAGE_BITS: u8 = 10;
 const INDEX_OFFSET_SIZE: u8 = 8;
 const INDEX_LENGTH_SIZE: u8 = 8;
 
+/// Which filter, and the parameters that are the caller's to choose.
+///
+/// Not the whole `cd_values` word list. What a filter records about the
+/// *dataset* — element size, chunk geometry, the fill-value bytes — is derived
+/// at [`ChunkOptions::build_pipeline`] time from the dataset actually being
+/// written, so a filter carried from one dataset onto another (what
+/// [`repack`](crate::repack) does) describes the destination rather than
+/// restating the source's numbers. What a filter records about the *request* —
+/// a deflate level, a scale-offset mode and whether it records a fill value at
+/// all — is here, and is carried across unchanged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FilterKind {
+    /// ZFP fixed-rate compression, in bits per value. A primary transform:
+    /// it consumes the raw elements and displaces the byte filters.
+    #[cfg(feature = "zfp")]
+    Zfp(f64),
+    /// Scale-offset, with whether the filter records the dataset's fill value.
+    /// Also a primary transform: it displaces shuffle, but a byte compressor
+    /// may follow it.
+    ScaleOffset(ScaleOffset, FillAvailability),
+    /// Byte shuffle.
+    Shuffle,
+    /// The h5py LZF filter (id 32000).
+    Lzf,
+    /// Deflate, at the given level (0-9).
+    Deflate(u32),
+    /// Fletcher32 checksum.
+    Fletcher32,
+}
+
+impl FilterKind {
+    /// The registered HDF5 filter id this kind is written as.
+    ///
+    /// Identity for every purpose that asks "is this filter in the pipeline":
+    /// two `Deflate`s at different levels are one filter appearing twice, not
+    /// two filters, which is what makes [`ChunkOptions::set_filter`] replace
+    /// rather than accumulate.
+    fn filter_id(self) -> u16 {
+        match self {
+            #[cfg(feature = "zfp")]
+            Self::Zfp(_) => FILTER_ZFP,
+            Self::ScaleOffset(..) => FILTER_SCALEOFFSET,
+            Self::Shuffle => FILTER_SHUFFLE,
+            Self::Lzf => FILTER_LZF,
+            Self::Deflate(_) => FILTER_DEFLATE,
+            Self::Fletcher32 => FILTER_FLETCHER32,
+        }
+    }
+
+    /// Where this filter sits in the pipeline this crate's own writer builds:
+    /// a primary transform first, then shuffle, then a byte compressor, then
+    /// the checksum last. Lower runs earlier, so it is applied to less
+    /// processed bytes.
+    fn canonical_rank(self) -> u8 {
+        match self {
+            #[cfg(feature = "zfp")]
+            Self::Zfp(_) => 0,
+            Self::ScaleOffset(..) => 1,
+            Self::Shuffle => 2,
+            Self::Lzf => 3,
+            Self::Deflate(_) => 4,
+            Self::Fletcher32 => 5,
+        }
+    }
+
+    /// Whether a filter added through [`ChunkOptions::set_filter`] is recorded
+    /// optional.
+    ///
+    /// Only LZF is. Unlike every other filter here it *can* decline a chunk:
+    /// liblzf returns 0 for one it cannot shrink, and h5py's filter relies on
+    /// the optional flag to store that chunk raw with its filter-mask bit set.
+    /// A mandatory LZF makes that a hard error, so h5py could not write
+    /// incompressible data back into a file we wrote. (Our own writer applies
+    /// LZF unconditionally — a grown stream is a valid stream — so it never
+    /// sets a mask bit; the flag is for the writers that come after us.)
+    ///
+    /// For a filter that cannot fail the flag is unobservable here, and leaving
+    /// those mandatory keeps our bytes stable against existing fixtures. h5py
+    /// marks every filter optional; we match it only where it means something.
+    fn default_optional(self) -> bool {
+        matches!(self, Self::Lzf)
+    }
+}
+
+/// A filter together with whether a reader may skip it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilterSpec {
+    /// Which filter, and its parameters.
+    pub kind: FilterKind,
+    /// `H5Z_FLAG_OPTIONAL` (flags bit 0): a reader that cannot apply this
+    /// filter may skip it. A mandatory filter must be applied for the data to
+    /// decode, so a reader missing it has to fail.
+    pub optional: bool,
+}
+
 /// Options for chunked dataset creation.
 #[derive(Debug, Clone, Default)]
 pub struct ChunkOptions {
     /// Chunk dimensions (one per dataset dimension).
     pub chunk_dims: Option<Vec<u64>>,
-    /// Deflate compression level (0-9), None = no deflate.
-    pub deflate_level: Option<u32>,
-    /// Whether to apply shuffle filter before compression.
-    pub shuffle: bool,
-    /// Whether to apply the h5py LZF filter (id 32000). Mutually exclusive
-    /// with deflate; ignored when ZFP is active (ZFP replaces byte
-    /// compressors).
-    pub lzf: bool,
-    /// Whether to apply fletcher32 checksum.
-    pub fletcher32: bool,
-    /// ZFP fixed-rate compression (bits per value), None = no ZFP.
-    /// When set, takes priority over shuffle + deflate.
-    #[cfg(feature = "zfp")]
-    pub zfp_rate: Option<f64>,
-    /// Scale-offset compression mode, None = no scale-offset. When set it is
-    /// the primary transform (mutually exclusive with ZFP, replaces shuffle)
-    /// and may be followed by deflate.
-    pub scale_offset: Option<ScaleOffset>,
-    /// Whether the scale-offset filter records the dataset's fill value.
+    /// The dataset's filter pipeline, in the order it is written: each filter's
+    /// output is the next one's input, and a reader reverses the list.
     ///
-    /// The default records it, which is what the reference library does for
-    /// every dataset whose fill value is not explicitly undefined. See
-    /// [`FillAvailability`] for why the other setting exists and who sets it.
-    pub scale_offset_fill: FillAvailability,
+    /// An ordered list rather than one switch per filter, because the order is
+    /// observable and is not always this crate's canonical one. `fletcher32`
+    /// before deflate checksums the uncompressed bytes; after it, the
+    /// compressed ones — a different checksum over different data, and a
+    /// different thing to verify on read. A file written elsewhere may declare
+    /// any order, and `repack` reproduces what it read (issue #333), which a
+    /// set of independent switches cannot express at all.
+    ///
+    /// Add to it through [`set_filter`](Self::set_filter), which places a
+    /// filter where this crate's own writer puts it, or
+    /// [`push_filter`](Self::push_filter), which appends one exactly where the
+    /// caller wants it.
+    pub filters: Vec<FilterSpec>,
 }
 
 impl ChunkOptions {
     /// Whether any chunking option is enabled.
     pub fn is_chunked(&self) -> bool {
-        self.chunk_dims.is_some()
-            || self.deflate_level.is_some()
-            || self.shuffle
-            || self.lzf
-            || self.fletcher32
-            || self.zfp_enabled()
-            || self.scale_offset.is_some()
+        self.chunk_dims.is_some() || !self.filters.is_empty()
+    }
+
+    /// Add `kind` at the position this crate's own writer gives it, replacing
+    /// any filter with the same id already present.
+    ///
+    /// This is what the `DatasetBuilder` switches (`with_shuffle`,
+    /// `with_deflate`, ...) call. Placing by
+    /// [`canonical_rank`](FilterKind::canonical_rank) rather than by call order
+    /// is what keeps `with_deflate(6).with_shuffle()` and
+    /// `with_shuffle().with_deflate(6)` writing the same bytes: those setters
+    /// name a filter to apply, not a position to apply it at.
+    pub fn set_filter(&mut self, kind: FilterKind) {
+        let spec = FilterSpec {
+            optional: kind.default_optional(),
+            kind,
+        };
+        // Naming a filter twice sets its parameter rather than applying it
+        // twice, which is what the `Option<u32>`-per-filter fields this replaced
+        // did. The whole entry is overwritten, optional flag included: this
+        // setter states what the crate's own writer wants, so a flag carried in
+        // by `push_filter` does not survive it. Overwritten where it sits rather
+        // than removed and re-inserted, so a pushed pipeline at least keeps its
+        // order. No caller mixes the two today; both halves are stated because
+        // the field is `pub` and nothing enforces that.
+        if let Some(slot) = self
+            .filters
+            .iter_mut()
+            .find(|f| f.kind.filter_id() == kind.filter_id())
+        {
+            *slot = spec;
+            return;
+        }
+        let at = self
+            .filters
+            .iter()
+            .position(|f| f.kind.canonical_rank() > kind.canonical_rank())
+            .unwrap_or(self.filters.len());
+        self.filters.insert(at, spec);
+    }
+
+    /// Append `spec` after every filter already added, keeping its optional
+    /// flag as given.
+    ///
+    /// For reproducing a pipeline that already exists: `repack` reads a
+    /// source's filters and re-applies them in the order and with the flags it
+    /// found, which need not be the canonical order
+    /// [`set_filter`](Self::set_filter) produces.
+    pub fn push_filter(&mut self, spec: FilterSpec) {
+        self.filters.push(spec);
+    }
+
+    /// Whether the pipeline includes the filter with this id.
+    fn has(&self, id: u16) -> bool {
+        self.filters.iter().any(|f| f.kind.filter_id() == id)
+    }
+
+    /// Refuse a filter the pipeline asks for that this build cannot apply.
+    /// Returns a static reason on the first problem; callers map it to their
+    /// own error type, as they do for
+    /// [`validate_geometry`](Self::validate_geometry).
+    ///
+    /// Deflate is behind a crate feature, but
+    /// [`build_pipeline`](Self::build_pipeline) emits its descriptor either
+    /// way, so nothing downstream refuses the request — the first chunk to be
+    /// compressed fails instead, with `UnsupportedFilter`.
+    ///
+    /// Called from the in-place edit path, which has file bytes to protect: a
+    /// commit that got that far would have written some. The whole-file writer
+    /// does not call it and still fails at the first chunk, which costs only a
+    /// discarded buffer.
+    pub fn refuse_unavailable_filters(&self) -> Result<(), &'static str> {
+        #[cfg(not(feature = "deflate"))]
+        if self.has(FILTER_DEFLATE) {
+            return Err("deflate compression requires the `deflate` crate feature");
+        }
+        Ok(())
     }
 
     #[cfg(feature = "zfp")]
     #[inline]
     fn zfp_enabled(&self) -> bool {
-        self.zfp_rate.is_some()
+        self.has(FILTER_ZFP)
     }
 
     #[cfg(not(feature = "zfp"))]
@@ -134,31 +291,36 @@ impl ChunkOptions {
         };
 
         if self.zfp_enabled() {
-            if self.scale_offset.is_some() {
+            if self.has(FILTER_SCALEOFFSET) {
                 return clash("scale-offset", "ZFP");
             }
-            if self.shuffle {
+            if self.has(FILTER_SHUFFLE) {
                 return clash("shuffle", "ZFP");
             }
-            if self.lzf {
+            if self.has(FILTER_LZF) {
                 return clash("lzf", "ZFP");
             }
-            if self.deflate_level.is_some() {
+            if self.has(FILTER_DEFLATE) {
                 return clash("deflate", "ZFP");
             }
         }
-        if self.scale_offset.is_some() && self.shuffle {
+        if self.has(FILTER_SCALEOFFSET) && self.has(FILTER_SHUFFLE) {
             return clash("shuffle", "scale-offset");
         }
         // Not a primary transform, but the same shape: LZF and deflate fill one
         // byte-compressor slot, and stacking two of them is never useful.
-        if self.lzf && self.deflate_level.is_some() {
+        if self.has(FILTER_LZF) && self.has(FILTER_DEFLATE) {
             return clash("lzf", "deflate");
         }
         Ok(())
     }
 
     /// Build a FilterPipeline from the options.
+    ///
+    /// The filters come out in [`filters`](Self::filters) order, carrying their
+    /// optional flags: that is the order they are applied in and the order the
+    /// message stores, and it is not always this crate's canonical one — see
+    /// the field for why.
     ///
     /// The context's chunk dimensions and element type are only consulted when
     /// the ZFP filter is active — they're embedded into the ZFP cd_values so the
@@ -192,108 +354,98 @@ impl ChunkOptions {
         let chunk_dims = ctx.chunk_dims;
         let scale_offset_type = ctx.scale_offset_type;
 
-        let mut filters = Vec::new();
         let _ = ctx.element_type; // used only under the `zfp` feature below
 
-        // ZFP is a standalone compressor: `refuse_conflicting_filters` has
-        // already established that nothing it would displace was asked for.
-        #[cfg(feature = "zfp")]
-        if let Some(rate) = self.zfp_rate {
-            let elem_ty = ctx.element_type.ok_or_else(|| {
-                FormatError::UnsupportedZfp(
-                    "ZFP compression requires the dataset's datatype to be one \
-                     of f32, f64, i32, or i64"
-                        .into(),
-                )
-            })?;
-            filters.push(FilterDescription {
-                filter_id: FILTER_ZFP,
-                name: Some("zfp".into()),
-                flags: 0,
-                client_data: crate::zfp::zfp_cd_values_rate(rate, elem_ty, chunk_dims)?,
+        // In the order they are stored, which is the order they are applied:
+        // `compress_chunk_with` walks the same list, and the reader reverses it.
+        // `refuse_conflicting_filters` above has already established that no
+        // filter here displaces another.
+        let mut filters = Vec::with_capacity(self.filters.len());
+        for spec in &self.filters {
+            // No flag bit other than H5Z_FLAG_OPTIONAL is written.
+            let flags = if spec.optional { H5Z_FLAG_OPTIONAL } else { 0 };
+            filters.push(match spec.kind {
+                #[cfg(feature = "zfp")]
+                FilterKind::Zfp(rate) => {
+                    let elem_ty = ctx.element_type.ok_or_else(|| {
+                        FormatError::UnsupportedZfp(
+                            "ZFP compression requires the dataset's datatype to be one \
+                             of f32, f64, i32, or i64"
+                                .into(),
+                        )
+                    })?;
+                    FilterDescription {
+                        filter_id: FILTER_ZFP,
+                        name: Some("zfp".into()),
+                        flags,
+                        client_data: crate::zfp::zfp_cd_values_rate(rate, elem_ty, chunk_dims)?,
+                    }
+                }
+                FilterKind::ScaleOffset(mode, fill_avail) => {
+                    let ty = scale_offset_type.ok_or_else(|| {
+                        FormatError::FilterError(
+                            "scale-offset requires an integer or floating-point scalar \
+                             datatype with a definite (little/big endian) byte order"
+                                .into(),
+                        )
+                    })?;
+                    let nelmts =
+                        u32::try_from(chunk_dims.iter().product::<u64>()).map_err(|_| {
+                            FormatError::FilterError(
+                                "scale-offset: chunk has too many elements".into(),
+                            )
+                        })?;
+                    FilterDescription {
+                        filter_id: FILTER_SCALEOFFSET,
+                        name: None,
+                        flags,
+                        client_data: build_cd_values(
+                            mode,
+                            ty,
+                            element_size,
+                            nelmts,
+                            fill_avail.with_value(fill)?,
+                        )?,
+                    }
+                }
+                FilterKind::Shuffle => FilterDescription {
+                    filter_id: FILTER_SHUFFLE,
+                    name: None,
+                    flags,
+                    client_data: vec![element_size],
+                },
+                FilterKind::Lzf => FilterDescription {
+                    filter_id: FILTER_LZF,
+                    // Ids >= 256 serialize a name; "lzf" is h5py's registered
+                    // name. Derived rather than carried from a source pipeline,
+                    // since it is a property of the filter, not of the file.
+                    name: Some("lzf".into()),
+                    // `h5py_cd_values` records the chunk's *raw* byte size as
+                    // the decompressed size h5py should expect. That is exact
+                    // only where LZF reads the raw elements; behind another
+                    // filter it can understate them — behind fletcher32 by the
+                    // 4 checksum bytes, behind scale-offset by whatever it
+                    // packed to. Neither reader is misled: ours never consults
+                    // the value (`inner_output_cap` folds over the real prefix)
+                    // and h5py's filter grows its buffer on `E2BIG`. Not new
+                    // here — canonical rank already put LZF after scale-offset.
+                    flags,
+                    client_data: crate::lzf::h5py_cd_values(element_size, chunk_dims).to_vec(),
+                },
+                FilterKind::Deflate(level) => FilterDescription {
+                    filter_id: FILTER_DEFLATE,
+                    name: None,
+                    flags,
+                    client_data: vec![level],
+                },
+                FilterKind::Fletcher32 => FilterDescription {
+                    filter_id: FILTER_FLETCHER32,
+                    name: None,
+                    flags,
+                    client_data: vec![],
+                },
             });
         }
-
-        // Scale-offset is also a primary transform: it displaces shuffle, but
-        // may be followed by a byte compressor (pushed first so the pipeline
-        // order is [scaleoffset, lzf|deflate]).
-        if let Some(mode) = self.scale_offset {
-            let ty = scale_offset_type.ok_or_else(|| {
-                FormatError::FilterError(
-                    "scale-offset requires an integer or floating-point scalar \
-                     datatype with a definite (little/big endian) byte order"
-                        .into(),
-                )
-            })?;
-            let nelmts = u32::try_from(chunk_dims.iter().product::<u64>()).map_err(|_| {
-                FormatError::FilterError("scale-offset: chunk has too many elements".into())
-            })?;
-            filters.push(FilterDescription {
-                filter_id: FILTER_SCALEOFFSET,
-                name: None,
-                flags: 0,
-                client_data: build_cd_values(
-                    mode,
-                    ty,
-                    element_size,
-                    nelmts,
-                    self.scale_offset_fill.with_value(fill)?,
-                )?,
-            });
-        }
-
-        if self.shuffle {
-            filters.push(FilterDescription {
-                filter_id: FILTER_SHUFFLE,
-                name: None,
-                flags: 0,
-                client_data: vec![element_size],
-            });
-        }
-
-        // LZF fills the same byte-compressor slot as deflate; h5py's convention
-        // is shuffle then lzf.
-        if self.lzf {
-            filters.push(FilterDescription {
-                filter_id: FILTER_LZF,
-                // Ids >= 256 serialize a name; "lzf" is h5py's registered name.
-                name: Some("lzf".into()),
-                // Optional (bit 0), which is what h5py records. Unlike every
-                // other filter here, LZF *can* fail: liblzf returns 0 for a
-                // chunk it cannot shrink, and h5py's filter relies on the
-                // optional flag to store that chunk raw with its filter-mask
-                // bit set. A mandatory LZF makes that a hard error, so h5py
-                // cannot write incompressible data back into a file we wrote.
-                // Our own writer still applies LZF unconditionally (a grown
-                // stream is a valid stream), so it never sets a mask bit; the
-                // flag exists for the writers that come after us.
-                flags: 1,
-                client_data: crate::lzf::h5py_cd_values(element_size, chunk_dims).to_vec(),
-            });
-        }
-
-        if let Some(level) = self.deflate_level {
-            filters.push(FilterDescription {
-                filter_id: FILTER_DEFLATE,
-                name: None,
-                flags: 0,
-                client_data: vec![level],
-            });
-        }
-
-        if self.fletcher32 {
-            filters.push(FilterDescription {
-                filter_id: FILTER_FLETCHER32,
-                name: None,
-                flags: 0,
-                client_data: vec![],
-            });
-        }
-
-        // Note: h5py marks every filter optional (flags=0x0001); we match it
-        // only on LZF, the one filter here whose compressor can decline a
-        // chunk. For a filter that cannot fail the flag is unobservable, and
-        // leaving those at 0 keeps our bytes stable against existing fixtures.
 
         if filters.is_empty() {
             Ok(None)
@@ -3577,6 +3729,26 @@ mod tests {
         assert!(explicit.validate_geometry(&[0], None).is_ok());
     }
 
+    /// Options carrying `filters`, placed the way the `DatasetBuilder`
+    /// switches place them — so a test that means "shuffle then deflate", the
+    /// combination a caller asks for, does not have to restate the canonical
+    /// order it comes out in. A test about a *stored* order pushes instead.
+    fn filtered(filters: &[FilterKind]) -> ChunkOptions {
+        let mut options = ChunkOptions::default();
+        for &f in filters {
+            options.set_filter(f);
+        }
+        options
+    }
+
+    /// [`filtered`] with chunk dimensions.
+    fn chunked(chunk_dims: &[u64], filters: &[FilterKind]) -> ChunkOptions {
+        ChunkOptions {
+            chunk_dims: Some(chunk_dims.to_vec()),
+            ..filtered(filters)
+        }
+    }
+
     fn f64_to_bytes(data: &[f64]) -> Vec<u8> {
         let mut b = Vec::with_capacity(data.len() * 8);
         for &v in data {
@@ -3770,11 +3942,7 @@ mod tests {
     #[test]
     fn roundtrip_1d_single_chunk_deflate() {
         let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
-        let options = ChunkOptions {
-            chunk_dims: Some(vec![100]),
-            deflate_level: Some(6),
-            ..Default::default()
-        };
+        let options = chunked(&[100], &[FilterKind::Deflate(6)]);
         let result = roundtrip_chunked(&values, &[100], &[100], &options);
         assert_eq!(result, values);
     }
@@ -3794,11 +3962,7 @@ mod tests {
     #[test]
     fn roundtrip_1d_multi_chunk_deflate() {
         let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
-        let options = ChunkOptions {
-            chunk_dims: Some(vec![20]),
-            deflate_level: Some(6),
-            ..Default::default()
-        };
+        let options = chunked(&[20], &[FilterKind::Deflate(6)]);
         let result = roundtrip_chunked(&values, &[100], &[20], &options);
         assert_eq!(result, values);
     }
@@ -3807,12 +3971,7 @@ mod tests {
     #[test]
     fn roundtrip_1d_shuffle_deflate() {
         let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
-        let options = ChunkOptions {
-            chunk_dims: Some(vec![50]),
-            deflate_level: Some(6),
-            shuffle: true,
-            ..Default::default()
-        };
+        let options = chunked(&[50], &[FilterKind::Shuffle, FilterKind::Deflate(6)]);
         let result = roundtrip_chunked(&values, &[100], &[50], &options);
         assert_eq!(result, values);
     }
@@ -3979,11 +4138,7 @@ mod tests {
 
     #[test]
     fn chunk_options_auto_dims() {
-        let options = ChunkOptions {
-            chunk_dims: None,
-            deflate_level: Some(6),
-            ..Default::default()
-        };
+        let options = filtered(&[FilterKind::Deflate(6)]);
         let dims = options.resolve_chunk_dims(&[100, 50]);
         assert_eq!(dims, vec![100, 50]);
     }
@@ -4001,11 +4156,10 @@ mod tests {
         let elem = NonZeroUsize::new(8).expect("8 is non-zero");
         let fill = 2.5f64.to_le_bytes();
         let parms = |fill_availability, fill: FillPattern<'_>| {
-            let options = ChunkOptions {
-                scale_offset: Some(ScaleOffset::FloatDScale(2)),
-                scale_offset_fill: fill_availability,
-                ..Default::default()
-            };
+            let options = filtered(&[FilterKind::ScaleOffset(
+                ScaleOffset::FloatDScale(2),
+                fill_availability,
+            )]);
             let pl = options.build_pipeline(&ctx, fill).unwrap().unwrap();
             let f = pl
                 .filters
@@ -4040,10 +4194,10 @@ mod tests {
         );
         // And a fill value that could not be read refuses the pipeline rather
         // than recording a zero the encoder would treat every real zero as.
-        let options = ChunkOptions {
-            scale_offset: Some(ScaleOffset::FloatDScale(2)),
-            ..Default::default()
-        };
+        let options = filtered(&[FilterKind::ScaleOffset(
+            ScaleOffset::FloatDScale(2),
+            FillAvailability::Defined,
+        )]);
         assert!(matches!(
             options.build_pipeline(&ctx, FillPattern::UNKNOWN),
             Err(FormatError::UnreadableFillValue)
@@ -4051,37 +4205,40 @@ mod tests {
         // But only the setting that would record it refuses: a filter that
         // records no fill value has nowhere to put one, so a value it could not
         // read is not an obstacle to saying there is none.
-        let undefined = ChunkOptions {
-            scale_offset: Some(ScaleOffset::FloatDScale(2)),
-            scale_offset_fill: FillAvailability::Undefined,
-            ..Default::default()
-        };
+        let undefined = filtered(&[FilterKind::ScaleOffset(
+            ScaleOffset::FloatDScale(2),
+            FillAvailability::Undefined,
+        )]);
         assert!(undefined.build_pipeline(&ctx, FillPattern::UNKNOWN).is_ok());
 
         // The default is the reference library's: every scale-offset dataset it
         // writes records a fill value, including one whose fill value was never
-        // set. Asserted here as well as in the crosschecks because those are
-        // gated to little-endian 64-bit targets, where the `cross` jobs run
-        // nothing that would notice this flipping back.
+        // set. Asserted through the builder switch, which is the one place that
+        // chooses an availability on the caller's behalf — and asserted here as
+        // well as in the crosschecks because those are gated to little-endian
+        // 64-bit targets, where the `cross` jobs run nothing that would notice
+        // this flipping back.
+        let mut db = crate::type_builders::DatasetBuilder::new("d");
+        db.with_scale_offset(ScaleOffset::FloatDScale(2));
         assert_eq!(
-            ChunkOptions::default().scale_offset_fill,
-            FillAvailability::Defined
+            db.chunk_options.filters,
+            vec![FilterSpec {
+                kind: FilterKind::ScaleOffset(
+                    ScaleOffset::FloatDScale(2),
+                    FillAvailability::Defined
+                ),
+                optional: false,
+            }]
         );
         // Every other pipeline is buildable from the same pattern: only the
         // filter that records the fill value needs to read it.
-        let plain = ChunkOptions {
-            deflate_level: Some(6),
-            ..Default::default()
-        };
+        let plain = filtered(&[FilterKind::Deflate(6)]);
         assert!(plain.build_pipeline(&ctx, FillPattern::UNKNOWN).is_ok());
     }
 
     #[test]
     fn chunk_options_pipeline_deflate() {
-        let options = ChunkOptions {
-            deflate_level: Some(6),
-            ..Default::default()
-        };
+        let options = filtered(&[FilterKind::Deflate(6)]);
         let pl = options
             .build_pipeline(&ChunkContext::basic(&[], 8), FillPattern::ZERO)
             .unwrap()
@@ -4092,12 +4249,11 @@ mod tests {
 
     #[test]
     fn chunk_options_pipeline_shuffle_deflate_fletcher32() {
-        let options = ChunkOptions {
-            deflate_level: Some(6),
-            shuffle: true,
-            fletcher32: true,
-            ..Default::default()
-        };
+        let options = filtered(&[
+            FilterKind::Shuffle,
+            FilterKind::Deflate(6),
+            FilterKind::Fletcher32,
+        ]);
         let pl = options
             .build_pipeline(&ChunkContext::basic(&[], 8), FillPattern::ZERO)
             .unwrap()
@@ -4106,6 +4262,82 @@ mod tests {
         assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
         assert_eq!(pl.filters[1].filter_id, FILTER_DEFLATE);
         assert_eq!(pl.filters[2].filter_id, FILTER_FLETCHER32);
+    }
+
+    /// `set_filter` places a filter at this crate's canonical rank whatever
+    /// order the caller names them in, and replaces rather than repeats.
+    ///
+    /// This is what the `DatasetBuilder` switches promise: they name a filter to
+    /// apply, not a position to apply it at, so `with_deflate(6).with_shuffle()`
+    /// has to write the same bytes as `with_shuffle().with_deflate(6)`. The
+    /// pipeline being an ordered list now (issue #333) is exactly what would let
+    /// that drift.
+    #[test]
+    fn setting_filters_places_them_in_canonical_order_whatever_order_they_arrive_in() {
+        let ids = |o: &ChunkOptions| -> Vec<u16> {
+            o.filters.iter().map(|f| f.kind.filter_id()).collect()
+        };
+        let canonical = [FILTER_SHUFFLE, FILTER_DEFLATE, FILTER_FLETCHER32];
+
+        assert_eq!(
+            ids(&filtered(&[
+                FilterKind::Shuffle,
+                FilterKind::Deflate(6),
+                FilterKind::Fletcher32,
+            ])),
+            canonical
+        );
+        assert_eq!(
+            ids(&filtered(&[
+                FilterKind::Fletcher32,
+                FilterKind::Deflate(6),
+                FilterKind::Shuffle,
+            ])),
+            canonical
+        );
+
+        // Naming one twice sets its parameter, rather than applying it twice.
+        let twice = filtered(&[
+            FilterKind::Deflate(1),
+            FilterKind::Shuffle,
+            FilterKind::Deflate(9),
+        ]);
+        assert_eq!(ids(&twice), [FILTER_SHUFFLE, FILTER_DEFLATE]);
+        assert_eq!(twice.filters[1].kind, FilterKind::Deflate(9));
+    }
+
+    /// A pushed pipeline reaches the file in the order and with the optional
+    /// flags it was pushed with, not this crate's canonical order (issue #333).
+    ///
+    /// `fletcher32` between shuffle and deflate is the case that matters: it
+    /// checksums the shuffled bytes, where the canonical placement at the end
+    /// would checksum the deflated ones. That is a different checksum over
+    /// different data, so a `repack` that quietly re-ordered it produced a
+    /// destination verifying something the source never did.
+    #[test]
+    fn a_pushed_pipeline_keeps_its_order_and_its_optional_flags() {
+        let mut options = ChunkOptions::default();
+        for (kind, optional) in [
+            (FilterKind::Shuffle, true),
+            (FilterKind::Fletcher32, false),
+            (FilterKind::Deflate(4), true),
+        ] {
+            options.push_filter(FilterSpec { kind, optional });
+        }
+
+        let pl = options
+            .build_pipeline(&ChunkContext::basic(&[], 8), FillPattern::ZERO)
+            .unwrap()
+            .unwrap();
+        let stored: Vec<(u16, u16)> = pl.filters.iter().map(|f| (f.filter_id, f.flags)).collect();
+        assert_eq!(
+            stored,
+            [
+                (FILTER_SHUFFLE, 1),
+                (FILTER_FLETCHER32, 0),
+                (FILTER_DEFLATE, 1),
+            ]
+        );
     }
 
     /// Every request naming two filters where one would displace the other is
@@ -4120,64 +4352,41 @@ mod tests {
     #[test]
     fn conflicting_filter_requests_are_refused() {
         let so = ScaleOffset::FloatDScale(2);
+        let fill = FillAvailability::Defined;
         let cases: &[(&str, &str, ChunkOptions)] = &[
             (
                 "lzf",
                 "deflate",
-                ChunkOptions {
-                    lzf: true,
-                    deflate_level: Some(6),
-                    ..Default::default()
-                },
+                filtered(&[FilterKind::Lzf, FilterKind::Deflate(6)]),
             ),
             (
                 "shuffle",
                 "scale-offset",
-                ChunkOptions {
-                    shuffle: true,
-                    scale_offset: Some(so),
-                    ..Default::default()
-                },
+                filtered(&[FilterKind::Shuffle, FilterKind::ScaleOffset(so, fill)]),
             ),
             #[cfg(feature = "zfp")]
             (
                 "scale-offset",
                 "ZFP",
-                ChunkOptions {
-                    scale_offset: Some(so),
-                    zfp_rate: Some(16.0),
-                    ..Default::default()
-                },
+                filtered(&[FilterKind::ScaleOffset(so, fill), FilterKind::Zfp(16.0)]),
             ),
             #[cfg(feature = "zfp")]
             (
                 "shuffle",
                 "ZFP",
-                ChunkOptions {
-                    shuffle: true,
-                    zfp_rate: Some(16.0),
-                    ..Default::default()
-                },
+                filtered(&[FilterKind::Shuffle, FilterKind::Zfp(16.0)]),
             ),
             #[cfg(feature = "zfp")]
             (
                 "lzf",
                 "ZFP",
-                ChunkOptions {
-                    lzf: true,
-                    zfp_rate: Some(16.0),
-                    ..Default::default()
-                },
+                filtered(&[FilterKind::Lzf, FilterKind::Zfp(16.0)]),
             ),
             #[cfg(feature = "zfp")]
             (
                 "deflate",
                 "ZFP",
-                ChunkOptions {
-                    deflate_level: Some(6),
-                    zfp_rate: Some(16.0),
-                    ..Default::default()
-                },
+                filtered(&[FilterKind::Deflate(6), FilterKind::Zfp(16.0)]),
             ),
         ];
 
@@ -4228,39 +4437,22 @@ mod tests {
     /// blanket ban on combining filters.
     #[test]
     fn compatible_filter_requests_still_build() {
-        let so = Some(ScaleOffset::FloatDScale(2));
+        let so = FilterKind::ScaleOffset(ScaleOffset::FloatDScale(2), FillAvailability::Defined);
         let cases: &[(ChunkOptions, &[u16])] = &[
             (
-                ChunkOptions {
-                    shuffle: true,
-                    deflate_level: Some(6),
-                    ..Default::default()
-                },
+                filtered(&[FilterKind::Shuffle, FilterKind::Deflate(6)]),
                 &[FILTER_SHUFFLE, FILTER_DEFLATE],
             ),
             (
-                ChunkOptions {
-                    shuffle: true,
-                    lzf: true,
-                    ..Default::default()
-                },
+                filtered(&[FilterKind::Shuffle, FilterKind::Lzf]),
                 &[FILTER_SHUFFLE, FILTER_LZF],
             ),
             (
-                ChunkOptions {
-                    scale_offset: so,
-                    deflate_level: Some(6),
-                    ..Default::default()
-                },
+                filtered(&[so, FilterKind::Deflate(6)]),
                 &[FILTER_SCALEOFFSET, FILTER_DEFLATE],
             ),
             (
-                ChunkOptions {
-                    scale_offset: so,
-                    lzf: true,
-                    fletcher32: true,
-                    ..Default::default()
-                },
+                filtered(&[so, FilterKind::Lzf, FilterKind::Fletcher32]),
                 &[FILTER_SCALEOFFSET, FILTER_LZF, FILTER_FLETCHER32],
             ),
         ];
@@ -4580,11 +4772,10 @@ mod tests {
                 for &unlimited in &[false, true] {
                     let values: Vec<f64> = (0..elements).map(|i| i as f64).collect();
                     let raw = f64_to_bytes(&values);
-                    let options = ChunkOptions {
-                        chunk_dims: Some(vec![chunk]),
-                        deflate_level: deflate.then_some(6),
-                        ..Default::default()
-                    };
+                    let mut options = chunked(&[chunk], &[]);
+                    if deflate {
+                        options.set_filter(FilterKind::Deflate(6));
+                    }
                     let dims = [chunk];
                     let maxshape = unlimited.then_some([u64::MAX]);
                     let set = compress_chunks(

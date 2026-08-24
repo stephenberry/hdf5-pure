@@ -3794,8 +3794,8 @@ the same commit to replace it",
                     .into_iter()
                     .map(|f| Filter {
                         id: f.filter_id,
+                        is_optional: f.is_optional(),
                         name: f.name,
-                        is_optional: f.flags & 0x1 != 0,
                         client_data: f.client_data,
                     })
                     .collect()

@@ -115,7 +115,7 @@ use std::sync::Arc;
 
 use crate::attribute::AttributeMessage;
 use crate::chunked_read::ChunkInfo;
-use crate::chunked_write::{ChunkMeta, ChunkProvider};
+use crate::chunked_write::{ChunkMeta, ChunkProvider, FilterKind, FilterSpec};
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::datatype::{Datatype, ReferenceType, embedded_reference_slots};
@@ -587,7 +587,7 @@ fn emit_dataset(
     // re-apply is refused here exactly as it is on the re-encode path below —
     // the filters are reproduced through the same `carry_shape_and_pipeline`.
     if storage_is_unallocated(&layout, &source_chunks) {
-        check_pipeline(pipeline.as_ref(), path)?;
+        let filters = check_pipeline(pipeline.as_ref(), path)?;
         db.fill = fill;
         db.with_unallocated_storage(datatype, &dims);
         carry_shape_and_pipeline(
@@ -595,7 +595,7 @@ fn emit_dataset(
             &dims,
             dataspace.max_dimensions.as_deref(),
             &layout,
-            &pipeline,
+            &filters,
         );
         copy_dataset_attrs(db, ds, path, drop, addr_map)?;
         return Ok(());
@@ -731,7 +731,7 @@ fn emit_dataset(
     // Contiguous/compact, or a sparse chunked dataset: read the decompressed
     // bytes and re-encode. This path can only reproduce lossless filters, so
     // refuse a lossy pipeline before reading.
-    check_pipeline(pipeline.as_ref(), path)?;
+    let filters = check_pipeline(pipeline.as_ref(), path)?;
 
     if n_elements == 0 {
         // An empty dataset owns no element bytes: carry just the datatype and
@@ -748,7 +748,7 @@ fn emit_dataset(
         &dims,
         dataspace.max_dimensions.as_deref(),
         &layout,
-        &pipeline,
+        &filters,
     );
 
     // Carry the dataset's attributes, refusing if any cannot be represented.
@@ -785,14 +785,15 @@ fn copy_dataset_attrs(
 /// variable-length re-staging paths, which both rebuild their elements from
 /// scratch and so must reapply the layout themselves.
 ///
-/// `check_pipeline` has already rejected any filter not handled here, so the
-/// match over filter ids is exhaustive.
+/// `filters` are the ones [`check_pipeline`] decoded, which is what makes them
+/// safe to re-apply: there is no way to reach this with a pipeline that was not
+/// proved reproducible first.
 fn carry_shape_and_pipeline(
     db: &mut DatasetBuilder,
     dims: &[u64],
     max_dimensions: Option<&[u64]>,
     layout: &DataLayout,
-    pipeline: &Option<FilterPipeline>,
+    filters: &[FilterSpec],
 ) {
     // A max-shape that differs from the current shape means a resizable dataset.
     if let Some(maxshape) = max_dimensions
@@ -816,45 +817,21 @@ fn carry_shape_and_pipeline(
         db.with_chunks(&logical);
     }
 
-    // Re-apply supported filters in their stored order.
-    if let Some(p) = pipeline {
-        for f in &p.filters {
-            match f.filter_id {
-                FILTER_SHUFFLE => {
-                    db.with_shuffle();
-                }
-                FILTER_FLETCHER32 => {
-                    db.with_fletcher32();
-                }
-                FILTER_DEFLATE => {
-                    // Client-data[0] is the deflate level; default to 6 if absent.
-                    db.with_deflate(f.client_data.first().copied().unwrap_or(6));
-                }
-                FILTER_LZF => {
-                    db.with_lzf();
-                }
-                FILTER_SCALEOFFSET => {
-                    // `check_pipeline` guarantees integer (lossless) mode here.
-                    // Re-apply with the source's minbits parameter; integer
-                    // scale-offset reconstructs the exact element bytes.
-                    //
-                    // Its fill availability is re-applied too. The value it
-                    // records comes from the dataset's own fill value, carried
-                    // separately, so only the availability needs saying — and
-                    // saying it keeps a source that records none from gaining
-                    // one, which would re-encode every chunk a code point wider.
-                    if let Some((mode @ ScaleOffset::Integer(_), fill)) =
-                        scaleoffset::scale_offset_mode(&f.client_data)
-                    {
-                        db.with_scale_offset(mode);
-                        db.chunk_options.scale_offset_fill = fill;
-                    } else {
-                        unreachable!("check_pipeline rejected non-integer scale-offset");
-                    }
-                }
-                _ => unreachable!("check_pipeline rejected unsupported filters"),
-            }
-        }
+    // Re-apply the source's filters in the source's own order, each carrying
+    // the optional flag it was stored with (issue #333).
+    //
+    // Both are observable, and neither is necessarily what this crate's own
+    // writer would choose. `fletcher32` between shuffle and deflate checksums
+    // the shuffled bytes; moved to the end it checksums the deflated ones — a
+    // different checksum over different data, and a different thing for a
+    // reader to verify. A filter that loses its optional flag becomes one a
+    // reader must be able to apply, where before it could skip it.
+    //
+    // Pushed rather than set through the `with_*` switches, which name a filter
+    // to apply and place it at this crate's canonical rank: that is right for a
+    // caller composing a pipeline and wrong for reproducing one that exists.
+    for &spec in filters {
+        db.chunk_options.push_filter(spec);
     }
 }
 
@@ -878,7 +855,7 @@ fn emit_vlen_string_dataset(
 ) -> Result<(), Error> {
     // A lossy pipeline cannot be reproduced, so refuse it before reading — the
     // same guard the fixed-size re-encode path applies.
-    check_pipeline(pipeline.as_ref(), path)?;
+    let filters = check_pipeline(pipeline.as_ref(), path)?;
 
     // Read each element's exact heap bytes, preserving the null-vs-empty
     // distinction. Reading bytes (not the lossily UTF-8-decoded `String`) keeps
@@ -903,7 +880,7 @@ fn emit_vlen_string_dataset(
         dims,
         ds.dataspace()?.max_dimensions.as_deref(),
         layout,
-        pipeline,
+        &filters,
     );
     Ok(())
 }
@@ -925,7 +902,7 @@ fn emit_vlen_sequence_dataset(
     layout: &DataLayout,
     pipeline: &Option<FilterPipeline>,
 ) -> Result<(), Error> {
-    check_pipeline(pipeline.as_ref(), path)?;
+    let filters = check_pipeline(pipeline.as_ref(), path)?;
 
     // Read each element's exact heap bytes (preserving the null-vs-empty
     // distinction and any embedded NULs), then re-stage with the source datatype.
@@ -946,7 +923,7 @@ fn emit_vlen_sequence_dataset(
         dims,
         ds.dataspace()?.max_dimensions.as_deref(),
         layout,
-        pipeline,
+        &filters,
     );
     Ok(())
 }
@@ -985,7 +962,7 @@ fn emit_embedded_address_dataset(
 ) -> Result<(), Error> {
     // This path re-encodes, so a lossy filter cannot be reproduced — the same
     // guard the other re-staging paths apply.
-    check_pipeline(pipeline.as_ref(), path)?;
+    let filters = check_pipeline(pipeline.as_ref(), path)?;
 
     // An embedded object address is resolved as the elements are re-staged, which
     // a compressed chunk would need rewritten in place, so the layout guards that
@@ -1046,7 +1023,7 @@ fn emit_embedded_address_dataset(
         dims,
         ds.dataspace()?.max_dimensions.as_deref(),
         layout,
-        pipeline,
+        &filters,
     );
     Ok(())
 }
@@ -1698,38 +1675,58 @@ fn check_layout(layout: &DataLayout, path: &str) -> Result<(), Error> {
 ///
 /// The dense chunked path (the common case) copies compressed chunks verbatim
 /// and never calls this — there every filter is safe because nothing is decoded.
-fn check_pipeline(pipeline: Option<&FilterPipeline>, path: &str) -> Result<(), Error> {
+fn check_pipeline(pipeline: Option<&FilterPipeline>, path: &str) -> Result<Vec<FilterSpec>, Error> {
     let Some(p) = pipeline else {
-        return Ok(());
+        return Ok(Vec::new());
     };
-    // Re-encoding replays filters through the builder, which emits its own
-    // fixed order and refuses lzf + deflate on one dataset, so a foreign
-    // pipeline carrying both cannot be reproduced faithfully.
+    // Re-encoding replays the filters through the builder, which refuses lzf and
+    // deflate on one dataset — they fill the same byte-compressor slot — so a
+    // foreign pipeline carrying both cannot be reproduced. Refused here, by
+    // name, rather than left to surface as the builder's combination error.
     let has = |id| p.filters.iter().any(|f| f.filter_id == id);
     if has(FILTER_LZF) && has(FILTER_DEFLATE) {
         return Err(Error::RepackUnsupported(format!(
             "dataset {path}: an lzf + deflate pipeline cannot be re-encoded faithfully"
         )));
     }
-    for f in &p.filters {
-        match f.filter_id {
-            FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_LZF => {}
-            FILTER_SCALEOFFSET => match scaleoffset::scale_offset_mode(&f.client_data) {
-                Some((ScaleOffset::Integer(_), _)) => {}
-                _ => {
+    p.filters
+        .iter()
+        .map(|f| {
+            let kind = match f.filter_id {
+                FILTER_SHUFFLE => FilterKind::Shuffle,
+                FILTER_FLETCHER32 => FilterKind::Fletcher32,
+                // Client-data[0] is the deflate level; default to 6 if absent.
+                FILTER_DEFLATE => FilterKind::Deflate(f.client_data.first().copied().unwrap_or(6)),
+                FILTER_LZF => FilterKind::Lzf,
+                // Only the lossless integer mode qualifies, re-applied with the
+                // source's minbits parameter. Its fill availability comes along
+                // too: the value the filter records is the dataset's own fill
+                // value, carried separately, so only the availability needs
+                // saying — and saying it keeps a source that recorded none from
+                // gaining one, which would re-encode every chunk a code point
+                // wider.
+                FILTER_SCALEOFFSET => match scaleoffset::scale_offset_mode(&f.client_data) {
+                    Some((mode @ ScaleOffset::Integer(_), fill)) => {
+                        FilterKind::ScaleOffset(mode, fill)
+                    }
+                    _ => {
+                        return Err(Error::RepackUnsupported(format!(
+                            "dataset {path}: only lossless integer scale-offset can be repacked faithfully"
+                        )));
+                    }
+                },
+                other => {
                     return Err(Error::RepackUnsupported(format!(
-                        "dataset {path}: only lossless integer scale-offset can be repacked faithfully"
+                        "dataset {path}: filter id {other} cannot be repacked yet"
                     )));
                 }
-            },
-            other => {
-                return Err(Error::RepackUnsupported(format!(
-                    "dataset {path}: filter id {other} cannot be repacked yet"
-                )));
-            }
-        }
-    }
-    Ok(())
+            };
+            Ok(FilterSpec {
+                kind,
+                optional: f.is_optional(),
+            })
+        })
+        .collect()
 }
 
 /// Canonicalize a path to slash-free form: split on `/`, drop empty components,
@@ -1800,9 +1797,24 @@ mod tests {
                     single_chunk_filtered_size: None,
                     single_chunk_filter_mask: None,
                 },
-                &pipeline,
+                // Routed through `check_pipeline`, as every production caller
+                // is: it is the step that decodes the availability out of the
+                // source's parameters.
+                &check_pipeline(pipeline.as_ref(), "d").expect("integer scale-offset repacks"),
             );
-            db.chunk_options.scale_offset_fill
+            let [
+                FilterSpec {
+                    kind: FilterKind::ScaleOffset(_, fill),
+                    ..
+                },
+            ] = db.chunk_options.filters[..]
+            else {
+                panic!(
+                    "expected one scale-offset filter, got {:?}",
+                    db.chunk_options.filters
+                );
+            };
+            fill
         };
 
         assert_eq!(
@@ -1816,10 +1828,9 @@ mod tests {
     }
 
     /// A foreign pipeline carrying both lzf and deflate is refused with the
-    /// repack error, not the builder's combination error: the builder replays
-    /// filters in its own fixed order, so the stored order cannot be
-    /// reproduced. The builder cannot produce such a file, hence a synthetic
-    /// pipeline rather than a file-level test.
+    /// repack error naming the pair, not the builder's combination error raised
+    /// later from deeper down. The builder cannot produce such a file, hence a
+    /// synthetic pipeline rather than a file-level test.
     #[test]
     fn lzf_plus_deflate_pipeline_is_refused() {
         use crate::filter_pipeline::FilterDescription;
