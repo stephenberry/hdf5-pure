@@ -819,6 +819,82 @@ fn gathering_writes_does_not_recopy_what_it_holds() {
     assert_eq!(&back[CHUNK..CHUNK * 2], &batch[..CHUNK]);
 }
 
+/// A page buffer does not recopy what it holds when a write lands *inside* a run
+/// it is already holding.
+///
+/// The companion to the bound above, through the configuration that reaches the
+/// other fast path. `absorb` has two: extending a pending run at its end, which
+/// one large append reaches by itself, and patching a write that falls wholly
+/// inside a run already held, which needs a run grown to the byte budget and
+/// then written into again. Only a buffer held *across* operations gets there —
+/// every append here re-patches the object header and chunk index that the runs
+/// before it left in the buffer — so the default gathering cannot bound this
+/// path and this is the vehicle that can (issues #288 and #308).
+#[test]
+fn a_page_buffer_does_not_recopy_what_it_holds_across_operations() {
+    const CHUNK: usize = 512;
+    const APPENDS: usize = 256;
+    const RAW_BYTES: u64 = (CHUNK * APPENDS * 8) as u64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("page_buffered.h5");
+    let mut builder = FileBuilder::new();
+    builder
+        .with_file_space_strategy(hdf5_pure::FileSpaceStrategy::Page, true, 1)
+        .with_file_space_page_size(4096);
+    builder
+        .create_dataset("growing")
+        .with_f64_data(&[1.0f64; CHUNK])
+        .with_shape(&[CHUNK as u64])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[CHUNK as u64]);
+    builder.write(&path).unwrap();
+
+    // Built outside the region: this is the caller's buffer, not the library's.
+    let batch: Vec<f64> = (0..CHUNK).map(|i| i as f64).collect();
+    // Scoped: a `Dataset` owns a handle on the session, so the session outlives
+    // `file` itself, and with a page buffer that is the difference between a
+    // file with every append in it and one still holding them.
+    let measured = {
+        let file = File::open_rw_with_options(
+            &path,
+            hdf5_pure::FileAccessProperties::new()
+                .with_sync_policy(hdf5_pure::SyncPolicy::OnClose)
+                .with_page_buffer_size(1 << 20),
+        )
+        .unwrap();
+        let mut ds = file.dataset("growing").unwrap();
+        measure("page_buffered_appends", || {
+            for _ in 0..APPENDS {
+                ds.append(&batch).unwrap();
+            }
+        })
+        .1
+    };
+
+    // The appended data is in this measurement, so a measurement of nothing
+    // cannot pass the ceiling below by default.
+    assert!(
+        measured.bytes >= RAW_BYTES,
+        "the appended data is not in this measurement, so the bound below is \
+         measuring something other than the appends: {measured}"
+    );
+
+    // Measured at 7.3x the raw bytes when a write inside a held run patches it in
+    // place, and at 516x when each one rebuilds the run it lands in — two orders
+    // of magnitude apart, so this bound need not be tight to separate them.
+    assert!(
+        measured.bytes < 64 * RAW_BYTES,
+        "a page buffer must not recopy what it holds: measured {measured} against \
+         {RAW_BYTES} bytes of appended data"
+    );
+
+    let file = File::open(&path).unwrap();
+    let back = file.dataset("growing").unwrap().read_f64().unwrap();
+    assert_eq!(back.len(), CHUNK * (APPENDS + 1));
+    assert_eq!(&back[CHUNK..CHUNK * 2], &batch[..]);
+}
+
 /// A write too large for the gather budget is issued rather than copied into it.
 ///
 /// Gathering holds a write so it can be merged with its neighbours, and a write

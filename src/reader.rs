@@ -137,6 +137,7 @@ pub struct FileAccessProperties {
     memory_strategy: Option<MemoryStrategy>,
     libver_bounds: Option<(LibVer, LibVer)>,
     sync_policy: SyncPolicy,
+    page_buffer_size: usize,
 }
 
 impl FileAccessProperties {
@@ -149,6 +150,7 @@ impl FileAccessProperties {
             memory_strategy: None,
             libver_bounds: None,
             sync_policy: SyncPolicy::Always,
+            page_buffer_size: 0,
         }
     }
 
@@ -245,11 +247,102 @@ impl FileAccessProperties {
     /// storage before returning. [`SyncPolicy::OnClose`] issues no `fsync` at all,
     /// which is what the reference C library does; the writes still reach the
     /// operating system by the time the operation making them returns, so only
-    /// power-loss durability moves to the caller.
+    /// power-loss durability moves to the caller. [`with_page_buffer_size`](Self::with_page_buffer_size),
+    /// off by default, is the one setting that changes that — and it requires
+    /// this policy.
     ///
     /// The read-only opens ignore this: they write nothing.
     pub const fn with_sync_policy(mut self, sync_policy: SyncPolicy) -> Self {
         self.sync_policy = sync_policy;
+        self
+    }
+
+    /// Let a read-write session's writes accumulate in a page buffer of
+    /// `bytes`, so repeated small updates landing in the same page cost one
+    /// write rather than one each.
+    ///
+    /// Defaults to `0`, which is off — as `H5Pset_page_buffer_size` defaults to
+    /// off — and leaves the gathering every read-write session already does: one
+    /// write per dirty page per *ordering barrier*, so a commit or an append
+    /// still reaches the operating system in full before it returns. What this
+    /// buys on top is letting a dirty page survive those barriers, which is where
+    /// a workload of many small appends into a few pages does most of its
+    /// repeating: a session of 32 chunk appends cost 160 writes with the default
+    /// and 10 with a page buffer.
+    ///
+    /// **It pays off over a long session, and costs on a short one.** The crash
+    /// mark below is two `fsync`s per session whatever the session then does, so
+    /// there is a break-even: measured on an Apple M1 Max (APFS) with 256-byte
+    /// appends into eight datasets, 400 appends ran 0.63x — slower — 800 broke
+    /// even, and 6,400 ran 1.64x. The ratio climbs with session length, because
+    /// the same pages are re-dirtied more often, and narrows to about 1.15x once
+    /// 64 KiB payloads rather than metadata churn dominate. Re-measure on the
+    /// host that matters: `cargo bench --bench hot_paths -- page_buffer` runs
+    /// both sides of the crossing.
+    ///
+    /// # What it costs, and what pays for it
+    ///
+    /// Gathered writes go out in address order, and every publish point sits
+    /// below the content it reaches, so all of them are issued first. A write
+    /// that fails, or a process that dies, mid-flush can therefore leave a file
+    /// whose superblock, dataset length or object header names bytes that never
+    /// arrived — and two of those read back **clean**, as fill values or as a
+    /// deleted object's data, with every checksum verifying. That is what a
+    /// write-back page buffer is, rather than a fault in this one:
+    /// `H5Pset_page_buffer_size` reorders the same way and makes no
+    /// crash-consistency claim either.
+    ///
+    /// So this session raises superblock status-flag bit 0
+    /// (`H5F_SUPER_WRITE_ACCESS`) for its whole life, `fsync`ed once at open and
+    /// cleared on a clean [`File::close`] or drop — the mark the reference C
+    /// library raises for *any* writer. A session that dies with pages in memory
+    /// leaves that byte standing, and a file carrying it is refused by this
+    /// crate, by `H5Fopen` and by h5py alike, with
+    /// [`Error::FileMarkedInUse`](crate::Error::FileMarkedInUse). The silent
+    /// wrong answer becomes a refusal, and
+    /// [`File::clear_swmr_flag`](crate::File::clear_swmr_flag) — the `h5clear -s`
+    /// equivalent — is how to look at such a file anyway, knowing what it may
+    /// hold. A completed commit's bytes may also still be in this process's
+    /// memory when it returns.
+    ///
+    /// # Refusals
+    ///
+    /// Five, each refused with
+    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported) rather than
+    /// quietly ignored:
+    ///
+    /// - a file not created with
+    ///   [`FileSpaceStrategy::Page`](crate::FileSpaceStrategy::Page), which has no
+    ///   page boundary to align to;
+    /// - a budget below that file's file-space page size;
+    /// - a budget below the 1 MiB a session already gathers under, since a page
+    ///   buffer *replaces* that budget and a smaller one issues more writes than
+    ///   leaving this unset;
+    /// - a superblock older than version 3, whose status-flags byte no library
+    ///   reads back, so the mark above would announce nothing;
+    /// - [`SyncPolicy::Always`](crate::SyncPolicy::Always), the default, where
+    ///   every barrier is an `fsync` that flushes the buffer on its way out — so
+    ///   it would hold nothing while still costing the mark. Pair this with
+    ///   [`with_sync_policy(SyncPolicy::OnClose)`](Self::with_sync_policy).
+    ///
+    /// [`File::create_with_options`] refuses a creation/access pair it could not
+    /// then reopen with, rather than writing the file first, and
+    /// [`File::open_swmr_writer`] refuses a page buffer outright: its readers
+    /// observe the order its writes become visible in, which is exactly what a
+    /// buffer coalesces away.
+    ///
+    /// The first two are stricter than the C library *on this path*.
+    /// `H5Pset_page_buffer_size` refuses them at `H5Fcreate`, but `H5Fopen`
+    /// silently sets the budget to zero for an unpaged file and silently rounds a
+    /// sub-page budget up to one page. A property quietly ignored is worse than
+    /// one refused. The read-only opens ignore this setting; they write nothing.
+    ///
+    /// Only the budget of `H5Pset_page_buffer_size` is modeled; its
+    /// `min_meta_perc` / `min_raw_perc` reservations are not, since this buffer
+    /// does not evict — it flushes whole.
+    #[doc(alias = "H5Pset_page_buffer_size")]
+    pub const fn with_page_buffer_size(mut self, bytes: usize) -> Self {
+        self.page_buffer_size = bytes;
         self
     }
 
@@ -290,6 +383,12 @@ impl FileAccessProperties {
     /// Return the configured `fsync` policy.
     pub const fn sync_policy(&self) -> SyncPolicy {
         self.sync_policy
+    }
+
+    /// Return the configured page-buffer budget in bytes; `0` when none was
+    /// asked for.
+    pub const fn page_buffer_size(&self) -> usize {
+        self.page_buffer_size
     }
 }
 
@@ -449,6 +548,9 @@ impl Drop for FileInner {
         }
         let _ = session.finalize_persist();
         let _ = session.force_sync();
+        // After the sync, never before: the mark says this session's writes may
+        // still be in memory, and it stops being true only once they are not.
+        let _ = session.release_crash_mark();
     }
 }
 
@@ -631,6 +733,21 @@ impl FileInner {
         // `WriteEngine::open_swmr_writer` says why.
         session.set_libver_bounds(properties.libver_bounds)?;
         session.set_sync_policy(properties.sync_policy);
+        // A page buffer holds dirty pages across ordering barriers, and under
+        // `Always` every barrier is an `fsync` that flushes it — so it would hold
+        // nothing, and the caller would have paid a real guarantee (see
+        // `with_page_buffer_size`) for nothing in return. Refused rather than
+        // quietly ignored, as the two refusals in `set_page_buffer_size` and the
+        // SWMR one are, and as this crate refuses `MemoryStrategy::Bounded` on a
+        // writer that cannot honor it (issue #288).
+        if properties.page_buffer_size != 0 && properties.sync_policy == SyncPolicy::Always {
+            return Err(Error::EditUnsupported(
+                "a page buffer does nothing under SyncPolicy::Always, whose every barrier is \
+                 an fsync that flushes it; pair with_page_buffer_size with \
+                 with_sync_policy(SyncPolicy::OnClose), or drop it",
+            ));
+        }
+        session.set_page_buffer_size(properties.page_buffer_size)?;
         // The engine parsed and normalized this at open; take it rather than
         // re-parsing, so the image need not be able to hand out a slice.
         let superblock = session.superblock().clone();
@@ -673,6 +790,17 @@ impl FileInner {
             return Err(Error::EditUnsupported(
                 "the SWMR writer requires a version 3 superblock, which is the v1.10 format; \
                  raise the FileAccessProperties library-version bound to open it",
+            ));
+        }
+        // And a page buffer is the third. A SWMR reader follows the writer's
+        // ordered phases as they become visible, so coalescing those writes is
+        // not a slower or larger file but a reader that sees a state the phases
+        // exist to keep it from seeing.
+        if properties.page_buffer_size != 0 {
+            return Err(Error::EditUnsupported(
+                "the SWMR writer cannot buffer its writes: its readers observe the order they \
+                 become visible in; leave FileAccessProperties::with_page_buffer_size unset to \
+                 open it",
             ));
         }
         let session = WriteEngine::open_swmr_writer(path, properties.sync_policy)?;
@@ -1876,16 +2004,25 @@ impl File {
         })
     }
 
-    /// Clear a stale SWMR-write flag left in `path` by a writer that exited
-    /// without a clean [`close`](Self::close) — the `h5clear -s` equivalent, for
-    /// recovering a file that both this crate and the reference C library
-    /// otherwise refuse to open ([`Error::FileMarkedInUse`](crate::Error::FileMarkedInUse)).
-    /// A no-op if the flag is already clear.
+    /// Clear a stale status flag left in `path` by a writer that exited without a
+    /// clean [`close`](Self::close) — the `h5clear -s` equivalent, for recovering
+    /// a file that both this crate and the reference C library otherwise refuse
+    /// to open ([`Error::FileMarkedInUse`](crate::Error::FileMarkedInUse)). A
+    /// no-op if the flag is already clear.
     ///
     /// It takes the exclusive OS lock first, so it cannot clear the flag out
     /// from under a *live* [`open_rw`](Self::open_rw) writer. A live SWMR writer
     /// holds no lock, so make sure it is really gone: clearing the flag under
     /// one leaves its readers with no record that it is publishing.
+    ///
+    /// It also clears the crash mark a page-buffered session raises
+    /// ([`FileAccessProperties::with_page_buffer_size`]), and there the warning is
+    /// sharper. That mark stands for pages that were still in memory, so a file
+    /// still carrying it was left by a writer that did not finish: clearing it
+    /// hands back a file whose datasets may read clean and return fill values or
+    /// a deleted object's bytes, with every checksum verifying. Clear it to
+    /// salvage what is there, not to resume trusting it. `h5clear` makes the same
+    /// trade for the same reason.
     pub fn clear_swmr_flag<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
         crate::file_lock::clear_swmr_flag_at(path.as_ref())
     }
@@ -2087,7 +2224,11 @@ impl File {
                 // point at which either write can be ordered at all.
                 self.with_mirror_session(false, |session| {
                     session.finalize_persist()?;
-                    session.force_sync()
+                    session.force_sync()?;
+                    // Last, and only after the sync: a page-buffered session's
+                    // crash mark stands for writes that were still in memory,
+                    // and this is the point at which none are.
+                    session.release_crash_mark()
                 })?;
             }
             self.inner.closed.store(true, Ordering::Release);
@@ -6307,6 +6448,223 @@ mod tests {
             policy_of(&bounded),
             SyncPolicy::OnClose,
             "File::open_rw_with_options (bounded)"
+        );
+    }
+
+    /// The page-buffer property is refused where it cannot be honored, rather
+    /// than accepted and ignored (issues #288 and #308).
+    ///
+    /// Each refusal has a different reason and none stands in for the others: an
+    /// unpaged file has no page boundary to align a page buffer to, a budget
+    /// under one page is a buffer that drains on every page it touches, a budget
+    /// under the session's own gather budget issues *more* writes than leaving
+    /// the property unset, a pre-version-3 superblock carries a status-flags byte
+    /// no library reads back so the crash mark would announce nothing, and the
+    /// SWMR writer's readers observe the order its writes become visible in.
+    /// The first two are where the C library refuses `H5Pset_page_buffer_size`
+    /// too; the rest are this crate's.
+    ///
+    /// Every case also asserts the file is left byte-identical. Each refusal
+    /// fires with a read-write session already open, and the version-3 one fires
+    /// from the same function that raises the mark — so a refusal ordered after
+    /// the raise would leave a file marked in use by a session that never
+    /// existed, which is a file nothing can open until `clear_swmr_flag`.
+    #[test]
+    fn a_page_buffer_is_refused_where_it_cannot_be_honored() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let fixture = |name: &str, paged: bool| {
+            let path = dir.path().join(name);
+            let mut b = FileBuilder::new();
+            if paged {
+                b.with_file_space_strategy(crate::FileSpaceStrategy::Page, true, 1)
+                    .with_file_space_page_size(16 * 1024);
+            }
+            b.create_dataset("d")
+                .with_i32_data(&[1, 2, 3, 4])
+                .with_shape(&[4]);
+            b.write(&path).unwrap();
+            path
+        };
+        let buffered = |bytes| {
+            FileAccessProperties::new()
+                .with_sync_policy(SyncPolicy::OnClose)
+                .with_page_buffer_size(bytes)
+        };
+
+        // Each refusal fires after the session is already open read-write, so the
+        // file it declined must be left exactly as it was — and still openable.
+        let untouched = |label: &str, path: &std::path::Path, before: &[u8]| {
+            assert_eq!(
+                std::fs::read(path).unwrap(),
+                before,
+                "{label}: a refused open changed the file"
+            );
+            assert!(
+                File::open(path).is_ok(),
+                "{label}: a refused open left the file unopenable"
+            );
+        };
+
+        let unpaged = fixture("unpaged.h5", false);
+        let before = std::fs::read(&unpaged).unwrap();
+        let refused = File::open_rw_with_options(&unpaged, buffered(1 << 20));
+        assert!(
+            matches!(&refused, Err(Error::EditUnsupported(m)) if m.contains("FileSpaceStrategy::Page")),
+            "a page buffer on an unpaged file must be refused, got {refused:?}"
+        );
+        untouched("unpaged", &unpaged, &before);
+
+        let paged = fixture("paged.h5", true);
+        let before = std::fs::read(&paged).unwrap();
+        let refused = File::open_rw_with_options(&paged, buffered(8192));
+        assert!(
+            matches!(&refused, Err(Error::EditUnsupported(m)) if m.contains("page size")),
+            "a budget below one page must be refused, got {refused:?}"
+        );
+        untouched("budget under one page", &paged, &before);
+
+        // A budget that clears the page size but not the byte budget a session
+        // already gathers under. This is the sharpest of the three: such a buffer
+        // looks reasonable and would replace a 1 MiB gather budget with a smaller
+        // one, issuing *more* writes than leaving the property unset.
+        let refused = File::open_rw_with_options(&paged, buffered(64 * 1024));
+        assert!(
+            matches!(&refused, Err(Error::EditUnsupported(m)) if m.contains("already gathers")),
+            "a budget under the session gather budget must be refused, got {refused:?}"
+        );
+        untouched("budget under the gather budget", &paged, &before);
+
+        // And the pairing a caller reaches by doing nothing, since Always is the
+        // default: every barrier there is an fsync that flushes the buffer.
+        let refused = File::open_rw_with_options(
+            &paged,
+            FileAccessProperties::new().with_page_buffer_size(1 << 20),
+        );
+        assert!(
+            matches!(&refused, Err(Error::EditUnsupported(m)) if m.contains("SyncPolicy::Always")),
+            "a page buffer under SyncPolicy::Always must be refused, got {refused:?}"
+        );
+        untouched("page buffer under Always", &paged, &before);
+
+        // A version-2 superblock. This crate's writer refuses `Page` below the
+        // 1.10 format, so the file is built at version 3 and its superblock
+        // rewritten — the v2 and v3 layouts are identical apart from the version
+        // byte and what the flags byte means, which is exactly the point.
+        let old_format = dir.path().join("v2.h5");
+        std::fs::copy(&paged, &old_format).unwrap();
+        {
+            let mut bytes = std::fs::read(&old_format).unwrap();
+            let sig = crate::signature::find_signature(&bytes).unwrap();
+            let mut sb = crate::superblock::Superblock::parse(&bytes, sig).unwrap();
+            assert_eq!(sb.version, 3, "the fixture must start at the newer format");
+            sb.version = 2;
+            let rewritten = sb.serialize();
+            bytes[sig..sig + rewritten.len()].copy_from_slice(&rewritten);
+            std::fs::write(&old_format, &bytes).unwrap();
+        }
+        let before = std::fs::read(&old_format).unwrap();
+        assert!(
+            File::open(&old_format).is_ok(),
+            "the version-2 fixture must be a readable file, or the refusal below \
+             could be about anything"
+        );
+        let refused = File::open_rw_with_options(&old_format, buffered(1 << 20));
+        assert!(
+            matches!(&refused, Err(Error::EditUnsupported(m)) if m.contains("version-3 superblock")),
+            "a page buffer on a pre-v3 superblock must be refused, got {refused:?}"
+        );
+        untouched("version-2 superblock", &old_format, &before);
+
+        let swmr = fixture("swmr.h5", false);
+        let before = std::fs::read(&swmr).unwrap();
+        let refused = File::open_swmr_writer_with_options(&swmr, buffered(1 << 20));
+        assert!(
+            matches!(&refused, Err(Error::EditUnsupported(m)) if m.contains("SWMR")),
+            "the SWMR writer must refuse a page buffer, got {refused:?}"
+        );
+        // The sharpest of the three: `open_swmr_writer` raises the on-disk
+        // SWMR-write flag, and a refusal that fired after it would leave every
+        // later open reporting `FileMarkedInUse`.
+        untouched("swmr", &swmr, &before);
+
+        // And an unset page buffer refuses none of the three.
+        for (name, paged) in [("ok_unpaged.h5", false), ("ok_paged.h5", true)] {
+            let f = File::open_rw_with_options(fixture(name, paged), FileAccessProperties::new());
+            assert!(f.is_ok(), "{name}: an unset page buffer refuses nothing");
+        }
+        let f = File::open_swmr_writer_with_options(
+            fixture("ok_swmr.h5", false),
+            FileAccessProperties::new(),
+        );
+        assert!(f.is_ok(), "swmr: an unset page buffer refuses nothing");
+    }
+
+    /// `File::create_with_options` refuses a creation/access pair whose file it
+    /// could write but not then open, rather than writing it and failing the open
+    /// it promised (issue #288).
+    ///
+    /// A page buffer needs a paged file and a budget of at least its page size,
+    /// and both of those are properties of the file being *created* — so the
+    /// refusal belongs before the bytes are written, not in the reopen. The
+    /// assertion that matters here is `file_left`: an error alone would pass with
+    /// the file already on disk, which is the defect.
+    #[test]
+    fn create_with_options_refuses_a_page_buffer_it_could_not_reopen_with() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let paged = |page: u64| {
+            crate::FileCreateProperties::new()
+                .with_file_space_strategy(crate::FileSpaceStrategy::Page, true, 1)
+                .with_file_space_page_size(page)
+        };
+        // 8192 clears the format's 4096 default and still falls short of this
+        // file's 16 KiB page, so it fails only against the page size actually
+        // read from the file.
+        let cases: [(&str, crate::FileCreateProperties, usize); 3] = [
+            ("unpaged file", crate::FileCreateProperties::new(), 1 << 20),
+            ("budget under one page", paged(16 * 1024), 8192),
+            (
+                "budget under the gather budget",
+                paged(16 * 1024),
+                64 * 1024,
+            ),
+        ];
+
+        for (label, create, budget) in cases {
+            let path = dir
+                .path()
+                .join(std::format!("{}.h5", label.replace(' ', "_")));
+            let result = File::create_with_options(
+                &path,
+                create,
+                FileAccessProperties::new()
+                    .with_sync_policy(SyncPolicy::OnClose)
+                    .with_page_buffer_size(budget),
+            );
+            assert!(
+                matches!(result, Err(Error::EditUnsupported(_))),
+                "{label}: expected a refusal, got {result:?}"
+            );
+            assert!(
+                !path.exists(),
+                "{label}: the file was written and only then refused"
+            );
+        }
+
+        // The honorable pair still creates.
+        let ok = File::create_with_options(
+            dir.path().join("ok.h5"),
+            paged(16 * 1024),
+            FileAccessProperties::new()
+                .with_sync_policy(SyncPolicy::OnClose)
+                .with_page_buffer_size(1 << 20),
+        );
+        assert!(
+            ok.is_ok(),
+            "a paged file with an ample budget must create: {ok:?}"
         );
     }
 

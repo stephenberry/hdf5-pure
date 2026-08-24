@@ -69,9 +69,9 @@ use crate::source::{BytesSource, MetadataCacheConfig, MetadataReadCache, Source}
 ///
 /// An `fsync` always flushes first, so nothing here weakens durability against
 /// *power* loss. What each mode trades is which intermediate states another
-/// process can observe. Neither mode reorders: the ordering barriers that decide
-/// whether a failed write leaves the previous file or a broken one are kept by
-/// both. Each variant states what it trades.
+/// process can observe, and — for [`Session`](Self::Session) alone — the order
+/// they become observable in, which is what decides whether a failed write
+/// leaves the previous file or a broken one. Each variant states its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteBuffering {
     /// Every write reaches the operating system as it is made, in the order the
@@ -110,6 +110,49 @@ pub(crate) enum WriteBuffering {
     /// rather than to widen what this merges — so the guarantee now holds under
     /// [`Unbuffered`](WriteBuffering::Unbuffered) too.
     Operation { page_size: u64, max_bytes: usize },
+    /// Dirty bytes live until `max_bytes` of them accumulate, an `fsync` is
+    /// issued, or the session closes — spanning both operations and the ordering
+    /// barriers inside them.
+    ///
+    /// This is the `H5Pset_page_buffer_size` analogue, and it is opt-in because of
+    /// what crossing those barriers costs. Gathered writes are issued in address
+    /// order, and **every** publish point of an operation sits at a lower address
+    /// than the content it reaches — a commit's superblock and root at address 0,
+    /// an append's dataspace dimension and array-header element count in the
+    /// object header near the front, the chunk bytes and index blocks they name at
+    /// end-of-file. Held across their barriers, they are all issued first.
+    ///
+    /// So a write that fails, or a process that dies, mid-flush can leave:
+    ///
+    /// - a root or an end-of-file naming bytes that never arrived — a file that
+    ///   fails to read, which is the *benign* case;
+    /// - a dataset whose length was published but whose rows were not, which reads
+    ///   back **clean**, as fill values;
+    /// - a dataset header published over a region a previous commit freed, which
+    ///   reads back **clean**, as the deleted object's bytes.
+    ///
+    /// The last two are silent: every checksum verifies and the reader has no
+    /// signal. Measured, not reasoned — each was produced by failing one write of
+    /// a two-write drain.
+    ///
+    /// This is what a write-back page buffer is, rather than a defect in this one:
+    /// `H5Pset_page_buffer_size` makes no crash-consistency claim either, and the
+    /// C library's page buffer reorders the same way. What is given up is a
+    /// guarantee this crate adds *on top of* HDF5, not one an HDF5 user brings
+    /// with them. A completed commit's bytes may also still be in this process's
+    /// memory when it returns.
+    ///
+    /// Which is why installing this mode is not the whole feature: the engine
+    /// raises the superblock's write-access flag for the life of the session
+    /// (`WriteEngine::raise_crash_mark`), so the files described above are
+    /// refused rather than read. The C library ships its page buffer without one;
+    /// this mode is not offered without it (issue #308).
+    ///
+    /// Under [`SyncPolicy::Always`](crate::SyncPolicy::Always) this mode holds
+    /// nothing in practice, since every barrier is an `fsync` and flushes on its
+    /// way out. It is a setting for a session that has already moved the `fsync`
+    /// cadence to the application.
+    Session { page_size: u64, max_bytes: usize },
 }
 
 impl WriteBuffering {
@@ -119,6 +162,10 @@ impl WriteBuffering {
         match self {
             WriteBuffering::Unbuffered => None,
             WriteBuffering::Operation {
+                page_size,
+                max_bytes,
+            }
+            | WriteBuffering::Session {
                 page_size,
                 max_bytes,
             } => Some((page_size, max_bytes)),
@@ -274,9 +321,8 @@ pub(crate) trait FileImage: Source + Send + Sync {
     /// is what makes gathering free — the engine's barriers keep their ordering
     /// meaning under every [`SyncPolicy`](crate::SyncPolicy), and every operation
     /// ends with one, so a finished commit or append has reached the operating
-    /// system either way. A mode that did nothing here would be trading that
-    /// guarantee, which is why the effect is the mode's to state rather than
-    /// this method's to assume.
+    /// system either way. [`WriteBuffering::Session`] deliberately does nothing
+    /// here; that is exactly the guarantee an explicit page buffer trades.
     ///
     /// It forces nothing to durable storage. That is [`sync_all`](Self::sync_all)'s
     /// job, and whether it happens is the policy's decision.
@@ -360,11 +406,12 @@ pub(crate) trait FileImage: Source + Send + Sync {
 /// # What it does not do
 ///
 /// It does not evict. Exceeding the byte budget flushes everything rather than
-/// choosing a victim page, and under [`WriteBuffering::Operation`] the budget is
-/// only ever reached by one large operation, whose runs are long and contiguous
-/// and gain nothing from being kept. A mode that reached the budget by
-/// accumulating across operations instead would be the case for choosing a
-/// victim; no measurement here has asked for one.
+/// choosing a victim page. Under [`WriteBuffering::Operation`] the budget is only
+/// ever reached by one large operation, whose runs are long and contiguous and
+/// gain nothing from being kept; under [`WriteBuffering::Session`] it is reached
+/// by accumulation, and flushing whole then costs one extra pass over pages that
+/// were about to be written anyway. Choosing a victim would buy the difference
+/// between those two, which no measurement here has asked for.
 pub(crate) struct BufferedWrites {
     handle: fs::File,
     mode: WriteBuffering,
@@ -506,20 +553,20 @@ impl BufferedWrites {
     /// The extension path is the one an operation reaches by itself, and the
     /// expensive one to lose: measured on a four-megabyte append, whose batches
     /// each grow a run at end-of-file to the budget, disabling it costs 553 MB of
-    /// copying against 22 MB with it. That is what
-    /// `gathering_writes_does_not_recopy_what_it_holds` bounds.
+    /// copying against 22 MB with it.
     ///
     /// The containment path costs almost nothing in that same append, because the
     /// patches land in the header and index runs rather than in the long one at
-    /// end-of-file. Its worth was measured on a buffer held *across* operations,
-    /// where a patch lands inside a run already grown to the budget: 541 MB
-    /// against 7.7 MB. That configuration is issue #308.
+    /// end-of-file. It is reached instead by a buffer held *across* operations —
+    /// [`WriteBuffering::Session`] — where a patch lands inside a run already
+    /// grown to the budget: measured over 256 appends into a one-megabyte page
+    /// buffer, 407 MB of copying against 7.7 MB, to write one megabyte.
     ///
-    /// It is a pure optimization, not a correctness requirement: disabling it
-    /// passes the whole suite, because the general merge reaches the same bytes
-    /// by unioning the runs and overwriting. It is kept because it is right the
-    /// day #308 returns — but a reader who finds it in the way should know that
-    /// no test today can tell it from the slow path.
+    /// One test per path, each through the one configuration that reaches it:
+    /// `gathering_writes_does_not_recopy_what_it_holds` bounds the extension
+    /// path, and `a_page_buffer_does_not_recopy_what_it_holds_across_operations`
+    /// the containment path — the only test in the suite that fails when that
+    /// one is disabled.
     fn absorb(&mut self, offset: u64, bytes: &[u8]) {
         let mut lo = offset;
         let mut hi = offset + bytes.len() as u64;
@@ -686,7 +733,7 @@ impl BufferedWrites {
     /// mode which does *not* release here has to say so instead of inheriting it.
     pub(crate) fn ordering_barrier(&mut self) -> Result<(), Error> {
         match self.mode {
-            WriteBuffering::Unbuffered => Ok(()),
+            WriteBuffering::Unbuffered | WriteBuffering::Session { .. } => Ok(()),
             WriteBuffering::Operation { .. } => self.flush(),
         }
     }
@@ -1874,36 +1921,45 @@ mod tests {
         }
     }
 
-    /// A barrier is where gathering gives its ordering back: everything held
-    /// reaches the operating system before anything written after it does. The
-    /// engine places its barriers exactly where two writes are ordered, so a mode
-    /// that held across one would be reordering the file.
+    /// Operation retention drains at every ordering barrier; session retention
+    /// does not, which is the whole difference between the default and an
+    /// explicit page buffer.
     #[test]
-    fn operation_retention_releases_at_an_ordering_barrier() {
+    fn session_retention_survives_an_ordering_barrier_and_operation_retention_does_not() {
         let dir = tempfile::tempdir().unwrap();
         for backing in BACKINGS {
-            let (path, mut img) =
-                gathering_named(dir.path(), "released", b"abcdef", backing, GATHERED);
+            let held = WriteBuffering::Session {
+                page_size: PAGE,
+                max_bytes: 4096,
+            };
+            let (path, mut img) = gathering_named(dir.path(), "held", b"abcdef", backing, held);
             img.write_at(0, b"Z").unwrap();
-            // Held until the barrier: without gathering this byte would already
-            // be on disk, which is what makes the barrier load-bearing rather
-            // than incidental.
-            assert_eq!(
-                std::fs::read(&path).unwrap(),
-                b"abcdef",
-                "{backing:?}: a gathered write must wait for its barrier"
-            );
             img.ordering_barrier().unwrap();
             assert_eq!(
                 std::fs::read(&path).unwrap(),
+                b"abcdef",
+                "{backing:?}: a page buffer must survive an ordering barrier"
+            );
+            img.sync_all().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"Zbcdef", "{backing:?}");
+
+            // The other half of the name, which is the default and the one the
+            // engine's barriers depend on.
+            let (released, mut img) =
+                gathering_named(dir.path(), "released", b"abcdef", backing, GATHERED);
+            img.write_at(0, b"Z").unwrap();
+            img.ordering_barrier().unwrap();
+            assert_eq!(
+                std::fs::read(&released).unwrap(),
                 b"Zbcdef",
                 "{backing:?}: operation retention must release at an ordering barrier"
             );
         }
     }
 
-    /// The budget is a ceiling on what is held, not advice: one long operation
-    /// that never drained until its barrier would spend memory without bound.
+    /// The budget is a ceiling on what is held, not advice: a session-retained
+    /// buffer that never drained until close would spend memory without bound on
+    /// a long-running writer.
     #[test]
     fn the_budget_drains_a_buffer_that_would_outgrow_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1912,7 +1968,7 @@ mod tests {
                 dir.path(),
                 &vec![0u8; 4096],
                 backing,
-                WriteBuffering::Operation {
+                WriteBuffering::Session {
                     page_size: PAGE,
                     max_bytes: 100,
                 },

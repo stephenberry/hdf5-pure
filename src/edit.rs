@@ -860,6 +860,21 @@ pub(crate) struct WriteEngine {
     /// It is a property of one commit, not of the session, so `commit` clears it
     /// on entry rather than trusting the previous run to have left it false.
     repointed: bool,
+    /// Superblock status flags this session raised on the file and holds for its
+    /// lifetime — the SWMR pair, or the page buffer's crash mark — or `0` when it
+    /// holds none.
+    ///
+    /// A clean commit publishes *this* rather than a literal zero. The zero was
+    /// there to scrub a flag the file arrived carrying (one a crashed writer left
+    /// behind), and it still does: this is `0` unless the session raised
+    /// something itself. What it must not do is scrub a mark that is still
+    /// standing for a reason, which a page-buffered session's is for every
+    /// commit it makes (issue #308).
+    ///
+    /// Maintained only by [`set_consistency_flags`](Self::set_consistency_flags),
+    /// which is the one place this crate writes that byte, so the field cannot
+    /// drift from what is on the disk.
+    held_status_flags: u32,
     /// Who owns this session's `fsync` cadence, from the fapl's
     /// [`FileAccessProperties::with_sync_policy`]. Consulted by
     /// [`barrier`](Self::barrier) and [`barrier_data`](Self::barrier_data) —
@@ -982,9 +997,10 @@ impl From<EditBacking> for MemoryStrategy {
 /// power.
 ///
 /// A session does gather the many small writes *inside* one such operation and
-/// issue them a page at a time (issue #288). That gathering releases at every
-/// ordering barrier, so it keeps the guarantee in the paragraph above rather
-/// than trading it.
+/// issue them a page at a time (issue #288), and an explicit
+/// [page buffer](crate::FileAccessProperties::with_page_buffer_size) extends that
+/// across operations — trading exactly the guarantee in the paragraph above,
+/// which is why it is opt-in and this is not.
 ///
 /// The reference C library does not `fsync` on its normal path either: the
 /// default `sec2` driver installs no flush callback at all, so `H5Fflush` drains
@@ -1102,6 +1118,35 @@ pub(crate) fn create_would_refuse_reopen(
              write the file and then refuse to open it; drop the userblock, or leave \
              MemoryStrategy unset to mirror this file",
         );
+    }
+    // The two page-buffer refusals `set_page_buffer_size` makes at open, restated
+    // as the creation pair that would walk into them. They are phrased as
+    // something to *add* to the properties in hand rather than as something to
+    // recreate the file with, since the file does not exist yet (issue #288).
+    if access.page_buffer_size() != 0 {
+        let page_size = match create.file_space_strategy() {
+            Some((FileSpaceStrategy::Page, _, _)) => create
+                .file_space_page_size()
+                .unwrap_or(crate::file_space_info::DEFAULT_PAGE_SIZE),
+            _ => {
+                return Some(
+                    "a page buffer (with_page_buffer_size) needs a paged file, so creating one \
+                     this way would write the file and then fail to open it; add \
+                     with_file_space_strategy(FileSpaceStrategy::Page, true, ..) to the \
+                     creation properties, or drop the page buffer",
+                );
+            }
+        };
+        if (access.page_buffer_size() as u64) < page_size
+            || access.page_buffer_size() < WRITE_GATHER_BYTES
+        {
+            return Some(
+                "a page buffer smaller than the file's file-space page size, or than the \
+                 1 MiB a session already gathers under, would be refused at open — so \
+                 creating one this way would write the file and then fail to open it; raise \
+                 with_page_buffer_size",
+            );
+        }
     }
     None
 }
@@ -1389,7 +1434,8 @@ fn barrier_data(image: &mut dyn FileImage, sync_policy: SyncPolicy) -> Result<()
 }
 
 /// Byte budget for the writes one operation may gather before they are issued
-/// (see [`WriteBuffering::Operation`]).
+/// (see [`WriteBuffering::Operation`]), and the floor under an explicit
+/// [`page buffer`](crate::FileAccessProperties::with_page_buffer_size).
 ///
 /// A megabyte, the same figure as [`APPEND_BATCH_BYTES`] and for a related
 /// reason: that is already what a bounded session spends holding one batch of
@@ -1397,6 +1443,12 @@ fn barrier_data(image: &mut dyn FileImage, sync_policy: SyncPolicy) -> Result<()
 /// a new one. The two are not derived from each other and either may be tuned
 /// alone. An operation larger than this is flushed part-way, which costs it
 /// little — its writes are long and contiguous by then.
+///
+/// It is also the floor under an explicit
+/// [page buffer](crate::FileAccessProperties::with_page_buffer_size), because a
+/// page buffer replaces this budget: one smaller than it issues *more* writes
+/// than leaving it unset, so [`set_page_buffer_size`](WriteEngine::set_page_buffer_size)
+/// refuses it.
 const WRITE_GATHER_BYTES: usize = 1 << 20;
 
 /// Page the write gatherer merges within on a file that is not paged.
@@ -1715,15 +1767,94 @@ impl WriteEngine {
     }
 
     /// Set the superblock's consistency flags in the mirror and on disk, then
-    /// flush. Used to raise the SWMR-write flag on open and clear it on close.
-    /// Requires a base-0, version-2/3 file (checked by `open_swmr_writer`), since
-    /// [`Superblock::serialize`] emits the v2/v3 layout at the base address.
+    /// flush. The one place this crate writes that byte: the SWMR-write flag on
+    /// open and off on close, and the page buffer's crash mark
+    /// ([`raise_crash_mark`](Self::raise_crash_mark)).
+    ///
+    /// Requires a version-2/3 superblock, since [`Superblock::serialize`] emits
+    /// that layout; `open_swmr_writer` and
+    /// [`set_page_buffer_size`](Self::set_page_buffer_size) each check it.
+    ///
+    /// The root address is stored on disk *relative to the base address* while
+    /// the session holds it absolute (see the normalization in `open_imaged`),
+    /// so the serialized clone converts it back — as the commit tail does at the
+    /// only other place this crate serializes a superblock.
+    ///
+    /// No caller reaches a non-zero base today and no test covers the
+    /// conversion: `open_swmr_writer` refuses a userblock outright, and a *paged*
+    /// userblock file — the one shape a page buffer could otherwise arrive on —
+    /// is refused read-write before this, because persisted free space is
+    /// declined for a non-zero base and a paged file without it cannot be edited.
+    /// It is written this way so the site is correct by construction rather than
+    /// by that coincidence: without it, writing the absolute address here would
+    /// repoint the root past the end of the file while claiming only to have
+    /// touched a flag.
     pub(crate) fn set_consistency_flags(&mut self, flags: u32) -> Result<(), Error> {
         self.superblock.consistency_flags = flags;
-        let bytes = self.superblock.serialize();
+        self.held_status_flags = flags;
+        let mut on_disk = self.superblock.clone();
+        // Exact, not saturating: `open_imaged` built the in-memory address by
+        // adding the base to the stored one, so it is never below it.
+        debug_assert!(
+            on_disk.root_group_address >= on_disk.base_address,
+            "the root address is held absolute, so it cannot be below the base"
+        );
+        on_disk.root_group_address -= on_disk.base_address;
+        let bytes = on_disk.serialize();
         self.write_at(self.sb_sig_off, &bytes)?;
         self.barrier_data()?;
         Ok(())
+    }
+
+    /// Raise the page buffer's crash mark: superblock status-flag bit 0
+    /// (`H5F_SUPER_WRITE_ACCESS`), the byte the C library raises for any writer
+    /// and this crate otherwise raises only for a SWMR one.
+    ///
+    /// It is what makes a write-back page buffer safe to offer. Holding dirty
+    /// pages across the engine's ordering barriers issues every publish point
+    /// ahead of the content it names, so a process that dies mid-flush can leave
+    /// a file that reads **clean** and returns fill values or a deleted object's
+    /// bytes. With the mark standing, that file is not read at all: this crate's
+    /// [`check_status_flags`](crate::file_lock::check_status_flags) refuses it,
+    /// and so do `H5Fopen` and h5py. A silent wrong answer becomes a refusal
+    /// naming [`File::clear_swmr_flag`](crate::File::clear_swmr_flag), the
+    /// `h5clear -s` equivalent, as the way to look at it anyway.
+    ///
+    /// Two properties are load-bearing and neither is the policy's to skip:
+    ///
+    /// - It is written **before** the buffering mode changes, so no buffered
+    ///   write can reach the disk ahead of it.
+    /// - It is **fsynced**, unconditionally, which is the half no test here can
+    ///   see: reaching the operating system already covers a process that dies,
+    ///   and this suite reproduces no power loss, so removing the `sync_all` below
+    ///   fails nothing. It is there because power loss is exactly the case where
+    ///   the buffer's held writes may be partly on the platter while a mark still
+    ///   in the page cache is not. One `fsync` per session buys it.
+    fn raise_crash_mark(&mut self) -> Result<(), Error> {
+        self.set_consistency_flags(file_lock::WRITE_ACCESS)?;
+        self.image.sync_all()
+    }
+
+    /// Clear the mark [`raise_crash_mark`](Self::raise_crash_mark) raised, once
+    /// everything it stood for is durable. A no-op for a session that raised
+    /// none, which is every session that did not ask for a page buffer.
+    ///
+    /// Called from `File::close` and `FileInner::drop`, **after** their
+    /// `force_sync`. The order is the whole point: clearing first and flushing
+    /// second would leave a window in which the file's held writes are still in
+    /// memory and nothing on the disk says so, which is the state the mark
+    /// exists to make unreachable.
+    pub(crate) fn release_crash_mark(&mut self) -> Result<(), Error> {
+        // An exact match, not a bit test: this clears the mark *this* mechanism
+        // raised and nothing else. A SWMR session holds the pair, and its own
+        // teardown takes that down; masking bit 0 out of it here would leave a
+        // half-set byte that `check_status_flags` reports as flags in
+        // disagreement.
+        if self.held_status_flags != file_lock::WRITE_ACCESS {
+            return Ok(());
+        }
+        self.set_consistency_flags(0)?;
+        self.image.sync_all()
     }
 
     /// Shared open path. `lock = Some(policy)` acquires an exclusive OS lock under
@@ -1858,6 +1989,7 @@ impl WriteEngine {
             libver_ceiling: None,
             fsm_len: len,
             repointed: false,
+            held_status_flags: 0,
             sync_policy: SyncPolicy::Always,
         };
         // If the file persists its free space, seed the free list from the
@@ -1896,6 +2028,88 @@ impl WriteEngine {
         self.paged
             .as_ref()
             .map_or(DEFAULT_GATHER_PAGE, |pg| pg.page_size)
+    }
+
+    /// Let this session's writes span operations, up to `max_bytes` of them: the
+    /// `H5Pset_page_buffer_size` analogue, requested through
+    /// [`FileAccessProperties::with_page_buffer_size`](crate::FileAccessProperties::with_page_buffer_size).
+    ///
+    /// Refused on a file that is not paged, and for a budget below the file's
+    /// page size: a page buffer that cannot hold one page flushes on every page
+    /// it touches, and page buffering on an unpaged file has no page boundary to
+    /// align to. The C library reaches the same two conclusions at `H5Fopen` and
+    /// acts on them *silently* — zeroing the budget in the first case, rounding
+    /// up in the second — which is the one part of its behavior not worth
+    /// copying. A zero budget leaves the session's default gathering alone,
+    /// matching the property's own "unset" value.
+    pub(crate) fn set_page_buffer_size(&mut self, max_bytes: usize) -> Result<(), Error> {
+        if max_bytes == 0 {
+            return Ok(());
+        }
+        // A lock-free session's readers observe the order its writes become
+        // visible in. `File::open_swmr_writer` refuses this property before it
+        // raises the on-disk flag, which is the refusal a caller sees; this one is
+        // here because the guarantee belongs to the engine that would break it,
+        // and a SWMR session on a paged file satisfies both checks below.
+        if self.swmr_mode {
+            return Err(Error::EditUnsupported(
+                "a SWMR writer cannot buffer its writes: its readers observe the order they \
+                 become visible in",
+            ));
+        }
+        if self.paged.is_none() {
+            return Err(Error::EditUnsupported(
+                "a page buffer (H5Pset_page_buffer_size) requires a file created with \
+                 with_file_space_strategy(FileSpaceStrategy::Page, ..)",
+            ));
+        }
+        let page_size = self.gather_page_size();
+        if (max_bytes as u64) < page_size {
+            return Err(Error::EditUnsupported(
+                "a page buffer must be at least the file's file-space page size",
+            ));
+        }
+        // A page buffer *replaces* the byte budget the session was already
+        // gathering under, so one smaller than that budget is not a weaker
+        // version of this feature — it is a downgrade on the default, and a
+        // steep one. Measured on a 4 KiB-paged file, one four-megabyte append
+        // cost 37 writes with no page buffer, 60 with a 64 KiB one, and 517 with
+        // a 4 KiB one. The crossover is exactly this constant, so it is the
+        // floor (issue #288).
+        if max_bytes < WRITE_GATHER_BYTES {
+            return Err(Error::EditUnsupported(
+                "a page buffer must be at least the byte budget a session already gathers \
+                 under (1 MiB); a smaller one replaces that budget and issues more writes \
+                 than leaving it unset",
+            ));
+        }
+        // The crash mark below is the whole reason this property is offered at
+        // all, and only a version-3 superblock carries one that anybody reads:
+        // `check_status_flags` is gated there, matching where the C library gates
+        // it. A version-2 paged file is reachable — `LibVer::V18` writes a
+        // version-2 superblock and nothing about paged file space rules it out —
+        // so this is a refusal rather than an assertion (issue #308).
+        if self.superblock.version < 3 {
+            return Err(Error::EditUnsupported(
+                "a page buffer marks the file for the life of the session, so that a session \
+                 that crashes leaves one every reader refuses rather than one that reads \
+                 clean; only a version-3 superblock carries a status-flags byte any library \
+                 reads back, and this file's is older. Rewrite it at the 1.10 format \
+                 (repack, or FileBuilder's default bounds), or drop the page buffer",
+            ));
+        }
+        // Before the mode change, and durable: from here on a write may sit in
+        // memory across a barrier, and the file has to say so on the disk first.
+        //
+        // Nothing can fail between the two and leave the file marked with no
+        // session behind it. `raise_crash_mark` ends in a `sync_all`, which
+        // flushes, so the gatherer is empty when `set_write_buffering` flushes it
+        // again — the one fallible step it takes.
+        self.raise_crash_mark()?;
+        self.image.set_write_buffering(WriteBuffering::Session {
+            page_size,
+            max_bytes,
+        })
     }
 
     /// Read the superblock-extension File Space Info message; if it requests
@@ -2609,12 +2823,13 @@ impl WriteEngine {
     /// the content it names, which is the one order the whole tail is built to
     /// avoid. A write that then fails, or a process that dies mid-flush, would
     /// leave a superblock naming bytes that are not in the file, where before it
-    /// left the previous file intact (issue #288). No buffering mode this engine
-    /// takes holds across one; a mode that did would be trading exactly that
-    /// guarantee, which is why [#308] proposes to pair one with an on-disk mark
-    /// that makes the resulting file refuse to open.
+    /// left the previous file intact (issue #288).
     ///
-    /// [#308]: https://github.com/stephenberry/hdf5-pure/issues/308
+    /// [`WriteBuffering::Session`] — an explicit page buffer — is the deliberate
+    /// exception, and [`ordering_barrier`](crate::image::FileImage::ordering_barrier)
+    /// is what encodes that: it does nothing under that mode, which is precisely
+    /// the guarantee such a caller is trading away. What that caller gets back is
+    /// a file that *says* so — see [`raise_crash_mark`](Self::raise_crash_mark).
     ///
     /// The teardown barrier is deliberately *not* one of these points:
     /// [`File::close`](crate::File::close) and `FileInner::drop` write after the
@@ -4634,11 +4849,14 @@ impl WriteEngine {
             let mut new_sb = self.superblock.clone();
             new_sb.root_group_address = new_root - base;
             new_sb.eof_address = new_eof;
-            // Clear any write/SWMR consistency flag rather than re-emitting one
-            // the source file carried (e.g. left set by a crashed SWMR writer):
-            // this clean commit leaves the file properly closed for the C library
-            // (issue #73). serialize() recomputes the v2/v3 checksum.
-            new_sb.consistency_flags = 0;
+            // Publish the flags this session *raised*, which is none for almost
+            // every session — so a flag the source file arrived carrying (left set
+            // by a crashed SWMR writer, say) is scrubbed and this clean commit
+            // leaves the file properly closed for the C library (issue #73). A
+            // page-buffered session is the exception: its crash mark has to
+            // outlive every commit it makes (issue #308). serialize() recomputes
+            // the v2/v3 checksum.
+            new_sb.consistency_flags = self.held_status_flags;
             let sb_bytes = new_sb.serialize();
             self.write_at(self.sb_sig_off, &sb_bytes)?;
             self.repointed = true;
@@ -4855,9 +5073,9 @@ impl WriteEngine {
         new_sb.root_group_address = new_root;
         new_sb.eof_address = final_eof;
         new_sb.superblock_extension_address = Some(ext_addr);
-        // Clear any leftover write/SWMR consistency flag on a clean commit (see
-        // the non-persisting path above and issue #73).
-        new_sb.consistency_flags = 0;
+        // Publish what this session raised, scrubbing anything the file arrived
+        // carrying (see the non-persisting path above, issue #73 and issue #308).
+        new_sb.consistency_flags = self.held_status_flags;
         let sb_bytes = new_sb.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
         self.repointed = true;
@@ -5047,7 +5265,7 @@ impl WriteEngine {
         new_sb.root_group_address = new_root;
         new_sb.eof_address = final_eof;
         new_sb.superblock_extension_address = Some(ext_addr);
-        new_sb.consistency_flags = 0;
+        new_sb.consistency_flags = self.held_status_flags;
         let sb_bytes = new_sb.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
         self.repointed = true;
@@ -13523,8 +13741,9 @@ mod tests {
             // against 16 paged. A commit rebuilds a group, repoints a root and
             // re-homes the free-space managers, all inside one phase and all into
             // a handful of pages, which is what merging within a barrier is for.
-            // Merging *across* barriers would go further and is issue #308, held
-            // back on what it would cost a crashed session.
+            // Merging *across* barriers goes further and is what an explicit page
+            // buffer does; `a_page_buffer_holds_dirty_pages_across_operations`
+            // measures that.
             assert!(
                 gathered_commit * 3 < straight_commit,
                 "paged={paged}: gathering must cost meaningfully fewer writes for a \
@@ -13590,6 +13809,57 @@ mod tests {
             s.gather_page_size(),
             DEFAULT_GATHER_PAGE,
             "an unpaged file has no page size of its own"
+        );
+    }
+
+    /// A page buffer keeps dirty pages across operations, so a workload that
+    /// touches the same pages again and again pays for them once rather than
+    /// once per operation (issue #288) — and still produces the same file.
+    ///
+    /// This is what the default gathering deliberately does *not* do, so the
+    /// comparison is against that default rather than against no gathering at
+    /// all: what is being measured is the second reduction, not the first.
+    #[test]
+    fn a_page_buffer_holds_dirty_pages_across_operations() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let per_op = dir.path().join("per_op.h5");
+        let buffered = dir.path().join("buffered.h5");
+        gather_fixture(&per_op, 4, true);
+        gather_fixture(&buffered, 4, true);
+
+        let run = |path: &std::path::Path, page_buffer: usize| {
+            let mut s = WriteEngine::open_with_locking(path, FileLocking::Enabled).unwrap();
+            s.set_sync_policy(SyncPolicy::OnClose);
+            if page_buffer != 0 {
+                s.set_page_buffer_size(page_buffer).unwrap();
+            }
+            let (appends, commit) = gather_workload(&mut s);
+            // The teardown `File::close` and `FileInner::drop` perform, in their
+            // order. A bare engine owes it too — it is what takes the crash mark
+            // down — and nothing does it for one: this crate deliberately keeps
+            // teardown writes off `WriteEngine::drop`, so that dropping a probe
+            // session (as the bounded/mirrored dispatch does) writes nothing.
+            // Without it the buffered file ends still marked, and the byte
+            // comparison below is what says so.
+            s.force_sync().unwrap();
+            s.release_crash_mark().unwrap();
+            drop(s);
+            appends + commit
+        };
+        let per_op_writes = run(&per_op, 0);
+        let buffered_writes = run(&buffered, 1 << 20);
+
+        assert!(
+            buffered_writes * 4 < per_op_writes,
+            "a page buffer must cost meaningfully fewer writes than the \
+             per-operation default, but cost {buffered_writes} against {per_op_writes}"
+        );
+        assert_eq!(
+            std::fs::read(&per_op).unwrap(),
+            std::fs::read(&buffered).unwrap(),
+            "a page buffer changed the file it produced"
         );
     }
 
@@ -13671,43 +13941,61 @@ mod tests {
         }
     }
 
-    /// Gathering changes no byte through the **bounded** backing either, which is
-    /// the one `File::open_rw` actually picks for a latest-format file.
+    /// The page buffer produces the same bytes through the **bounded** backing,
+    /// which is the one `File::open_rw` actually picks for a latest-format file.
     ///
     /// The test above drives the whole-file mirror, whose reads come from memory
     /// and so never meet the pending writes at all. The bounded image has no
     /// mirror: every read it serves goes to the disk and is then patched with
     /// whatever is still gathered, so it is the backing where a wrong overlay
     /// silently plans the next edit against bytes that are neither on the disk nor
-    /// in the buffer — and the defect is invisible in a write *count*. Byte
-    /// identity against the same session with the gathering off is the assertion
-    /// a wrong overlay cannot pass.
+    /// in the buffer. Byte identity against the same session without the buffer is
+    /// the assertion a wrong overlay cannot pass.
     #[test]
-    fn gathering_changes_no_byte_through_the_bounded_backing() {
+    fn a_page_buffer_changes_no_byte_through_the_bounded_backing() {
+        use crate::reader::File;
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let run = |name: &str, gathered: bool| {
+        let run = |name: &str, page_buffer: usize| {
             let path = dir.path().join(name);
             gather_fixture(&path, 4, true);
-            let mut engine = open_bounded_session(&path);
-            engine.set_sync_policy(SyncPolicy::OnClose);
-            if !gathered {
-                engine
-                    .image
-                    .set_write_buffering(WriteBuffering::Unbuffered)
+            {
+                let props = crate::FileAccessProperties::new()
+                    .with_sync_policy(SyncPolicy::OnClose)
+                    .with_memory_strategy(MemoryStrategy::Bounded)
+                    .with_page_buffer_size(page_buffer);
+                let file = File::open_rw_with_options(&path, props).unwrap();
+                assert_eq!(
+                    file.edit_backing(),
+                    Some(crate::EditBacking::Bounded),
+                    "{name}: this must exercise the mirrorless backing"
+                );
+                let root = file.root();
+                for round in 0..4u8 {
+                    for t in 0..4 {
+                        let mut ds = file.dataset(&std::format!("t{t}")).unwrap();
+                        ds.append(&[i32::from(round); 64]).unwrap();
+                    }
+                }
+                for t in 0..4 {
+                    root.create_dataset(&std::format!("n{t}"), |b| {
+                        b.with_f64_data(&[2.5f64; 32]).with_shape(&[32]);
+                    })
                     .unwrap();
+                }
+                file.commit().unwrap();
+                root.set_attr("tag", crate::AttrValue::I32(1)).unwrap();
+                file.commit().unwrap();
+                file.close().unwrap();
             }
-            gather_workload(&mut engine);
-            engine.force_sync().unwrap();
-            drop(engine);
             std::fs::read(&path).unwrap()
         };
 
         assert_eq!(
-            run("bounded_straight.h5", false),
-            run("bounded_gathered.h5", true),
-            "gathering changed the file the bounded backing produced"
+            run("bounded_plain.h5", 0),
+            run("bounded_buffered.h5", 1 << 20),
+            "a page buffer changed the file the bounded backing produced"
         );
     }
 

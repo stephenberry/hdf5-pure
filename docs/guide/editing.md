@@ -344,6 +344,59 @@ A session appending one chunk to each of eight datasets, four times over, issued
 
 There is no setting for this and nothing to opt into. The one session that does *not* gather is the [SWMR](swmr.md) writer, whose readers follow its ordered phases as they become visible; coalescing those would not make a smaller file, it would let a reader see a state the phases exist to hide.
 
+### Letting pages live longer
+
+Under the default, a page dirtied on either side of a barrier is written twice. `H5Pset_page_buffer_size`'s analogue lifts that:
+
+```rust
+use hdf5_pure::{File, FileAccessProperties, SyncPolicy};
+
+let file = File::open_rw_with_options(
+    "ring.h5",
+    FileAccessProperties::new()
+        .with_sync_policy(SyncPolicy::OnClose)
+        .with_page_buffer_size(4 << 20),
+).unwrap();
+```
+
+Dirty pages then survive across barriers, commits and appends until the budget is spent, an `fsync` is issued, or the session closes. On that same session, that takes the 160 down to 10.
+
+Five things are required, each refused rather than quietly ignored:
+
+- **A paged file** created with `FileSpaceStrategy::Page`, and a budget of at least that file's page size.
+- **A budget of at least 1 MiB**, which is what a session already gathers between barriers. A smaller page buffer *replaces* that budget rather than extending it, and issues more writes than leaving the property unset: measured on a 4 KiB-paged file, one 4 MiB append cost 37 writes unset, 60 with a 64 KiB buffer, and 517 with a 4 KiB one.
+- **A version-3 superblock**, because the session marks the file while it holds it and nothing reads that byte back on an older one. See below.
+- **`SyncPolicy::OnClose`.** Under the default `Always` every barrier is an `fsync` that flushes the buffer, so it would hold nothing while still costing the mark.
+- **A session long enough to pay for the mark.** See below.
+
+`File::create_with_options` refuses a creation/access pair it could not reopen with, rather than writing the file first, and the SWMR writer refuses a page buffer outright: its readers observe the order its writes become visible in, which is exactly what a buffer coalesces away. The first two refusals are deliberately *stricter* than the C library on the path that matters — `H5Pset_page_buffer_size` refuses them at `H5Fcreate`, but at `H5Fopen` it silently zeroes the budget on an unpaged file and rounds a sub-page budget up.
+
+### What a page buffer trades, and what pays for it
+
+Gathered writes go out in address order, and every publish point sits below the content it reaches: a commit's superblock and root at address 0, an append's dataspace dimension and chunk-index element count in the object header near the front, the chunk bytes and index blocks they name at end-of-file. Held across their barriers, all of them are issued first. A write that fails, or a process that dies, mid-flush can therefore leave:
+
+- a root or an end-of-file naming bytes that never arrived — a file that fails to read, which is the benign case;
+- a dataset whose length was published but whose rows were not, which reads back **clean**, as fill values;
+- a dataset header published over a region an earlier commit freed, which reads back **clean**, as the deleted object's data.
+
+The last two are silent: every checksum verifies and a reader has no signal. This is what a write-back page buffer *is* rather than a fault in this one — `H5Pset_page_buffer_size` reorders the same way and makes no crash-consistency claim either — but the guarantee being switched off is one this crate adds on top of HDF5, not one an HDF5 user arrives expecting.
+
+So a page-buffered session **marks the file for its lifetime**: superblock status-flag bit 0, `H5F_SUPER_WRITE_ACCESS`, the byte the reference C library raises for any writer and this crate otherwise raises only for a SWMR one. It is written and `fsync`ed at open, republished by every commit, and cleared on a clean `close` or drop. A session that dies with pages in memory leaves it standing, and a file carrying it is refused by this crate, by `H5Fopen` and by h5py alike with `Error::FileMarkedInUse`. The silent wrong answer becomes a refusal; `File::clear_swmr_flag` (the `h5clear -s` equivalent) is how to look at such a file anyway, knowing what it may hold.
+
+### When it is worth it
+
+The mark costs two `fsync`s per session, at open and at close, whatever the session then does — so a page buffer pays off over a long session and costs on a short one. Measured on an Apple M1 Max (APFS), 256-byte appends into eight datasets:
+
+| appends | default | page buffer | ratio |
+|---:|---:|---:|---:|
+| 400 | 15.5 ms | 24.6 ms | 0.63 |
+| 800 | 28.8 ms | 29.2 ms | 0.99 |
+| 1,600 | 50.2 ms | 40.0 ms | 1.25 |
+| 3,200 | 92.5 ms | 59.2 ms | 1.56 |
+| 6,400 | 200.9 ms | 122.7 ms | 1.64 |
+
+Break-even is near 800 appends here, and the ratio climbs past it because the same pages are re-dirtied more often the longer the session runs. It narrows to about 1.15 once 64 KiB payloads rather than metadata churn dominate. Both figures are one host's: `cargo bench --bench hot_paths -- page_buffer` runs both sides of the crossing on yours.
+
 ## Supported targets and formats
 
 Contiguous and chunked datasets (with any filter the whole-file writer supports) and compact-link groups are supported. The editor works across every on-disk format the reference HDF5 C library and h5py produce:

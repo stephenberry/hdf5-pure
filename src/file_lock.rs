@@ -15,6 +15,12 @@
 //!   can reset it, so a crash freezes it set. Recover it with
 //!   [`crate::File::clear_swmr_flag`] (the `h5clear -s` equivalent).
 //!
+//! A crash freezing the byte set is what makes it useful beyond SWMR: a session
+//! given a page buffer ([`crate::FileAccessProperties::with_page_buffer_size`])
+//! raises [`WRITE_ACCESS`] for its lifetime, so a writer that dies with pages
+//! still in memory leaves a file this crate, `H5Fopen` and h5py all refuse
+//! rather than one that reads clean and returns the wrong bytes (issue #308).
+//!
 //! Both are enforced here: [`acquire_exclusive`] takes the lock, and
 //! [`check_status_flags`] refuses an open the on-disk byte says is unsafe
 //! (issue #245). The two cover different windows — the lock catches a live
@@ -145,8 +151,18 @@ pub(crate) fn acquire_exclusive(
 
 /// Superblock status-flag bit 0 (`H5F_SUPER_WRITE_ACCESS`): the file is open
 /// for write access. The reference C library raises it for *any* writer; this
-/// crate raises it only in [`crate::File::open_swmr_writer`], alongside
-/// [`SWMR_WRITE_ACCESS`].
+/// crate raises it for two:
+///
+/// - [`crate::File::open_swmr_writer`], alongside [`SWMR_WRITE_ACCESS`];
+/// - a session given a page buffer
+///   ([`crate::FileAccessProperties::with_page_buffer_size`]), which raises this
+///   bit alone. That session holds dirty pages across the write engine's
+///   ordering barriers, so a process that died mid-flush could leave a file that
+///   reads clean and returns the wrong bytes; the mark makes it a file every
+///   reader refuses instead (issue #308).
+///
+/// An ordinary [`crate::File::open_rw`] session raises nothing, and is guarded by
+/// the OS lock alone.
 pub(crate) const WRITE_ACCESS: u32 = 0x01;
 
 /// Superblock status-flag bit 2 (`H5F_SUPER_SWMR_WRITE_ACCESS`): the writer
@@ -195,9 +211,11 @@ pub(crate) enum OpenIntent {
 /// C library raises the write bit on a version-0/1/2 file too and never reads
 /// it back, so checking those versions would refuse files `H5Fopen` accepts —
 /// every file left behind by a crashed C writer that predates SWMR. Nothing is
-/// lost by matching it: SWMR writing requires a version-3 superblock in both
-/// libraries (see [`crate::File::open_swmr_writer`]), so no flag this crate
-/// raises falls outside the gate.
+/// lost by matching it: both paths that raise a flag here require a version-3
+/// superblock — SWMR writing because both libraries do (see
+/// [`crate::File::open_swmr_writer`]), and a page buffer because it refuses to
+/// buffer behind a mark no reader would honor — so no flag this crate raises
+/// falls outside the gate.
 pub(crate) fn check_status_flags(
     superblock: &Superblock,
     intent: OpenIntent,
@@ -237,10 +255,16 @@ pub(crate) fn check_status_flags(
     )))
 }
 
-/// Clear a stale SWMR-write flag left in `path` by a writer that exited without a
+/// Clear a stale status flag left in `path` by a writer that exited without a
 /// clean close — the `h5clear -s` equivalent, behind
 /// [`File::clear_swmr_flag`](crate::File::clear_swmr_flag). Safe to call on a
 /// file whose flag is already clear.
+///
+/// It clears the byte whole, so it recovers a page-buffered session's crash mark
+/// ([`WRITE_ACCESS`]) as well as a SWMR writer's pair. What it recovers is
+/// *access*, not correctness: a page-buffered writer that crashed may have left
+/// the file inconsistent in ways no checksum shows, which is the whole reason
+/// the mark stands. `h5clear` makes the same trade.
 ///
 /// This is the one recovery rewrite that takes the exclusive lock without going
 /// through the editor, which is why it lives beside the locking policy it
