@@ -332,7 +332,7 @@ The default is `SyncPolicy::Always`, which is every guarantee described above th
 
 ## Write gathering
 
-A commit or an in-place append is not one write. A single append issues the chunk's bytes at end-of-file and then patches the chunk index, the array header, the dataspace dimension in the object header, and the superblock's recorded end-of-file — five writes on a measured file, four of them between a few dozen and a couple of hundred bytes, landing in a handful of pages that the *next* append patches again. Issued one at a time, those four are four syscalls and four page dirtyings for a few hundred bytes of bookkeeping, and on flash a page dirtied four times is written four times. (The first append into a dataset costs eight, since it builds the index block the rest go on to patch.)
+A commit or an in-place append is not one write. A single append writes the chunk's bytes at end-of-file and the superblock's recorded end-of-file, then patches the chunk index, the array header, and the dataspace dimension in the object header — five writes on a measured file, four of them a few dozen to a hundred-odd bytes, landing in a handful of pages that the *next* append patches again. Issued one at a time, that is four syscalls and four page dirtyings for a few hundred bytes of bookkeeping, and on flash a page dirtied four times is written four times. (An append that has to allocate a new extensible-array data block costs eight, which the first append into a dataset always does.)
 
 Every read-write session therefore gathers its writes and emits **one write per dirty page**. The bytes it holds are released at every *ordering barrier* — the points the commit and append sequences already define, where writes made before must reach the disk before writes made after — so:
 
@@ -340,11 +340,9 @@ Every read-write session therefore gathers its writes and emits **one write per 
 - nothing about crash safety changes: the barriers keep their ordering meaning under both policies, so a write that fails still leaves the file in the state it had before the operation;
 - nothing about the resulting file changes — the bytes are identical either way.
 
-How much that saves depends on how much of an operation falls inside one barrier interval, and a session's two halves differ sharply. Measured on a paged file, a session appending one chunk to each of eight datasets, four times over, and then committing eight staged dataset creations: the appends make 184 write calls and issue 184, the commit makes 24 and issues 4.
+How much that saves depends on how much of an operation falls between two barriers. Measured on a paged file, a session appending one chunk to each of eight datasets, four times over, and then committing eight staged dataset creations: the appends issue all 184 of the write calls they make, while the commit's 24 go out as 4. An append's writes are separated by the barriers its own ordering needs, so there is almost nothing left to merge — four of the five land in two pages, two apiece, and all five still go out separately. A commit's tail puts many writes into a handful of pages as it rebuilds a group, repoints a root and re-homes the free-space managers, which is what merging within a barrier is for.
 
-An append's writes are separated by the barriers its ordering needs — two of the five land in one page here and still go out separately — so there is almost nothing left to merge. A commit's tail rebuilds a group, repoints a root and re-homes the free-space managers inside a single interval and a handful of pages, which is what merging within a barrier is for. Merging *across* barriers is what [the next section](#letting-pages-live-longer) adds.
-
-There is no setting for this and nothing to opt into. The one session that does *not* gather is the [SWMR](swmr.md) writer, whose readers follow its ordered phases as they become visible; coalescing those would not make a smaller file, it would let a reader see a state the phases exist to hide.
+There is no setting for the gathering and nothing to opt into; merging *across* barriers is what [the next section](#letting-pages-live-longer) adds. The one session that does *not* gather is the [SWMR](swmr.md) writer, whose readers follow its ordered phases as they become visible; coalescing those would not make a smaller file, it would let a reader see a state the phases exist to hide.
 
 ### Letting pages live longer
 
@@ -361,7 +359,7 @@ let file = File::open_rw_with_options(
 ).unwrap();
 ```
 
-Dirty pages then survive across barriers, commits and appends until the budget is spent, an `fsync` is issued, or the session closes. Measured on a paged file, 32 chunk appends into eight datasets followed by a commit: **188 writes with the default gathering, 4 with a page buffer** — two of which are the mark below going up and coming down. The appends issue nothing at all until the session ends.
+Dirty pages then survive across barriers, commits and appends until the budget is spent, an `fsync` is issued, or the session closes. Measured on a paged file, 32 chunk appends into eight datasets followed by a commit: **188 writes with the default gathering, 5 with a page buffer** — two of which are the mark below going up and coming down. The appends issue nothing at all until the session ends.
 
 Six things are required, each refused rather than quietly ignored:
 

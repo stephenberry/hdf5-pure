@@ -14237,13 +14237,6 @@ mod tests {
     /// The comparison is against this same engine with the gathering turned off,
     /// rather than against a recorded number: how many writes a commit needs is
     /// an implementation detail that should be free to fall further.
-    ///
-    /// The figures recorded in the comments below are also quoted in prose this
-    /// test does not check, at twice the datasets: `docs/guide/editing.md` and
-    /// `PendingWrites`'s own documentation both describe this workload at eight,
-    /// where the appends make 184 write calls and issue 184 while the commit
-    /// makes 24 and issues 4. A change that moves the numbers here moves those
-    /// too (issue #346).
     #[test]
     fn gathering_writes_costs_fewer_of_them_and_changes_no_byte() {
         use tempfile::tempdir;
@@ -14768,9 +14761,11 @@ mod tests {
     /// writer is the regime where it still shows: it gathers nothing by design,
     /// so every write the engine makes is a syscall. Stated as a ceiling on the
     /// count rather than as an exact figure, since what an append needs is free to
-    /// fall — and it has: 12 before issue #307 published each checksummed
-    /// structure in one write, 8 after. Six statistics written singly puts it five
-    /// over; a checksum written apart from the value it covers, four.
+    /// fall — and it has: for the append this measures, the first into a dataset,
+    /// 12 before issue #307 published each checksummed structure in one write and
+    /// 8 after; an append that reuses the data block that one allocates costs 5.
+    /// Six statistics written singly puts it five over; a checksum written apart
+    /// from the value it covers, four.
     #[test]
     fn an_unbuffered_append_costs_a_small_constant_number_of_writes() {
         use tempfile::tempdir;

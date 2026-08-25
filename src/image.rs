@@ -360,23 +360,21 @@ pub(crate) trait FileImage: Source + Send + Sync {
 /// # What it gathers
 ///
 /// A commit or an in-place append issues many small writes into a few pages. One
-/// measured in-place append costs five write calls: the chunk at end-of-file, and
-/// a patch each to the chunk index, the array header, the object header's
-/// dataspace dimension and the superblock's recorded end-of-file, those four
-/// running from a few dozen to a couple of hundred bytes and landing in pages the
-/// *next* append dirties again. The first append into a dataset costs eight,
-/// since it builds the index block the rest go on to patch.
+/// measured in-place append costs five write calls — the chunk at end-of-file,
+/// the superblock's recorded end-of-file, and a patch each to the chunk index,
+/// the array header and the object header's dataspace dimension — so four small
+/// patches around one payload write, landing in pages the *next* append dirties
+/// again. An append that has to allocate a new extensible-array data block costs
+/// eight, which the first append into a dataset always does.
 ///
-/// How much of that merges is bounded by the ordering barriers, since a barrier
-/// is where held bytes are released, and an append puts one between the phases
-/// that have to reach the disk in order — enough of them that little merges:
-/// measured on a paged fixture, two of those five writes land in one page and
-/// still go out separately. So a session appending one chunk to each of eight
-/// such datasets, four times over, makes 184 write calls and issues 184; on the
-/// appends, gathered and ungathered are a near-tie. What the gathering collects
-/// is the commit tail, which is one barrier interval: the commit staging eight
-/// dataset creations after those appends makes 24 write calls and issues 4
-/// (issue #288).
+/// A barrier is where held bytes are released, and an append puts one between
+/// each pair of phases that must reach the disk in order, so on the appends there
+/// is little left to merge: measured on a paged fixture, four of those five
+/// writes fall in two pages, two apiece, and all five still go out separately.
+/// What the gathering collects is the commit tail, which puts many writes into a
+/// handful of pages as it rebuilds a group, repoints a root and re-homes the
+/// free-space managers: a commit staging eight dataset creations makes 24 write
+/// calls and issues 4 (issue #288).
 ///
 /// Pending writes are held as disjoint byte runs, merged on insert when they
 /// touch or overlap, and emitted at flush as **one write per dirty page**: runs

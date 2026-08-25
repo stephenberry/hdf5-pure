@@ -268,7 +268,7 @@ impl FileAccessProperties {
     /// buys on top is letting a dirty page survive those barriers, which is where
     /// a workload of many small appends into a few pages does most of its
     /// repeating. Measured on a paged file, 32 chunk appends into eight datasets
-    /// followed by a commit: **188 writes with the default gathering and 4 with a
+    /// followed by a commit: **188 writes with the default gathering and 5 with a
     /// page buffer**, of which two are the mark below going up and coming down.
     /// The appends issue nothing at all until the session ends.
     ///
