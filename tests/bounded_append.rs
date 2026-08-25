@@ -461,6 +461,60 @@ fn metadata_cache_stays_coherent_across_appends() {
     assert_eq!(fresh.shape().unwrap(), vec![6]);
 }
 
+/// The coherence above is kept by dropping cached windows an append overwrites.
+/// That is the one thing a read-only budget never does, and the figure that
+/// tells a caller a larger budget will not help this workload (issue #353).
+#[test]
+fn appends_report_the_cached_windows_they_invalidate() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("mdc_invalidations.h5");
+    build(&p, 4, 4, false);
+    let properties = FileAccessProperties::new()
+        .with_memory_strategy(MemoryStrategy::Bounded)
+        .with_sync_policy(SyncPolicy::OnClose)
+        .with_metadata_cache(MetadataCacheConfig::new(256 * 1024));
+    let file = File::open_rw_with_options(&p, properties).unwrap();
+    let mut ds = file.dataset("d").unwrap();
+
+    assert_eq!(ds.read_i32().unwrap(), vec![0, 1, 2, 3]);
+    let primed = file
+        .metadata_cache_stats()
+        .expect("a bounded session with a budget has a cache");
+    assert!(primed.entries() > 0, "the read filled it: {primed:?}");
+    assert_eq!(primed.invalidations(), 0, "nothing written yet");
+
+    ds.append(&[4i32, 5]).unwrap();
+
+    let after = file.metadata_cache_stats().unwrap();
+    assert!(
+        after.invalidations() > 0,
+        "the append patched the dataspace under a cached window: {after:?}"
+    );
+    assert_eq!(ds.read_i32().unwrap(), (0..6).collect::<Vec<_>>());
+}
+
+/// A mirrored session holds the whole file, so there is no metadata cache in
+/// front of it whatever the budget says.
+#[test]
+fn a_mirrored_session_reports_no_metadata_cache() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("mdc_mirrored.h5");
+    build(&p, 4, 4, false);
+    let file = File::open_rw_with_options(
+        &p,
+        FileAccessProperties::new()
+            .with_memory_strategy(MemoryStrategy::Mirrored)
+            .with_sync_policy(SyncPolicy::OnClose)
+            .with_metadata_cache(MetadataCacheConfig::new(256 * 1024)),
+    )
+    .unwrap();
+    assert_eq!(
+        file.dataset("d").unwrap().read_i32().unwrap(),
+        vec![0, 1, 2, 3]
+    );
+    assert_eq!(file.metadata_cache_stats(), None);
+}
+
 #[test]
 fn reads_match_streaming_capabilities() {
     let dir = tempdir().unwrap();

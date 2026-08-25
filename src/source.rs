@@ -149,6 +149,123 @@ impl Default for MetadataCacheConfig {
     }
 }
 
+/// What a file's metadata cache has done, and what it is holding.
+///
+/// Returned by [`crate::File::metadata_cache_stats`]. This is the `hdf5-pure`
+/// counterpart to HDF5's `H5Fget_mdc_hit_rate` and `H5Fget_mdc_size`:
+/// [`entries`](Self::entries) and [`bytes`](Self::bytes) are a point-in-time
+/// view of occupancy, and the counters are cumulative since the file was
+/// opened or since the last
+/// [`reset_metadata_cache_stats`](crate::File::reset_metadata_cache_stats).
+///
+/// The reason to look is that [`MetadataCacheConfig`] is a budget chosen before
+/// a single read has happened, and nothing else reports whether it was the
+/// right one:
+///
+/// - [`hit_rate`](Self::hit_rate) says whether the cache is earning its memory.
+/// - [`evictions`](Self::evictions) says whether the budget is the binding
+///   constraint. A hit rate below expectations with no evictions is not a
+///   budget problem, and raising it will not help.
+/// - [`oversize_reads`](Self::oversize_reads) says whether
+///   [`max_entry_bytes`](MetadataCacheConfig::max_entry_bytes) is turning reads
+///   away before they reach the cache at all.
+/// - [`invalidations`](Self::invalidations) says how much of the cache a
+///   read-write session is throwing away with its own writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MetadataCacheStats {
+    hits: u64,
+    misses: u64,
+    oversize_reads: u64,
+    evictions: u64,
+    invalidations: u64,
+    entries: usize,
+    bytes: usize,
+}
+
+impl MetadataCacheStats {
+    /// Metadata reads served from the cache.
+    pub const fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Metadata reads eligible for the cache that were not in it.
+    pub const fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// Metadata reads that bypassed the cache because they exceed
+    /// [`MetadataCacheConfig::max_entry_bytes`] (or the whole budget).
+    ///
+    /// These are counted apart from [`misses`](Self::misses) rather than folded
+    /// into them: the cache was never offered the read, so charging it as a miss
+    /// would report a failure at work it could not have done. They still show up
+    /// in [`reads`](Self::reads).
+    pub const fn oversize_reads(&self) -> u64 {
+        self.oversize_reads
+    }
+
+    /// Entries dropped to stay inside [`MetadataCacheConfig::max_bytes`].
+    pub const fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// Entries dropped because an in-place write overlapped them.
+    ///
+    /// Only a read-write session invalidates; this stays zero on a read-only
+    /// open. Invalidations approaching [`misses`](Self::misses) mean the session
+    /// is rewriting the metadata it is caching, and a larger budget will not
+    /// change that.
+    pub const fn invalidations(&self) -> u64 {
+        self.invalidations
+    }
+
+    /// Entries currently held.
+    ///
+    /// Against [`bytes`](Self::bytes) this is the mean entry size, which is what
+    /// says whether a few large reads are spending the budget; pair it with
+    /// [`oversize_reads`](Self::oversize_reads) to see the ones already refused.
+    pub const fn entries(&self) -> usize {
+        self.entries
+    }
+
+    /// Bytes currently held, to compare against
+    /// [`MetadataCacheConfig::max_bytes`].
+    pub const fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Every metadata read through this source: hits, misses, and reads too
+    /// large to admit.
+    ///
+    /// The last of those three is not in [`hit_rate`](Self::hit_rate)'s
+    /// denominator, so `hits() / reads()` is a different figure and a lower one.
+    pub const fn reads(&self) -> u64 {
+        self.hits
+            .saturating_add(self.misses)
+            .saturating_add(self.oversize_reads)
+    }
+
+    /// The fraction of *eligible* metadata reads served from the cache, or
+    /// `None` before any eligible read has happened.
+    ///
+    /// `None` rather than C's `0.0`, which `H5Fget_mdc_hit_rate` also returns
+    /// for a cache that has missed every access: the two mean opposite things to
+    /// a caller deciding whether to raise the budget, and only one of them is a
+    /// reason to.
+    pub fn hit_rate(&self) -> Option<f64> {
+        let eligible = self.hits.saturating_add(self.misses);
+        if eligible == 0 {
+            return None;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a hit rate is a ratio; f64 holds these counts exactly far past any \
+                      read count a process will reach"
+        )]
+        Some(self.hits as f64 / eligible as f64)
+    }
+}
+
 /// A random-access, read-only source of the bytes of an HDF5 file.
 ///
 /// Offsets are `u64` (HDF5's native address width); lengths of individual reads
@@ -214,6 +331,29 @@ pub trait Source {
     fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
         self.read_exact_at(offset, len)
     }
+
+    /// What the metadata cache in front of this source has done, or `None` when
+    /// it has none.
+    ///
+    /// The observation half of [`read_metadata_at`](Self::read_metadata_at):
+    /// that method exists so an implementation *may* cache a metadata read, and
+    /// this one reports whether doing so paid. The default is `None`, since most
+    /// sources cache nothing.
+    ///
+    /// A wrapper that forwards `read_metadata_at` to an inner source must
+    /// forward this too. Leaving it defaulted would have it report *no* cache
+    /// where there is a full one, which reads as "caching is off" rather than as
+    /// the missing forward it is.
+    fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
+        None
+    }
+
+    /// Zero that cache's cumulative counters, leaving its contents alone.
+    ///
+    /// The counterpart of HDF5's `H5Freset_mdc_hit_rate_stats`, for measuring
+    /// one phase of a program rather than a whole run. A no-op where there is no
+    /// cache, and it evicts nothing: occupancy is not a counter.
+    fn reset_metadata_cache_stats(&self) {}
 }
 
 // Forward `Source` through references and boxes so `&S`, `&dyn Source`,
@@ -233,6 +373,14 @@ impl<S: Source + ?Sized> Source for &S {
     fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
         (**self).read_metadata_at(offset, len)
     }
+
+    fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
+        (**self).metadata_cache_stats()
+    }
+
+    fn reset_metadata_cache_stats(&self) {
+        (**self).reset_metadata_cache_stats();
+    }
 }
 
 #[cfg(feature = "std")]
@@ -250,6 +398,14 @@ impl<S: Source + ?Sized> Source for std::boxed::Box<S> {
 
     fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
         (**self).read_metadata_at(offset, len)
+    }
+
+    fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
+        (**self).metadata_cache_stats()
+    }
+
+    fn reset_metadata_cache_stats(&self) {
+        (**self).reset_metadata_cache_stats();
     }
 }
 
@@ -315,6 +471,16 @@ impl<S: Source + ?Sized> Source for BaseOffsetSource<'_, S> {
                 length: len as u64,
             })?;
         self.inner.read_metadata_at(abs, len)
+    }
+
+    // The metadata reads above are the inner source's, so its cache is the one
+    // to report on. A base-relative view holds none of its own.
+    fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
+        self.inner.metadata_cache_stats()
+    }
+
+    fn reset_metadata_cache_stats(&self) {
+        self.inner.reset_metadata_cache_stats();
     }
 }
 
@@ -406,6 +572,12 @@ pub(crate) struct MetadataReadCache {
     /// offset an entry that overlaps it can start. It only grows, so the window
     /// it gives can be wider than needed but never too narrow.
     longest_entry: usize,
+    /// Cumulative counters, reported as [`MetadataCacheStats`].
+    hits: u64,
+    misses: u64,
+    oversize_reads: u64,
+    evictions: u64,
+    invalidations: u64,
 }
 
 #[cfg(feature = "std")]
@@ -417,7 +589,79 @@ impl MetadataReadCache {
             current_bytes: 0,
             tick: 0,
             longest_entry: 0,
+            hits: 0,
+            misses: 0,
+            oversize_reads: 0,
+            evictions: 0,
+            invalidations: 0,
         }
+    }
+
+    /// Take the cache's lock, treating a poisoned one as held rather than
+    /// panicking: a cache is a performance aid, and a reader that panicked
+    /// elsewhere leaves no invariant here for a later caller to trip over.
+    pub(crate) fn locked(lock: &std::sync::Mutex<Self>) -> std::sync::MutexGuard<'_, Self> {
+        lock.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Serve one [`Source::read_metadata_at`] through the cache behind `lock`,
+    /// falling back to `read` and recording what happened.
+    ///
+    /// Both call sites that have a metadata cache — [`MetadataCachingSource`]
+    /// and `crate::image::HandleImage` — go through here rather than each
+    /// repeating the admission rule and its five counters; they differ only in
+    /// what `read` does, which is why it is a closure.
+    ///
+    /// The lock is taken up to twice and never held across `read`. A metadata
+    /// read is file I/O, and serializing every one of them behind this mutex
+    /// would cost more than the cache saves.
+    pub(crate) fn read_through(
+        lock: &std::sync::Mutex<Self>,
+        config: MetadataCacheConfig,
+        offset: u64,
+        len: usize,
+        read: impl FnOnce() -> Result<Vec<u8>, FormatError>,
+    ) -> Result<Vec<u8>, FormatError> {
+        // A zero-length read is not a read of anything, and a disabled cache has
+        // no counters worth keeping; neither is worth a lock.
+        if len == 0 || !config.is_enabled() {
+            return read();
+        }
+        if len > config.max_entry_bytes() || len > config.max_bytes() {
+            Self::locked(lock).oversize_reads += 1;
+            return read();
+        }
+        if let Some(bytes) = Self::locked(lock).get(offset, len) {
+            return Ok(bytes);
+        }
+        let bytes = read()?;
+        Self::locked(lock).insert(offset, len, bytes.clone(), config.max_bytes());
+        Ok(bytes)
+    }
+
+    /// Snapshot the counters and the current occupancy.
+    pub(crate) fn stats(&self) -> MetadataCacheStats {
+        MetadataCacheStats {
+            hits: self.hits,
+            misses: self.misses,
+            oversize_reads: self.oversize_reads,
+            evictions: self.evictions,
+            invalidations: self.invalidations,
+            entries: self.entries.len(),
+            bytes: self.current_bytes,
+        }
+    }
+
+    /// Zero the counters, keeping every entry. Occupancy is a measurement of the
+    /// cache's contents rather than a tally of its history, so resetting the
+    /// history must not disturb it.
+    pub(crate) fn reset_stats(&mut self) {
+        self.hits = 0;
+        self.misses = 0;
+        self.oversize_reads = 0;
+        self.evictions = 0;
+        self.invalidations = 0;
     }
 
     /// Drop one entry and its access row together, keeping the two maps and the
@@ -457,6 +701,7 @@ impl MetadataReadCache {
             })
             .map(|(key, _)| *key)
             .collect();
+        self.invalidations += doomed.len() as u64;
         for key in doomed {
             self.remove(key);
         }
@@ -468,11 +713,15 @@ impl MetadataReadCache {
         // run. The counter formerly wrapped, which would have inverted the very
         // ordering it exists to record.
         let tick = self.tick + 1;
-        let entry = self.entries.get_mut(&key)?;
+        let Some(entry) = self.entries.get_mut(&key) else {
+            self.misses += 1;
+            return None;
+        };
         let previous = core::mem::replace(&mut entry.last_access, tick);
         let bytes = entry.bytes.clone();
-        // Only past the `?` is this a hit, so only here does the clock move.
+        // Only past the lookup is this a hit, so only here does the clock move.
         self.tick = tick;
+        self.hits += 1;
         self.by_access.remove(&previous);
         self.by_access.insert(tick, key);
         Some(bytes)
@@ -513,6 +762,10 @@ impl MetadataReadCache {
             let Some((_, &key)) = self.by_access.first_key_value() else {
                 break;
             };
+            // Counted here rather than in `remove`, which also serves
+            // invalidation and replacement. Only a drop the *budget* forced is
+            // an eviction, and that is the one that says to raise it.
+            self.evictions += 1;
             self.remove(key);
         }
     }
@@ -557,29 +810,21 @@ impl<S: Source> Source for MetadataCachingSource<S> {
     }
 
     fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
-        if !self.config.is_enabled()
-            || len == 0
-            || len > self.config.max_entry_bytes
-            || len > self.config.max_bytes
-        {
-            return self.inner.read_metadata_at(offset, len);
-        }
+        MetadataReadCache::read_through(&self.cache, self.config, offset, len, || {
+            self.inner.read_metadata_at(offset, len)
+        })
+    }
 
-        if let Some(bytes) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(offset, len)
-        {
-            return Ok(bytes);
-        }
+    /// `None` when the configuration disabled the cache, which is what the
+    /// wrapper being present but inert means to a caller.
+    fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
+        self.config
+            .is_enabled()
+            .then(|| MetadataReadCache::locked(&self.cache).stats())
+    }
 
-        let bytes = self.inner.read_metadata_at(offset, len)?;
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(offset, len, bytes.clone(), self.config.max_bytes);
-        Ok(bytes)
+    fn reset_metadata_cache_stats(&self) {
+        MetadataReadCache::locked(&self.cache).reset_stats();
     }
 }
 
@@ -993,6 +1238,190 @@ mod tests {
             "a hit cost {large:.0} ns with {LARGE} entries against {small:.0} ns with \
              {SMALL} -- growing the cache should not move it, and a cost that tracks \
              its size is the shape of a store being searched rather than indexed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // What the cache reports about itself (issue #353)
+    // -----------------------------------------------------------------------
+
+    /// A source of `len` bytes that serves every metadata read, so a cache in
+    /// front of it is the only thing that can make a read not happen.
+    #[cfg(feature = "std")]
+    fn ramp(len: usize) -> BytesSource<Vec<u8>> {
+        BytesSource::new((0..len).map(|i| i as u8).collect::<Vec<u8>>())
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_read_too_large_to_admit_is_not_charged_as_a_miss() {
+        // 64-byte entries are eligible; anything above that is turned away
+        // before it reaches the cache.
+        let config = MetadataCacheConfig::new(4096).with_max_entry_bytes(64);
+        let source = MetadataCachingSource::new(ramp(4096), config);
+
+        source.read_metadata_at(0, 64).unwrap(); // miss, then admitted
+        source.read_metadata_at(0, 64).unwrap(); // hit
+        source.read_metadata_at(128, 256).unwrap(); // too large to admit
+        source.read_metadata_at(128, 256).unwrap(); // and so, still too large
+
+        let stats = source.metadata_cache_stats().unwrap();
+        assert_eq!(stats.hits(), 1);
+        assert_eq!(stats.misses(), 1);
+        assert_eq!(stats.oversize_reads(), 2);
+        assert_eq!(stats.reads(), 4);
+        // The two oversize reads are the caller's to fix by raising
+        // `max_entry_bytes`, and folding them in would report the cache at 25%
+        // rather than saying which knob is turning them away.
+        assert_eq!(stats.hit_rate(), Some(0.5));
+
+        // The other half of the same rule. `with_max_entry_bytes` can name a cap
+        // above the whole budget, and a read between the two would pass the entry
+        // check only for `insert` to refuse it every time -- a permanent miss
+        // reported as an ordinary one. The budget turns it away up front instead.
+        let lopsided = MetadataCacheConfig::new(128).with_max_entry_bytes(512);
+        let source = MetadataCachingSource::new(ramp(4096), lopsided);
+        source.read_metadata_at(0, 256).unwrap();
+        source.read_metadata_at(0, 256).unwrap();
+        let stats = source.metadata_cache_stats().unwrap();
+        assert_eq!(stats.oversize_reads(), 2);
+        assert_eq!(stats.misses(), 0);
+        assert_eq!(stats.hit_rate(), None);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn no_eligible_read_yet_is_not_a_hit_rate_of_zero() {
+        let config = MetadataCacheConfig::new(4096).with_max_entry_bytes(64);
+        let source = MetadataCachingSource::new(ramp(4096), config);
+
+        let fresh = source.metadata_cache_stats().unwrap();
+        assert_eq!(fresh.hit_rate(), None, "nothing has been read");
+
+        source.read_metadata_at(0, 256).unwrap();
+        assert_eq!(
+            source.metadata_cache_stats().unwrap().hit_rate(),
+            None,
+            "a read the cache never saw does not make a rate out of it"
+        );
+
+        source.read_metadata_at(0, 64).unwrap();
+        assert_eq!(
+            source.metadata_cache_stats().unwrap().hit_rate(),
+            Some(0.0),
+            "one eligible read that missed *is* a rate, and the opposite reading"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_budget_and_a_write_drop_entries_for_different_reasons() {
+        // Two 64-byte entries fit; a third forces one out.
+        const BUDGET: usize = 128;
+        let mut cache = MetadataReadCache::new();
+        cache.insert(0, 64, vec![1u8; 64], BUDGET);
+        cache.insert(64, 64, vec![2u8; 64], BUDGET);
+
+        // Re-reading a key replaces it. Nothing was dropped for want of room or
+        // because the bytes changed, so neither counter moves.
+        cache.insert(0, 64, vec![1u8; 64], BUDGET);
+        let replaced = cache.stats();
+        assert_eq!(replaced.entries(), 2);
+        assert_eq!(replaced.evictions(), 0);
+        assert_eq!(replaced.invalidations(), 0);
+
+        cache.insert(128, 64, vec![3u8; 64], BUDGET);
+        let evicted = cache.stats();
+        assert_eq!(evicted.evictions(), 1, "the budget forced this one");
+        assert_eq!(evicted.invalidations(), 0);
+        // The least recently used of the three went, leaving [0, 64) and
+        // [128, 192).
+        assert_eq!(evicted.entries(), 2);
+
+        // A write across [32, 160) reaches into both survivors: one starts
+        // before it, the other after.
+        cache.invalidate_overlapping(32, 128);
+        let invalidated = cache.stats();
+        assert_eq!(invalidated.invalidations(), 2, "the write overlapped both");
+        assert_eq!(
+            invalidated.evictions(),
+            1,
+            "a write is not the budget, and a caller told to raise the budget \
+             because of one would be raising it for nothing"
+        );
+        assert_eq!(invalidated.entries(), 0);
+        assert_eq!(invalidated.bytes(), 0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn resetting_the_counters_keeps_the_entries() {
+        const BUDGET: usize = 4096;
+        let mut cache = MetadataReadCache::new();
+        cache.insert(0, 64, vec![1u8; 64], BUDGET);
+        assert!(cache.get(0, 64).is_some());
+        assert!(cache.get(512, 64).is_none());
+
+        cache.reset_stats();
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits(), 0);
+        assert_eq!(stats.misses(), 0);
+        assert_eq!(stats.hit_rate(), None);
+        // Occupancy measures the cache rather than tallying its history, so a
+        // reset that emptied it would answer a different question than the one
+        // `H5Freset_mdc_hit_rate_stats` asks.
+        assert_eq!(stats.entries(), 1);
+        assert_eq!(stats.bytes(), 64);
+        assert!(cache.get(0, 64).is_some(), "the entry is still servable");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_disabled_cache_reports_nothing_rather_than_zeroes() {
+        let source = MetadataCachingSource::new(ramp(4096), MetadataCacheConfig::disabled());
+        assert_eq!(
+            source.read_metadata_at(0, 64).unwrap(),
+            (0..64u8).collect::<Vec<u8>>()
+        );
+        assert_eq!(
+            source.metadata_cache_stats(),
+            None,
+            "an all-zero snapshot would read as a cache that is on and idle"
+        );
+        source.reset_metadata_cache_stats();
+        assert_eq!(
+            source.metadata_cache_stats(),
+            None,
+            "and resetting one there is nothing to reset does not conjure one"
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_wrapper_reports_the_cache_it_reads_through() {
+        let config = MetadataCacheConfig::new(4096);
+        let source = MetadataCachingSource::new(ramp(4096), config);
+        // The base-relative view a userblock file reads through forwards its
+        // metadata reads to the inner source, so it must forward the account of
+        // them too.
+        let framed = BaseOffsetSource {
+            inner: &source,
+            base: 512,
+        };
+        framed.read_metadata_at(0, 64).unwrap();
+        framed.read_metadata_at(0, 64).unwrap();
+
+        let stats = framed.metadata_cache_stats().expect("forwarded");
+        assert_eq!((stats.hits(), stats.misses()), (1, 1));
+        assert_eq!(stats, source.metadata_cache_stats().unwrap());
+
+        framed.reset_metadata_cache_stats();
+        assert_eq!(source.metadata_cache_stats().unwrap().hits(), 0);
+        assert_eq!(
+            source.metadata_cache_stats().unwrap().entries(),
+            1,
+            "reset through the view is a reset of counters, not a flush"
         );
     }
 }

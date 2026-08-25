@@ -127,6 +127,129 @@ fn open_streaming_with_access_properties_reads_chunked_data() {
     assert_eq!(dataset.read_i32().unwrap(), data);
 }
 
+/// Build a file of `count` small datasets, enough distinct object headers that
+/// a metadata cache has something to hold and a tight budget something to evict.
+fn write_many_datasets(path: &std::path::Path, count: usize) {
+    let mut b = FileBuilder::new();
+    let values: Vec<i32> = (0..32).collect();
+    for i in 0..count {
+        b.create_dataset(&format!("d{i:03}"))
+            .with_i32_data(&values)
+            .with_shape(&[32]);
+    }
+    b.write(path).unwrap();
+}
+
+/// The metadata-cache budget is a number chosen before a single read has
+/// happened; these are the figures that say whether it was the right one
+/// (issue #353).
+#[test]
+fn metadata_cache_stats_report_what_the_budget_bought() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mdc_stats.h5");
+    const DATASETS: usize = 32;
+    write_many_datasets(&path, DATASETS);
+
+    let read_every = |file: &File| {
+        for i in 0..DATASETS {
+            file.dataset(&format!("d{i:03}"))
+                .unwrap()
+                .read_i32()
+                .unwrap();
+        }
+    };
+
+    // No budget: nothing to report. `None` rather than an all-zero snapshot,
+    // which would read as a cache that is on and doing nothing.
+    let uncached = File::open_streaming(&path).unwrap();
+    read_every(&uncached);
+    assert_eq!(uncached.metadata_cache_stats(), None);
+    // A buffered open holds the whole file already, so a metadata cache would
+    // be a second copy of bytes it has.
+    assert_eq!(File::open(&path).unwrap().metadata_cache_stats(), None);
+
+    const BUDGET: usize = 1 << 20;
+    let file = File::open_streaming_with_options(
+        &path,
+        FileAccessProperties::new().with_metadata_cache(MetadataCacheConfig::new(BUDGET)),
+    )
+    .unwrap();
+
+    read_every(&file);
+    let warm = file
+        .metadata_cache_stats()
+        .expect("a budget was set, so there is a cache to report");
+    assert!(warm.misses() > 0, "the first pass is what populates it");
+    assert!(warm.entries() > 0 && warm.bytes() > 0);
+    assert!(warm.bytes() <= BUDGET, "the budget is a bound: {warm:?}");
+    assert_eq!(
+        warm.evictions(),
+        0,
+        "1 MiB holds this file's metadata whole: {warm:?}"
+    );
+    assert_eq!(
+        warm.invalidations(),
+        0,
+        "a read-only open writes nothing to invalidate against: {warm:?}"
+    );
+
+    // The reads that fill a cache miss by definition, so a rate taken over the
+    // whole run charges the steady state for the warm-up. Reset, then measure
+    // the part that repeats.
+    file.reset_metadata_cache_stats();
+    let cleared = file.metadata_cache_stats().unwrap();
+    assert_eq!(cleared.reads(), 0);
+    assert_eq!(cleared.hit_rate(), None);
+    assert_eq!(
+        (cleared.entries(), cleared.bytes()),
+        (warm.entries(), warm.bytes()),
+        "a reset clears counters and evicts nothing"
+    );
+
+    read_every(&file);
+    let steady = file.metadata_cache_stats().unwrap();
+    assert!(steady.reads() > 0);
+    assert_eq!(
+        steady.hit_rate(),
+        Some(1.0),
+        "a second pass over the same objects re-reads the same windows, and the \
+         budget held every one of them: {steady:?}"
+    );
+}
+
+/// The other half of the same question: a budget too small to hold the working
+/// set says so, in the one figure that means "raising this would help".
+#[test]
+fn a_budget_too_small_for_the_file_reports_evictions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mdc_tight.h5");
+    const DATASETS: usize = 32;
+    write_many_datasets(&path, DATASETS);
+
+    const BUDGET: usize = 1024;
+    let file = File::open_streaming_with_options(
+        &path,
+        FileAccessProperties::new().with_metadata_cache(MetadataCacheConfig::new(BUDGET)),
+    )
+    .unwrap();
+    for i in 0..DATASETS {
+        file.dataset(&format!("d{i:03}"))
+            .unwrap()
+            .read_i32()
+            .unwrap();
+    }
+
+    let stats = file.metadata_cache_stats().unwrap();
+    assert!(
+        stats.evictions() > 0,
+        "32 datasets do not fit in 1 KiB of metadata: {stats:?}"
+    );
+    assert!(
+        stats.bytes() <= BUDGET,
+        "the budget still bounds it: {stats:?}"
+    );
+}
+
 /// Recursively assert the streaming backend reports the identical groups,
 /// datasets, shapes, and attributes as the buffered backend for the group at
 /// `path`. Returns the number of attributes compared, so a caller can confirm

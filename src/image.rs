@@ -63,7 +63,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::convert::TryToUsize;
 use crate::error::{Error, FormatError};
-use crate::source::{BytesSource, MetadataCacheConfig, MetadataReadCache, Source};
+use crate::source::{
+    BytesSource, MetadataCacheConfig, MetadataCacheStats, MetadataReadCache, Source,
+};
 
 /// How long a write may sit in memory before it must reach the operating system.
 ///
@@ -1115,9 +1117,7 @@ impl HandleImage {
         let Some((_, cache)) = &self.metadata_cache else {
             return;
         };
-        cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        MetadataReadCache::locked(cache)
             .invalidate_overlapping(offset, len.to_usize().unwrap_or(usize::MAX));
     }
 }
@@ -1174,22 +1174,20 @@ impl Source for HandleImage {
         let Some((config, cache)) = &self.metadata_cache else {
             return self.read_exact_at(offset, len);
         };
-        if len == 0 || len > config.max_entry_bytes() || len > config.max_bytes() {
-            return self.read_exact_at(offset, len);
+        MetadataReadCache::read_through(cache, *config, offset, len, || {
+            self.read_exact_at(offset, len)
+        })
+    }
+
+    fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
+        let (_, cache) = self.metadata_cache.as_ref()?;
+        Some(MetadataReadCache::locked(cache).stats())
+    }
+
+    fn reset_metadata_cache_stats(&self) {
+        if let Some((_, cache)) = &self.metadata_cache {
+            MetadataReadCache::locked(cache).reset_stats();
         }
-        if let Some(bytes) = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(offset, len)
-        {
-            return Ok(bytes);
-        }
-        let bytes = self.read_exact_at(offset, len)?;
-        cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(offset, len, bytes.clone(), config.max_bytes());
-        Ok(bytes)
     }
 }
 

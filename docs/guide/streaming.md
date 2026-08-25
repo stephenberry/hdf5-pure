@@ -111,6 +111,8 @@ let values = ds.read_f64().unwrap();
 
 ## Confirming cache behavior
 
+### The chunk cache
+
 To confirm a cache is behaving as configured, `Dataset::chunk_cache_stats()` returns a read-only `ChunkCacheStats` snapshot taken after a read. It reports whether the parsed index is loaded (`index_loaded()`), how many decompressed chunks are retained (`cached_chunks()`), and how many bytes of chunk data are retained (`cached_bytes()`).
 
 ```rust
@@ -126,6 +128,41 @@ assert!(stats.cached_chunks() > 0);
 ```
 
 The counts are a point-in-time view and change as further reads populate or evict chunks. A disabled cache, or one over its byte or slot budget, reports fewer or no retained chunks.
+
+### The metadata cache
+
+A cache budget is a number chosen before a single read has happened. `File::metadata_cache_stats` reports what it bought, so the next number is measured rather than guessed. It is the counterpart of HDF5's `H5Fget_mdc_hit_rate` and `H5Fget_mdc_size`, and returns `None` when the open has no metadata cache to report on.
+
+```rust
+use hdf5_pure::{File, FileAccessProperties, MetadataCacheConfig};
+
+let access = FileAccessProperties::new().with_metadata_cache(MetadataCacheConfig::new(8 << 20));
+let file = File::open_streaming_with_options("huge.h5", access).unwrap();
+
+// The reads that fill a cache miss by definition, so a rate measured over the
+// whole run charges the steady state for the warm-up.
+for name in file.root().datasets().unwrap() {
+    let _ = file.dataset(&name).unwrap().read_raw().unwrap();
+}
+file.reset_metadata_cache_stats();
+
+for name in file.root().datasets().unwrap() {
+    let _ = file.dataset(&name).unwrap().read_raw().unwrap();
+}
+let stats = file.metadata_cache_stats().unwrap();
+println!("{:?} over {} reads, {} of {} bytes held", stats.hit_rate(), stats.reads(), stats.bytes(), 8 << 20);
+```
+
+Which figure to read depends on what you are asking:
+
+- **`hit_rate`** is the headline: the fraction of eligible reads served without touching the file. `None` means no eligible read has happened yet, which is not the same as a cache that has missed everything.
+- **`evictions`** is what says a larger budget would help. A disappointing hit rate *with* evictions is a budget too small for the working set; the same hit rate with none is a workload that does not revisit metadata, and raising the budget will not change it.
+- **`oversize_reads`** counts reads turned away, for exceeding `max_entry_bytes` or the budget itself, before the cache saw them. A file with large fractal heaps or index blocks can be missing from the cache entirely for this reason while the hit rate looks healthy.
+- **`invalidations`** applies to a read-write session: entries dropped because a write overlapped them. Approaching the miss count, it means the session is rewriting the metadata it is caching.
+
+`reset_metadata_cache_stats` clears the counters and evicts nothing, so occupancy carries across it.
+
+Set the budget generously; the [property-support reference](../reference/property-support.md#the-metadata-cache-h5pset_mdc_config) covers why `H5AC_cache_config_t`'s adaptive-resize policy is not modeled, field by field.
 
 ## Writing without buffering
 

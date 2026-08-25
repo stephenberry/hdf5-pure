@@ -40,8 +40,8 @@ use crate::read_spec::RawReadSpec;
 use crate::shared_message::{self, BufferedResolver, SharedResolver, SourceResolver};
 use crate::signature;
 use crate::source::{
-    BaseOffsetSource, BytesSource, MetadataCacheConfig, MetadataCachingSource, ReadSeekSource,
-    Source, frame,
+    BaseOffsetSource, BytesSource, MetadataCacheConfig, MetadataCacheStats, MetadataCachingSource,
+    ReadSeekSource, Source, frame,
 };
 use crate::superblock::Superblock;
 use crate::vl_data::{self, VlenStringReadOptions};
@@ -170,6 +170,21 @@ impl Source for SourceView<'_> {
         match self {
             SourceView::Mem(b) => BytesSource::new(*b).read_metadata_at(offset, len),
             SourceView::Stream(s) => s.read_metadata_at(offset, len),
+        }
+    }
+
+    fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
+        match self {
+            // A whole-file buffer is already the cache, and holds no second one.
+            SourceView::Mem(_) => None,
+            SourceView::Stream(s) => s.metadata_cache_stats(),
+        }
+    }
+
+    fn reset_metadata_cache_stats(&self) {
+        match self {
+            SourceView::Mem(_) => {}
+            SourceView::Stream(s) => s.reset_metadata_cache_stats(),
         }
     }
 }
@@ -1307,6 +1322,17 @@ impl FileInner {
             Backend::Edit(m) => Some(m.lock().unwrap_or_else(|e| e.into_inner()).edit_backing()),
             _ => None,
         }
+    }
+
+    /// What this file's metadata cache has done, or `None` where the backend
+    /// holds none.
+    fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
+        self.with_source(|source| source.metadata_cache_stats())
+    }
+
+    /// Zero those counters, keeping the cached entries.
+    fn reset_metadata_cache_stats(&self) {
+        self.with_source(|source| source.reset_metadata_cache_stats());
     }
 
     /// Returns a reference to the parsed superblock.
@@ -2627,6 +2653,54 @@ impl File {
     /// reopen should be pinned to what this one got.
     pub fn edit_backing(&self) -> Option<EditBacking> {
         self.inner.edit_backing()
+    }
+
+    /// What this file's metadata cache has done, and what it is holding.
+    ///
+    /// [`FileAccessProperties::with_metadata_cache`] sets a byte budget before
+    /// any read has happened; this is how a caller finds out whether it was the
+    /// right one. See [`MetadataCacheStats`] for which figure answers which
+    /// question. Together the two are the `hdf5-pure` counterpart of HDF5's
+    /// `H5Fget_mdc_hit_rate` and `H5Fget_mdc_size`.
+    ///
+    /// `None` where there is no metadata cache to report on: a buffered
+    /// [`open`](Self::open) or [`from_bytes`](Self::from_bytes), which already
+    /// holds the whole file; a mirrored read-write session, for the same reason;
+    /// or a streaming or bounded open left at the default disabled budget.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), hdf5_pure::Error> {
+    /// use hdf5_pure::{File, FileAccessProperties, MetadataCacheConfig};
+    ///
+    /// let properties =
+    ///     FileAccessProperties::new().with_metadata_cache(MetadataCacheConfig::new(8 << 20));
+    /// let file = File::open_streaming_with_options("data.h5", properties)?;
+    /// for name in file.root().datasets()? {
+    ///     let _ = file.dataset(&name)?.read_raw()?;
+    /// }
+    ///
+    /// let stats = file.metadata_cache_stats().expect("the budget enabled a cache");
+    /// println!("{:?} over {} reads, {} evicted", stats.hit_rate(), stats.reads(), stats.evictions());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
+        self.inner.metadata_cache_stats()
+    }
+
+    /// Zero this file's metadata-cache counters, keeping every cached entry.
+    ///
+    /// HDF5's `H5Freset_mdc_hit_rate_stats`, for measuring one phase of a
+    /// program rather than a whole run: the reads that populate a cache miss by
+    /// definition, so a hit rate taken over the run charges the steady state for
+    /// the warm-up. Reset after warming to measure the part that repeats.
+    ///
+    /// It evicts nothing: occupancy, which
+    /// [`metadata_cache_stats`](Self::metadata_cache_stats) also reports, is a
+    /// measurement of the cache rather than a tally of its history. A file with
+    /// no metadata cache ignores the call.
+    pub fn reset_metadata_cache_stats(&self) {
+        self.inner.reset_metadata_cache_stats();
     }
 
     /// Returns a reference to the parsed superblock.
@@ -5519,6 +5593,40 @@ mod tests {
     use super::*;
     use crate::FileBuilder;
     use std::sync::atomic::AtomicUsize;
+
+    // -----------------------------------------------------------------------
+    // Reporting the metadata cache (issue #353)
+    // -----------------------------------------------------------------------
+
+    /// `SourceView` serves its metadata reads from the streaming backend's
+    /// cache, so it has to forward the account of them as well. It is the one
+    /// wrapper `File::metadata_cache_stats` does not itself go through (that
+    /// dispatch uses `with_source`, which reaches the read-write backend too), so
+    /// nothing else would notice the forward going missing.
+    #[test]
+    fn the_source_view_reports_the_cache_it_reads_through() {
+        let backend = MetadataCachingSource::new(
+            BytesSource::new((0..=255u8).collect::<Vec<u8>>()),
+            MetadataCacheConfig::new(4096),
+        );
+        let view = SourceView::Stream(&backend);
+
+        assert_eq!(view.metadata_cache_stats().unwrap().reads(), 0);
+        view.read_metadata_at(0, 64).unwrap();
+        view.read_metadata_at(0, 64).unwrap();
+        let stats = view
+            .metadata_cache_stats()
+            .expect("the backend has a cache, so the view reports it");
+        assert_eq!((stats.hits(), stats.misses()), (1, 1));
+
+        view.reset_metadata_cache_stats();
+        let cleared = view.metadata_cache_stats().unwrap();
+        assert_eq!(cleared.hits(), 0);
+        assert_eq!(cleared.entries(), 1, "a reset evicts nothing");
+
+        // A whole-file buffer is the cache; there is no second one to report.
+        assert_eq!(SourceView::Mem(&[0u8; 16]).metadata_cache_stats(), None);
+    }
 
     // -----------------------------------------------------------------------
     // Handle re-validation across an edit (issue #351)
