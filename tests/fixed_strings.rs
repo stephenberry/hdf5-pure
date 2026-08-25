@@ -9,7 +9,8 @@
 //! C-library interop lives in `fixed_string_crosscheck.rs`.
 
 use hdf5_pure::{
-    CharacterSet, Datatype, File, FileBuilder, FormatError, StringPadding, VlenStringReadOptions,
+    CharacterSet, Datatype, Error, File, FileBuilder, FormatError, StringPadding,
+    VlenStringReadOptions,
 };
 use tempfile::tempdir;
 
@@ -163,8 +164,14 @@ fn a_fixed_width_dataset_is_refused_by_the_vlen_reader() {
 
     let ds = file.dataset("station").unwrap();
     assert!(
-        ds.read_vlen_strings(VlenStringReadOptions::default())
-            .is_err()
+        matches!(
+            ds.read_vlen_strings(VlenStringReadOptions::default()),
+            Err(Error::Format(FormatError::TypeMismatch {
+                expected: "VariableLength string",
+                ..
+            }))
+        ),
+        "expected a type mismatch naming the type it wanted"
     );
     // The charset-agnostic reader still works on it, which is the point of
     // `read_string` dispatching on the datatype.

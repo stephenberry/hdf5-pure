@@ -12,12 +12,10 @@
 //! wrong width would agree with each other and with nothing else. The C library
 //! divides by the width the *message* declares, so it is the side that can tell.
 //!
-//! It is also the authority on the datatype itself. `H5T_STR_NULLPAD` and
-//! `H5T_STR_NULLTERM` are different types on disk carrying the same values here,
-//! and `H5T_CSET_ASCII` and `H5T_CSET_UTF8` decide which of `FixedAscii` and
-//! `FixedUnicode` a C-side reader is allowed to ask for at all — so a charset
-//! written wrong is not a cosmetic difference, it is a dataset the C library
-//! refuses to hand over.
+//! It is also the authority on the datatype itself. `H5T_CSET_ASCII` and
+//! `H5T_CSET_UTF8` are separate types on disk, and the C library will not hand a
+//! dataset over as the charset it was not written as — measured here rather than
+//! assumed — so a charset written wrong is not a cosmetic difference.
 //!
 //! Every call here goes through the safe `hdf5-metno` API, which serializes its
 //! own C calls through an internal lock, so these tests need no extra guard.
@@ -65,9 +63,10 @@ fn the_c_library_reports_the_width_this_crate_declared() {
 }
 
 /// The values, read by the C library at the width the C library found. The empty
-/// element is in the middle deliberately: an all-padding element is where a
-/// reader that stopped at the first NUL and a reader that measured from the
-/// declared width would part company.
+/// element sits in the middle deliberately: it contributes no bytes of its own,
+/// so a writer that emitted values rather than fixed-width slots would leave
+/// every element after it shifted, and only an element that follows one can
+/// catch that.
 #[test]
 fn the_c_library_reads_back_every_value() {
     let dir = tempdir().unwrap();
@@ -112,6 +111,38 @@ fn the_c_library_reads_back_every_value() {
         .unwrap()
         .to_vec();
     assert_eq!(utf8.iter().map(|s| s.as_str()).collect::<Vec<_>>(), values);
+}
+
+/// The charset bit is load-bearing on the C side, not decoration: `FixedAscii`
+/// and `FixedUnicode` are separate C-side types, and the library will not hand a
+/// dataset over as the one it was not written as.
+#[test]
+fn the_c_library_holds_each_charset_to_its_own_reader() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("charsets.h5");
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("ascii")
+        .with_ascii_strings(&["north"])
+        .unwrap();
+    b.create_dataset("utf8").with_strings(&["north"]).unwrap();
+    b.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    assert!(
+        file.dataset("utf8")
+            .unwrap()
+            .read_1d::<FixedAscii<5>>()
+            .is_err(),
+        "a UTF-8 dataset was handed over as ASCII"
+    );
+    assert!(
+        file.dataset("ascii")
+            .unwrap()
+            .read_1d::<FixedUnicode<5>>()
+            .is_err(),
+        "an ASCII dataset was handed over as UTF-8"
+    );
 }
 
 /// A multi-byte value is stored as bytes and read back as characters. The width
