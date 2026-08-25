@@ -706,6 +706,8 @@ fn numeric_array_attr<T: Copy, const N: usize>(
 
 pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMessage {
     match value {
+        AttrValue::F32(v) => numeric_scalar_attr(name, make_f32_type(), &v.to_le_bytes()),
+        AttrValue::F32Array(a) => numeric_array_attr(name, make_f32_type(), a, f32::to_le_bytes),
         AttrValue::F64(v) => numeric_scalar_attr(name, make_f64_type(), &v.to_le_bytes()),
         AttrValue::F64Array(a) => numeric_array_attr(name, make_f64_type(), a, f64::to_le_bytes),
         AttrValue::I8(v) => numeric_scalar_attr(name, make_i8_type(), &v.to_le_bytes()),
@@ -1223,11 +1225,12 @@ pub(crate) fn simple_1d(n: u64) -> Dataspace {
 
 /// Convenient attribute values for the write API.
 ///
-/// Each integer variant names the width it is stored at, and a value written
+/// Each numeric variant names the width it is stored at, and a value written
 /// from one reads back as the same variant: an `I16` attribute is two bytes on
-/// disk and arrives as `I16`, not widened to `I64` (issue #350). The accessors
-/// below read any of them as `i64`/`u64`, so code that only wants the number
-/// need not enumerate the widths.
+/// disk and arrives as `I16`, not widened to `I64` (issue #350), and an `F32`
+/// is four and arrives as `F32` (issue #354). The accessors below read any
+/// integer as `i64`/`u64` and any float as `f64`, so code that only wants the
+/// number need not enumerate the widths.
 ///
 /// Non-exhaustive: variants are added as this crate supports more attribute
 /// datatypes, so match a read-back value with a `_` arm. Constructing the
@@ -1235,6 +1238,8 @@ pub(crate) fn simple_1d(n: u64) -> Dataspace {
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AttrValue {
+    F32(f32),
+    F32Array(Vec<f32>),
     F64(f64),
     F64Array(Vec<f64>),
     I8(i8),
@@ -1425,7 +1430,9 @@ impl AttrValue {
     /// caller that wants either shape asks for both.
     pub fn as_f64(&self) -> Option<f64> {
         match self {
+            Self::F32(v) => Some(f64::from(*v)),
             Self::F64(v) => Some(*v),
+            Self::F32Array(v) if v.len() == 1 => Some(f64::from(v[0])),
             Self::F64Array(v) if v.len() == 1 => Some(v[0]),
             _ => None,
         }
@@ -1436,6 +1443,8 @@ impl AttrValue {
     /// Returns `None` for a non-float value.
     pub fn to_f64s(&self) -> Option<Vec<f64>> {
         match self {
+            Self::F32(v) => Some(vec![f64::from(*v)]),
+            Self::F32Array(v) => Some(v.iter().copied().map(f64::from).collect()),
             Self::F64(v) => Some(vec![*v]),
             Self::F64Array(v) => Some(v.clone()),
             _ => None,
@@ -1457,6 +1466,8 @@ impl AttrValue {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
+            Self::F32(_) => "f32",
+            Self::F32Array(_) => "f32[]",
             Self::F64(_) => "f64",
             Self::F64Array(_) => "f64[]",
             Self::I8(_) => "i8",
@@ -1506,6 +1517,7 @@ impl fmt::Display for AttrValue {
     /// elided; use `Debug` for the whole value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::F32(v) => write!(f, "{v:?}"),
             Self::F64(v) => write!(f, "{v:?}"),
             Self::I8(v) => write!(f, "{v}"),
             Self::I16(v) => write!(f, "{v}"),
@@ -1516,6 +1528,7 @@ impl fmt::Display for AttrValue {
             Self::U32(v) => write!(f, "{v}"),
             Self::U64(v) => write!(f, "{v}"),
             Self::String(v) | Self::AsciiString(v) => write!(f, "{v:?}"),
+            Self::F32Array(v) => write_elements(f, v),
             Self::F64Array(v) => write_elements(f, v),
             Self::I8Array(v) => write_elements(f, v),
             Self::I16Array(v) => write_elements(f, v),
@@ -3003,6 +3016,26 @@ mod attr_value_accessor_tests {
         assert_eq!(AttrValue::F64Array(vec![1.5, 2.5]).as_f64(), None);
     }
 
+    /// The float accessors span both widths, so a caller that wants the number
+    /// need not know whether the file stored four bytes or eight (#354).
+    /// Widening an `f32` is exact, which the extremes of its range state.
+    #[test]
+    fn the_float_accessors_span_both_widths() {
+        assert_eq!(AttrValue::F32(1.5).as_f64(), Some(1.5));
+        assert_eq!(AttrValue::F32Array(vec![1.5]).as_f64(), Some(1.5));
+        assert_eq!(AttrValue::F32Array(vec![1.5, 2.5]).as_f64(), None);
+        assert_eq!(AttrValue::F32(f32::MAX).as_f64(), Some(f64::from(f32::MAX)));
+        assert_eq!(AttrValue::F32(1.5).to_f64s(), Some(vec![1.5]));
+        assert_eq!(
+            AttrValue::F32Array(vec![f32::MIN, f32::MAX]).to_f64s(),
+            Some(vec![f64::from(f32::MIN), f64::from(f32::MAX)])
+        );
+        assert_eq!(AttrValue::F32Array(vec![]).to_f64s(), Some(vec![]));
+        // An integer is still not a float, at either width.
+        assert_eq!(AttrValue::F32(1.0).as_i64(), None);
+        assert_eq!(AttrValue::I32(1).as_f64(), None);
+    }
+
     /// The float accessors do not convert integers. A caller that accepts
     /// either asks for both, rather than having a silent widening decided here.
     #[test]
@@ -3040,6 +3073,8 @@ mod attr_value_display_tests {
     /// because the check is the compiler's, not the run's.
     fn one_of_every_variant() -> Vec<AttrValue> {
         let values = vec![
+            AttrValue::F32(0.0),
+            AttrValue::F32Array(vec![]),
             AttrValue::F64(0.0),
             AttrValue::F64Array(vec![]),
             AttrValue::I8(0),
@@ -3066,6 +3101,7 @@ mod attr_value_display_tests {
         ];
         for value in &values {
             match value {
+                AttrValue::F32(_) | AttrValue::F32Array(_) => {}
                 AttrValue::F64(_) | AttrValue::F64Array(_) => {}
                 AttrValue::I8(_) | AttrValue::I8Array(_) => {}
                 AttrValue::I16(_) | AttrValue::I16Array(_) => {}
@@ -3114,6 +3150,8 @@ mod attr_value_display_tests {
     #[test]
     fn display_writes_the_value_not_the_variant() {
         assert_eq!(AttrValue::F64(1.5).to_string(), "1.5");
+        assert_eq!(AttrValue::F32(1.5).to_string(), "1.5");
+        assert_eq!(AttrValue::F32(1.0).to_string(), "1.0");
         assert_eq!(AttrValue::I8(-7).to_string(), "-7");
         assert_eq!(AttrValue::I16(-7).to_string(), "-7");
         assert_eq!(AttrValue::I32(-7).to_string(), "-7");

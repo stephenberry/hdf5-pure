@@ -193,25 +193,26 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
 /// dataspace kind — not the element count — decides scalar against array, so a
 /// one-element array stays an array. Charset selects the `Ascii*` variants.
 ///
-/// An integer keeps the width it is stored at: the 1-, 2-, 4- and 8-byte
+/// A number keeps the width it is stored at. An integer's 1-, 2-, 4- and 8-byte
 /// datatypes take the [`AttrValue`] variant of that width, signed or unsigned as
-/// the datatype says (issue #350). A width the format allows but Rust has no
-/// integer for — 3 bytes, say — widens to the 64-bit variant, as does a value
-/// that does not fit the width its own datatype declares, which takes a
-/// precision wider than that width to reach. Both carry the value unchanged; only
-/// the variant is wider than the file. A width *above* 8 bytes is the exception,
-/// and not this decode's doing: the numeric readers model an element as a 64-bit
-/// word, so such a value arrives already truncated to its low 8 bytes.
+/// the datatype says (issue #350), and a 4-byte float takes
+/// [`F32`](AttrValue::F32) rather than widening to `f64` (issue #354). An
+/// integer width the format allows but Rust has no integer for — 3 bytes, say —
+/// widens to the 64-bit variant, as does a value that does not fit the width its
+/// own datatype declares, which takes a precision wider than that width to
+/// reach. Both carry the value unchanged; only the variant is wider than the
+/// file. A width *above* 8 bytes is the exception, and not this decode's doing:
+/// the numeric readers model an element as a 64-bit word, so such a value
+/// arrives already truncated to its low 8 bytes.
 ///
 /// What is still not recoverable, because [`AttrValue`] has no way to express
 /// it — each of these reads correctly but would be rewritten differently:
 ///
-/// - **Float width.** A 32-bit float widens to `f64`; there is no `f32` variant
-///   (issue #354).
 /// - **Byte order and precision.** Every integer variant writes back
 ///   little-endian at its full width, so a big-endian attribute, or one storing
 ///   fewer bits than its bytes hold, reads correctly and would be re-encoded in
-///   this crate's own layout.
+///   this crate's own layout. The same holds for a float whose exponent or
+///   mantissa is not laid out the way IEEE 754 lays it out.
 /// - **Enumeration members.** An enum attribute decodes through its integer base
 ///   type, so its codes survive and the member names do not. This is how h5py's
 ///   `np.bool_` attributes arrive, written as `enum[FALSE, TRUE]`: as `0`/`1` of
@@ -252,6 +253,16 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
     // An enumeration is stored as values of its integer base type, so it decodes
     // through that base — the same view the numeric readers take of an enum dataset.
     match crate::data_read::effective_numeric(&attr.datatype) {
+        Datatype::FloatingPoint { size: 4, .. } => {
+            let vals = attr.read_as_f64().ok()?;
+            if scalar {
+                Some(AttrValue::F32(narrow_f32(*vals.first()?)))
+            } else {
+                Some(AttrValue::F32Array(
+                    vals.into_iter().map(narrow_f32).collect(),
+                ))
+            }
+        }
         Datatype::FloatingPoint { .. } => {
             let vals = attr.read_as_f64().ok()?;
             if scalar {
@@ -323,6 +334,21 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
         }
         _ => None,
     }
+}
+
+/// A 4-byte float's value, as the `f32` the file holds.
+///
+/// The decoders model every float as an `f64`, and an IEEE 4-byte value widens
+/// into one exactly, so narrowing it back is the identity rather than a
+/// rounding step — the cast can only lose something for a 4-byte float laid out
+/// some other way, whose value is reconstructed first and whose 24 or fewer
+/// mantissa bits an `f32` still holds.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "narrows a value the reader widened from the 4 bytes the file holds, which is exact for the IEEE layout"
+)]
+fn narrow_f32(value: f64) -> f32 {
+    value as f32
 }
 
 /// The variant a signed integer attribute takes, chosen from the width its
@@ -662,15 +688,33 @@ mod tests {
         );
     }
 
-    /// Array-ness survives at length one for numbers too. The integers say the
-    /// same thing at every width in
-    /// [`every_integer_width_round_trips_to_itself`], so this one is the float.
+    /// Array-ness survives at length one for numbers too, and a float keeps its
+    /// width: a 4-byte attribute reads back as `F32`, not widened to `F64`
+    /// (#354). The integers say the same thing at every width in
+    /// [`every_integer_width_round_trips_to_itself`].
+    ///
+    /// The `f32` values are the ones a narrowing that rounded would get wrong:
+    /// the extremes of the range, and a subnormal, which is where the exponent
+    /// handling of a widen-then-narrow round trip breaks if it breaks at all.
     #[test]
     fn every_float_variant_round_trips_to_itself() {
         let cases = vec![
             ("f64_scalar", AttrValue::F64(1.5)),
             ("f64_one", AttrValue::F64Array(vec![1.5])),
             ("f64_two", AttrValue::F64Array(vec![1.5, 2.5])),
+            ("f32_scalar", AttrValue::F32(1.5)),
+            ("f32_one", AttrValue::F32Array(vec![1.5])),
+            ("f32_two", AttrValue::F32Array(vec![f32::MIN, f32::MAX])),
+            (
+                "f32_edges",
+                AttrValue::F32Array(vec![
+                    f32::MIN_POSITIVE,
+                    f32::from_bits(1),
+                    f32::EPSILON,
+                    -0.0,
+                    f32::INFINITY,
+                ]),
+            ),
         ];
         let read = round_trip(&cases);
         for (name, written) in &cases {
@@ -797,7 +841,7 @@ mod tests {
     /// Both ends are under test at once: the writer stores each variant at its
     /// own width, and the reader picks the variant back out of that width. A
     /// writer that stored `I16` in four bytes would be read as `I32` and fail
-    /// here, so the pair cannot drift together — and `attr_integer_width_crosscheck`
+    /// here, so the pair cannot drift together — and `attr_width_crosscheck`
     /// is what says the width means the same thing outside this crate, with the
     /// reference C library reading the bytes.
     ///

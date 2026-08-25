@@ -2834,13 +2834,14 @@ impl Group {
     /// writer chose rather than the shape of the data alone: a one-element array
     /// stays an array, an ASCII string does not arrive as a UTF-8
     /// [`String`](AttrValue::String), and a 16-bit integer arrives as
-    /// [`I16`](AttrValue::I16) rather than widened. Prefer the accessors —
+    /// [`I16`](AttrValue::I16) rather than widened, a 32-bit float as
+    /// [`F32`](AttrValue::F32). Prefer the accessors —
     /// [`AttrValue::as_str`], [`as_strings`](AttrValue::as_strings),
     /// [`as_i64`](AttrValue::as_i64) and the rest — over matching on the variant,
     /// unless the encoding is the thing you care about. **The variant may become
     /// more specific in a future release** as `AttrValue` grows further ones
-    /// (a 32-bit float, variable-length strings), and a `_` arm is required
-    /// regardless because the enum is `#[non_exhaustive]`.
+    /// (variable-length strings, say), and a `_` arm is required regardless
+    /// because the enum is `#[non_exhaustive]`.
     ///
     /// An attribute whose datatype has no `AttrValue` representation is omitted
     /// from the map rather than reported as an error. Read

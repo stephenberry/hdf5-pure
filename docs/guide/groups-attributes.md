@@ -65,8 +65,8 @@ The `AttrValue` variants and their HDF5 encodings are:
 
 | Variant | HDF5 encoding |
 |---|---|
-| `AttrValue::F64` | 64-bit float scalar |
-| `AttrValue::F64Array` | 64-bit float array |
+| `AttrValue::F32` / `AttrValue::F32Array` | 32-bit float scalar / array |
+| `AttrValue::F64` / `AttrValue::F64Array` | 64-bit float scalar / array |
 | `AttrValue::I8` / `AttrValue::I8Array` | Signed 8-bit integer scalar / array |
 | `AttrValue::I16` / `AttrValue::I16Array` | Signed 16-bit integer scalar / array |
 | `AttrValue::I32` / `AttrValue::I32Array` | Signed 32-bit integer scalar / array |
@@ -110,7 +110,7 @@ println!("attributes:   {:?}", sensors.attrs().unwrap());
 
 ### Reading an attribute value
 
-An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, the datatype's charset selects the `Ascii` variants, and an integer's width selects among `I8` … `U64`. A `VarLenAsciiArray` of one element stays a `VarLenAsciiArray`, an `AsciiString` does not arrive as a `String`, and a 16-bit attribute does not arrive as an `I64`.
+An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, the datatype's charset selects the `Ascii` variants, and a number's width selects among `I8` … `U64` and `F32` / `F64`. A `VarLenAsciiArray` of one element stays a `VarLenAsciiArray`, an `AsciiString` does not arrive as a `String`, and a 16-bit integer does not arrive as an `I64`.
 
 That fidelity means several variants can carry the same logical value, so match on the variant only when the encoding is what you care about. Otherwise use the accessors, each of which spans every variant that can hold the shape it names:
 
@@ -128,18 +128,18 @@ let fields: Option<Vec<&str>> = attrs.get("MATLAB_fields").and_then(AttrValue::a
 
 What a read cannot recover, because `AttrValue` has no way to express it. Each of these reads correctly, and each would come back differently if it were *rewritten from the value* — which is why [`repack`](repack.md) copies an attribute's encoding rather than rebuilding it from one:
 
-- **Float width.** A 32-bit float widens to `f64`; there is no `f32` variant. Integers keep their width, at 1, 2, 4 and 8 bytes; a width with no Rust integer of its own — 3 bytes, say — widens to 64-bit.
-- **Byte order and precision.** Every integer variant writes back little-endian at its full width, so a big-endian attribute, or one storing fewer bits than its bytes hold, reads correctly but would be re-encoded in this crate's own layout.
+- **Byte order and precision.** Every numeric variant writes back little-endian at its full width, so a big-endian attribute, one storing fewer bits than its bytes hold, or a float laid out other than the way IEEE 754 lays it out, reads correctly but would be re-encoded in this crate's own layout.
+- **Unrepresentable integer widths.** A number keeps its width at 1, 2, 4 and 8 bytes; an integer width with no Rust integer of its own — 3 bytes, say — widens to 64-bit.
 - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR` — what h5py writes, and what this crate's writer never emits — has no variant of its own and reads as the fixed-width variant of the same charset.
 - **Rank.** Every array variant is one-dimensional, so a rank-2 attribute reads as its elements flattened.
 - **Padding and declared width.** A fixed-width string reports its content, not its `STRSIZE` or which padding it used.
 - **Enumeration member names.** An enum attribute decodes through its integer base, so its codes arrive and its labels do not.
 
-The variant may become **more specific** in a future release as `AttrValue` grows further variants — the integer widths landed that way — so match with a `_` arm, which the `#[non_exhaustive]` enum requires anyway, or read through the accessors, which are unaffected by such a change.
+The variant may become **more specific** in a future release as `AttrValue` grows further variants — the numeric widths landed that way — so match with a `_` arm, which the `#[non_exhaustive]` enum requires anyway, or read through the accessors, which are unaffected by such a change.
 
 ### Reading an attribute's datatype
 
-`attr_datatypes()` reports the on-disk [`Datatype`](../reference/data-types.md#the-datatype-model) of every attribute, keyed by name. It is the type channel to `attrs()`'s value channel, the pair a dataset already has in `datatype()` and its `read_*` methods, and it is where the *datatype* entries in the list above — byte order and precision, float width, string padding and declared width, enumeration member names — can still be read.
+`attr_datatypes()` reports the on-disk [`Datatype`](../reference/data-types.md#the-datatype-model) of every attribute, keyed by name. It is the type channel to `attrs()`'s value channel, the pair a dataset already has in `datatype()` and its `read_*` methods, and it is where the *datatype* entries in the list above — byte order and precision, string padding and declared width, enumeration member names — can still be read.
 
 **Rank is not among them.** An attribute's rank lives in its dataspace, which nothing public exposes, so a rank-2 attribute reads as a flat array from `attrs()` with no way to recover its shape from either channel.
 

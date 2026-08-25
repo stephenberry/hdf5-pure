@@ -381,7 +381,7 @@ The payload limit covers bytes referenced by VL elements and excludes Rust conta
 
 | Variant | HDF5 encoding |
 |---|---|
-| `AttrValue::F64` / `F64Array` | 64-bit float scalar/array |
+| `AttrValue::F32` / `F64` (+ `…Array`) | Float scalar/array, at that width |
 | `AttrValue::I8` / `I16` / `I32` / `I64` (+ `…Array`) | Signed integer scalar/array, at that width |
 | `AttrValue::U8` / `U16` / `U32` / `U64` (+ `…Array`) | Unsigned integer scalar/array, at that width |
 | `AttrValue::String` / `StringArray` | UTF-8 null-padded string |

@@ -2,22 +2,23 @@
 // which is gated to 64-bit little-endian targets; skip them elsewhere so the pure-Rust
 // suite can run under `cross test --target i686-...`.
 #![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
-//! An integer attribute keeps the width it is stored at, in both directions
-//! across the reference C library (issue #350).
+//! A numeric attribute keeps the width it is stored at, in both directions
+//! across the reference C library (issues #350 and #354).
 //!
-//! `AttrValue` used to carry integers only at 64 bits, so an attribute written
-//! from a value was eight bytes wide whatever the caller asked for, and one read
-//! back arrived as `I64`/`U64` whatever the file held. The C library preserves
-//! `H5T_NATIVE_INT16` and its siblings, and it wrote most of the files this
-//! crate is pointed at, so it is the authority on both halves: what a width
-//! means on disk, and what the files in the wild carry.
+//! `AttrValue` used to carry integers only at 64 bits and floats only at 64,
+//! so an attribute written from a value was eight bytes wide whatever the
+//! caller asked for, and one read back arrived as `I64`/`U64`/`F64` whatever
+//! the file held. The C library preserves `H5T_NATIVE_INT16`, `H5T_NATIVE_FLOAT`
+//! and their siblings, and it wrote most of the files this crate is pointed at,
+//! so it is the authority on both halves: what a width means on disk, and what
+//! the files in the wild carry.
 //!
-//! The values are the extremes of each width — `i8::MIN`, `u16::MAX` and the
-//! rest — because a value that only fits at its own width is what catches a
-//! narrowing that wrapped or a widening that lost a sign, which `-7` in every
-//! slot would not.
+//! The values are the extremes of each width — `i8::MIN`, `u16::MAX`, `f32::MAX`
+//! and the rest — because a value that only fits at its own width is what
+//! catches a narrowing that wrapped or rounded, or a widening that lost a sign,
+//! which `-7` in every slot would not.
 
-use hdf5::types::{IntSize, TypeDescriptor};
+use hdf5::types::{FloatSize, IntSize, TypeDescriptor};
 use hdf5_pure::{AttrValue, File, FileBuilder};
 use tempfile::tempdir;
 
@@ -25,6 +26,16 @@ use tempfile::tempdir;
 /// the C library must report for it.
 fn scalar_widths() -> Vec<(&'static str, AttrValue, TypeDescriptor)> {
     vec![
+        (
+            "f32",
+            AttrValue::F32(f32::MAX),
+            TypeDescriptor::Float(FloatSize::U4),
+        ),
+        (
+            "f64",
+            AttrValue::F64(f64::MAX),
+            TypeDescriptor::Float(FloatSize::U8),
+        ),
         (
             "i8",
             AttrValue::I8(i8::MIN),
@@ -73,6 +84,16 @@ fn scalar_widths() -> Vec<(&'static str, AttrValue, TypeDescriptor)> {
 /// writes.
 fn array_widths() -> Vec<(&'static str, AttrValue, TypeDescriptor)> {
     vec![
+        (
+            "f32s",
+            AttrValue::F32Array(vec![f32::MIN, f32::MAX]),
+            TypeDescriptor::Float(FloatSize::U4),
+        ),
+        (
+            "f64s",
+            AttrValue::F64Array(vec![f64::MIN, f64::MAX]),
+            TypeDescriptor::Float(FloatSize::U8),
+        ),
         (
             "i8s",
             AttrValue::I8Array(vec![i8::MIN, i8::MAX]),
@@ -145,19 +166,24 @@ fn c_reads_every_width_this_crate_writes() {
         );
         // The values too, so a file that declares the right width and stores the
         // wrong bytes in it does not pass. Each lane reads through the widest
-        // integer of its own signedness, which holds every value on that side.
-        if matches!(expected, TypeDescriptor::Unsigned(_)) {
-            assert_eq!(
+        // type of its own kind, which holds every value on that side exactly.
+        match expected {
+            TypeDescriptor::Unsigned(_) => assert_eq!(
                 attr.read_raw::<u64>().unwrap(),
                 value.to_u64s().unwrap(),
                 "attribute {name} holds wrong values"
-            );
-        } else {
-            assert_eq!(
+            ),
+            TypeDescriptor::Integer(_) => assert_eq!(
                 attr.read_raw::<i64>().unwrap(),
                 value.to_i64s().unwrap(),
                 "attribute {name} holds wrong values"
-            );
+            ),
+            TypeDescriptor::Float(_) => assert_eq!(
+                attr.read_raw::<f64>().unwrap(),
+                value.to_f64s().unwrap(),
+                "attribute {name} holds wrong values"
+            ),
+            other => panic!("attribute {name} expects an unhandled descriptor {other:?}"),
         }
     }
     file.close().unwrap();
@@ -167,8 +193,8 @@ fn c_reads_every_width_this_crate_writes() {
 /// of that width, rather than every one of them arriving as 64-bit.
 ///
 /// This is the half a caller sees on somebody else's file — an instrument
-/// writing `int16` counts, an h5py `np.uint8` flag — and the half issue #350
-/// reported.
+/// writing `int16` counts, an h5py `np.uint8` flag, a `np.float32` calibration —
+/// and the half issues #350 and #354 reported.
 #[test]
 fn every_width_the_c_library_writes_reads_back_as_itself() {
     let dir = tempdir().unwrap();
@@ -200,6 +226,8 @@ fn every_width_the_c_library_writes_reads_back_as_itself() {
         c_attr!("u16", u16, u16::MAX, [0u16, u16::MAX]);
         c_attr!("u32", u32, u32::MAX, [0u32, u32::MAX]);
         c_attr!("u64", u64, u64::MAX, [0u64, u64::MAX]);
+        c_attr!("f32", f32, f32::MAX, [f32::MIN, f32::MAX]);
+        c_attr!("f64", f64, f64::MAX, [f64::MIN, f64::MAX]);
         file.close().unwrap();
     }
 
@@ -223,6 +251,10 @@ fn every_width_the_c_library_writes_reads_back_as_itself() {
         ("u32_array", AttrValue::U32Array(vec![0, u32::MAX])),
         ("u64_scalar", AttrValue::U64(u64::MAX)),
         ("u64_array", AttrValue::U64Array(vec![0, u64::MAX])),
+        ("f32_scalar", AttrValue::F32(f32::MAX)),
+        ("f32_array", AttrValue::F32Array(vec![f32::MIN, f32::MAX])),
+        ("f64_scalar", AttrValue::F64(f64::MAX)),
+        ("f64_array", AttrValue::F64Array(vec![f64::MIN, f64::MAX])),
     ];
     for (name, value) in &expected {
         assert_eq!(attrs.get(*name), Some(value), "attribute {name}");

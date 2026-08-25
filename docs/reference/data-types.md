@@ -75,14 +75,14 @@ Two accessors describe an existing dataset's type:
 
 ## Attribute values
 
-`AttrValue` is the write-side attribute enum. Reading attributes yields the same enum (a `HashMap<String, AttrValue>` from `attrs()`), and an integer keeps the width it is stored at: a 2-byte signed attribute arrives as `I16` / `I16Array`. What the reader does normalize is the layout *inside* that width — every integer variant is little-endian at its full precision, so a big-endian attribute reads correctly and would be rewritten in this crate's own layout. A width with no Rust integer of its own, 3 bytes say, comes back as `I64` / `U64`. An enumeration attribute decodes through its integer base type, the same view the numeric readers take of an enum dataset, so its codes arrive and its member names do not — this is how an h5py `np.bool_` attribute, stored as `enum[FALSE, TRUE]`, reads back as `0` or `1`. `repack` does not go through `AttrValue`, so an attribute keeps whatever encoding it had when copied.
+`AttrValue` is the write-side attribute enum. Reading attributes yields the same enum (a `HashMap<String, AttrValue>` from `attrs()`), and a number keeps the width it is stored at: a 2-byte signed attribute arrives as `I16` / `I16Array`, a 4-byte float as `F32` / `F32Array`. What the reader does normalize is the layout *inside* that width — every numeric variant is little-endian at its full precision and, for a float, in IEEE 754 layout, so a big-endian attribute reads correctly and would be rewritten in this crate's own layout. An integer width with no Rust integer of its own, 3 bytes say, comes back as `I64` / `U64`. An enumeration attribute decodes through its integer base type, the same view the numeric readers take of an enum dataset, so its codes arrive and its member names do not — this is how an h5py `np.bool_` attribute, stored as `enum[FALSE, TRUE]`, reads back as `0` or `1`. `repack` does not go through `AttrValue`, so an attribute keeps whatever encoding it had when copied.
 
 `attr_datatypes()` reports what that normalization drops: the [`Datatype`](#the-datatype-model) of every attribute, including the ones `attrs()` omits for having no `AttrValue` at all. It is the attribute equivalent of `Dataset::datatype()`, and it is what identifies a `np.bool_` attribute as boolean rather than as an ordinary one-byte integer. Like `Dataset::datatype()` it resolves a committed (shared) datatype to the type it names, though neither reports that type's *name*, and neither channel exposes an attribute's rank; see the [groups and attributes guide](../guide/groups-attributes.md#reading-an-attributes-datatype).
 
 | Variant | HDF5 encoding |
 |---|---|
-| `AttrValue::F64` | 64-bit float scalar |
-| `AttrValue::F64Array` | 64-bit float array |
+| `AttrValue::F32` / `F32Array` | 32-bit float scalar / array |
+| `AttrValue::F64` / `F64Array` | 64-bit float scalar / array |
 | `AttrValue::I8` / `I16` / `I32` / `I64` | Signed integer scalar, at that width |
 | `AttrValue::I8Array` / `I16Array` / `I32Array` / `I64Array` | Signed integer array, at that width |
 | `AttrValue::U8` / `U16` / `U32` / `U64` | Unsigned integer scalar, at that width |
