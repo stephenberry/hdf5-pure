@@ -139,7 +139,7 @@ The variant may become **more specific** in a future release as `AttrValue` grow
 
 ### Reading an attribute's datatype
 
-`attr_datatypes()` reports the on-disk [`Datatype`](../reference/data-types.md#the-datatype-model) of every attribute, keyed by name. It is the type channel to `attrs()`'s value channel, the pair a dataset already has in `datatype()` and its `read_*` methods, and it is where the *datatype* entries in the list above — width, padding and declared width, enumeration member names — can still be read.
+`attr_datatypes()` reports the on-disk [`Datatype`](../reference/data-types.md#the-datatype-model) of every attribute, keyed by name. It is the type channel to `attrs()`'s value channel, the pair a dataset already has in `datatype()` and its `read_*` methods, and it is where the *datatype* entries in the list above — byte order and precision, float width, string padding and declared width, enumeration member names — can still be read.
 
 **Rank is not among them.** An attribute's rank lives in its dataspace, which nothing public exposes, so a rank-2 attribute reads as a flat array from `attrs()` with no way to recover its shape from either channel.
 

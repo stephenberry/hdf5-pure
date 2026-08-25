@@ -2830,16 +2830,17 @@ impl Group {
     /// Read all attributes of this group.
     ///
     /// Each value takes the [`AttrValue`] variant that describes its on-disk
-    /// encoding, so the variant reflects the charset and dataspace its writer
-    /// chose rather than the shape of the data alone: a one-element array stays
-    /// an array, and an ASCII string does not arrive as a UTF-8
-    /// [`String`](AttrValue::String). Prefer the accessors — [`AttrValue::as_str`],
-    /// [`as_strings`](AttrValue::as_strings), [`as_i64`](AttrValue::as_i64) and
-    /// the rest — over matching on the variant, unless the encoding is the thing
-    /// you care about. **The variant may become more specific in a future
-    /// release** as `AttrValue` grows narrower ones (fixed widths, variable-length
-    /// strings), and a `_` arm is required regardless because the enum is
-    /// `#[non_exhaustive]`.
+    /// encoding, so the variant reflects the charset, width and dataspace its
+    /// writer chose rather than the shape of the data alone: a one-element array
+    /// stays an array, an ASCII string does not arrive as a UTF-8
+    /// [`String`](AttrValue::String), and a 16-bit integer arrives as
+    /// [`I16`](AttrValue::I16) rather than widened. Prefer the accessors —
+    /// [`AttrValue::as_str`], [`as_strings`](AttrValue::as_strings),
+    /// [`as_i64`](AttrValue::as_i64) and the rest — over matching on the variant,
+    /// unless the encoding is the thing you care about. **The variant may become
+    /// more specific in a future release** as `AttrValue` grows further ones
+    /// (a 32-bit float, variable-length strings), and a `_` arm is required
+    /// regardless because the enum is `#[non_exhaustive]`.
     ///
     /// An attribute whose datatype has no `AttrValue` representation is omitted
     /// from the map rather than reported as an error. Read
@@ -2856,8 +2857,10 @@ impl Group {
     /// This is the type channel to [`attrs`](Self::attrs)'s value channel, the
     /// pair a dataset already has in [`Dataset::datatype`] and its `read_*`
     /// methods. An [`AttrValue`] is a deliberately lossy view of the value, so an
-    /// attribute's stored width, string padding and enumeration members are
-    /// recoverable only from here. Its *rank* is not: that lives in the
+    /// attribute's byte order, sub-width precision, string padding and
+    /// enumeration members are recoverable only from here — its width is not,
+    /// since [`attrs`](Self::attrs) keeps that. Its *rank* is not either: that
+    /// lives in the
     /// dataspace, which nothing public exposes, so a rank-2 attribute still
     /// reads as a flat `AttrValue` array with no way to recover its shape.
     ///

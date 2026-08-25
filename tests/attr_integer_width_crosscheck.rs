@@ -103,6 +103,16 @@ fn array_widths() -> Vec<(&'static str, AttrValue, TypeDescriptor)> {
             AttrValue::U32Array(vec![0, u32::MAX]),
             TypeDescriptor::Unsigned(IntSize::U4),
         ),
+        (
+            "i64s",
+            AttrValue::I64Array(vec![i64::MIN, i64::MAX]),
+            TypeDescriptor::Integer(IntSize::U8),
+        ),
+        (
+            "u64s",
+            AttrValue::U64Array(vec![0, u64::MAX]),
+            TypeDescriptor::Unsigned(IntSize::U8),
+        ),
     ]
 }
 
@@ -134,30 +144,21 @@ fn c_reads_every_width_this_crate_writes() {
             "attribute {name} reached the file at the wrong width"
         );
         // The values too, so a file that declares the right width and stores the
-        // wrong bytes in it does not pass.
-        let read: Vec<i128> = if matches!(expected, TypeDescriptor::Unsigned(_)) {
-            attr.read_raw::<u64>()
-                .unwrap()
-                .into_iter()
-                .map(i128::from)
-                .collect()
+        // wrong bytes in it does not pass. Each lane reads through the widest
+        // integer of its own signedness, which holds every value on that side.
+        if matches!(expected, TypeDescriptor::Unsigned(_)) {
+            assert_eq!(
+                attr.read_raw::<u64>().unwrap(),
+                value.to_u64s().unwrap(),
+                "attribute {name} holds wrong values"
+            );
         } else {
-            attr.read_raw::<i64>()
-                .unwrap()
-                .into_iter()
-                .map(i128::from)
-                .collect()
-        };
-        let expected_values: Vec<i128> = value
-            .to_i64s()
-            .map(|v| v.into_iter().map(i128::from).collect())
-            .or_else(|| {
-                value
-                    .to_u64s()
-                    .map(|v| v.into_iter().map(i128::from).collect())
-            })
-            .unwrap();
-        assert_eq!(read, expected_values, "attribute {name} holds wrong values");
+            assert_eq!(
+                attr.read_raw::<i64>().unwrap(),
+                value.to_i64s().unwrap(),
+                "attribute {name} holds wrong values"
+            );
+        }
     }
     file.close().unwrap();
 }

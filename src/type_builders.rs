@@ -1405,14 +1405,6 @@ impl AttrValue {
     /// gives, and each element is converted once, into the vector handed back.
     fn int_elements<T: TryFrom<i128>>(&self) -> Option<Vec<T>> {
         match self {
-            Self::I8(v) => one_int(*v),
-            Self::I16(v) => one_int(*v),
-            Self::I32(v) => one_int(*v),
-            Self::I64(v) => one_int(*v),
-            Self::U8(v) => one_int(*v),
-            Self::U16(v) => one_int(*v),
-            Self::U32(v) => one_int(*v),
-            Self::U64(v) => one_int(*v),
             Self::I8Array(v) => many_ints(v),
             Self::I16Array(v) => many_ints(v),
             Self::I32Array(v) => many_ints(v),
@@ -1421,7 +1413,9 @@ impl AttrValue {
             Self::U16Array(v) => many_ints(v),
             Self::U32Array(v) => many_ints(v),
             Self::U64Array(v) => many_ints(v),
-            _ => None,
+            // Everything else holds at most one integer, and `single_int` is
+            // already that list; a non-integer value refuses there.
+            _ => Some(vec![self.single_int()?]),
         }
     }
 
@@ -1488,12 +1482,6 @@ impl AttrValue {
             Self::VarLenAsciiArray(_) => "vlen_ascii_string[]",
         }
     }
-}
-
-/// One integer element as a one-element vector of `T`, for
-/// [`AttrValue::int_elements`]'s scalar arms.
-fn one_int<T: TryFrom<i128>, E: Into<i128>>(value: E) -> Option<Vec<T>> {
-    Some(vec![T::try_from(value.into()).ok()?])
 }
 
 /// Every element of an integer array as `T`, for
@@ -2961,8 +2949,8 @@ mod attr_value_accessor_tests {
         assert_eq!(AttrValue::I64(4).to_i64s(), Some(vec![4]));
         assert_eq!(AttrValue::I32(4).to_i64s(), Some(vec![4]));
         assert_eq!(AttrValue::U32(4).to_i64s(), Some(vec![4]));
-        // The most common unsigned read shape: every scalar unsigned attribute
-        // arrives as `U64`, so this arm carries real traffic.
+        // A `u64` attribute is what a C-written `H5T_NATIVE_UINT64` arrives as,
+        // so this arm carries real traffic.
         assert_eq!(AttrValue::U64(4).to_i64s(), Some(vec![4]));
         assert_eq!(
             AttrValue::I64Array(vec![1, 2, 3]).to_i64s(),
@@ -3044,9 +3032,12 @@ mod attr_value_display_tests {
     /// One value of every `AttrValue` variant.
     ///
     /// The match below names each variant with no `_` arm, so a variant added to
-    /// the enum stops this module compiling until it is listed here as well.
-    /// Without that, a test that walks "every variant" walks only the ones that
-    /// existed when it was written — and #350 added ten at once.
+    /// the enum stops this module compiling until it is named there — which is
+    /// the prompt to add it to the list above, the thing the tests actually walk.
+    /// Without it, a test that walks "every variant" walks only the ones that
+    /// existed when it was written, and #350 added ten at once. The match runs
+    /// over the values for want of a way to write it once; its arms are empty
+    /// because the check is the compiler's, not the run's.
     fn one_of_every_variant() -> Vec<AttrValue> {
         let values = vec![
             AttrValue::F64(0.0),
