@@ -1048,3 +1048,67 @@ fn an_in_place_edit_refuses_a_committed_datatype() {
     let out = File::open(&path).unwrap();
     assert_eq!(out.root().datasets().unwrap(), vec!["seed".to_string()]);
 }
+
+/// What the C library calls a named datatype is what this crate's by-name
+/// lookups accept, and nothing else (issue #364).
+///
+/// A dataset's object header carries a datatype message of its own — its element
+/// type — so a lookup that went looking for a datatype message found one, and
+/// `named_datatype` answered with it. `/typed` is the case that makes the wrong
+/// answer indistinguishable from a right one: its element type *is* the
+/// committed type, so both names produced the same value, and nothing in the
+/// result said which object had been asked for.
+///
+/// The classification is taken from `H5O_get_info_by_name`, which is what
+/// `H5Topen` itself gates on, rather than from a list written here: this crate
+/// and the reference library must sort the same file the same way, and only one
+/// of them is ground truth.
+#[test]
+fn only_what_the_c_library_calls_a_named_datatype_is_accepted() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("committed.h5");
+    write_committed_fixture(&path, EVERYTHING);
+    // A group as well, so all three of the C library's object classes are
+    // present: a check written as "is not a dataset" would let this one through.
+    {
+        let file = hdf5::File::open_rw(&path).expect("reopen fixture");
+        file.create_group("g").expect("create /g");
+    }
+
+    let c_file = hdf5::File::open(&path).expect("the C library opens the fixture");
+    let names = c_file.member_names().expect("root members");
+    let ours = File::open(&path).expect("hdf5-pure opens the fixture");
+    let root = ours.root();
+
+    let mut named = Vec::new();
+    for name in &names {
+        let c_says = c_file.loc_type_by_name(name).expect("C library classifies");
+        let got = root.named_datatype(name);
+        if c_says == hdf5::LocationType::NamedDatatype {
+            named.push(name.clone());
+            assert_eq!(
+                got.expect("a committed type must read"),
+                committed_i32(),
+                "{name} is a named datatype to the C library"
+            );
+            root.named_datatype_references(name)
+                .expect("a committed type must count");
+        } else {
+            assert!(
+                matches!(&got, Err(hdf5_pure::Error::NotANamedDatatype(p)) if p == name),
+                "{name} is {c_says:?} to the C library, and answered {got:?}"
+            );
+            assert!(matches!(
+                root.named_datatype_references(name),
+                Err(hdf5_pure::Error::NotANamedDatatype(_))
+            ));
+        }
+    }
+
+    // The fixture is only worth this much if it holds all three classes, and the
+    // listing has to agree with the per-name answers above.
+    assert!(names.len() > named.len(), "the fixture holds only types");
+    assert_eq!(root.named_datatypes().unwrap(), named);
+    assert_eq!(named, ["mytype"]);
+}

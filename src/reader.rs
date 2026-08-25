@@ -3092,10 +3092,7 @@ impl Group {
         let mut names = Vec::new();
         for entry in &entries {
             let hdr = self.file.parse_header(entry.object_header_address)?;
-            if has_message(&hdr, MessageType::Datatype)
-                && !has_message(&hdr, MessageType::DataLayout)
-                && !is_group(&hdr)
-            {
+            if is_named_datatype(&hdr) {
                 names.push(entry.name.clone());
             }
         }
@@ -3104,9 +3101,12 @@ impl Group {
 
     /// The datatype a committed (`H5Tcommit`) child object holds.
     ///
-    /// `name` must be one [`named_datatypes`](Self::named_datatypes) returned;
-    /// any other name fails with [`FormatError::PathNotFound`], and a child that
-    /// is not a datatype object fails for want of a datatype message.
+    /// `name` must be one [`named_datatypes`](Self::named_datatypes) returned: a
+    /// name that reaches nothing fails with [`FormatError::PathNotFound`], and
+    /// one that reaches an object of another kind fails with
+    /// [`Error::NotANamedDatatype`], the way `H5Topen` does. A dataset is the
+    /// case worth naming: its object header carries a datatype message of its
+    /// own, its element type, and that is not what this returns.
     pub fn named_datatype(&self, name: &str) -> Result<Datatype, Error> {
         Ok(self.named_datatype_at(name)?.0)
     }
@@ -3118,9 +3118,12 @@ impl Group {
     /// says whether unlinking the name would destroy the type or merely stop it
     /// being reachable by that name. A header that stores no count has exactly
     /// one reference, which is what the format means by omitting the message.
+    ///
+    /// `name` is classified as [`named_datatype`](Self::named_datatype)
+    /// classifies it, so a name reaching another kind of object is
+    /// [`Error::NotANamedDatatype`] rather than that object's own count.
     pub fn named_datatype_references(&self, name: &str) -> Result<u32, Error> {
-        let entry = self.child_entry(name)?;
-        let hdr = self.file.parse_header(entry.object_header_address)?;
+        let (_, hdr) = self.named_datatype_header(name)?;
         let Ok(msg) = find_message(&hdr, MessageType::ObjectReferenceCount) else {
             return Ok(1);
         };
@@ -3143,6 +3146,21 @@ impl Group {
             .ok_or_else(|| Error::Format(FormatError::PathNotFound(name.to_string())))
     }
 
+    /// The object header of a child that is a committed datatype, and its
+    /// address.
+    ///
+    /// The one place the by-name datatype lookups classify what they reached, so
+    /// that a child this refuses cannot be one
+    /// [`named_datatypes`](Self::named_datatypes) would list.
+    fn named_datatype_header(&self, name: &str) -> Result<(u64, ObjectHeader), Error> {
+        let entry = self.child_entry(name)?;
+        let hdr = self.file.parse_header(entry.object_header_address)?;
+        if !is_named_datatype(&hdr) {
+            return Err(Error::NotANamedDatatype(name.to_string()));
+        }
+        Ok((entry.object_header_address, hdr))
+    }
+
     /// The datatype a committed child object holds, and the address of the object
     /// header holding it.
     ///
@@ -3150,11 +3168,10 @@ impl Group {
     /// naming the same address name one type, and reproducing that requires
     /// matching them up by address rather than by what the type decodes to.
     pub(crate) fn named_datatype_at(&self, name: &str) -> Result<(Datatype, u64), Error> {
-        let entry = self.child_entry(name)?;
-        let hdr = self.file.parse_header(entry.object_header_address)?;
+        let (address, hdr) = self.named_datatype_header(name)?;
         let msg = find_message(&hdr, MessageType::Datatype)?;
         let (dt, _) = Datatype::parse(&self.file.message_body(msg)?)?;
-        Ok((dt, entry.object_header_address))
+        Ok((dt, address))
     }
 
     /// List the names of subgroups in this group.
@@ -5572,6 +5589,27 @@ fn has_message(header: &ObjectHeader, msg_type: MessageType) -> bool {
     header.messages.iter().any(|m| m.msg_type == msg_type)
 }
 
+/// Whether an object header describes a committed (`H5Tcommit`) datatype: it
+/// carries a datatype and is neither a dataset nor a group.
+///
+/// A dataset's header carries a datatype message too — its element type — so
+/// "has a datatype message" is not the question, and a lookup that asked only
+/// that answered a dataset's element type where it owed a refusal (issue #364).
+/// The listing and the by-name lookups share this one predicate so they cannot
+/// disagree about the same child.
+///
+/// The reference library classifies in the same order, most specific last
+/// (`H5O__obj_class_real` walks its table in reverse: group, then dataset, then
+/// datatype), and this is what `H5Topen` gates on. It reads "is a dataset" as a
+/// datatype beside a *dataspace* where this reads it as a datatype beside a data
+/// layout; every dataset either library writes carries both, so the two rules
+/// part only on a header missing one of them.
+fn is_named_datatype(header: &ObjectHeader) -> bool {
+    has_message(header, MessageType::Datatype)
+        && !has_message(header, MessageType::DataLayout)
+        && !is_group(header)
+}
+
 /// The root-relative path of a child named `name` under `parent`, or `None` if
 /// the parent has no resolvable path (reached by object reference).
 ///
@@ -6256,6 +6294,135 @@ mod tests {
             file.root().group("mytype"),
             Err(Error::NotAGroup(_))
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Opening something else as a named datatype (issue #364)
+    // -----------------------------------------------------------------------
+
+    /// An object header carrying exactly `types`, and nothing that would make it
+    /// parse: the predicate below reads message types and no message body.
+    fn header_of(types: &[MessageType]) -> ObjectHeader {
+        ObjectHeader {
+            version: 2,
+            messages: types
+                .iter()
+                .map(|&msg_type| crate::object_header::HeaderMessage {
+                    msg_type,
+                    size: 0,
+                    flags: 0,
+                    creation_order: None,
+                    data: Vec::new(),
+                })
+                .collect(),
+            reference_count: None,
+            flags: 0,
+            access_time: None,
+            modification_time: None,
+            change_time: None,
+            birth_time: None,
+        }
+    }
+
+    /// The rule the listing and both by-name lookups now share, stated over the
+    /// message combinations rather than over one file's children.
+    ///
+    /// Two of these cannot be produced by any writer, here or in the reference
+    /// library, which is why this is a predicate test and not another fixture. A
+    /// header carrying links *and* a datatype is a group to the C library, which
+    /// tests for a group before a datatype (`H5O__obj_class_real` walks its
+    /// table most-specific-last); a header carrying neither is no object class
+    /// at all, and must not become a datatype by default.
+    #[test]
+    fn a_committed_datatype_is_a_datatype_that_is_neither_dataset_nor_group() {
+        for (label, types, expected) in [
+            ("a committed datatype", &[MessageType::Datatype][..], true),
+            (
+                "a dataset, whose element type is a datatype message too",
+                &[MessageType::Datatype, MessageType::DataLayout],
+                false,
+            ),
+            ("a group with a link table", &[MessageType::LinkInfo], false),
+            (
+                "a group with a symbol table",
+                &[MessageType::SymbolTable],
+                false,
+            ),
+            (
+                "a group carrying a datatype",
+                &[MessageType::LinkInfo, MessageType::Datatype],
+                false,
+            ),
+            (
+                "a header with no datatype at all",
+                &[MessageType::Dataspace],
+                false,
+            ),
+        ] {
+            assert_eq!(is_named_datatype(&header_of(types)), expected, "{label}");
+        }
+    }
+
+    /// The issue: the by-name datatype lookups asked only whether the child had
+    /// a datatype message. Every dataset does — its element type — so a dataset
+    /// answered, and the two entry points disagreed with the
+    /// `named_datatypes()` listing about the same child.
+    ///
+    /// The sharp case is a dataset whose element type *is* the committed one:
+    /// `named_datatype` then returned the same value for the dataset's name as
+    /// for the type's, so nothing in the answer said which had been asked for.
+    #[test]
+    fn a_child_that_is_not_a_committed_datatype_is_refused_by_name() {
+        let mut b = FileBuilder::new();
+        b.commit_datatype("mytype", crate::make_i32_type());
+        b.create_dataset("typed")
+            .with_i32_data(&[1, 2, 3])
+            .with_committed_datatype("mytype");
+        b.create_dataset("plain").with_f64_data(&[1.0]);
+        let g = b.create_group("g").finish();
+        b.add_group(g);
+        let file = File::from_bytes(b.finish().unwrap()).unwrap();
+        let root = file.root();
+
+        // The listing is the contract both lookups now share, so it is what the
+        // refusals below have to agree with.
+        assert_eq!(root.named_datatypes().unwrap(), ["mytype"]);
+
+        // A dataset, a dataset carrying that very type, and a group: three kinds
+        // that are not a committed datatype, against both entry points. Neither
+        // had the check, so each needs its own assertion.
+        for name in ["typed", "plain", "g"] {
+            let got = root.named_datatype(name);
+            assert!(
+                matches!(&got, Err(Error::NotANamedDatatype(p)) if p == name),
+                "named_datatype({name:?}) answered {got:?}"
+            );
+            let got = root.named_datatype_references(name);
+            assert!(
+                matches!(&got, Err(Error::NotANamedDatatype(p)) if p == name),
+                "named_datatype_references({name:?}) answered {got:?}"
+            );
+        }
+
+        // A name that reaches nothing stays distinct from one that reaches the
+        // wrong kind, as it is for `group` and `dataset`.
+        assert!(matches!(
+            root.named_datatype("absent"),
+            Err(Error::Format(FormatError::PathNotFound(_)))
+        ));
+        assert!(matches!(
+            root.named_datatype_references("absent"),
+            Err(Error::Format(FormatError::PathNotFound(_)))
+        ));
+
+        // And the committed type still reads, by both entry points — the value,
+        // not merely `is_ok`, since a lookup that refused everything would pass
+        // every assertion above.
+        assert_eq!(
+            root.named_datatype("mytype").unwrap(),
+            crate::make_i32_type()
+        );
+        assert_eq!(root.named_datatype_references("mytype").unwrap(), 2);
     }
 
     /// The mirror of [`a_handle_whose_path_becomes_a_group_keeps_refusing`]: a
