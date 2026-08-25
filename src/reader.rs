@@ -31,7 +31,7 @@ use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterPipeline;
 use crate::free_space_manager;
 use crate::group_v1::GroupEntry;
-use crate::group_v2;
+use crate::group_v2::{self, is_group};
 use crate::layout_info::{Chunk, ChunkIndex, Filter, Layout};
 use crate::libver::LibVer;
 use crate::message_type::MessageType;
@@ -1023,7 +1023,13 @@ impl FileInner {
     /// bytes it labels is not ordered against either, so a handle shared across
     /// threads can still serve one read from a header a concurrent commit had
     /// moved. What these counters order is a handle against edits already made,
-    /// not against one in flight.
+    /// not against one in flight. The callers that classify what they resolved
+    /// to — [`Dataset::resolved`], [`Group::header_address`] — parse that header
+    /// in the same unordered window, so a commit landing inside it can also make
+    /// a live handle report [`Error::NotADataset`](crate::Error::NotADataset) or
+    /// [`Error::NotAGroup`](crate::Error::NotAGroup) for an object whose kind
+    /// never changed. That is the same staleness reporting itself instead of
+    /// answering, which is the better half of the trade.
     fn locate(&self, path: Option<&str>, memo: Resolution) -> Result<Resolution, Error> {
         let revisions = self.revisions();
         Ok(revisions.at(match path {
@@ -2567,7 +2573,10 @@ impl File {
         let revisions = self.inner.revisions();
         let addr = self.inner.resolve_path(path)?;
         if !is_group(&self.inner.parse_header(addr)?) {
-            return Err(Error::NotAGroup(path.to_string()));
+            // Normalized, so that the same object refused here and refused by a
+            // live handle below names itself the same way: a handle knows only
+            // the normalized path it memoized.
+            return Err(Error::NotAGroup(normalize_path(path)));
         }
         Ok(Group::new(
             self.inner.clone(),
@@ -2891,6 +2900,10 @@ impl Group {
         // re-check, so an address installed and then refused would be the
         // answer every later call returns without looking at it again.
         if !is_group(&self.file.parse_header(at.address)?) {
+            // A path-less handle never reaches here: it failed the short-circuit
+            // above, and `locate` answers `StaleHandle` for one whose address
+            // memo it cannot reuse. The default stands for the root's own empty
+            // path, which is the only empty one a handle holds.
             return Err(Error::NotAGroup(self.path.clone().unwrap_or_default()));
         }
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
@@ -5485,14 +5498,6 @@ fn has_message(header: &ObjectHeader, msg_type: MessageType) -> bool {
     header.messages.iter().any(|m| m.msg_type == msg_type)
 }
 
-fn is_group(header: &ObjectHeader) -> bool {
-    header.messages.iter().any(|m| {
-        m.msg_type == MessageType::LinkInfo
-            || m.msg_type == MessageType::Link
-            || m.msg_type == MessageType::SymbolTable
-    })
-}
-
 /// The root-relative path of a child named `name` under `parent`, or `None` if
 /// the parent has no resolvable path (reached by object reference).
 ///
@@ -6057,23 +6062,39 @@ mod tests {
     /// wrong answer rather than an error.
     #[test]
     fn opening_a_dataset_as_a_group_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wrong_kind.h5");
-        revalidation_fixture(&path);
-        let file = File::open(&path).unwrap();
+        let mut b = FileBuilder::new();
+        b.create_dataset("plain").with_i32_data(&[1]);
+        let mut g = b.create_group("g");
+        g.create_dataset("inner").with_i32_data(&[2]);
+        b.add_group(g.finish());
+        let file = File::from_bytes(b.finish().unwrap()).unwrap();
+        let nested = file.group("g").unwrap();
 
-        // Both by-name forms: from the file by path, and from a group by child
-        // name. Each has its own lookup, and each was missing the check.
-        assert!(
-            matches!(file.group("plain"), Err(Error::NotAGroup(ref p)) if p == "plain"),
-            "File::group answered {:?}",
-            file.group("plain").map(|_| "a group"),
-        );
-        assert!(
-            matches!(file.root().group("plain"), Err(Error::NotAGroup(ref n)) if n == "plain"),
-            "Group::group answered {:?}",
-            file.root().group("plain").map(|_| "a group"),
-        );
+        // Both by-name forms — from the file by path, and from a group by child
+        // name — at the root and one level down. Each is its own lookup, and
+        // each was missing the check. The refusal names the object, which is
+        // what the old `PathNotFound("object header is not a group")` could not.
+        for (label, named, got) in [
+            ("File::group", "plain", file.group("plain")),
+            ("Group::group", "plain", file.root().group("plain")),
+            ("File::group nested", "g/inner", file.group("g/inner")),
+            (
+                "Group::group from a subgroup",
+                "inner",
+                nested.group("inner"),
+            ),
+        ] {
+            assert!(
+                matches!(&got, Err(Error::NotAGroup(p)) if p == named),
+                "{label} answered {:?}",
+                got.map(|_| "a group")
+            );
+        }
+
+        // The name it reports is the normalized one, so the same object refused
+        // at a lookup and refused through a live handle names itself the same
+        // way — a handle holds only the normalized path.
+        assert!(matches!(file.group("/plain/"), Err(Error::NotAGroup(ref p)) if p == "plain"));
 
         // A name that resolves to nothing stays distinct from one that resolves
         // to the wrong kind: the second reports what is there.
@@ -6086,10 +6107,30 @@ mod tests {
             Err(Error::Format(FormatError::PathNotFound(_)))
         ));
 
-        // And a real group still opens, by either form and at either depth.
+        // And a real group still opens, by either form.
         assert!(file.group("g").is_ok());
         assert!(file.root().group("g").is_ok());
-        assert!(file.group("g").unwrap().datasets().is_ok());
+    }
+
+    /// A v1 symbol-table group must keep opening by name.
+    ///
+    /// The predicate that decides a lookup was, until this change, only a filter
+    /// over a listing, where failing to recognise a form merely left a group out.
+    /// Gating the lookup on it makes each form it names load-bearing, and the v1
+    /// form is the one with no writer here to produce it — the bytes are a
+    /// fixture, and a classifier that forgot the symbol table would refuse every
+    /// group in every file written before the 1.8 format.
+    #[test]
+    fn a_symbol_table_group_still_opens_by_name() {
+        let file =
+            File::from_bytes(include_bytes!("../tests/fixtures/two_groups.h5").to_vec()).unwrap();
+
+        // Names, not a count: this file holds two one-child groups, so a lookup
+        // that classified correctly and then took its sibling's address would
+        // pass any count worth asserting.
+        for lookup in [file.group("group1"), file.root().group("group1")] {
+            assert_eq!(lookup.unwrap().datasets().unwrap(), ["values"]);
+        }
     }
 
     /// A committed datatype is neither a dataset nor a group, so it separates
@@ -6132,21 +6173,24 @@ mod tests {
             .unwrap();
         file.commit().unwrap();
 
+        // `attrs` every time round: it is the call that answered with the
+        // dataset's attributes instead of failing, and a check installed after
+        // the memo rather than before it would let the second call through.
         for call in 1..=3 {
-            // `attrs` first and every time round: it is the call that answered
-            // with the dataset's attributes instead of failing.
             assert!(
                 matches!(group.attrs(), Err(Error::NotAGroup(ref p)) if p == "g"),
                 "call {call} answered {:?}",
                 group.attrs()
             );
-            assert!(matches!(group.datasets(), Err(Error::NotAGroup(_))));
-            assert!(matches!(group.groups(), Err(Error::NotAGroup(_))));
-            assert!(matches!(
-                group.dataset("anything"),
-                Err(Error::NotAGroup(_))
-            ));
         }
+        // The rest of the read surface funnels through the same re-resolve, so
+        // once each is enough to say the refusal is the group's, not `attrs`'s.
+        assert!(matches!(group.datasets(), Err(Error::NotAGroup(_))));
+        assert!(matches!(group.groups(), Err(Error::NotAGroup(_))));
+        assert!(matches!(
+            group.dataset("anything"),
+            Err(Error::NotAGroup(_))
+        ));
 
         // The path still names something, and that something still opens as
         // what it now is.

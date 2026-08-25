@@ -330,6 +330,17 @@ fn is_v1_group(object_header: &ObjectHeader) -> bool {
         .any(|m| m.msg_type == MessageType::SymbolTable)
 }
 
+/// Whether an object header describes a group at all, in either form.
+///
+/// The union of the two predicates above, which is to say: exactly the headers
+/// [`resolve_group_entries`] will enumerate rather than refuse. A by-name group
+/// lookup ([`crate::File::group`], [`crate::Group::group`]) asks the same
+/// question to decide whether to open at all, and asks it here so that a header
+/// this module would enumerate cannot be one that lookup turns away.
+pub(crate) fn is_group(object_header: &ObjectHeader) -> bool {
+    is_v1_group(object_header) || is_v2_group(object_header)
+}
+
 /// Unified path resolution that works for both v1 and v2 groups.
 ///
 /// Detects group version from object header messages and dispatches accordingly.

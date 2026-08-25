@@ -984,13 +984,9 @@ pub enum Error {
     Format(FormatError),
     /// The object at the given path is not a dataset.
     NotADataset(String),
-    /// The object at the given path exists but is not a group, so it cannot be
-    /// opened as one ([`crate::File::group`], [`crate::Group::group`]).
-    ///
-    /// The counterpart to [`NotADataset`](Self::NotADataset), and what
-    /// distinguishes a name that resolves to the wrong kind of object from one
-    /// that resolves to nothing at all
-    /// ([`FormatError::PathNotFound`](crate::FormatError::PathNotFound)).
+    /// The object at the given path is not a group. A name that resolves to
+    /// nothing at all is
+    /// [`FormatError::PathNotFound`](crate::FormatError::PathNotFound) instead.
     NotAGroup(String),
     /// A required header message was not found.
     MissingMessage(crate::message_type::MessageType),

@@ -5282,8 +5282,10 @@ fn a_group_and_a_dataset_replace_each_other() {
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
+    // The mirror of the refusal above, and the same shape: a kind, not an
+    // absence.
     assert!(
-        file.dataset("g").is_err(),
+        matches!(file.dataset("g"), Err(Error::NotADataset(_))),
         "`g` still resolves as a dataset"
     );
     assert_eq!(file.dataset("g/back").unwrap().read_i32().unwrap(), vec![7]);
