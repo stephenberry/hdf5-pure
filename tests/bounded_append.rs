@@ -508,7 +508,10 @@ fn a_mirrored_session_reports_no_metadata_cache() {
             .with_metadata_cache(MetadataCacheConfig::new(256 * 1024)),
     )
     .unwrap();
-    assert_eq!(file.dataset("d").unwrap().read_i32().unwrap(), vec![0, 1, 2, 3]);
+    assert_eq!(
+        file.dataset("d").unwrap().read_i32().unwrap(),
+        vec![0, 1, 2, 3]
+    );
     assert_eq!(file.metadata_cache_stats(), None);
 }
 

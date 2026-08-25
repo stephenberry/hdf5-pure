@@ -2675,7 +2675,7 @@ impl File {
     /// let properties =
     ///     FileAccessProperties::new().with_metadata_cache(MetadataCacheConfig::new(8 << 20));
     /// let file = File::open_streaming_with_options("data.h5", properties)?;
-    /// for name in file.dataset_names() {
+    /// for name in file.root().datasets()? {
     ///     let _ = file.dataset(&name)?.read_raw()?;
     /// }
     ///

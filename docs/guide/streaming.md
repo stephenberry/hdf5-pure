@@ -90,6 +90,41 @@ The chunk cache configured here is the file-wide default; it applies to every da
 | `ChunkCacheConfig` (file-wide) | `H5Pset_cache` raw-data settings | Decompressed chunk bytes and retained chunk indexes, as the default for all datasets |
 | `ChunkCacheConfig` (per dataset) | `H5Pset_chunk_cache` | Same, overridden for one dataset |
 
+### Checking whether the budget was right
+
+A cache budget is a number chosen before a single read has happened. `File::metadata_cache_stats` reports what it bought, so the next number is measured rather than guessed. It is the counterpart of HDF5's `H5Fget_mdc_hit_rate` and `H5Fget_mdc_size`, and returns `None` when the open has no metadata cache to report on.
+
+```rust
+use hdf5_pure::{File, FileAccessProperties, MetadataCacheConfig};
+
+let access = FileAccessProperties::new().with_metadata_cache(MetadataCacheConfig::new(8 << 20));
+let file = File::open_streaming_with_options("huge.h5", access).unwrap();
+
+// The reads that fill a cache miss by definition, so a rate measured over the
+// whole run charges the steady state for the warm-up.
+for name in file.root().datasets().unwrap() {
+    let _ = file.dataset(&name).unwrap().read_raw().unwrap();
+}
+file.reset_metadata_cache_stats();
+
+for name in file.root().datasets().unwrap() {
+    let _ = file.dataset(&name).unwrap().read_raw().unwrap();
+}
+let stats = file.metadata_cache_stats().unwrap();
+println!("{:?} over {} reads, {} of {} bytes held", stats.hit_rate(), stats.reads(), stats.bytes(), 8 << 20);
+```
+
+Which figure to read depends on what you are asking:
+
+- **`hit_rate`** is the headline: the fraction of eligible reads served without touching the file. `None` means no eligible read has happened yet, which is not the same as a cache that has missed everything.
+- **`evictions`** is what says a larger budget would help. A disappointing hit rate *with* evictions is a budget too small for the working set; the same hit rate with none is a workload that does not revisit metadata, and raising the budget will not change it.
+- **`oversize_reads`** counts reads turned away for exceeding `max_entry_bytes` before the cache saw them. A file with large fractal heaps or index blocks can be missing from the cache entirely for this reason while the hit rate looks healthy.
+- **`invalidations`** applies to a read-write session: entries dropped because a write overlapped them. Approaching the miss count, it means the session is rewriting the metadata it is caching.
+
+`reset_metadata_cache_stats` clears the four counters and evicts nothing, so occupancy carries across it.
+
+Set the budget generously. The store is indexed rather than searched, so a hit costs the same whether it holds a thousand entries or sixty thousand, and an over-large budget costs memory and nothing else. That is also why the crate models the memory budget of `H5AC_cache_config_t` and not its adaptive-resize policy, which exists to spare a caller a choice that is cheap to get right here; see the [property-support reference](../reference/property-support.md#the-metadata-cache-h5pset_mdc_config) for the field-by-field map.
+
 ### Per-dataset overrides
 
 To override the chunk cache for a single dataset, open it with `dataset_with_options(name, DatasetAccessProperties)`. This is the analogue of HDF5's per-dataset access property list (`H5Pset_chunk_cache`). The override replaces the file-wide default for that one dataset; other datasets keep the default. A dataset that is read once front-to-back, for instance, gains nothing from caching its decompressed chunks, so you can disable the cache with `ChunkCacheConfig::disabled()`:

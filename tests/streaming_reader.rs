@@ -152,7 +152,10 @@ fn metadata_cache_stats_report_what_the_budget_bought() {
 
     let read_every = |file: &File| {
         for i in 0..DATASETS {
-            file.dataset(&format!("d{i:03}")).unwrap().read_i32().unwrap();
+            file.dataset(&format!("d{i:03}"))
+                .unwrap()
+                .read_i32()
+                .unwrap();
         }
     };
 
@@ -230,7 +233,10 @@ fn a_budget_too_small_for_the_file_reports_evictions() {
     )
     .unwrap();
     for i in 0..DATASETS {
-        file.dataset(&format!("d{i:03}")).unwrap().read_i32().unwrap();
+        file.dataset(&format!("d{i:03}"))
+            .unwrap()
+            .read_i32()
+            .unwrap();
     }
 
     let stats = file.metadata_cache_stats().unwrap();
@@ -238,7 +244,10 @@ fn a_budget_too_small_for_the_file_reports_evictions() {
         stats.evictions() > 0,
         "32 datasets do not fit in 1 KiB of metadata: {stats:?}"
     );
-    assert!(stats.bytes() <= BUDGET, "the budget still bounds it: {stats:?}");
+    assert!(
+        stats.bytes() <= BUDGET,
+        "the budget still bounds it: {stats:?}"
+    );
 }
 
 /// Recursively assert the streaming backend reports the identical groups,
