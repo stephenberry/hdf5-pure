@@ -145,7 +145,7 @@ The variant may become **more specific** in a future release as `AttrValue` grow
 
 It reports **every** attribute message, including the ones `attrs()` omits because no `AttrValue` can carry them, so a name missing from that map can be told from one the object does not have.
 
-One datatype is not reported faithfully: a **committed** (shared) type, created with `H5Tcommit`, is stored on the attribute as a reference to a shared message rather than as the type itself, and both this and `Dataset::datatype()` decode that reference as though it were an inline datatype. netCDF-4 user-defined types and h5py's `f["t"] = np.dtype(...)` reach a file this way.
+A **committed** (shared) type, created with `H5Tcommit`, is stored on the attribute as a reference to the type's own object header rather than as the type itself, and both this and `Dataset::datatype()` follow that reference and report the type it names. netCDF-4 user-defined types and h5py's `f["t"] = np.dtype(...)` reach a file this way. What neither channel reports is the type's *name*: two attributes sharing `/mytype` give the same `Datatype` as one that spells it out inline.
 
 A boolean attribute needs both channels. The C library gives `H5T_NATIVE_HBOOL` — what h5py writes for every `np.bool_` — an `enum[FALSE, TRUE]` over an 8-bit base, so the value arrives as `0` or `1`, indistinguishable from an `i8`, and only the datatype records which it was:
 
