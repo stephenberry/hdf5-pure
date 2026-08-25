@@ -86,7 +86,7 @@ assert!(signal.attrs().unwrap().contains_key("units")); // same handle, new file
 
 Two cases report rather than answer:
 
-- **Reading** through a handle onto an object the commit **deleted** fails the way opening it by name would (`FormatError::PathNotFound`). The bytes a deleted object leaves behind still parse as the object that left them, so reading them would answer with data no longer in the file. Its write methods address the file by path as they always did, so they still stage, and the commit refuses them.
+- **Reading** through a handle onto an object the commit **deleted** fails the way opening it by name would (`FormatError::PathNotFound`); onto one the commit **replaced with an object of a different kind**, it is `Error::NotADataset` or `Error::NotAGroup`. The bytes a deleted object leaves behind still parse as the object that left them, so reading them would answer with data no longer in the file. Its write methods address the file by path as they always did, so they still stage, and the commit refuses them.
 - A handle reached by **object reference** (`Dataset::dereference`) knows only an object-header address and has no path to look up, so it returns `Error::StaleHandle` once anything that could have moved that header has run — a commit, a staged edit, a `sync`, a `close`. Dereference again from a fresh read. An immediate `append` moves no header, so such a handle keeps reading and appending across one.
 
 ## Operations

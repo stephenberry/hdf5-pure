@@ -984,6 +984,10 @@ pub enum Error {
     Format(FormatError),
     /// The object at the given path is not a dataset.
     NotADataset(String),
+    /// The object at the given path is not a group. A name that resolves to
+    /// nothing at all is
+    /// [`FormatError::PathNotFound`](crate::FormatError::PathNotFound) instead.
+    NotAGroup(String),
     /// A required header message was not found.
     MissingMessage(crate::message_type::MessageType),
     /// An array shape error from the `ndarray` integration: either the flat
@@ -1122,6 +1126,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::Format(e) => write!(f, "HDF5 format error: {e}"),
             Error::NotADataset(path) => write!(f, "not a dataset: {path}"),
+            Error::NotAGroup(path) => write!(f, "not a group: {path}"),
             Error::MissingMessage(mt) => write!(f, "missing required message: {mt}"),
             Error::Shape(msg) => write!(f, "array shape error: {msg}"),
             Error::SwmrUnsupported => write!(
