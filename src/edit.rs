@@ -14761,9 +14761,11 @@ mod tests {
     /// writer is the regime where it still shows: it gathers nothing by design,
     /// so every write the engine makes is a syscall. Stated as a ceiling on the
     /// count rather than as an exact figure, since what an append needs is free to
-    /// fall — and it has: 12 before issue #307 published each checksummed
-    /// structure in one write, 8 after. Six statistics written singly puts it five
-    /// over; a checksum written apart from the value it covers, four.
+    /// fall — and it has: for the append this measures, the first into a dataset,
+    /// 12 before issue #307 published each checksummed structure in one write and
+    /// 8 after; an append that reuses the data block that one allocates costs 5.
+    /// Six statistics written singly puts it five over; a checksum written apart
+    /// from the value it covers, four.
     #[test]
     fn an_unbuffered_append_costs_a_small_constant_number_of_writes() {
         use tempfile::tempdir;

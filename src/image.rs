@@ -360,11 +360,21 @@ pub(crate) trait FileImage: Source + Send + Sync {
 /// # What it gathers
 ///
 /// A commit or an in-place append issues many small writes into a few pages. One
-/// measured in-place append costs eight: an eight-kilobyte chunk at end-of-file,
-/// and seven index, checksum, dimension and superblock patches averaging eighteen
-/// bytes each, landing in pages the *next* append dirties again. A session
-/// appending one chunk to each of eight such datasets, four times over, makes 256
-/// of those write calls and issues 160 of them gathered (issue #288).
+/// measured in-place append costs five write calls — the chunk at end-of-file,
+/// the superblock's recorded end-of-file, and a patch each to the chunk index,
+/// the array header and the object header's dataspace dimension — so four small
+/// patches around one payload write, landing in pages the *next* append dirties
+/// again. An append that has to allocate a new extensible-array data block costs
+/// eight, which the first append into a dataset always does.
+///
+/// A barrier is where held bytes are released, and an append puts one between
+/// each pair of phases that must reach the disk in order, so on the appends there
+/// is little left to merge: measured on a paged fixture, four of those five
+/// writes fall in two pages, two apiece, and all five still go out separately.
+/// What the gathering collects is the commit tail, which puts many writes into a
+/// handful of pages as it rebuilds a group, repoints a root and re-homes the
+/// free-space managers: a commit staging eight dataset creations makes 24 write
+/// calls and issues 4 (issue #288).
 ///
 /// Pending writes are held as disjoint byte runs, merged on insert when they
 /// touch or overlap, and emitted at flush as **one write per dirty page**: runs
