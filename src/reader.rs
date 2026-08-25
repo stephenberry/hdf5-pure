@@ -5597,6 +5597,40 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     // -----------------------------------------------------------------------
+    // Reporting the metadata cache (issue #353)
+    // -----------------------------------------------------------------------
+
+    /// `SourceView` serves its metadata reads from the streaming backend's
+    /// cache, so it has to forward the account of them as well. It is the one
+    /// wrapper `File::metadata_cache_stats` does not itself go through — that
+    /// dispatch uses `with_source`, which reaches the read-write backend too —
+    /// so nothing else would notice the forward going missing.
+    #[test]
+    fn the_source_view_reports_the_cache_it_reads_through() {
+        let backend = MetadataCachingSource::new(
+            BytesSource::new((0..=255u8).collect::<Vec<u8>>()),
+            MetadataCacheConfig::new(4096),
+        );
+        let view = SourceView::Stream(&backend);
+
+        assert_eq!(view.metadata_cache_stats().unwrap().reads(), 0);
+        view.read_metadata_at(0, 64).unwrap();
+        view.read_metadata_at(0, 64).unwrap();
+        let stats = view
+            .metadata_cache_stats()
+            .expect("the backend has a cache, so the view reports it");
+        assert_eq!((stats.hits(), stats.misses()), (1, 1));
+
+        view.reset_metadata_cache_stats();
+        let cleared = view.metadata_cache_stats().unwrap();
+        assert_eq!(cleared.hits(), 0);
+        assert_eq!(cleared.entries(), 1, "a reset evicts nothing");
+
+        // A whole-file buffer is the cache; there is no second one to report.
+        assert_eq!(SourceView::Mem(&[0u8; 16]).metadata_cache_stats(), None);
+    }
+
+    // -----------------------------------------------------------------------
     // Handle re-validation across an edit (issue #351)
     // -----------------------------------------------------------------------
 
