@@ -322,7 +322,7 @@ jobs:
           --lib --test write_read_roundtrip --test serde_roundtrip --test zfp_roundtrip
           --test streaming_reader --test dense_attr_limits --test dense_attr_vlen
           --test attr_message_size_limit --test userblock_dense_attrs
-          --test c_1_8_read_compat
+          --test c_1_8_read_compat --test fixed_strings
 
   # Real big-endian execution under QEMU. Every integer this crate writes is
   # little-endian on disk, so on a big-endian host every read and write has to
@@ -349,7 +349,7 @@ jobs:
           --features "std checksum deflate zfp serde ndarray provenance"
           --lib --test write_read_roundtrip --test serde_roundtrip
           --test complex_bulk_array --test complex_integer
-          --test streaming_reader --test vlen_strings
+          --test streaming_reader --test vlen_strings --test fixed_strings
 
   # Bare-metal no_std build: proves the crate links without `std` on a genuine
   # `none` target (the existing no-std-check only runs on the std-capable host).
