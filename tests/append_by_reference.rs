@@ -91,7 +91,9 @@ fn a_dereferenced_handle_can_append_on_a_bounded_file() {
 /// its data-layout message still points at the live chunk index — so an append
 /// through a handle that captured the old address would succeed *into the dead
 /// header*, grow its dataspace, and report `Ok` while the live dataset stood
-/// still. It must be refused instead.
+/// still. It must be refused instead, with the same [`Error::StaleHandle`] a
+/// *read* through that handle now reports (issue #351): one condition, one
+/// error, whichever way the handle is used.
 #[test]
 fn appending_by_reference_after_a_commit_is_refused_not_silently_lost() {
     let dir = tempdir().unwrap();
@@ -112,7 +114,7 @@ fn appending_by_reference_after_a_commit_is_refused_not_silently_lost() {
 
         let err = by_ref.append(&[12i32, 13, 14, 15]).unwrap_err();
         assert!(
-            matches!(err, Error::AppendInPlaceUnsupported(_)),
+            matches!(err, Error::StaleHandle),
             "unexpected error: {err:?}"
         );
 
@@ -135,8 +137,29 @@ fn appending_by_reference_after_a_commit_is_refused_not_silently_lost() {
     );
 }
 
+/// A handle dereferenced *while* edits are already staged is refused too, and by
+/// a different rule than the one above: nothing has moved under it, so it is not
+/// stale — the session simply cannot check a raw address against edits it has not
+/// applied. Two conditions, two errors, each saying which it is.
+#[test]
+fn appending_by_reference_dereferenced_after_staging_is_refused_by_the_session() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("byref_staged_first.h5");
+    build(&p);
+    let file = File::open_rw(&p).unwrap();
+    file.root().create_group("g").unwrap();
+    // Dereferenced now, so its address is the file's current one.
+    let mut by_ref = deref_dataset(&file);
+    let err = by_ref.append(&[8i32]).unwrap_err();
+    assert!(
+        matches!(err, Error::AppendInPlaceUnsupported(_)),
+        "unexpected error: {err:?}"
+    );
+}
+
 /// The staged-edit form of the same rule: an address cannot be checked against a
-/// pending edit that may move it.
+/// pending edit that may move it, so staging one ends this handle just as
+/// committing would.
 #[test]
 fn appending_by_reference_with_staged_edits_pending_is_refused() {
     let dir = tempdir().unwrap();
@@ -147,7 +170,7 @@ fn appending_by_reference_with_staged_edits_pending_is_refused() {
     file.root().create_group("g").unwrap();
     let err = by_ref.append(&[8i32]).unwrap_err();
     assert!(
-        matches!(err, Error::AppendInPlaceUnsupported(_)),
+        matches!(err, Error::StaleHandle),
         "unexpected error: {err:?}"
     );
 }

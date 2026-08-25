@@ -515,7 +515,7 @@ fn emit_dataset(
     // undefined data address, exactly as a never-written one does, and this crate
     // does not follow the external files. Refused rather than reproduced, which
     // would silently emit a schema-only dataset in place of one holding data.
-    if ds.has_external_storage() {
+    if ds.has_external_storage()? {
         return Err(Error::RepackUnsupported(format!(
             "dataset {path}: external data storage (H5Pset_external) cannot be repacked -- its \
              element bytes live in files this crate does not read"
@@ -711,7 +711,7 @@ fn emit_dataset(
                 maxshape,
                 &chunk_dims,
                 elem_size,
-                ds.filter_pipeline_message_bytes(),
+                ds.filter_pipeline_message_bytes()?,
                 meta,
                 Box::new(provider),
             );
@@ -1421,7 +1421,7 @@ fn build_object_address_map(file: &File) -> Result<HashMap<u64, String>, Error> 
     let root = file.root();
     // The root group can itself be referenced (the writer registers it under the
     // empty path).
-    map.insert(root.header_address(), String::new());
+    map.insert(root.header_address()?, String::new());
     collect_addresses(&root, "", &mut map)?;
     Ok(map)
 }
@@ -1434,7 +1434,7 @@ fn collect_addresses(
     map: &mut HashMap<u64, String>,
 ) -> Result<(), Error> {
     for (name, ds) in group.iter_datasets()? {
-        map.insert(ds.header_address(), join(prefix, &name));
+        map.insert(ds.header_address()?, join(prefix, &name));
     }
     // A committed datatype is an object with an address like any other: a dataset
     // or attribute naming one is resolved through this map, and an object
@@ -1445,7 +1445,7 @@ fn collect_addresses(
     }
     for (name, child) in group.iter_groups()? {
         let child_path = join(prefix, &name);
-        map.insert(child.header_address(), child_path.clone());
+        map.insert(child.header_address()?, child_path.clone());
         collect_addresses(&child, &child_path, map)?;
     }
     Ok(())
