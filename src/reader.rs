@@ -2088,6 +2088,26 @@ impl File {
     /// [`SyncPolicy::Always`]; under
     /// [`SyncPolicy::OnClose`](crate::SyncPolicy::OnClose) it has reached the
     /// operating system and waits for a [`sync`](Self::sync).
+    ///
+    /// **A commit refused before it publishes leaves every dataset reading what
+    /// it read before.** Almost everything such a commit writes lands where
+    /// nothing reaches it until the commit's linearization point; the one edit
+    /// that does not is a same-length [`Dataset::write`], which overwrites the
+    /// dataset's existing block, and the refusal writes those bytes back on its
+    /// way out. A refusal raised before the first write keeps the staged batch
+    /// too, so it can be corrected and committed again (issue #316).
+    ///
+    /// # Errors
+    ///
+    /// Two failures do not carry that promise, and both call for **re-reading**
+    /// the datasets the batch named rather than for a retry:
+    ///
+    /// - [`Error::CommitPartiallyApplied`](crate::Error::CommitPartiallyApplied),
+    ///   where the restore itself failed, so a dataset may hold either value.
+    /// - An error from a step *after* the commit published — repointing the
+    ///   object references that named a moved object is the one that can raise
+    ///   it. The batch is in the file and stays there; what failed is work the
+    ///   commit owed afterwards. The file is valid either way.
     pub fn commit(&self) -> Result<(), Error> {
         self.with_mirror_session(true, |session| session.commit())
     }
