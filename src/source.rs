@@ -154,7 +154,7 @@ impl Default for MetadataCacheConfig {
 /// Returned by [`crate::File::metadata_cache_stats`]. This is the `hdf5-pure`
 /// counterpart to HDF5's `H5Fget_mdc_hit_rate` and `H5Fget_mdc_size`:
 /// [`entries`](Self::entries) and [`bytes`](Self::bytes) are a point-in-time
-/// view of occupancy, and the four counters are cumulative since the file was
+/// view of occupancy, and the counters are cumulative since the file was
 /// opened or since the last
 /// [`reset_metadata_cache_stats`](crate::File::reset_metadata_cache_stats).
 ///

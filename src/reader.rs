@@ -2697,7 +2697,7 @@ impl File {
     /// definition, so a hit rate taken over the run charges the steady state for
     /// the warm-up. Reset after warming to measure the part that repeats.
     ///
-    /// It evicts nothing — occupancy, which
+    /// It evicts nothing: occupancy, which
     /// [`metadata_cache_stats`](Self::metadata_cache_stats) also reports, is a
     /// measurement of the cache rather than a tally of its history. A file with
     /// no metadata cache ignores the call.
@@ -5602,9 +5602,9 @@ mod tests {
 
     /// `SourceView` serves its metadata reads from the streaming backend's
     /// cache, so it has to forward the account of them as well. It is the one
-    /// wrapper `File::metadata_cache_stats` does not itself go through — that
-    /// dispatch uses `with_source`, which reaches the read-write backend too —
-    /// so nothing else would notice the forward going missing.
+    /// wrapper `File::metadata_cache_stats` does not itself go through (that
+    /// dispatch uses `with_source`, which reaches the read-write backend too), so
+    /// nothing else would notice the forward going missing.
     #[test]
     fn the_source_view_reports_the_cache_it_reads_through() {
         let backend = MetadataCachingSource::new(
