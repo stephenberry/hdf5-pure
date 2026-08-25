@@ -7,7 +7,7 @@ use alloc::{boxed::Box, string::String, string::ToString, vec, vec::Vec};
 
 use core::fmt;
 
-use core::num::NonZeroUsize;
+use core::num::{NonZeroU32, NonZeroUsize};
 
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::{ChunkMeta, ChunkOptions, ChunkProvider, FilterKind, StorageAllocation};
@@ -731,7 +731,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
-                    size: fixed_string_size(bytes.len()),
+                    size: fixed_string_size(bytes.len()).get(),
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Utf8,
                 },
@@ -741,17 +741,17 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             }
         }
         AttrValue::StringArray(arr) => {
-            let elem_size = fixed_string_size(arr.iter().map(|s| s.len()).max().unwrap_or(0));
+            let elem_size = derived_string_width(arr);
             let mut raw = Vec::new();
             for s in arr {
                 let mut b = s.as_bytes().to_vec();
-                b.resize(elem_size as usize, 0);
+                b.resize(elem_size.get() as usize, 0);
                 raw.extend_from_slice(&b);
             }
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
-                    size: elem_size,
+                    size: elem_size.get(),
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Utf8,
                 },
@@ -765,7 +765,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
-                    size: fixed_string_size(bytes.len()),
+                    size: fixed_string_size(bytes.len()).get(),
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Ascii,
                 },
@@ -775,17 +775,17 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             }
         }
         AttrValue::AsciiStringArray(arr) => {
-            let elem_size = fixed_string_size(arr.iter().map(|s| s.len()).max().unwrap_or(0));
+            let elem_size = derived_string_width(arr);
             let mut raw = Vec::new();
             for s in arr {
                 let mut b = s.as_bytes().to_vec();
-                b.resize(elem_size as usize, 0);
+                b.resize(elem_size.get() as usize, 0);
                 raw.extend_from_slice(&b);
             }
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
-                    size: elem_size,
+                    size: elem_size.get(),
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Ascii,
                 },
@@ -1186,21 +1186,60 @@ pub(crate) fn patch_vl_refs_masked(
 /// An empty string is therefore stored as one padding byte, which reads back as
 /// the empty string under any of the three padding rules. Storing it needs no
 /// refusal: the value is representable, it was only the datatype that was not.
-fn fixed_string_size(len: usize) -> u32 {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "string byte length is stored in the 4-byte fixed-string datatype size field"
-    )]
-    let size = len.max(1) as u32;
-    size
+///
+/// The upper end is the datatype message's own 4-byte size field: no fixed-width
+/// string element can be wider than [`u32::MAX`], so a longer `len` saturates
+/// there rather than wrapping to a small width whose elements would each store a
+/// truncated prefix. Saturating is not itself the answer for such a value —
+/// [`encode_fixed_strings`] then finds it longer than the width and refuses it,
+/// which is the whole handling of a string HDF5 has no fixed-width type for.
+fn fixed_string_size(len: usize) -> NonZeroU32 {
+    // The `unwrap_or` is the empty-string rule above: zero bytes still take one.
+    NonZeroU32::new(u32::try_from(len).unwrap_or(u32::MAX)).unwrap_or(NonZeroU32::MIN)
 }
 
 /// A scalar fixed-width string's raw data: its bytes, never empty, so that the
 /// message matches the `STRSIZE` [`fixed_string_size`] declares.
 fn pad_to_size(bytes: &[u8]) -> Vec<u8> {
     let mut out = bytes.to_vec();
-    out.resize(fixed_string_size(bytes.len()) as usize, 0);
+    out.resize(fixed_string_size(bytes.len()).get() as usize, 0);
     out
+}
+
+/// `STRSIZE` for a fixed-width string dataset built from `values`: wide enough
+/// for the longest of them, and never zero.
+///
+/// Shared with the attribute side so the same values written as an
+/// [`AttrValue::AsciiStringArray`] and as a dataset declare the same width, and
+/// generic over the string type because the attribute variants own theirs while
+/// the dataset entry points borrow the caller's.
+fn derived_string_width<S: AsRef<str>>(values: &[S]) -> NonZeroU32 {
+    fixed_string_size(values.iter().map(|s| s.as_ref().len()).max().unwrap_or(0))
+}
+
+/// The raw element bytes of a fixed-width string dataset: each value's bytes
+/// zero-padded on the right to `width`, which is what
+/// [`StringPadding::NullPad`] declares on the wire.
+///
+/// A value longer than `width` is refused rather than truncated. A stored prefix
+/// reads back as a value the caller never wrote, and reads back without error,
+/// so nothing downstream could tell it apart from real data.
+fn encode_fixed_strings(values: &[&str], width: NonZeroU32) -> Result<Vec<u8>, FormatError> {
+    let width_bytes = width.get() as usize;
+    let mut raw = Vec::with_capacity(values.len().saturating_mul(width_bytes));
+    for (index, value) in values.iter().enumerate() {
+        let bytes = value.as_bytes();
+        if bytes.len() > width_bytes {
+            return Err(FormatError::FixedStringTooLong {
+                index,
+                len: bytes.len(),
+                width: width.get(),
+            });
+        }
+        raw.extend_from_slice(bytes);
+        raw.resize(raw.len() + (width_bytes - bytes.len()), 0);
+    }
+    Ok(raw)
 }
 
 pub(crate) fn scalar_ds() -> Dataspace {
@@ -2280,6 +2319,143 @@ impl DatasetBuilder {
         self
     }
 
+    /// Write a fixed-width ASCII string dataset, sized to the longest value.
+    ///
+    /// Every element occupies the same number of bytes — the length of the
+    /// longest value, or one byte when they are all empty — zero-padded on the
+    /// right, and the datatype is `H5T_STRING { STRSIZE = width, NULLPAD,
+    /// ASCII }`. This is the encoding
+    /// [`AttrValue::AsciiStringArray`] writes as an attribute, so the same
+    /// values land on disk the same way whichever they are stored as, and
+    /// [`Dataset::read_string`](crate::Dataset::read_string) reads them back
+    /// without the caller trimming anything.
+    ///
+    /// The shape defaults to `[values.len()]` unless
+    /// [`with_shape`](Self::with_shape) sets it. Use
+    /// [`with_ascii_strings_sized`](Self::with_ascii_strings_sized) to declare a
+    /// width instead of deriving one, [`with_strings`](Self::with_strings) for
+    /// UTF-8, and [`with_vlen_strings`](Self::with_vlen_strings) when elements
+    /// should not share a width at all.
+    ///
+    /// Only a value with no fixed-width HDF5 datatype at all — one longer than
+    /// the datatype message's 4-byte size field can describe — is refused, with
+    /// [`FormatError::FixedStringTooLong`].
+    ///
+    /// ```
+    /// use hdf5_pure::{File, FileBuilder};
+    ///
+    /// let mut fb = FileBuilder::new();
+    /// fb.create_dataset("station")
+    ///     .with_ascii_strings(&["north", "s", "east"])
+    ///     .unwrap();
+    /// let file = File::from_bytes(fb.finish().unwrap()).unwrap();
+    /// let ds = file.dataset("station").unwrap();
+    /// assert_eq!(ds.read_string().unwrap(), ["north", "s", "east"]);
+    /// ```
+    pub fn with_ascii_strings(&mut self, values: &[&str]) -> Result<&mut Self, FormatError> {
+        self.stage_fixed_strings(values, derived_string_width(values), CharacterSet::Ascii)
+    }
+
+    /// Write a fixed-width ASCII string dataset of a width you declare.
+    ///
+    /// The width-deriving [`with_ascii_strings`](Self::with_ascii_strings) sizes
+    /// the datatype to the values in hand, which is the wrong rule when the
+    /// values in hand are not all the values: a dataset can be extended, and a
+    /// later, longer string would have nowhere to go. Declaring the width is
+    /// also how a rewrite reproduces a source dataset's own `STRSIZE`, and how a
+    /// writer matches a column width that came from a schema rather than from
+    /// data.
+    ///
+    /// A value longer than `width` is refused with
+    /// [`FormatError::FixedStringTooLong`] rather than stored as a prefix, and a
+    /// `width` of zero with [`FormatError::ZeroFixedStringWidth`], since no HDF5
+    /// string datatype may be zero bytes wide. Shorter values are zero-padded,
+    /// as `NULLPAD` declares.
+    ///
+    /// ```
+    /// use hdf5_pure::{File, FileBuilder, FormatError};
+    ///
+    /// let mut fb = FileBuilder::new();
+    /// fb.create_dataset("station")
+    ///     .with_ascii_strings_sized(&["north", "s"], 16)
+    ///     .unwrap();
+    /// let file = File::from_bytes(fb.finish().unwrap()).unwrap();
+    /// assert_eq!(
+    ///     file.dataset("station").unwrap().read_string().unwrap(),
+    ///     ["north", "s"]
+    /// );
+    ///
+    /// // A value the declared width cannot hold is refused, not truncated.
+    /// let mut fb = FileBuilder::new();
+    /// assert!(matches!(
+    ///     fb.create_dataset("station").with_ascii_strings_sized(&["north"], 2),
+    ///     Err(FormatError::FixedStringTooLong { index: 0, .. })
+    /// ));
+    /// ```
+    pub fn with_ascii_strings_sized(
+        &mut self,
+        values: &[&str],
+        width: u32,
+    ) -> Result<&mut Self, FormatError> {
+        let width = NonZeroU32::new(width).ok_or(FormatError::ZeroFixedStringWidth)?;
+        self.stage_fixed_strings(values, width, CharacterSet::Ascii)
+    }
+
+    /// Write a fixed-width UTF-8 string dataset, sized to the longest value.
+    ///
+    /// The UTF-8 counterpart of
+    /// [`with_ascii_strings`](Self::with_ascii_strings), standing to it as
+    /// [`AttrValue::StringArray`] stands to [`AttrValue::AsciiStringArray`]: the
+    /// same encoding under a different charset bit. The width is a count of
+    /// *bytes*, so a value with multi-byte characters takes more of it than its
+    /// character count suggests.
+    pub fn with_strings(&mut self, values: &[&str]) -> Result<&mut Self, FormatError> {
+        self.stage_fixed_strings(values, derived_string_width(values), CharacterSet::Utf8)
+    }
+
+    /// Write a fixed-width UTF-8 string dataset of a width you declare.
+    ///
+    /// The UTF-8 counterpart of
+    /// [`with_ascii_strings_sized`](Self::with_ascii_strings_sized), refusing
+    /// the same two ways. `width` counts bytes rather than characters, and a
+    /// value is measured whole: this never splits one across the width boundary,
+    /// because it never truncates at all.
+    pub fn with_strings_sized(
+        &mut self,
+        values: &[&str],
+        width: u32,
+    ) -> Result<&mut Self, FormatError> {
+        let width = NonZeroU32::new(width).ok_or(FormatError::ZeroFixedStringWidth)?;
+        self.stage_fixed_strings(values, width, CharacterSet::Utf8)
+    }
+
+    /// Shared body of the fixed-width string entry points.
+    ///
+    /// The declared `STRSIZE` and the padding applied to every element come from
+    /// the one `width` here, which is what keeps the datatype message and the
+    /// element bytes describing the same thing. Other paddings (`NULLTERM`,
+    /// `SPACEPAD`) and other charsets stay the business of
+    /// [`with_raw_data`](Self::with_raw_data) with a hand-built
+    /// [`Datatype::String`].
+    fn stage_fixed_strings(
+        &mut self,
+        values: &[&str],
+        width: NonZeroU32,
+        charset: CharacterSet,
+    ) -> Result<&mut Self, FormatError> {
+        let raw = encode_fixed_strings(values, width)?;
+        self.datatype = Some(Datatype::String {
+            size: width.get(),
+            padding: StringPadding::NullPad,
+            charset,
+        });
+        self.set_element_bytes(raw);
+        if self.shape.is_none() {
+            self.shape = Some(vec![values.len() as u64]);
+        }
+        Ok(self)
+    }
+
     /// Write a variable-length string dataset from an explicit source datatype
     /// and per-element byte payloads, preserving the null-vs-empty distinction.
     ///
@@ -3202,5 +3378,195 @@ mod attr_value_display_tests {
 
         assert!(!shown.contains('…'), "{shown}");
         assert!(shown.ends_with("7]"), "{shown}");
+    }
+}
+
+#[cfg(test)]
+mod fixed_string_tests {
+    use super::{
+        AttrValue, CharacterSet, DatasetBuilder, Datatype, FormatError, StringPadding,
+        build_attr_message, derived_string_width,
+    };
+
+    /// One fixed-width string entry point as a value, so a case table can name
+    /// all four without repeating the body under each.
+    type Stage = fn(&mut DatasetBuilder) -> Result<&mut DatasetBuilder, FormatError>;
+
+    /// The staged datatype and the staged bytes, which every case here reads
+    /// together: a width the message declares and a stride the bytes use are two
+    /// halves of one rule, and a test that checked only the message would pass on
+    /// a builder that padded to something else.
+    fn staged(builder: &DatasetBuilder) -> (Datatype, Vec<u8>) {
+        (
+            builder.datatype.clone().expect("a datatype"),
+            builder.data.clone().expect("element bytes"),
+        )
+    }
+
+    /// The declared width, having asserted it is the stride the bytes actually
+    /// use. `count` is how many elements were written.
+    fn declared_width(builder: &DatasetBuilder, count: usize) -> u32 {
+        let (dt, raw) = staged(builder);
+        let Datatype::String { size, .. } = dt else {
+            panic!("expected a string datatype, got {dt:?}");
+        };
+        assert_eq!(
+            raw.len(),
+            size as usize * count,
+            "{count} elements of a {size}-byte type do not account for {} bytes",
+            raw.len()
+        );
+        size
+    }
+
+    #[test]
+    fn a_derived_width_is_the_longest_value_and_never_zero() {
+        assert_eq!(derived_string_width(&["north", "s", "east"]).get(), 5);
+        assert_eq!(derived_string_width(&["s", "east", "north"]).get(), 5);
+        // A multi-byte character is measured in bytes, not characters.
+        assert_eq!(derived_string_width(&["é", "ab"]).get(), 2);
+        // All-empty and no values at all both take the one byte the format's
+        // minimum requires, rather than a zero-width datatype.
+        assert_eq!(derived_string_width::<&str>(&[]).get(), 1);
+        assert_eq!(derived_string_width(&["", ""]).get(), 1);
+    }
+
+    #[test]
+    fn a_derived_width_dataset_pads_every_element_to_the_longest() {
+        let mut b = DatasetBuilder::new("d");
+        b.with_ascii_strings(&["north", "s", ""]).unwrap();
+
+        assert_eq!(declared_width(&b, 3), 5);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"north"); // exactly the width, unpadded
+        expected.extend_from_slice(b"s\0\0\0\0");
+        expected.extend_from_slice(b"\0\0\0\0\0"); // an empty value is all padding
+        assert_eq!(
+            staged(&b).1,
+            expected,
+            "each value is zero-padded on the right to the declared width"
+        );
+        assert_eq!(b.shape, Some(vec![3]));
+    }
+
+    #[test]
+    fn a_declared_width_is_used_verbatim_even_when_the_values_are_shorter() {
+        let mut b = DatasetBuilder::new("d");
+        b.with_ascii_strings_sized(&["ab", "c"], 4).unwrap();
+
+        assert_eq!(
+            declared_width(&b, 2),
+            4,
+            "the declared width stands; it is not shrunk to the values in hand"
+        );
+        assert_eq!(staged(&b).1, b"ab\0\0c\0\0\0".to_vec());
+    }
+
+    /// The refusal names *which* value overflowed, so a caller with a thousand
+    /// of them can find it. A wrong index is the mutation this catches, which is
+    /// why the offending value is neither first nor last.
+    #[test]
+    fn a_value_longer_than_the_declared_width_is_refused_not_truncated() {
+        let mut b = DatasetBuilder::new("d");
+        let refused = b.with_ascii_strings_sized(&["ab", "north", "cd"], 4);
+
+        assert!(
+            matches!(
+                refused,
+                Err(FormatError::FixedStringTooLong {
+                    index: 1,
+                    len: 5,
+                    width: 4
+                })
+            ),
+            "{:?}",
+            refused.map(|_| ())
+        );
+        assert!(
+            b.datatype.is_none() && b.data.is_none(),
+            "a refused call stages nothing"
+        );
+    }
+
+    /// A width of zero is the one width no HDF5 string datatype may have, and
+    /// nothing in the values can make it legal — an empty value fits it, so the
+    /// per-value check never fires.
+    #[test]
+    fn a_declared_width_of_zero_is_refused() {
+        for refused in [
+            DatasetBuilder::new("d").with_ascii_strings_sized(&[""], 0),
+            DatasetBuilder::new("d").with_strings_sized(&[""], 0),
+        ] {
+            assert!(
+                matches!(refused, Err(FormatError::ZeroFixedStringWidth)),
+                "{:?}",
+                refused.map(|_| ())
+            );
+        }
+    }
+
+    /// The charset bit is the only thing separating the two families, and it is
+    /// the one a reader uses to decide how to decode the bytes.
+    #[test]
+    fn each_entry_point_declares_its_own_charset_and_null_padding() {
+        let cases: [(Stage, _); 4] = [
+            (|b| b.with_ascii_strings(&["ab"]), CharacterSet::Ascii),
+            (
+                |b| b.with_ascii_strings_sized(&["ab"], 4),
+                CharacterSet::Ascii,
+            ),
+            (|b| b.with_strings(&["ab"]), CharacterSet::Utf8),
+            (|b| b.with_strings_sized(&["ab"], 4), CharacterSet::Utf8),
+        ];
+        for (stage, expected) in cases {
+            let mut b = DatasetBuilder::new("d");
+            stage(&mut b).unwrap();
+            let Datatype::String {
+                padding, charset, ..
+            } = staged(&b).0
+            else {
+                panic!("expected a string datatype");
+            };
+            assert_eq!(charset, expected);
+            assert_eq!(padding, StringPadding::NullPad);
+        }
+    }
+
+    /// The claim the entry-point docs make: the same values stored as an
+    /// attribute and as a dataset land on disk identically. They share
+    /// [`derived_string_width`], so the widths cannot drift, but the padding is
+    /// written by two separate loops and only this holds them together.
+    #[test]
+    fn a_fixed_string_dataset_matches_the_attribute_encoding_of_the_same_values() {
+        const VALUES: [&str; 3] = ["north", "s", ""];
+        let owned: Vec<String> = VALUES.iter().map(|s| (*s).to_string()).collect();
+
+        let cases: [(AttrValue, Stage); 2] = [
+            (AttrValue::AsciiStringArray(owned.clone()), |b| {
+                b.with_ascii_strings(&VALUES)
+            }),
+            (AttrValue::StringArray(owned), |b| b.with_strings(&VALUES)),
+        ];
+        for (attr, stage) in cases {
+            let message = build_attr_message("a", &attr);
+            let mut b = DatasetBuilder::new("d");
+            stage(&mut b).unwrap();
+            let (datatype, raw) = staged(&b);
+
+            assert_eq!(datatype, message.datatype, "{attr:?}");
+            assert_eq!(raw, message.raw_data, "{attr:?}");
+        }
+    }
+
+    /// `with_shape` still decides the dataspace, as it does for every other data
+    /// entry point; only the default comes from the value count.
+    #[test]
+    fn an_explicit_shape_survives_a_fixed_string_write() {
+        let mut b = DatasetBuilder::new("d");
+        b.with_shape(&[2, 2]);
+        b.with_ascii_strings(&["a", "b", "c", "d"]).unwrap();
+
+        assert_eq!(b.shape, Some(vec![2, 2]));
+        assert_eq!(declared_width(&b, 4), 1);
     }
 }

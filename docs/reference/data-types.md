@@ -13,6 +13,8 @@ This page is the reference for every datatype hdf5-pure can write, read, and mod
 | `with_f32_data` | IEEE 32-bit float |
 | `with_i8_data` / `with_i16_data` / `with_i32_data` / `with_i64_data` | Signed integers |
 | `with_u8_data` / `with_u16_data` / `with_u32_data` / `with_u64_data` | Unsigned integers |
+| `with_ascii_strings` / `with_strings` (and their `_sized` forms) | Fixed-width strings, null-padded, ASCII or UTF-8 |
+| `with_vlen_strings` | Variable-length UTF-8 strings (global heap) |
 | `with_complex32_data` | Compound `{real: f32, imag: f32}` |
 | `with_complex64_data` | Compound `{real: f64, imag: f64}` |
 | `with_compound_data` | Arbitrary compound types (explicit datatype + raw bytes) |
