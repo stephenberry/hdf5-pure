@@ -203,7 +203,7 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
 /// reach. Both carry the value unchanged; only the variant is wider than the
 /// file. A width *above* 8 bytes is the exception, and not this decode's doing:
 /// the numeric readers model an element as a 64-bit word, so such a value
-/// arrives already truncated to its low 8 bytes.
+/// arrives already truncated to its low 8 bytes (issue #361).
 ///
 /// What is still not recoverable, because [`AttrValue`] has no way to express
 /// it — each of these reads correctly but would be rewritten differently:
@@ -358,7 +358,8 @@ fn narrow_f32(value: f64) -> f32 {
 /// has — the format allows 3 bytes — and an element outside the range the
 /// declared width holds, which needs a datatype whose precision exceeds its own
 /// size to reach. Neither changes the value. A width above 8 bytes lands here
-/// too, already truncated to its low 8 bytes by the reader that decoded it.
+/// too, already truncated to its low 8 bytes by the reader that decoded it
+/// (issue #361).
 fn signed_attr_value(values: Vec<i64>, scalar: bool, width: u32) -> Option<AttrValue> {
     let narrowed = match width {
         1 => narrow_elements(&values, scalar, AttrValue::I8, AttrValue::I8Array),
