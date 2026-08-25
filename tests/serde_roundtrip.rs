@@ -215,7 +215,7 @@ fn assert_empty_struct_array(file: &File, name: &str) {
         "`{name}` must be a struct",
     );
     assert!(
-        matches!(attrs.get("MATLAB_empty"), Some(AttrValue::U64(1))),
+        matches!(attrs.get("MATLAB_empty"), Some(AttrValue::U32(1))),
         "`{name}` must be flagged empty, got {:?}",
         attrs.get("MATLAB_empty"),
     );

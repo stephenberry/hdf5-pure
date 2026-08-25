@@ -65,13 +65,16 @@ The `AttrValue` variants and their HDF5 encodings are:
 
 | Variant | HDF5 encoding |
 |---|---|
-| `AttrValue::F64` | 64-bit float scalar |
-| `AttrValue::F64Array` | 64-bit float array |
-| `AttrValue::I32` | Signed 32-bit integer scalar |
-| `AttrValue::I64` | Signed 64-bit integer scalar |
-| `AttrValue::I64Array` | Signed 64-bit integer array |
-| `AttrValue::U32` | Unsigned 32-bit integer scalar |
-| `AttrValue::U64` | Unsigned 64-bit integer scalar |
+| `AttrValue::F32` / `AttrValue::F32Array` | 32-bit float scalar / array |
+| `AttrValue::F64` / `AttrValue::F64Array` | 64-bit float scalar / array |
+| `AttrValue::I8` / `AttrValue::I8Array` | Signed 8-bit integer scalar / array |
+| `AttrValue::I16` / `AttrValue::I16Array` | Signed 16-bit integer scalar / array |
+| `AttrValue::I32` / `AttrValue::I32Array` | Signed 32-bit integer scalar / array |
+| `AttrValue::I64` / `AttrValue::I64Array` | Signed 64-bit integer scalar / array |
+| `AttrValue::U8` / `AttrValue::U8Array` | Unsigned 8-bit integer scalar / array |
+| `AttrValue::U16` / `AttrValue::U16Array` | Unsigned 16-bit integer scalar / array |
+| `AttrValue::U32` / `AttrValue::U32Array` | Unsigned 32-bit integer scalar / array |
+| `AttrValue::U64` / `AttrValue::U64Array` | Unsigned 64-bit integer scalar / array |
 | `AttrValue::String` | UTF-8 string (null-padded) |
 | `AttrValue::StringArray` | Array of UTF-8 strings |
 | `AttrValue::AsciiString` | Fixed-width ASCII string (charset = ASCII) |
@@ -107,7 +110,7 @@ println!("attributes:   {:?}", sensors.attrs().unwrap());
 
 ### Reading an attribute value
 
-An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, and the datatype's charset selects the `Ascii` variants. A `VarLenAsciiArray` of one element stays a `VarLenAsciiArray`, and an `AsciiString` does not arrive as a `String`.
+An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, the datatype's charset selects the `Ascii` variants, and a number's width selects among `I8` … `U64` and `F32` / `F64`. A `VarLenAsciiArray` of one element stays a `VarLenAsciiArray`, an `AsciiString` does not arrive as a `String`, and a 16-bit integer does not arrive as an `I64`.
 
 That fidelity means several variants can carry the same logical value, so match on the variant only when the encoding is what you care about. Otherwise use the accessors, each of which spans every variant that can hold the shape it names:
 
@@ -125,23 +128,24 @@ let fields: Option<Vec<&str>> = attrs.get("MATLAB_fields").and_then(AttrValue::a
 
 What a read cannot recover, because `AttrValue` has no way to express it. Each of these reads correctly, and each would come back differently if it were *rewritten from the value* — which is why [`repack`](repack.md) copies an attribute's encoding rather than rebuilding it from one:
 
-- **Width.** Integers and floats widen to `i64`/`u64`/`f64`; there are no narrower array variants.
+- **Byte order and precision.** Every numeric variant writes back little-endian at its full width, so a big-endian attribute, one storing fewer bits than its bytes hold, or a float laid out other than the way IEEE 754 lays it out, reads correctly but would be re-encoded in this crate's own layout.
+- **Unrepresentable integer widths.** A number keeps its width at 1, 2, 4 and 8 bytes; an integer width with no Rust integer of its own — 3 bytes, say — widens to 64-bit.
 - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR` — what h5py writes, and what this crate's writer never emits — has no variant of its own and reads as the fixed-width variant of the same charset.
 - **Rank.** Every array variant is one-dimensional, so a rank-2 attribute reads as its elements flattened.
 - **Padding and declared width.** A fixed-width string reports its content, not its `STRSIZE` or which padding it used.
 - **Enumeration member names.** An enum attribute decodes through its integer base, so its codes arrive and its labels do not.
 
-The variant may become **more specific** in a future release as `AttrValue` grows narrower variants, so match with a `_` arm — which the `#[non_exhaustive]` enum requires anyway — or read through the accessors, which are unaffected by such a change.
+The variant may become **more specific** in a future release as `AttrValue` grows further variants — the numeric widths landed that way — so match with a `_` arm, which the `#[non_exhaustive]` enum requires anyway, or read through the accessors, which are unaffected by such a change.
 
 ### Reading an attribute's datatype
 
-`attr_datatypes()` reports the on-disk [`Datatype`](../reference/data-types.md#the-datatype-model) of every attribute, keyed by name. It is the type channel to `attrs()`'s value channel, the pair a dataset already has in `datatype()` and its `read_*` methods, and it is where the *datatype* entries in the list above — width, padding and declared width, enumeration member names — can still be read.
+`attr_datatypes()` reports the on-disk [`Datatype`](../reference/data-types.md#the-datatype-model) of every attribute, keyed by name. It is the type channel to `attrs()`'s value channel, the pair a dataset already has in `datatype()` and its `read_*` methods, and it is where the *datatype* entries in the list above — byte order and precision, string padding and declared width, enumeration member names — can still be read.
 
 **Rank is not among them.** An attribute's rank lives in its dataspace, which nothing public exposes, so a rank-2 attribute reads as a flat array from `attrs()` with no way to recover its shape from either channel.
 
 It reports **every** attribute message, including the ones `attrs()` omits because no `AttrValue` can carry them, so a name missing from that map can be told from one the object does not have.
 
-One datatype is not reported faithfully: a **committed** (shared) type, created with `H5Tcommit`, is stored on the attribute as a reference to a shared message rather than as the type itself, and both this and `Dataset::datatype()` decode that reference as though it were an inline datatype. netCDF-4 user-defined types and h5py's `f["t"] = np.dtype(...)` reach a file this way.
+A **committed** (shared) type, created with `H5Tcommit`, is stored on the attribute as a reference to the type's own object header rather than as the type itself, and both this and `Dataset::datatype()` follow that reference and report the type it names. netCDF-4 user-defined types and h5py's `f["t"] = np.dtype(...)` reach a file this way. What neither channel reports is the type's *name*: two attributes sharing `/mytype` give the same `Datatype` as one that spells it out inline.
 
 A boolean attribute needs both channels. The C library gives `H5T_NATIVE_HBOOL` — what h5py writes for every `np.bool_` — an `enum[FALSE, TRUE]` over an 8-bit base, so the value arrives as `0` or `1`, indistinguishable from an `i8`, and only the datatype records which it was:
 

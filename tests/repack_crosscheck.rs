@@ -1682,9 +1682,9 @@ fn repack_preserves_c_written_unallocated_storage_in_every_layout() {
         );
         assert_eq!(
             ds.attrs().unwrap().get("units"),
-            // The reader normalizes a fixed-point attribute to its widest
-            // signed form; what matters here is that it is there at all.
-            Some(&hdf5_pure::AttrValue::I64(42)),
+            // The C library wrote it as a 4-byte signed integer, and it keeps
+            // that width through the repack and back out of the reader (#350).
+            Some(&hdf5_pure::AttrValue::I32(42)),
             "[{layout}] the attribute survived the new path"
         );
 

@@ -49,8 +49,9 @@ fn a_c_written_bool_attribute_reaches_the_caller() {
             .expect("write attribute");
     });
 
-    // The codes survive; `FALSE`/`TRUE` do not, since no `AttrValue` carries them.
-    assert_eq!(attrs.get("flag"), Some(&AttrValue::I64(1)));
+    // The codes survive; `FALSE`/`TRUE` do not, since no `AttrValue` carries
+    // them. The width does: the enum's base is one signed byte (#350).
+    assert_eq!(attrs.get("flag"), Some(&AttrValue::I8(1)));
 }
 
 #[test]
@@ -64,10 +65,7 @@ fn a_c_written_bool_array_attribute_reaches_the_caller() {
             .expect("write attribute");
     });
 
-    assert_eq!(
-        attrs.get("flags"),
-        Some(&AttrValue::I64Array(vec![1, 0, 1]))
-    );
+    assert_eq!(attrs.get("flags"), Some(&AttrValue::I8Array(vec![1, 0, 1])));
 }
 
 /// A boolean attribute must not cost the object its other attributes: the decoder
@@ -87,7 +85,7 @@ fn a_bool_attribute_sits_alongside_the_rest() {
             .expect("write attribute");
     });
 
-    assert_eq!(attrs.get("success"), Some(&AttrValue::I64(0)));
+    assert_eq!(attrs.get("success"), Some(&AttrValue::I8(0)));
     assert_eq!(attrs.get("frequency"), Some(&AttrValue::F64(30.0)));
 }
 
@@ -95,7 +93,7 @@ fn a_bool_attribute_sits_alongside_the_rest() {
 ///
 /// Decoding through the base type is what makes the value readable, and it is
 /// also what makes `true` and `1i8` indistinguishable in the value alone — both
-/// arrive as `AttrValue::I64(1)`, which the last assertion here states rather
+/// arrive as `AttrValue::I8(1)`, which the last assertion here states rather
 /// than assumes. `H5T_NATIVE_HBOOL`'s `enum[FALSE, TRUE]` over one byte is the
 /// only record of which was written, and `attr_datatypes` is the only way to
 /// read it. This is the shape a consumer matches on to map an h5py `np.bool_`

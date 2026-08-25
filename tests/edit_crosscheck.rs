@@ -2075,7 +2075,7 @@ fn a_never_written_dataset_is_copied_as_the_storage_it_never_had() {
     assert_eq!(copied.shape().unwrap(), vec![N as u64], "shape carried");
     assert_eq!(
         copied.attrs().unwrap().get("tag"),
-        Some(&AttrValue::I64(99)),
+        Some(&AttrValue::I32(99)),
         "the attribute carried across"
     );
     assert_eq!(
