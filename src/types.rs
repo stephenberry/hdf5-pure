@@ -193,14 +193,27 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
 /// dataspace kind — not the element count — decides scalar against array, so a
 /// one-element array stays an array. Charset selects the `Ascii*` variants.
 ///
+/// An integer keeps the width it is stored at: the 1-, 2-, 4- and 8-byte
+/// datatypes take the [`AttrValue`] variant of that width, signed or unsigned as
+/// the datatype says (issue #350). A width the format allows but Rust has no
+/// integer for — 3 bytes, say — widens to the 64-bit variant, as does a value
+/// that does not fit the width its own datatype declares, which takes a
+/// precision wider than that width to reach. Both carry the value unchanged;
+/// only the variant is wider than the file.
+///
 /// What is still not recoverable, because [`AttrValue`] has no way to express
 /// it — each of these reads correctly but would be rewritten differently:
 ///
-/// - **Width.** Integers and floats widen to `i64`/`u64`/`f64`; there are no
-///   narrower array variants.
+/// - **Float width.** A 32-bit float widens to `f64`; there is no `f32` variant
+///   (issue #354).
+/// - **Byte order and precision.** Every integer variant writes back
+///   little-endian at its full width, so a big-endian attribute, or one storing
+///   fewer bits than its bytes hold, reads correctly and would be re-encoded in
+///   this crate's own layout.
 /// - **Enumeration members.** An enum attribute decodes through its integer base
 ///   type, so its codes survive and the member names do not. This is how h5py's
-///   `np.bool_` attributes arrive, written as `enum[FALSE, TRUE]`: as `0`/`1`.
+///   `np.bool_` attributes arrive, written as `enum[FALSE, TRUE]`: as `0`/`1` of
+///   the base type's width.
 /// - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR`,
 ///   which this crate's writer never emits, has no variant of its own and reads
 ///   as the fixed-width variant of the same charset and arity.
@@ -243,22 +256,14 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
                 Some(AttrValue::F64Array(vals))
             }
         }
-        Datatype::FixedPoint { signed: true, .. } => {
-            let vals = attr.read_as_i64().ok()?;
-            if scalar {
-                Some(AttrValue::I64(*vals.first()?))
-            } else {
-                Some(AttrValue::I64Array(vals))
-            }
-        }
-        Datatype::FixedPoint { signed: false, .. } => {
-            let vals = attr.read_as_u64().ok()?;
-            if scalar {
-                Some(AttrValue::U64(*vals.first()?))
-            } else {
-                Some(AttrValue::U64Array(vals))
-            }
-        }
+        Datatype::FixedPoint {
+            signed: true, size, ..
+        } => signed_attr_value(attr.read_as_i64().ok()?, scalar, *size),
+        Datatype::FixedPoint {
+            signed: false,
+            size,
+            ..
+        } => unsigned_attr_value(attr.read_as_u64().ok()?, scalar, *size),
         Datatype::String { charset, .. } => {
             let strings = attr.read_as_strings().ok()?;
             let ascii = *charset == CharacterSet::Ascii;
@@ -313,6 +318,67 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
             }
         }
         _ => None,
+    }
+}
+
+/// The variant a signed integer attribute takes, chosen from the width its
+/// datatype declares so the value keeps that width (issue #350).
+///
+/// Falling back to the 64-bit variant is what covers a width no Rust integer
+/// has — the format allows 3 bytes — and an element outside the range the
+/// declared width holds, which needs a datatype whose precision exceeds its own
+/// size to reach. Neither changes the value.
+fn signed_attr_value(values: Vec<i64>, scalar: bool, width: u32) -> Option<AttrValue> {
+    let narrowed = match width {
+        1 => narrow_elements(&values, scalar, AttrValue::I8, AttrValue::I8Array),
+        2 => narrow_elements(&values, scalar, AttrValue::I16, AttrValue::I16Array),
+        4 => narrow_elements(&values, scalar, AttrValue::I32, AttrValue::I32Array),
+        _ => None,
+    };
+    match narrowed {
+        Some(value) => Some(value),
+        None if scalar => Some(AttrValue::I64(*values.first()?)),
+        None => Some(AttrValue::I64Array(values)),
+    }
+}
+
+/// The variant an unsigned integer attribute takes. The signed rule, in the
+/// unsigned variants: see [`signed_attr_value`].
+fn unsigned_attr_value(values: Vec<u64>, scalar: bool, width: u32) -> Option<AttrValue> {
+    let narrowed = match width {
+        1 => narrow_elements(&values, scalar, AttrValue::U8, AttrValue::U8Array),
+        2 => narrow_elements(&values, scalar, AttrValue::U16, AttrValue::U16Array),
+        4 => narrow_elements(&values, scalar, AttrValue::U32, AttrValue::U32Array),
+        _ => None,
+    };
+    match narrowed {
+        Some(value) => Some(value),
+        None if scalar => Some(AttrValue::U64(*values.first()?)),
+        None => Some(AttrValue::U64Array(values)),
+    }
+}
+
+/// Every element as the narrower integer `T`, in the variant `one` or `many`
+/// names, or `None` if any element does not fit `T` — the whole attribute then
+/// keeps the wider variant rather than one element wrapping.
+///
+/// A scalar with no elements is `None` too, which is the same answer the caller
+/// gives for a numeric attribute holding fewer bytes than its dataspace
+/// promises: no value would be truthful.
+fn narrow_elements<S: Copy, T: TryFrom<S>>(
+    values: &[S],
+    scalar: bool,
+    one: fn(T) -> AttrValue,
+    many: fn(Vec<T>) -> AttrValue,
+) -> Option<AttrValue> {
+    let narrowed: Vec<T> = values
+        .iter()
+        .map(|&v| T::try_from(v).ok())
+        .collect::<Option<Vec<T>>>()?;
+    if scalar {
+        Some(one(narrowed.into_iter().next()?))
+    } else {
+        Some(many(narrowed))
     }
 }
 
@@ -560,21 +626,23 @@ mod tests {
                 .build()
                 .unwrap();
 
+        // The base is one byte wide, so the code arrives as an 8-bit value (#350).
         assert_eq!(
             decode_raw(h5py_bool.clone(), vec![1], vec![]),
-            Some(AttrValue::I64(1))
+            Some(AttrValue::I8(1))
         );
         // Array-ness comes from the dataspace here as it does for every other type.
         assert_eq!(
             decode_raw(h5py_bool, vec![1, 0, 1], vec![3]),
-            Some(AttrValue::I64Array(vec![1, 0, 1]))
+            Some(AttrValue::I8Array(vec![1, 0, 1]))
         );
     }
 
     /// The base type's signedness and width carry through, so an enum over an
-    /// unsigned base lands in the unsigned variant with its value intact.
+    /// unsigned 16-bit base lands in the unsigned variant of that width with its
+    /// value intact.
     #[test]
-    fn an_unsigned_enum_attribute_keeps_its_base_signedness() {
+    fn an_unsigned_enum_attribute_keeps_its_base_signedness_and_width() {
         let mode =
             crate::type_builders::EnumTypeBuilder::with_base(crate::type_builders::make_u16_type())
                 .value("low", 1)
@@ -584,7 +652,7 @@ mod tests {
 
         assert_eq!(
             decode_raw(mode, 40_000_u16.to_le_bytes().to_vec(), vec![]),
-            Some(AttrValue::U64(40_000))
+            Some(AttrValue::U16(40_000))
         );
     }
 
@@ -721,15 +789,133 @@ mod tests {
         }
     }
 
-    /// Width is the one thing the read side still cannot recover: there are no
-    /// narrower array variants, so a 32-bit attribute widens. This pins the
-    /// documented limitation rather than endorsing it — if narrower variants
-    /// are ever added, this test is the one that should fail.
+    /// Every integer width round-trips as itself, rather than every one of them
+    /// arriving as 64-bit (#350).
+    ///
+    /// Both ends are under test at once: the writer stores each variant at its
+    /// own width, and the reader picks the variant back out of that width. A
+    /// writer that stored `I16` in four bytes would be read as `I32` and fail
+    /// here, so the pair cannot drift together — and the crosscheck against the
+    /// C library is what says the width means the same thing outside this crate.
+    ///
+    /// The extremes are the elements that matter: a value at the edge of its
+    /// width is what a decode that widened through the wrong signedness, or
+    /// narrowed with a wrap, gets wrong.
     #[test]
-    fn integer_width_is_not_recovered() {
-        let read = round_trip(&[("i32", AttrValue::I32(-7)), ("u32", AttrValue::U32(7))]);
-        assert_eq!(read.get("i32"), Some(&AttrValue::I64(-7)));
-        assert_eq!(read.get("u32"), Some(&AttrValue::U64(7)));
+    fn every_integer_width_round_trips_to_itself() {
+        let cases = vec![
+            ("i8", AttrValue::I8(-7)),
+            ("i8_one", AttrValue::I8Array(vec![-7])),
+            ("i8_two", AttrValue::I8Array(vec![i8::MIN, i8::MAX])),
+            ("i16", AttrValue::I16(-7)),
+            ("i16_one", AttrValue::I16Array(vec![-7])),
+            ("i16_two", AttrValue::I16Array(vec![i16::MIN, i16::MAX])),
+            ("i32", AttrValue::I32(-7)),
+            ("i32_one", AttrValue::I32Array(vec![-7])),
+            ("i32_two", AttrValue::I32Array(vec![i32::MIN, i32::MAX])),
+            ("u8", AttrValue::U8(7)),
+            ("u8_one", AttrValue::U8Array(vec![7])),
+            ("u8_two", AttrValue::U8Array(vec![0, u8::MAX])),
+            ("u16", AttrValue::U16(7)),
+            ("u16_one", AttrValue::U16Array(vec![7])),
+            ("u16_two", AttrValue::U16Array(vec![0, u16::MAX])),
+            ("u32", AttrValue::U32(7)),
+            ("u32_one", AttrValue::U32Array(vec![7])),
+            ("u32_two", AttrValue::U32Array(vec![0, u32::MAX])),
+        ];
+        let read = round_trip(&cases);
+        for (name, written) in &cases {
+            assert_eq!(read.get(*name), Some(written), "attribute {name}");
+        }
+    }
+
+    /// The width is on disk, not merely in the variant: each attribute above
+    /// occupies the bytes its width declares, which is what a reader outside
+    /// this crate sees.
+    #[test]
+    fn each_width_is_stored_at_that_width() {
+        let mut builder = crate::writer::FileBuilder::new();
+        let cases: [(&str, AttrValue, u32, bool); 8] = [
+            ("i8", AttrValue::I8(-7), 1, true),
+            ("i16", AttrValue::I16(-7), 2, true),
+            ("i32", AttrValue::I32(-7), 4, true),
+            ("i64", AttrValue::I64(-7), 8, true),
+            ("u8", AttrValue::U8(7), 1, false),
+            ("u16", AttrValue::U16(7), 2, false),
+            ("u32", AttrValue::U32(7), 4, false),
+            ("u64", AttrValue::U64(7), 8, false),
+        ];
+        for (name, value, _, _) in &cases {
+            builder.set_attr(name, value.clone());
+        }
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+        let bytes = builder.finish().unwrap();
+        let file = crate::File::from_bytes(bytes).unwrap();
+        let datatypes = file.root().attr_datatypes().unwrap();
+
+        for (name, _, width, signedness) in &cases {
+            let Some(Datatype::FixedPoint { size, signed, .. }) = datatypes.get(*name) else {
+                panic!("attribute {name} must be a fixed-point type");
+            };
+            assert_eq!(
+                (*size, *signed),
+                (*width, *signedness),
+                "attribute {name} must be stored at its own width"
+            );
+        }
+    }
+
+    /// A width no Rust integer has — the format allows any byte count — widens
+    /// to the 64-bit variant rather than losing the attribute. Three bytes is
+    /// what h5py's `np.dtype("u3")`-style types and some instrument writers
+    /// produce, and the value must still arrive.
+    #[test]
+    fn a_width_with_no_rust_integer_widens() {
+        let three_byte = Datatype::FixedPoint {
+            size: 3,
+            byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 24,
+        };
+        assert_eq!(
+            decode_raw(three_byte.clone(), vec![0xFF, 0xFF, 0xFF], vec![]),
+            Some(AttrValue::U64(0x00FF_FFFF))
+        );
+        assert_eq!(
+            decode_raw(three_byte, vec![1, 0, 0, 2, 0, 0], vec![2]),
+            Some(AttrValue::U64Array(vec![1, 2]))
+        );
+    }
+
+    /// A value outside the range its own width holds keeps the 64-bit variant
+    /// rather than being wrapped into the narrow one.
+    ///
+    /// It takes a datatype whose *precision* exceeds its size to get there: one
+    /// stored byte holding `0xFF`, sign-extended from bit 16 rather than bit 8,
+    /// decodes to 255 — which no `i8` holds. No writer produces such a type, but
+    /// a file is not this crate's to trust, and `-1` in place of `255` would be
+    /// a silent lie about what the file says.
+    #[test]
+    fn a_value_outside_its_declared_width_is_not_wrapped() {
+        let overwide = Datatype::FixedPoint {
+            size: 1,
+            byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 16,
+        };
+        assert_eq!(
+            decode_raw(overwide.clone(), vec![0xFF], vec![]),
+            Some(AttrValue::I64(255)),
+            "a scalar past `i8` must widen, not wrap"
+        );
+        assert_eq!(
+            decode_raw(overwide, vec![0x01, 0xFF], vec![2]),
+            Some(AttrValue::I64Array(vec![1, 255])),
+            "one element past `i8` widens the whole array, since a mixed answer \
+             would carry two different meanings for one attribute"
+        );
     }
 
     /// The accessors are what a consumer should use, and they read every shape

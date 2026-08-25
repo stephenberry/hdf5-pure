@@ -650,10 +650,10 @@ fn roundtrip_i32_u32_attributes() {
     let file = File::from_bytes(bytes).unwrap();
     let attrs = file.root().attrs().unwrap();
 
-    // I32 is read back as I64 (the reader promotes)
-    assert_eq!(attrs.get("MATLAB_int_decode"), Some(&AttrValue::I64(1)));
-    // U32 is read back as U64 (the reader promotes)
-    assert_eq!(attrs.get("MATLAB_empty"), Some(&AttrValue::U64(1)));
+    // Each reads back at the width it was written at (#350), which is what
+    // MATLAB sees: `MATLAB_int_decode` is a 4-byte signed attribute in the file.
+    assert_eq!(attrs.get("MATLAB_int_decode"), Some(&AttrValue::I32(1)));
+    assert_eq!(attrs.get("MATLAB_empty"), Some(&AttrValue::U32(1)));
 }
 
 #[test]

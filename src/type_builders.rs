@@ -610,10 +610,10 @@ fn int_fits(v: i64, width: usize, signed: bool) -> bool {
 /// [`Verbatim`](AttrSpec::Verbatim) carries an already-encoded message instead,
 /// so the datatype, dataspace and element bytes reach the file exactly as
 /// given. Repack uses it to copy an attribute across without routing it through
-/// [`AttrValue`], which is a decoded view and cannot express a narrow width, a
-/// variable-length string, a rank above one, or a string's padding — every one
-/// of which the value path would therefore rewrite (see [`AttrValue`]'s docs on
-/// what a decode does not recover).
+/// [`AttrValue`], which is a decoded view and cannot express a byte order, a
+/// sub-width precision, a variable-length string, a rank above one, or a
+/// string's padding — every one of which the value path would therefore rewrite
+/// (see [`AttrValue`]'s docs on what a decode does not recover).
 ///
 /// The element bytes are copied as-is, so a verbatim message is only correct for
 /// a datatype whose bytes mean the same thing in another file: anything holding
@@ -665,82 +665,63 @@ impl AttrSpec {
     }
 }
 
+/// A scalar numeric attribute: its own datatype, a scalar dataspace, and the
+/// element's little-endian bytes.
+fn numeric_scalar_attr(name: &str, datatype: Datatype, raw_data: &[u8]) -> AttributeMessage {
+    AttributeMessage {
+        name: name.to_string(),
+        datatype,
+        dataspace: scalar_ds(),
+        raw_data: raw_data.to_vec(),
+        datatype_location: DatatypeLocation::Inline,
+    }
+}
+
+/// A one-dimensional numeric attribute, its elements laid out little-endian at
+/// the width `datatype` declares.
+///
+/// `to_le_bytes` is the element's own encoder — `i16::to_le_bytes` and friends —
+/// so the bytes written can only be as wide as the type they came from, and the
+/// datatype beside them says the same width.
+fn numeric_array_attr<T: Copy, const N: usize>(
+    name: &str,
+    datatype: Datatype,
+    values: &[T],
+    to_le_bytes: fn(T) -> [u8; N],
+) -> AttributeMessage {
+    let mut raw_data = Vec::with_capacity(values.len() * N);
+    for &v in values {
+        raw_data.extend_from_slice(&to_le_bytes(v));
+    }
+    AttributeMessage {
+        name: name.to_string(),
+        datatype,
+        dataspace: simple_1d(values.len() as u64),
+        raw_data,
+        datatype_location: DatatypeLocation::Inline,
+    }
+}
+
 pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMessage {
     match value {
-        AttrValue::F64(v) => AttributeMessage {
-            name: name.to_string(),
-            datatype: make_f64_type(),
-            dataspace: scalar_ds(),
-            raw_data: v.to_le_bytes().to_vec(),
-            datatype_location: DatatypeLocation::Inline,
-        },
-        AttrValue::F64Array(arr) => {
-            let mut raw = Vec::with_capacity(arr.len() * 8);
-            for v in arr {
-                raw.extend_from_slice(&v.to_le_bytes());
-            }
-            AttributeMessage {
-                name: name.to_string(),
-                datatype: make_f64_type(),
-                dataspace: simple_1d(arr.len() as u64),
-                raw_data: raw,
-                datatype_location: DatatypeLocation::Inline,
-            }
-        }
-        AttrValue::I64(v) => AttributeMessage {
-            name: name.to_string(),
-            datatype: make_i64_type(),
-            dataspace: scalar_ds(),
-            raw_data: v.to_le_bytes().to_vec(),
-            datatype_location: DatatypeLocation::Inline,
-        },
-        AttrValue::I64Array(arr) => {
-            let mut raw = Vec::with_capacity(arr.len() * 8);
-            for v in arr {
-                raw.extend_from_slice(&v.to_le_bytes());
-            }
-            AttributeMessage {
-                name: name.to_string(),
-                datatype: make_i64_type(),
-                dataspace: simple_1d(arr.len() as u64),
-                raw_data: raw,
-                datatype_location: DatatypeLocation::Inline,
-            }
-        }
-        AttrValue::U64Array(arr) => {
-            let mut raw = Vec::with_capacity(arr.len() * 8);
-            for v in arr {
-                raw.extend_from_slice(&v.to_le_bytes());
-            }
-            AttributeMessage {
-                name: name.to_string(),
-                datatype: make_u64_type(),
-                dataspace: simple_1d(arr.len() as u64),
-                raw_data: raw,
-                datatype_location: DatatypeLocation::Inline,
-            }
-        }
-        AttrValue::I32(v) => AttributeMessage {
-            name: name.to_string(),
-            datatype: make_i32_type(),
-            dataspace: scalar_ds(),
-            raw_data: v.to_le_bytes().to_vec(),
-            datatype_location: DatatypeLocation::Inline,
-        },
-        AttrValue::U32(v) => AttributeMessage {
-            name: name.to_string(),
-            datatype: make_u32_type(),
-            dataspace: scalar_ds(),
-            raw_data: v.to_le_bytes().to_vec(),
-            datatype_location: DatatypeLocation::Inline,
-        },
-        AttrValue::U64(v) => AttributeMessage {
-            name: name.to_string(),
-            datatype: make_u64_type(),
-            dataspace: scalar_ds(),
-            raw_data: v.to_le_bytes().to_vec(),
-            datatype_location: DatatypeLocation::Inline,
-        },
+        AttrValue::F64(v) => numeric_scalar_attr(name, make_f64_type(), &v.to_le_bytes()),
+        AttrValue::F64Array(a) => numeric_array_attr(name, make_f64_type(), a, f64::to_le_bytes),
+        AttrValue::I8(v) => numeric_scalar_attr(name, make_i8_type(), &v.to_le_bytes()),
+        AttrValue::I8Array(a) => numeric_array_attr(name, make_i8_type(), a, i8::to_le_bytes),
+        AttrValue::I16(v) => numeric_scalar_attr(name, make_i16_type(), &v.to_le_bytes()),
+        AttrValue::I16Array(a) => numeric_array_attr(name, make_i16_type(), a, i16::to_le_bytes),
+        AttrValue::I32(v) => numeric_scalar_attr(name, make_i32_type(), &v.to_le_bytes()),
+        AttrValue::I32Array(a) => numeric_array_attr(name, make_i32_type(), a, i32::to_le_bytes),
+        AttrValue::I64(v) => numeric_scalar_attr(name, make_i64_type(), &v.to_le_bytes()),
+        AttrValue::I64Array(a) => numeric_array_attr(name, make_i64_type(), a, i64::to_le_bytes),
+        AttrValue::U8(v) => numeric_scalar_attr(name, make_u8_type(), &v.to_le_bytes()),
+        AttrValue::U8Array(a) => numeric_array_attr(name, make_u8_type(), a, u8::to_le_bytes),
+        AttrValue::U16(v) => numeric_scalar_attr(name, make_u16_type(), &v.to_le_bytes()),
+        AttrValue::U16Array(a) => numeric_array_attr(name, make_u16_type(), a, u16::to_le_bytes),
+        AttrValue::U32(v) => numeric_scalar_attr(name, make_u32_type(), &v.to_le_bytes()),
+        AttrValue::U32Array(a) => numeric_array_attr(name, make_u32_type(), a, u32::to_le_bytes),
+        AttrValue::U64(v) => numeric_scalar_attr(name, make_u64_type(), &v.to_le_bytes()),
+        AttrValue::U64Array(a) => numeric_array_attr(name, make_u64_type(), a, u64::to_le_bytes),
         AttrValue::String(s) => {
             let bytes = s.as_bytes();
             AttributeMessage {
@@ -1240,6 +1221,12 @@ pub(crate) fn simple_1d(n: u64) -> Dataspace {
 
 /// Convenient attribute values for the write API.
 ///
+/// Each integer variant names the width it is stored at, and a value written
+/// from one reads back as the same variant: an `I16` attribute is two bytes on
+/// disk and arrives as `I16`, not widened to `I64` (issue #350). The accessors
+/// below read any of them as `i64`/`u64`, so code that only wants the number
+/// need not enumerate the widths.
+///
 /// Non-exhaustive: variants are added as this crate supports more attribute
 /// datatypes, so match a read-back value with a `_` arm. Constructing the
 /// variants below is unaffected.
@@ -1248,10 +1235,20 @@ pub(crate) fn simple_1d(n: u64) -> Dataspace {
 pub enum AttrValue {
     F64(f64),
     F64Array(Vec<f64>),
+    I8(i8),
+    I8Array(Vec<i8>),
+    I16(i16),
+    I16Array(Vec<i16>),
     I32(i32),
+    I32Array(Vec<i32>),
     I64(i64),
     I64Array(Vec<i64>),
+    U8(u8),
+    U8Array(Vec<u8>),
+    U16(u16),
+    U16Array(Vec<u16>),
     U32(u32),
+    U32Array(Vec<u32>),
     U64(u64),
     /// Unsigned 64-bit integer array. Distinct from
     /// [`I64Array`](AttrValue::I64Array) because a value above [`i64::MAX`] has
@@ -1276,7 +1273,7 @@ pub enum AttrValue {
 /// One logical value has several representations here. A single string is a
 /// [`String`](AttrValue::String) or an [`AsciiString`](AttrValue::AsciiString)
 /// depending on charset, and a one-element array of either carries the same
-/// thing; an integer spans four widths. Code that only wants the value should
+/// thing; an integer spans eight widths. Code that only wants the value should
 /// not have to enumerate those, so each accessor spans every variant that can
 /// carry the shape it names and returns `None` for the rest.
 ///
@@ -1334,15 +1331,7 @@ impl AttrValue {
     /// [`i64::MAX`] does not fit and yields `None` rather than a wrapped
     /// negative; [`as_u64`](AttrValue::as_u64) reads it.
     pub fn as_i64(&self) -> Option<i64> {
-        match self {
-            Self::I64(v) => Some(*v),
-            Self::I32(v) => Some(i64::from(*v)),
-            Self::U32(v) => Some(i64::from(*v)),
-            Self::U64(v) => i64::try_from(*v).ok(),
-            Self::I64Array(v) if v.len() == 1 => Some(v[0]),
-            Self::U64Array(v) if v.len() == 1 => i64::try_from(v[0]).ok(),
-            _ => None,
-        }
+        self.single_int()
     }
 
     /// The value as one `u64`, when it holds exactly one integer.
@@ -1350,15 +1339,7 @@ impl AttrValue {
     /// Unsigned widths widen exactly. A negative value has no `u64` and yields
     /// `None`; [`as_i64`](AttrValue::as_i64) reads it.
     pub fn as_u64(&self) -> Option<u64> {
-        match self {
-            Self::U64(v) => Some(*v),
-            Self::U32(v) => Some(u64::from(*v)),
-            Self::I64(v) => u64::try_from(*v).ok(),
-            Self::I32(v) => u64::try_from(*v).ok(),
-            Self::U64Array(v) if v.len() == 1 => Some(v[0]),
-            Self::I64Array(v) if v.len() == 1 => u64::try_from(v[0]).ok(),
-            _ => None,
-        }
+        self.single_int()
     }
 
     /// Every integer the value holds as `i64`, with a scalar reading as one
@@ -1369,11 +1350,7 @@ impl AttrValue {
     /// per variant, so a wrapped negative is never handed back. Read those
     /// through [`to_u64s`](AttrValue::to_u64s).
     pub fn to_i64s(&self) -> Option<Vec<i64>> {
-        match self {
-            Self::I64Array(v) => Some(v.clone()),
-            Self::U64Array(v) => v.iter().map(|&e| i64::try_from(e).ok()).collect(),
-            _ => self.as_i64().map(|v| vec![v]),
-        }
+        self.int_elements()
     }
 
     /// Every integer the value holds as `u64`, with a scalar reading as one
@@ -1382,10 +1359,67 @@ impl AttrValue {
     /// Returns `None` for a non-integer value, and for a signed value with any
     /// negative element.
     pub fn to_u64s(&self) -> Option<Vec<u64>> {
+        self.int_elements()
+    }
+
+    /// The one integer this value holds, as `T`, or `None` unless it holds
+    /// exactly one — a scalar, or an array of length 1.
+    ///
+    /// Every width goes through `i128`, which holds [`i64::MIN`] and
+    /// [`u64::MAX`] alike, so the widening here is always exact and the only
+    /// narrowing is the caller's own conversion to `T`. That is what lets one
+    /// list of variants serve both [`as_i64`](AttrValue::as_i64) and
+    /// [`as_u64`](AttrValue::as_u64): a width added to the enum reaches both or
+    /// neither.
+    fn single_int<T: TryFrom<i128>>(&self) -> Option<T> {
+        let one: i128 = match self {
+            Self::I8(v) => (*v).into(),
+            Self::I16(v) => (*v).into(),
+            Self::I32(v) => (*v).into(),
+            Self::I64(v) => (*v).into(),
+            Self::U8(v) => (*v).into(),
+            Self::U16(v) => (*v).into(),
+            Self::U32(v) => (*v).into(),
+            Self::U64(v) => (*v).into(),
+            Self::I8Array(v) if v.len() == 1 => v[0].into(),
+            Self::I16Array(v) if v.len() == 1 => v[0].into(),
+            Self::I32Array(v) if v.len() == 1 => v[0].into(),
+            Self::I64Array(v) if v.len() == 1 => v[0].into(),
+            Self::U8Array(v) if v.len() == 1 => v[0].into(),
+            Self::U16Array(v) if v.len() == 1 => v[0].into(),
+            Self::U32Array(v) if v.len() == 1 => v[0].into(),
+            Self::U64Array(v) if v.len() == 1 => v[0].into(),
+            _ => return None,
+        };
+        T::try_from(one).ok()
+    }
+
+    /// Every integer this value holds, as `T`, with a scalar reading as one
+    /// element. `None` for a non-integer value, or for any element `T` cannot
+    /// hold — the range rule is per element, so a whole array is refused rather
+    /// than one of its values silently wrapping.
+    ///
+    /// Widths go through `i128` for the reason [`single_int`](AttrValue::single_int)
+    /// gives, and each element is converted once, into the vector handed back.
+    fn int_elements<T: TryFrom<i128>>(&self) -> Option<Vec<T>> {
         match self {
-            Self::U64Array(v) => Some(v.clone()),
-            Self::I64Array(v) => v.iter().map(|&e| u64::try_from(e).ok()).collect(),
-            _ => self.as_u64().map(|v| vec![v]),
+            Self::I8(v) => one_int(*v),
+            Self::I16(v) => one_int(*v),
+            Self::I32(v) => one_int(*v),
+            Self::I64(v) => one_int(*v),
+            Self::U8(v) => one_int(*v),
+            Self::U16(v) => one_int(*v),
+            Self::U32(v) => one_int(*v),
+            Self::U64(v) => one_int(*v),
+            Self::I8Array(v) => many_ints(v),
+            Self::I16Array(v) => many_ints(v),
+            Self::I32Array(v) => many_ints(v),
+            Self::I64Array(v) => many_ints(v),
+            Self::U8Array(v) => many_ints(v),
+            Self::U16Array(v) => many_ints(v),
+            Self::U32Array(v) => many_ints(v),
+            Self::U64Array(v) => many_ints(v),
+            _ => None,
         }
     }
 
@@ -1429,10 +1463,20 @@ impl AttrValue {
         match self {
             Self::F64(_) => "f64",
             Self::F64Array(_) => "f64[]",
+            Self::I8(_) => "i8",
+            Self::I8Array(_) => "i8[]",
+            Self::I16(_) => "i16",
+            Self::I16Array(_) => "i16[]",
             Self::I32(_) => "i32",
+            Self::I32Array(_) => "i32[]",
             Self::I64(_) => "i64",
             Self::I64Array(_) => "i64[]",
+            Self::U8(_) => "u8",
+            Self::U8Array(_) => "u8[]",
+            Self::U16(_) => "u16",
+            Self::U16Array(_) => "u16[]",
             Self::U32(_) => "u32",
+            Self::U32Array(_) => "u32[]",
             Self::U64(_) => "u64",
             Self::U64Array(_) => "u64[]",
             Self::String(_) => "string",
@@ -1442,6 +1486,20 @@ impl AttrValue {
             Self::VarLenAsciiArray(_) => "vlen_ascii_string[]",
         }
     }
+}
+
+/// One integer element as a one-element vector of `T`, for
+/// [`AttrValue::int_elements`]'s scalar arms.
+fn one_int<T: TryFrom<i128>, E: Into<i128>>(value: E) -> Option<Vec<T>> {
+    Some(vec![T::try_from(value.into()).ok()?])
+}
+
+/// Every element of an integer array as `T`, for
+/// [`AttrValue::int_elements`]'s array arms. One element that `T` cannot hold
+/// refuses the whole array, since a partial answer would be indistinguishable
+/// from a complete one.
+fn many_ints<T: TryFrom<i128>, E: Into<i128> + Copy>(values: &[E]) -> Option<Vec<T>> {
+    values.iter().map(|&e| T::try_from(e.into()).ok()).collect()
 }
 
 /// How many array elements [`AttrValue`] writes before eliding the rest.
@@ -1459,13 +1517,23 @@ impl fmt::Display for AttrValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::F64(v) => write!(f, "{v:?}"),
+            Self::I8(v) => write!(f, "{v}"),
+            Self::I16(v) => write!(f, "{v}"),
             Self::I32(v) => write!(f, "{v}"),
             Self::I64(v) => write!(f, "{v}"),
+            Self::U8(v) => write!(f, "{v}"),
+            Self::U16(v) => write!(f, "{v}"),
             Self::U32(v) => write!(f, "{v}"),
             Self::U64(v) => write!(f, "{v}"),
             Self::String(v) | Self::AsciiString(v) => write!(f, "{v:?}"),
             Self::F64Array(v) => write_elements(f, v),
+            Self::I8Array(v) => write_elements(f, v),
+            Self::I16Array(v) => write_elements(f, v),
+            Self::I32Array(v) => write_elements(f, v),
             Self::I64Array(v) => write_elements(f, v),
+            Self::U8Array(v) => write_elements(f, v),
+            Self::U16Array(v) => write_elements(f, v),
+            Self::U32Array(v) => write_elements(f, v),
             Self::U64Array(v) => write_elements(f, v),
             Self::StringArray(v) | Self::AsciiStringArray(v) | Self::VarLenAsciiArray(v) => {
                 write_elements(f, v)
@@ -2780,24 +2848,80 @@ mod attr_value_accessor_tests {
         assert_eq!(AttrValue::I64(1).as_strings(), None);
     }
 
-    #[test]
-    fn as_i64_widens_every_integer_variant() {
-        assert_eq!(AttrValue::I64(-7).as_i64(), Some(-7));
-        assert_eq!(AttrValue::I32(-7).as_i64(), Some(-7));
-        assert_eq!(AttrValue::U32(7).as_i64(), Some(7));
-        assert_eq!(AttrValue::U64(7).as_i64(), Some(7));
-        assert_eq!(AttrValue::I64Array(vec![-7]).as_i64(), Some(-7));
-        assert_eq!(AttrValue::U64Array(vec![7]).as_i64(), Some(7));
+    /// One value per integer variant, scalar and one-element array alike, for
+    /// the accessors that must span every width. Signed variants carry `-7`
+    /// where they can, so a sign lost in the widening shows up as a value.
+    fn every_integer_variant() -> Vec<(AttrValue, i64)> {
+        vec![
+            (AttrValue::I8(-7), -7),
+            (AttrValue::I16(-7), -7),
+            (AttrValue::I32(-7), -7),
+            (AttrValue::I64(-7), -7),
+            (AttrValue::U8(7), 7),
+            (AttrValue::U16(7), 7),
+            (AttrValue::U32(7), 7),
+            (AttrValue::U64(7), 7),
+            (AttrValue::I8Array(vec![-7]), -7),
+            (AttrValue::I16Array(vec![-7]), -7),
+            (AttrValue::I32Array(vec![-7]), -7),
+            (AttrValue::I64Array(vec![-7]), -7),
+            (AttrValue::U8Array(vec![7]), 7),
+            (AttrValue::U16Array(vec![7]), 7),
+            (AttrValue::U32Array(vec![7]), 7),
+            (AttrValue::U64Array(vec![7]), 7),
+        ]
     }
 
+    /// Every width reads as `i64`, which is what lets a caller ignore the width
+    /// the file happened to use — the point of keeping it on the variant (#350)
+    /// is that it is *available*, not that it must be handled.
+    #[test]
+    fn as_i64_widens_every_integer_variant() {
+        for (value, expected) in every_integer_variant() {
+            assert_eq!(value.as_i64(), Some(expected), "{}", value.type_name());
+            assert_eq!(
+                value.to_i64s(),
+                Some(vec![expected]),
+                "{} through the plural accessor",
+                value.type_name()
+            );
+        }
+    }
+
+    /// The same span for `u64`, where the signed variants' `-7` has no value and
+    /// the unsigned ones do.
     #[test]
     fn as_u64_widens_every_integer_variant() {
-        assert_eq!(AttrValue::U64(7).as_u64(), Some(7));
-        assert_eq!(AttrValue::U32(7).as_u64(), Some(7));
-        assert_eq!(AttrValue::I64(7).as_u64(), Some(7));
-        assert_eq!(AttrValue::I32(7).as_u64(), Some(7));
-        assert_eq!(AttrValue::U64Array(vec![7]).as_u64(), Some(7));
-        assert_eq!(AttrValue::I64Array(vec![7]).as_u64(), Some(7));
+        for (value, expected) in every_integer_variant() {
+            let expected = u64::try_from(expected).ok();
+            assert_eq!(value.as_u64(), expected, "{}", value.type_name());
+            assert_eq!(
+                value.to_u64s(),
+                expected.map(|v| vec![v]),
+                "{} through the plural accessor",
+                value.type_name()
+            );
+        }
+    }
+
+    /// The full range of each unsigned width reads as itself rather than
+    /// wrapping through a narrower conversion on the way to `u64`.
+    #[test]
+    fn the_widest_value_of_each_width_reads_as_itself() {
+        assert_eq!(AttrValue::U8(u8::MAX).as_u64(), Some(255));
+        assert_eq!(AttrValue::U16(u16::MAX).as_u64(), Some(65_535));
+        assert_eq!(AttrValue::U32(u32::MAX).as_u64(), Some(4_294_967_295));
+        assert_eq!(AttrValue::I8(i8::MIN).as_i64(), Some(-128));
+        assert_eq!(AttrValue::I16(i16::MIN).as_i64(), Some(-32_768));
+        assert_eq!(AttrValue::I32(i32::MIN).as_i64(), Some(-2_147_483_648));
+        assert_eq!(
+            AttrValue::U8Array(vec![u8::MAX, 0]).to_i64s(),
+            Some(vec![255, 0])
+        );
+        assert_eq!(
+            AttrValue::I16Array(vec![i16::MIN, i16::MAX]).to_i64s(),
+            Some(vec![-32_768, 32_767])
+        );
     }
 
     /// A `u64` past `i64::MAX` has no `i64` value, and a negative number has no
@@ -2915,17 +3039,30 @@ mod attr_value_accessor_tests {
 mod attr_value_display_tests {
     use super::{ATTR_DISPLAY_MAX_ELEMENTS, AttrValue};
 
-    /// A caller that fell through its own `_` arm has only this name to report,
-    /// so no two variants may share one.
-    #[test]
-    fn type_name_is_distinct_for_every_variant() {
-        let values = [
+    /// One value of every `AttrValue` variant.
+    ///
+    /// The match below names each variant with no `_` arm, so a variant added to
+    /// the enum stops this module compiling until it is listed here as well.
+    /// Without that, a test that walks "every variant" walks only the ones that
+    /// existed when it was written — and #350 added ten at once.
+    fn one_of_every_variant() -> Vec<AttrValue> {
+        let values = vec![
             AttrValue::F64(0.0),
             AttrValue::F64Array(vec![]),
+            AttrValue::I8(0),
+            AttrValue::I8Array(vec![]),
+            AttrValue::I16(0),
+            AttrValue::I16Array(vec![]),
             AttrValue::I32(0),
+            AttrValue::I32Array(vec![]),
             AttrValue::I64(0),
             AttrValue::I64Array(vec![]),
+            AttrValue::U8(0),
+            AttrValue::U8Array(vec![]),
+            AttrValue::U16(0),
+            AttrValue::U16Array(vec![]),
             AttrValue::U32(0),
+            AttrValue::U32Array(vec![]),
             AttrValue::U64(0),
             AttrValue::U64Array(vec![]),
             AttrValue::String(String::new()),
@@ -2934,6 +3071,30 @@ mod attr_value_display_tests {
             AttrValue::AsciiStringArray(vec![]),
             AttrValue::VarLenAsciiArray(vec![]),
         ];
+        for value in &values {
+            match value {
+                AttrValue::F64(_) | AttrValue::F64Array(_) => {}
+                AttrValue::I8(_) | AttrValue::I8Array(_) => {}
+                AttrValue::I16(_) | AttrValue::I16Array(_) => {}
+                AttrValue::I32(_) | AttrValue::I32Array(_) => {}
+                AttrValue::I64(_) | AttrValue::I64Array(_) => {}
+                AttrValue::U8(_) | AttrValue::U8Array(_) => {}
+                AttrValue::U16(_) | AttrValue::U16Array(_) => {}
+                AttrValue::U32(_) | AttrValue::U32Array(_) => {}
+                AttrValue::U64(_) | AttrValue::U64Array(_) => {}
+                AttrValue::String(_) | AttrValue::StringArray(_) => {}
+                AttrValue::AsciiString(_) | AttrValue::AsciiStringArray(_) => {}
+                AttrValue::VarLenAsciiArray(_) => {}
+            }
+        }
+        values
+    }
+
+    /// A caller that fell through its own `_` arm has only this name to report,
+    /// so no two variants may share one.
+    #[test]
+    fn type_name_is_distinct_for_every_variant() {
+        let values = one_of_every_variant();
 
         let mut names: Vec<&str> = values.iter().map(AttrValue::type_name).collect();
         let count = names.len();
@@ -2943,10 +3104,31 @@ mod attr_value_display_tests {
         assert!(!names.contains(&""));
     }
 
+    /// Every variant writes something. A `Display` arm added for a new variant
+    /// but left empty would show as nothing at all in the message quoting it,
+    /// which reads as an attribute with no value rather than a bug here.
+    #[test]
+    fn display_writes_something_for_every_variant() {
+        for value in one_of_every_variant() {
+            assert!(
+                !value.to_string().is_empty(),
+                "{} writes nothing",
+                value.type_name()
+            );
+        }
+    }
+
     #[test]
     fn display_writes_the_value_not_the_variant() {
         assert_eq!(AttrValue::F64(1.5).to_string(), "1.5");
+        assert_eq!(AttrValue::I8(-7).to_string(), "-7");
+        assert_eq!(AttrValue::I16(-7).to_string(), "-7");
         assert_eq!(AttrValue::I32(-7).to_string(), "-7");
+        assert_eq!(AttrValue::U8(255).to_string(), "255");
+        assert_eq!(AttrValue::U16(65_535).to_string(), "65535");
+        assert_eq!(AttrValue::U32(7).to_string(), "7");
+        assert_eq!(AttrValue::U8Array(vec![1, 2]).to_string(), "[1, 2]");
+        assert_eq!(AttrValue::I16Array(vec![-1, 2]).to_string(), "[-1, 2]");
         assert_eq!(AttrValue::U64(u64::MAX).to_string(), "18446744073709551615");
         assert_eq!(AttrValue::String("metres".into()).to_string(), "\"metres\"");
         assert_eq!(

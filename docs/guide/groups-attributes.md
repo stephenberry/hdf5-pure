@@ -67,11 +67,14 @@ The `AttrValue` variants and their HDF5 encodings are:
 |---|---|
 | `AttrValue::F64` | 64-bit float scalar |
 | `AttrValue::F64Array` | 64-bit float array |
-| `AttrValue::I32` | Signed 32-bit integer scalar |
-| `AttrValue::I64` | Signed 64-bit integer scalar |
-| `AttrValue::I64Array` | Signed 64-bit integer array |
-| `AttrValue::U32` | Unsigned 32-bit integer scalar |
-| `AttrValue::U64` | Unsigned 64-bit integer scalar |
+| `AttrValue::I8` / `AttrValue::I8Array` | Signed 8-bit integer scalar / array |
+| `AttrValue::I16` / `AttrValue::I16Array` | Signed 16-bit integer scalar / array |
+| `AttrValue::I32` / `AttrValue::I32Array` | Signed 32-bit integer scalar / array |
+| `AttrValue::I64` / `AttrValue::I64Array` | Signed 64-bit integer scalar / array |
+| `AttrValue::U8` / `AttrValue::U8Array` | Unsigned 8-bit integer scalar / array |
+| `AttrValue::U16` / `AttrValue::U16Array` | Unsigned 16-bit integer scalar / array |
+| `AttrValue::U32` / `AttrValue::U32Array` | Unsigned 32-bit integer scalar / array |
+| `AttrValue::U64` / `AttrValue::U64Array` | Unsigned 64-bit integer scalar / array |
 | `AttrValue::String` | UTF-8 string (null-padded) |
 | `AttrValue::StringArray` | Array of UTF-8 strings |
 | `AttrValue::AsciiString` | Fixed-width ASCII string (charset = ASCII) |
@@ -107,7 +110,7 @@ println!("attributes:   {:?}", sensors.attrs().unwrap());
 
 ### Reading an attribute value
 
-An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, and the datatype's charset selects the `Ascii` variants. A `VarLenAsciiArray` of one element stays a `VarLenAsciiArray`, and an `AsciiString` does not arrive as a `String`.
+An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, the datatype's charset selects the `Ascii` variants, and an integer's width selects among `I8` … `U64`. A `VarLenAsciiArray` of one element stays a `VarLenAsciiArray`, an `AsciiString` does not arrive as a `String`, and a 16-bit attribute does not arrive as an `I64`.
 
 That fidelity means several variants can carry the same logical value, so match on the variant only when the encoding is what you care about. Otherwise use the accessors, each of which spans every variant that can hold the shape it names:
 
@@ -125,13 +128,14 @@ let fields: Option<Vec<&str>> = attrs.get("MATLAB_fields").and_then(AttrValue::a
 
 What a read cannot recover, because `AttrValue` has no way to express it. Each of these reads correctly, and each would come back differently if it were *rewritten from the value* — which is why [`repack`](repack.md) copies an attribute's encoding rather than rebuilding it from one:
 
-- **Width.** Integers and floats widen to `i64`/`u64`/`f64`; there are no narrower array variants.
+- **Float width.** A 32-bit float widens to `f64`; there is no `f32` variant. Integers keep their width, at 1, 2, 4 and 8 bytes; a width with no Rust integer of its own — 3 bytes, say — widens to 64-bit.
+- **Byte order and precision.** Every integer variant writes back little-endian at its full width, so a big-endian attribute, or one storing fewer bits than its bytes hold, reads correctly but would be re-encoded in this crate's own layout.
 - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR` — what h5py writes, and what this crate's writer never emits — has no variant of its own and reads as the fixed-width variant of the same charset.
 - **Rank.** Every array variant is one-dimensional, so a rank-2 attribute reads as its elements flattened.
 - **Padding and declared width.** A fixed-width string reports its content, not its `STRSIZE` or which padding it used.
 - **Enumeration member names.** An enum attribute decodes through its integer base, so its codes arrive and its labels do not.
 
-The variant may become **more specific** in a future release as `AttrValue` grows narrower variants, so match with a `_` arm — which the `#[non_exhaustive]` enum requires anyway — or read through the accessors, which are unaffected by such a change.
+The variant may become **more specific** in a future release as `AttrValue` grows further variants — the integer widths landed that way — so match with a `_` arm, which the `#[non_exhaustive]` enum requires anyway, or read through the accessors, which are unaffected by such a change.
 
 ### Reading an attribute's datatype
 

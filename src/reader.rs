@@ -5705,19 +5705,41 @@ mod tests {
         }
     }
 
-    /// The datatype channel carries the width the value channel widens away: one
-    /// attribute, read as a 64-bit value and as the 4-byte type it is stored as.
+    /// The two channels on the axes each one carries.
     ///
-    /// The pair is the point. `AttrValue` is documented as lossy, so a caller
-    /// that needs the encoding — to map it onto a typed column, say — needs
-    /// somewhere else to read it, and for an attribute there was nowhere (#248).
+    /// Both now report an integer's width: the value channel keeps it (#350),
+    /// so `count` is `I32` and its datatype is the 4-byte signed type it is
+    /// stored as. What the value channel still cannot say is how those bytes are
+    /// laid out — `be` holds the same number big-endian and decodes to the same
+    /// `I32`, so the datatype channel is the only record that re-encoding from
+    /// the value would flip its byte order. `AttrValue` is documented as lossy;
+    /// this is where the loss is (#248).
     #[test]
-    fn attr_datatypes_reports_the_width_attrs_widens() {
-        for c in attr_channels(&[("count", AttrValue::I32(-7))], &[]).owners {
+    fn attr_datatypes_reports_the_byte_order_attrs_normalizes() {
+        let be = crate::attribute::AttributeMessage {
+            name: "be".into(),
+            datatype: Datatype::FixedPoint {
+                size: 4,
+                byte_order: crate::datatype::DatatypeByteOrder::BigEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 32,
+            },
+            dataspace: Dataspace {
+                space_type: crate::dataspace::DataspaceType::Scalar,
+                rank: 0,
+                dimensions: vec![],
+                max_dimensions: None,
+            },
+            raw_data: (-7i32).to_be_bytes().to_vec(),
+            datatype_location: crate::shared_message::DatatypeLocation::Inline,
+        };
+
+        for c in attr_channels(&[("count", AttrValue::I32(-7))], std::slice::from_ref(&be)).owners {
             assert_eq!(
                 c.values.get("count"),
-                Some(&AttrValue::I64(-7)),
-                "{}: the value channel widens every integer to 64 bits",
+                Some(&AttrValue::I32(-7)),
+                "{}: the value channel keeps the width the attribute was written at",
                 c.owner
             );
             let Some(Datatype::FixedPoint { size, signed, .. }) = c.datatypes.get("count") else {
@@ -5731,6 +5753,26 @@ mod tests {
                 (*size, *signed),
                 (4, true),
                 "{}: the datatype channel must report the width on disk",
+                c.owner
+            );
+
+            assert_eq!(
+                c.values.get("be"),
+                Some(&AttrValue::I32(-7)),
+                "{}: a big-endian attribute decodes to the value it holds",
+                c.owner
+            );
+            let Some(Datatype::FixedPoint { byte_order, .. }) = c.datatypes.get("be") else {
+                panic!(
+                    "{}: expected a fixed-point datatype, got {:?}",
+                    c.owner,
+                    c.datatypes.get("be")
+                );
+            };
+            assert_eq!(
+                *byte_order,
+                crate::datatype::DatatypeByteOrder::BigEndian,
+                "{}: the datatype channel is the only record of the byte order",
                 c.owner
             );
         }

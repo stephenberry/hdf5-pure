@@ -297,14 +297,14 @@ fn a_committed_attribute_datatype_resolves_to_the_type_it_names() {
         );
         assert_eq!(
             attrs.get("shared_attr"),
-            Some(&AttrValue::I64Array(vec![i64::from(ATTR_VALUE)])),
+            Some(&AttrValue::I32Array(vec![ATTR_VALUE])),
             "{owner}: a committed attribute's value was dropped"
         );
         // The ordinary attribute beside it is unaffected. Both fixtures' attributes
         // share one rank-1 dataspace, so both arrive as arrays.
         assert_eq!(
             attrs.get("plain"),
-            Some(&AttrValue::I64Array(vec![i64::from(-ATTR_VALUE)])),
+            Some(&AttrValue::I32Array(vec![-ATTR_VALUE])),
             "{owner}: an inline attribute changed"
         );
     }
@@ -365,7 +365,7 @@ fn committed_datatypes_resolve_in_dense_attribute_storage() {
             );
             assert_eq!(
                 attrs.get(&name),
-                Some(&AttrValue::I64Array(vec![i as i64])),
+                Some(&AttrValue::I32Array(vec![i32::try_from(i).unwrap()])),
                 "{backend}/{name}: a dense committed attribute's value was dropped"
             );
         }
@@ -398,7 +398,7 @@ fn an_edit_passes_over_a_committed_attribute_it_does_not_touch() {
     assert_eq!(attrs.get("added"), Some(&AttrValue::I64(5)));
     assert_eq!(
         attrs.get("shared_attr"),
-        Some(&AttrValue::I64Array(vec![i64::from(ATTR_VALUE)])),
+        Some(&AttrValue::I32Array(vec![ATTR_VALUE])),
         "the committed attribute did not survive an edit beside it"
     );
     assert_eq!(
@@ -646,7 +646,7 @@ fn repack_reproduces_a_committed_datatype() {
     assert_eq!(root_attr.get("shared_attr"), Some(&committed_i32()));
     assert_eq!(
         out.root().attrs().unwrap().get("shared_attr"),
-        Some(&AttrValue::I64Array(vec![ATTR_VALUE.into()]))
+        Some(&AttrValue::I32Array(vec![ATTR_VALUE]))
     );
 }
 

@@ -59,8 +59,8 @@
 //! - Group hierarchy of arbitrary depth.
 //! - Attributes, on datasets, groups, and root, carried across with the
 //!   encoding the source gave them rather than rebuilt from an [`AttrValue`],
-//!   which is a decoded view and cannot express a narrow width, a
-//!   variable-length string, or a rank above one.
+//!   which is a decoded view and cannot express a byte order, a sub-width
+//!   precision, a variable-length string, or a rank above one.
 //! - The source file's file-space management strategy (with its page size and
 //!   threshold), carried into the compact output as non-persistent — a repacked
 //!   file has no free space to persist.
@@ -1201,10 +1201,10 @@ fn attr_bytes_are_position_independent(dt: &Datatype) -> bool {
 /// An attribute whose bytes are position-independent is copied *verbatim*: the
 /// source's own datatype, dataspace and element bytes go straight into the
 /// destination message. That is what keeps a rewrite faithful, because
-/// [`AttrValue`] is a decoded view and cannot express an integer narrower than
-/// 64 bits, a variable-length string, a rank above one, or a string's padding —
-/// so anything routed through it comes out re-encoded as the widest variant of
-/// its class, flattened to rank 1 (issue #241).
+/// [`AttrValue`] is a decoded view and cannot express a big-endian integer, a
+/// sub-width precision, a variable-length string, a rank above one, or a
+/// string's padding — so anything routed through it comes out re-encoded in this
+/// crate's own layout, flattened to rank 1 (issue #241).
 ///
 /// The rest — variable-length data and references — hold source-file addresses,
 /// so their bytes cannot travel. Those fall back to `decode`, the decoded
@@ -1972,11 +1972,10 @@ mod attribute_fidelity_tests {
     ///
     /// Asserting the whole message covers width, charset, string padding,
     /// dataspace kind and rank, and the element bytes together — including the
-    /// ones no accessor on this crate would notice, since a decode normalizes a
-    /// narrow integer to `i64` on *both* sides of the comparison and so cannot
-    /// see the widening at all. It also covers all three kinds of owner, because
-    /// the root group, a subgroup and a dataset each reach the writer by a
-    /// different path.
+    /// ones no accessor on this crate would notice, since two messages that
+    /// decode to the same value can still differ on disk. It also covers all
+    /// three kinds of owner, because the root group, a subgroup and a dataset
+    /// each reach the writer by a different path.
     #[test]
     fn a_position_independent_attribute_crosses_a_repack_unchanged() {
         let dir = tempfile::tempdir().unwrap();
@@ -1984,9 +1983,9 @@ mod attribute_fidelity_tests {
 
         let attrs = || {
             [
-                // The width cases: `AttrValue` has no narrow *array* variants and
-                // no narrow scalars past 32 bits, so each of these is a decode
-                // that would widen.
+                // The width cases. A decode keeps these now (#350), so what
+                // they pin here is that the copy does too — the byte-order case
+                // a decode still cannot express is in the test below.
                 ("i32", AttrValue::I32(-7)),
                 ("u32", AttrValue::U32(4_294_967_295)),
                 // Charset and padding: an ASCII string and a UTF-8 one differ only
@@ -2104,6 +2103,27 @@ mod attribute_fidelity_tests {
                     max_dimensions: None,
                 },
                 raw_data: vec![],
+                datatype_location: crate::shared_message::DatatypeLocation::Inline,
+            },
+            // Big-endian, which every `AttrValue` integer variant normalizes to
+            // little-endian: the width survives a decode since #350, the layout
+            // of the bytes inside it does not.
+            AttributeMessage {
+                name: "big_endian".into(),
+                datatype: Datatype::FixedPoint {
+                    size: 4,
+                    byte_order: crate::datatype::DatatypeByteOrder::BigEndian,
+                    signed: true,
+                    bit_offset: 0,
+                    bit_precision: 32,
+                },
+                dataspace: Dataspace {
+                    space_type: DataspaceType::Scalar,
+                    rank: 0,
+                    dimensions: vec![],
+                    max_dimensions: None,
+                },
+                raw_data: (-7i32).to_be_bytes().to_vec(),
                 datatype_location: crate::shared_message::DatatypeLocation::Inline,
             },
             // Rank 2, which every `AttrValue` array variant flattens.

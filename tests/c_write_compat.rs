@@ -335,6 +335,6 @@ fn pure_reads_every_attribute_encoding_the_c_library_writes() {
         attrs.get("u64_two"),
         Some(&AttrValue::U64Array(vec![u64::MAX, 1]))
     );
-    // Width is not recovered: a 32-bit signed attribute widens.
-    assert_eq!(attrs.get("i32_scalar"), Some(&AttrValue::I64(-7)));
+    // The width is recovered: a 32-bit signed attribute stays 32-bit (#350).
+    assert_eq!(attrs.get("i32_scalar"), Some(&AttrValue::I32(-7)));
 }
