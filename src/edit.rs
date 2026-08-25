@@ -801,11 +801,27 @@ pub(crate) struct WriteEngine {
     ///
     /// Written only by
     /// [`write_inplace_journaled`](Self::write_inplace_journaled) and drained
-    /// only by [`undo_inplace_writes`](Self::undo_inplace_writes), and empty
-    /// whenever [`commit`](Self::commit) is not running: it holds a copy of
-    /// every value the attempt replaced, which is the same order as the
-    /// replacement bytes the staged set is already holding, but only for the
-    /// length of one apply phase.
+    /// only by [`undo_inplace_writes`](Self::undo_inplace_writes). Every
+    /// [`commit`](Self::commit) that returns leaves it empty, and one that
+    /// unwinds does not, which is why the next commit clears it on entry rather
+    /// than trusting it.
+    ///
+    /// **It costs a full copy of every value being replaced, read back off the
+    /// file first.** Measured on the bounded backing, whose contract is not to
+    /// hold the file in memory: a same-length overwrite of a 4 MB dataset made
+    /// its commit read 4,000,197 bytes where the same commit without the
+    /// journal read 197, and held the 4 MB until the commit ended. That is the
+    /// price of the guarantee and it is charged on the success path too, since
+    /// whether the bytes will be needed is not known until the attempt ends.
+    /// `a_bounded_commit_reads_the_value_it_is_replacing` states the rule so
+    /// the number is in the repository rather than a surprise.
+    ///
+    /// The alternative — planning a same-length overwrite as a relocating write,
+    /// as a variable-length one already is — would cost nothing here and was
+    /// rejected for a harder reason than cost: a relocating write is refused for
+    /// a dataset with more than one hard link
+    /// ([`count_incoming_hard_links`](Self::count_incoming_hard_links)), so it
+    /// would start refusing overwrites this engine accepts today.
     inplace_undo: Vec<(usize, Vec<u8>)>,
     /// True when this engine was opened for SWMR writing
     /// ([`open_swmr_writer`](Self::open_swmr_writer)): the append engine then
@@ -872,14 +888,26 @@ pub(crate) struct WriteEngine {
     /// [`finalize_persist`](Self::finalize_persist) settles at close. Meaningless
     /// (and untouched) when `persist` is `None`.
     fsm_len: u64,
-    /// Whether the commit currently running has repointed the superblock at its
-    /// new root. Set by whichever tail performs that write, read only by
-    /// [`commit`](Self::commit) to decide whether a failure may hand this
-    /// commit's allocations back to the free lists (see [`FreeSnapshot`]).
+    /// Whether the commit currently running has *asked* the disk to repoint the
+    /// superblock at its new root. Set by whichever tail performs that write,
+    /// immediately **before** issuing it, and read only by
+    /// [`commit`](Self::commit) to decide whether a failure may roll anything
+    /// back — the free lists (see [`FreeSnapshot`]), the staged set, and the
+    /// values in [`inplace_undo`](Self::inplace_undo).
+    ///
+    /// Set before rather than after for the reason the whole rollback exists: a
+    /// write that alters the file and then reports failure is a real device
+    /// behaviour, so a write call returning an error does not mean its bytes
+    /// are not on the disk. Once the publish has been issued, whether this
+    /// commit is live is unknowable from here, and every rollback is unsound —
+    /// undoing the values would tear a commit that did land, and re-offering
+    /// the regions would hand out space that commit is using. Doing nothing is
+    /// the only answer that is never actively wrong, and the error the caller
+    /// gets is the write failure that says so (issue #344).
     ///
     /// It is a property of one commit, not of the session, so `commit` clears it
     /// on entry rather than trusting the previous run to have left it false.
-    repointed: bool,
+    publish_attempted: bool,
     /// Superblock status flags this session raised on the file and holds for its
     /// lifetime — the SWMR pair, or the page buffer's crash mark — or `0` when it
     /// holds none.
@@ -913,15 +941,15 @@ pub(crate) struct WriteEngine {
 /// can be handed the same region. If the commit then fails, those regions are as
 /// dead as they were before it started: nothing the commit wrote is reachable,
 /// because the superblock still names the old root — and the one write that does
-/// not wait for the repoint, a same-length value overwrite, has been put back by
-/// [`WriteEngine::undo_inplace_writes`] before this is restored (issue #344).
-/// Restoring this snapshot gives them back instead of leaking them for the rest
-/// of the session.
+/// not wait for the repoint, a same-length value overwrite, is one
+/// [`WriteEngine::undo_inplace_writes`] has already tried to put back by the
+/// time this runs (issue #344). Restoring this snapshot gives them back instead
+/// of leaking them for the rest of the session.
 ///
 /// The restore is sound only *before* the repoint. After it, the objects written
 /// into those regions are live, and handing the same addresses out again would
 /// overwrite the tree the commit just published — which is why
-/// [`WriteEngine::repointed`] gates it.
+/// [`WriteEngine::publish_attempted`] gates it.
 struct FreeSnapshot {
     free: FreeList,
     paged: Option<(FreeList, FreeList)>,
@@ -2079,7 +2107,7 @@ impl WriteEngine {
             bounded: false,
             libver_ceiling: None,
             fsm_len: len,
-            repointed: false,
+            publish_attempted: false,
             held_status_flags: 0,
             sync_policy: SyncPolicy::Always,
         };
@@ -3666,13 +3694,21 @@ impl WriteEngine {
     /// batch is in it as slack, and a later `commit` must not re-issue the rest
     /// as if nothing had happened.
     ///
-    /// **What the file holds is a separate promise, and it survives that
-    /// failure: a refused commit leaves every dataset reading what it read
-    /// before.** "Slack" describes all but one of the edits a commit applies.
-    /// The exception is a same-length value overwrite, which writes straight
-    /// over the dataset's existing data block and so is live the moment it
-    /// lands, with no repoint to withhold; a commit that fails before its
-    /// repoint writes the prior bytes back over every one of them (issue #344).
+    /// **What the file holds is a separate promise: a commit that fails before
+    /// its repoint leaves every dataset reading what it read before.** "Slack"
+    /// describes all but one of the edits such a commit applies. The exception
+    /// is a same-length value overwrite, which writes straight over the
+    /// dataset's existing data block and so is live the moment it lands, with
+    /// no repoint to withhold; the prior bytes are written back over every one
+    /// of them on the way out (issue #344).
+    ///
+    /// Past the repoint the promise is the other one, and it has to be: the
+    /// commit has published, so its overwrites are the file's values and are
+    /// left standing. A failure there — `repoint_stored_references` is the step
+    /// that can produce one — returns an error over a file that holds the whole
+    /// batch, which is what
+    /// `a_commit_that_fails_past_its_repoint_keeps_the_value_it_published`
+    /// pins.
     ///
     /// # Errors
     ///
@@ -3682,11 +3718,15 @@ impl WriteEngine {
     /// Every other refusal leaves them all as they were.
     pub fn commit(&mut self) -> Result<(), Error> {
         let snapshot = self.snapshot_free();
-        self.repointed = false;
-        debug_assert!(
-            self.inplace_undo.is_empty(),
-            "a commit leaves no journal behind, whichever way it ends"
-        );
+        self.publish_attempted = false;
+        // Cleared at entry, like `superseded_heaps` and for the same reason: a
+        // previous attempt that unwound past this function — a panic caught by
+        // the session lock, which recovers from poisoning — would otherwise
+        // leave entries behind, and this commit's rollback would replay bytes
+        // captured before it over whatever lives at those addresses now. The
+        // clear on the way out is a separate duty: it stops a journal being
+        // held across the idle time between commits.
+        self.inplace_undo.clear();
         // The staged set comes out for the duration of the attempt and goes back
         // if the attempt refuses, so a refusal costs the session no staged work
         // (issue #316). What goes back is whatever the attempt did not take: its
@@ -3694,30 +3734,32 @@ impl WriteEngine {
         // move at the point of no return, so a preflight refusal restores every
         // edit and a failure past that point restores nothing.
         let mut staged = std::mem::take(&mut self.staged);
-        let result = self.commit_inner(&mut staged);
-        let restored = if result.is_err() && !self.repointed {
-            // The values go back *before* the free lists. Nothing today writes
-            // an allocated address into an in-place overwrite — `prepare_write`
-            // relocates a staged variable-length one for exactly that reason
-            // (issue #321) — so this order decides nothing yet. It is the order
-            // that stays correct if that ever changes, and it costs nothing:
-            // restore the file, then re-offer its regions (issue #344).
+        let mut result = self.commit_inner(&mut staged);
+        if result.is_err() && !self.publish_attempted {
+            // The three legs of the rollback: the file's values, the free
+            // lists, and the staged set. Nothing observes the order — the first
+            // touches the file and the others only in-memory state, inside one
+            // synchronous call — so it is written the way it reads: put the
+            // file back, then re-offer what the attempt drew from (issue #344).
             let restored = self.undo_inplace_writes();
             self.restore_free(snapshot);
             self.staged = staged;
-            restored
-        } else {
-            Ok(())
-        };
-        // Past the repoint the overwrite is part of what the commit published,
-        // and on success it is the file's value: neither is anything to undo.
-        self.inplace_undo.clear();
-        match restored {
-            // The refusal is the less consequential of the two: the caller can
-            // act on it only after re-reading the datasets this batch named.
-            Err(e) => Err(Error::CommitPartiallyApplied(Box::new(e))),
-            Ok(()) => result,
+            if let Err(restore) = restored {
+                // Both are worth carrying: the refusal is what the caller has to
+                // fix, and the write failure is what proves the file changed.
+                let refusal = result.expect_err("only a failed attempt is rolled back");
+                result = Err(Error::CommitPartiallyApplied {
+                    refusal: Box::new(refusal),
+                    restore: Box::new(restore),
+                });
+            }
         }
+        // For the paths that took no rollback — a commit that succeeded, whose
+        // overwrites are now the file's values, and one that failed with the
+        // publish already issued, where undoing anything is unsound. A rollback
+        // drained the journal on its way through, so it owes nothing here.
+        self.inplace_undo.clear();
+        result
     }
 
     /// The free lists as they stand now, for [`commit`](Self::commit) to restore
@@ -3793,10 +3835,15 @@ impl WriteEngine {
             return Ok(());
         }
         let mut failed = None;
-        // Newest first, which is what an undo log means. Today's entries cannot
-        // overlap — one commit refuses to overwrite the same dataset twice — so
-        // the order decides nothing, and saying it here is cheaper than
-        // depending on that.
+        // Newest first, and load-bearing rather than conventional. The commit
+        // refuses to overwrite the same *path* twice, which is not the same as
+        // the same dataset: an object reachable through two hard links has two
+        // paths and one data block, and a same-length overwrite through either
+        // is allowed precisely because it rewrites the block every link sees.
+        // Two such writes in one commit therefore journal the same address
+        // twice, the second entry holding what the first write put there.
+        // Replaying oldest-first would finish on that value — one from the very
+        // batch being rolled back.
         for (at, prior) in journal.into_iter().rev() {
             if let Err(e) = self.write_at(at, &prior) {
                 failed.get_or_insert(e);
@@ -3804,10 +3851,13 @@ impl WriteEngine {
         }
         match failed {
             Some(e) => Err(e),
-            // The commit orders these writes with a barrier of its own, so
-            // order the replacements the same way rather than leaving them
-            // behind whatever it managed to issue. They move no end-of-file,
-            // so the data-only barrier is the one that fits.
+            // A restore that is not a barrier can be gathered and reordered
+            // past a later write, which is the whole hazard write gathering
+            // introduced (issue #288); order it here instead. The data-only
+            // barrier is the one that fits, because putting bytes back into
+            // blocks that already existed moves no end-of-file — it is a
+            // narrower barrier than the `barrier()` the commit itself uses
+            // after these writes, deliberately.
             None => self.barrier_data(),
         }
     }
@@ -5000,8 +5050,8 @@ impl WriteEngine {
         // variable-length overwrite as a relocating write rather than an
         // in-place one (issue #321), so every entry hands its staged bytes back
         // untouched — which the `vlen.is_none()` assertion guarding the fast
-        // path states for the whole list, this one included. The journal
-        // therefore costs one copy of each value being replaced and no more.
+        // path states for the whole list, this one included. The journal below
+        // is what costs here, and it is not free: see `inplace_undo`.
         for (data_addr, bytes) in &inplace_writes {
             let raw = self.resolve_overwrite_bytes(bytes)?;
             self.write_inplace_journaled(*data_addr, &raw)?;
@@ -5099,14 +5149,14 @@ impl WriteEngine {
             // from being wrong silently (issue #308).
             new_sb.consistency_flags = self.held_status_flags;
             let sb_bytes = new_sb.serialize();
+            self.publish_attempted = true;
             self.write_at(self.sb_sig_off, &sb_bytes)?;
-            self.repointed = true;
             self.barrier()?;
             new_sb.root_group_address = new_root;
             self.superblock = new_sb;
         } else {
+            self.publish_attempted = true;
             self.repoint_v0v1_root(new_root - base, new_eof)?;
-            self.repointed = true;
             self.barrier()?;
             self.superblock.root_group_address = new_root;
             self.superblock.eof_address = new_eof;
@@ -5318,8 +5368,8 @@ impl WriteEngine {
         // tail, which no page-buffered session reaches (issue #73, issue #308).
         new_sb.consistency_flags = self.held_status_flags;
         let sb_bytes = new_sb.serialize();
+        self.publish_attempted = true;
         self.write_at(self.sb_sig_off, &sb_bytes)?;
-        self.repointed = true;
         self.barrier()?;
         self.superblock = new_sb;
 
@@ -5511,8 +5561,8 @@ impl WriteEngine {
         // outlive every commit the session makes (issue #308).
         new_sb.consistency_flags = self.held_status_flags;
         let sb_bytes = new_sb.serialize();
+        self.publish_attempted = true;
         self.write_at(self.sb_sig_off, &sb_bytes)?;
-        self.repointed = true;
         self.barrier()?;
         self.superblock = new_sb;
 
@@ -13033,7 +13083,7 @@ mod tests {
         }
         let refused = s.commit();
         assert!(
-            matches!(refused, Err(Error::CommitPartiallyApplied(_))),
+            matches!(refused, Err(Error::CommitPartiallyApplied { .. })),
             "a rollback that could not run is not an ordinary refusal: {refused:?}"
         );
         drop(s);
@@ -13109,8 +13159,8 @@ mod tests {
             "the reference write is what failed, after the commit published: {failed:?}"
         );
         assert!(
-            s.repointed,
-            "the failure has to be past the repoint for this test to mean anything"
+            s.publish_attempted,
+            "the failure has to be past the publish for this test to mean anything"
         );
         drop(s);
 
@@ -15020,6 +15070,366 @@ mod tests {
                  close-time manager re-homing with no fsync at all"
             );
         }
+    }
+
+    /// A write that alters the file and *then* reports failure is a real device
+    /// behaviour — it is the one `TornWriteImage` models — so a `write_at`
+    /// returning an error does not mean its bytes missed the disk. When the
+    /// write in question is the superblock repoint, that makes "did this commit
+    /// publish?" unanswerable from inside the engine, and every rollback
+    /// unsound: undoing the values would tear a commit that did land.
+    ///
+    /// So the flag that gates the rollback is raised *before* the publish is
+    /// issued, not after it returns, and this pins that. The commit here does
+    /// publish — `/extra` is readable afterwards, which is only possible
+    /// through the new root — while its `commit` returns the write's error.
+    /// Rolling back under it would leave `/nums` holding the pre-commit value
+    /// inside a tree that is otherwise entirely the new one (issue #344).
+    #[test]
+    fn a_commit_whose_publish_write_fails_rolls_nothing_back() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("torn_publish.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("nums").with_i32_data(&[1, 2, 3]);
+        b.write(&path).unwrap();
+
+        // The superblock sits at offset 0 on a file with no userblock.
+        let mut s = WriteEngine::open_torn_writes(&path, 0..48).unwrap();
+        s.stage_dataset_write("/nums", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&[9, 9, 9]);
+            db
+        })
+        .unwrap();
+        s.stage_created_dataset("/extra", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&[42]);
+            db
+        })
+        .unwrap();
+        let failed = s.commit();
+        assert!(
+            matches!(failed, Err(Error::Io(_))),
+            "the publish write is what failed: {failed:?}"
+        );
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("extra").unwrap().read_i32().unwrap(),
+            vec![42],
+            "the publish landed despite reporting failure, so this commit is live"
+        );
+        assert_eq!(
+            f.dataset("nums").unwrap().read_i32().unwrap(),
+            vec![9, 9, 9],
+            "a rollback under a commit that did publish would tear it"
+        );
+    }
+
+    /// Two hard links to one dataset are two paths over one data block, and the
+    /// commit's duplicate guard is by path — so one commit can journal the same
+    /// address twice, the second entry holding what the first write put there.
+    /// The undo therefore has to replay newest-first; oldest-first finishes on a
+    /// value from the very batch being rolled back (issue #344).
+    ///
+    /// A same-length overwrite through either link is deliberately allowed —
+    /// it rewrites the block every link sees, so unlike a relocating write it
+    /// needs no single-hard-link rule (`write_dataset_shared_hard_link_crosscheck`
+    /// is the interop half of that). Which is what makes this reachable.
+    ///
+    /// The second link is made with the reference C library because this crate
+    /// has no API that creates one.
+    #[test]
+    #[cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
+    fn an_undo_replays_two_hard_links_to_one_block_newest_first() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hard_link_undo.h5");
+        {
+            use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
+            let f = hdf5::FileBuilder::new()
+                .with_fapl(|fapl| fapl.libver_v110())
+                .with_fcpl(|fcpl| {
+                    fcpl.file_space_strategy(CStrategy::FreeSpaceManager {
+                        paged: false,
+                        persist: true,
+                        threshold: 1,
+                    })
+                })
+                .create(&path)
+                .unwrap();
+            f.new_dataset::<i32>()
+                .shape((3,))
+                .create("aa")
+                .unwrap()
+                .write(&[1i32, 2, 3])
+                .unwrap();
+            // A second name for the very same object header, and so the very
+            // same data block.
+            f.link_hard("aa", "bb").unwrap();
+            f.close().unwrap();
+        }
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        // Fail the commit in its tail, after both writes have landed.
+        s.superblock.superblock_extension_address = Some(0);
+        for (name, data) in [("/aa", [9, 9, 9]), ("/bb", [8, 8, 8])] {
+            s.stage_dataset_write(name, {
+                let mut db = crate::type_builders::DatasetBuilder::new("");
+                db.with_i32_data(&data);
+                db
+            })
+            .unwrap();
+        }
+        // A second kind of edit, so the batch takes the full commit path and has
+        // a tail to fail in.
+        s.stage_created_dataset("/extra", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&[42]);
+            db
+        })
+        .unwrap();
+        assert!(s.commit().is_err());
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("aa").unwrap().read_i32().unwrap(),
+            vec![1, 2, 3],
+            "the block both links share must hold the value it held before"
+        );
+        assert_eq!(f.dataset("bb").unwrap().read_i32().unwrap(), vec![1, 2, 3]);
+    }
+
+    /// The chunked in-place path (`WritePlan::InPlaceChunks`) journals one entry
+    /// per chunk, and — when the chunks shrink — the rewritten chunk index
+    /// beside them. A partial restore would leave the index recording the new
+    /// sizes against the old bytes, so this is the case where the rollback has
+    /// most to put back (issue #344).
+    ///
+    /// Filtered, and overwritten with data that compresses to almost nothing, so
+    /// every chunk's recorded size changes and the index write is part of what
+    /// is rolled back rather than an unchanged block.
+    #[test]
+    fn a_failed_commit_puts_back_every_chunk_it_overwrote() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("chunked_undo.h5");
+        let original: Vec<i32> = (0..4096i32)
+            .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ i)
+            .collect();
+        let mut b = FileBuilder::new();
+        b.create_dataset("grid")
+            .with_i32_data(&original)
+            .with_shape(&[4096])
+            .with_chunks(&[512])
+            .with_deflate(6);
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+        b.write(&path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        s.superblock.superblock_extension_address = Some(0);
+        s.stage_dataset_write("/grid", {
+            // Values only: an overwrite that restated the chunking or the
+            // filter would be refused as asking for more than an overwrite
+            // (issue #318). The layout comes from the dataset already there.
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&vec![0i32; 4096]);
+            db
+        })
+        .unwrap();
+        s.stage_created_dataset("/extra", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&[42]);
+            db
+        })
+        .unwrap();
+        assert!(s.commit().is_err());
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("grid").unwrap().read_i32().unwrap(),
+            original,
+            "every chunk, and the index sizing them, must read as it did before"
+        );
+    }
+
+    /// A commit clears the journal on entry, so it can never replay entries it
+    /// did not write itself (issue #344).
+    ///
+    /// Only an attempt that *unwound* leaves any — a panic caught by the session
+    /// lock, which recovers from poisoning — and the state it leaves is what
+    /// this constructs directly rather than by finding something to panic in:
+    /// an entry naming an address whose contents have moved on. Replaying it
+    /// would write bytes captured before the unwind over whatever lives there
+    /// now, and the entry clear on the way *out* cannot help, because that is
+    /// the step the unwind skipped.
+    ///
+    /// `superseded_heaps` two fields up clears at entry for the same reason and
+    /// says so; this is that rule applied to the journal.
+    #[test]
+    fn a_commit_does_not_replay_a_journal_it_did_not_write() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stale_journal.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("nums").with_i32_data(&[1, 2, 3]);
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+        b.write(&path).unwrap();
+
+        let nums_block = {
+            let f = crate::reader::File::open(&path).unwrap();
+            match f.dataset("nums").unwrap().layout().unwrap() {
+                crate::Layout::Contiguous {
+                    address: Some(a), ..
+                } => a as usize,
+                other => panic!("expected a contiguous dataset: {other:?}"),
+            }
+        };
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        // Exactly what an attempt that unwound past `commit` leaves behind.
+        let stale: Vec<u8> = [7i32, 7, 7].iter().flat_map(|v| v.to_le_bytes()).collect();
+        s.inplace_undo.push((nums_block, stale));
+
+        // An unrelated commit, failed in its tail so that it rolls back at all.
+        s.superblock.superblock_extension_address = Some(0);
+        s.stage_created_dataset("/extra", {
+            let mut db = crate::type_builders::DatasetBuilder::new("");
+            db.with_i32_data(&[42]);
+            db
+        })
+        .unwrap();
+        assert!(s.commit().is_err());
+        drop(s);
+
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("nums").unwrap().read_i32().unwrap(),
+            vec![1, 2, 3],
+            "the commit replayed a journal entry that was not its own"
+        );
+    }
+
+    /// Putting the values back is a write like any other, so it has to be
+    /// ordered like one: a restore left sitting in the gathering buffer can be
+    /// issued after a later write to the same block, which is the reordering
+    /// hazard write gathering introduced (issue #288).
+    ///
+    /// Measured as a difference rather than a total, so it states the rule and
+    /// not one commit's arithmetic: a refused commit with nothing to put back
+    /// issues no barrier at all — it fails before the one it would have made —
+    /// and the same refusal carrying a value overwrite issues exactly the one
+    /// that orders the restore.
+    #[test]
+    fn a_rollback_orders_the_values_it_puts_back() {
+        use crate::writer::FileBuilder;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tempfile::tempdir;
+
+        let mut counted = Vec::new();
+        for with_overwrite in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("rollback_syncs.h5");
+            let mut b = FileBuilder::new();
+            b.create_dataset("nums").with_i32_data(&[1, 2, 3]);
+            b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+            b.write(&path).unwrap();
+
+            let syncs = Arc::new(AtomicU64::new(0));
+            let mut s =
+                WriteEngine::open_sync_counting(&path, SyncPolicy::Always, Arc::clone(&syncs))
+                    .unwrap();
+            // Fail the commit in its tail, after the apply phase has written.
+            s.superblock.superblock_extension_address = Some(0);
+            if with_overwrite {
+                s.stage_dataset_write("/nums", {
+                    let mut db = crate::type_builders::DatasetBuilder::new("");
+                    db.with_i32_data(&[9, 9, 9]);
+                    db
+                })
+                .unwrap();
+            }
+            s.stage_created_dataset("/extra", {
+                let mut db = crate::type_builders::DatasetBuilder::new("");
+                db.with_i32_data(&[42]);
+                db
+            })
+            .unwrap();
+            let before = syncs.load(Ordering::Relaxed);
+            assert!(s.commit().is_err());
+            counted.push(syncs.load(Ordering::Relaxed) - before);
+        }
+
+        assert_eq!(
+            counted[0], 0,
+            "a refusal with nothing to put back reaches no barrier"
+        );
+        assert_eq!(
+            counted[1],
+            counted[0] + 1,
+            "a refusal that put values back must order them: {counted:?}"
+        );
+    }
+
+    /// The journal reads back what it is about to overwrite, so a bounded
+    /// commit's reads scale with the value being replaced rather than staying
+    /// near the metadata-only figure
+    /// [`a_bounded_commit_reads_far_less_than_the_file`] pins for a commit that
+    /// overwrites nothing.
+    ///
+    /// This is the cost of the guarantee in issue #344 and it is charged even
+    /// when the commit succeeds, since whether the bytes will be needed is not
+    /// known until the attempt ends. Stated as a rule — reads land between the
+    /// payload and a small multiple of it — rather than as one target's exact
+    /// count, so it holds wherever the suite runs.
+    #[test]
+    fn a_bounded_commit_reads_the_value_it_is_replacing() {
+        use crate::writer::FileBuilder;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("journal_reads.h5");
+        let data: Vec<i32> = (0..250_000).collect();
+        let payload = (data.len() * 4) as u64;
+        let mut b = FileBuilder::new();
+        b.create_dataset("nums").with_i32_data(&data);
+        b.write(&p).unwrap();
+
+        let read_bytes = Arc::new(AtomicU64::new(0));
+        let mut engine = WriteEngine::open_bounded_counting(&p, Arc::clone(&read_bytes)).unwrap();
+        engine
+            .stage_dataset_write("/nums", {
+                let mut db = crate::type_builders::DatasetBuilder::new("");
+                db.with_i32_data(&data);
+                db
+            })
+            .unwrap();
+        let before = read_bytes.load(Ordering::Relaxed);
+        engine.commit().unwrap();
+        let read = read_bytes.load(Ordering::Relaxed) - before;
+
+        assert!(
+            read >= payload,
+            "the journal must read the whole value it replaces: {read} of {payload}"
+        );
+        assert!(
+            read < payload + (64 << 10),
+            "and not much more than it: {read} against {payload}"
+        );
     }
 }
 

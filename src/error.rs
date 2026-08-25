@@ -1084,9 +1084,21 @@ pub enum Error {
     ///
     /// It is the one refusal after which a caller must **re-read** rather than
     /// simply retry: the datasets the batch overwrote may hold either value.
-    /// The carried error is the write failure that prevented the restore, not
-    /// the one that refused the commit.
-    CommitPartiallyApplied(Box<Error>),
+    ///
+    /// Both errors are carried because in the shape this is most likely to take
+    /// they say different things: a commit refused for a reason the caller can
+    /// act on, followed by an I/O failure that prevented the restore. Reporting
+    /// only the second would leave the caller retrying a batch without knowing
+    /// what was wrong with it.
+    CommitPartiallyApplied {
+        /// Why the commit was refused — what a caller must fix before staging
+        /// the batch again.
+        refusal: Box<Error>,
+        /// The write failure that then prevented the prior values being put
+        /// back. This is the one that proves the file changed, so it is what
+        /// [`source`](std::error::Error::source) reports.
+        restore: Box<Error>,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -1135,10 +1147,10 @@ impl fmt::Display for Error {
             }
             Error::FileLocked(reason) => write!(f, "file is locked: {reason}"),
             Error::FileMarkedInUse(reason) => write!(f, "file is marked in use: {reason}"),
-            Error::CommitPartiallyApplied(cause) => write!(
+            Error::CommitPartiallyApplied { refusal, restore } => write!(
                 f,
-                "a refused commit could not restore a value it had overwritten, so the file \
-                 holds part of the refused batch: {cause}"
+                "a commit refused ({refusal}) could not restore a value it had overwritten \
+                 ({restore}), so the file holds part of the refused batch"
             ),
         }
     }
@@ -1150,7 +1162,7 @@ impl std::error::Error for Error {
         match self {
             Error::Io(e) => Some(e),
             Error::Format(e) => Some(e),
-            Error::CommitPartiallyApplied(e) => Some(&**e),
+            Error::CommitPartiallyApplied { restore, .. } => Some(&**restore),
             _ => None,
         }
     }
