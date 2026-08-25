@@ -135,7 +135,7 @@
 //!
 //! Each commit vacates space: the object headers it rewrites are superseded, and
 //! a deletion abandons its target's blocks. Those regions are recorded in a
-//! session-local free list and reused by later commits in the same session —
+//! session-local free list and drawn on by later writes in the same session —
 //! a new object is written into a fitting freed region instead of growing the
 //! file, and when freed space forms a run reaching end-of-file the file is
 //! physically truncated. The reuse is crash-safe: it only ever overwrites space
@@ -145,7 +145,14 @@
 //! before its repoint gives back what it drew, so a failed attempt costs the
 //! session nothing.
 //!
-//! Everything a commit places goes through one allocator
+//! Both write paths draw on that list, through allocators of their own. The
+//! immediate [`Dataset::append`](crate::Dataset::append) allocates its chunks and
+//! index blocks through [`Store::alloc_raw`], which
+//! [`WriteEngine::immediate_reuse_allowed`] gates: an append has no superblock
+//! repoint to publish its allocations with, so it reuses only where the space it
+//! overwrites is dead on the disk as it stands, which excludes a file that
+//! persists its free-space managers and the SWMR writer (issue #349). Everything
+//! a *commit* places goes through the other allocator
 //! ([`WriteEngine::reserve`] and [`WriteEngine::place`]), including a chunked
 //! dataset's data region and a dense attribute heap. Those carry addresses of
 //! their own, so they are sized before they are placed and then built for the
@@ -2925,8 +2932,58 @@ impl WriteEngine {
             superblock: &mut self.superblock,
             sb_sig_off: self.sb_sig_off,
             paged: self.paged.as_mut(),
+            // This adapter's one caller only reads; nothing is allocated here.
+            free: None,
             sync_policy: self.sync_policy,
         }
+    }
+
+    /// Whether an immediate in-place append may allocate out of
+    /// [`free`](Self::free) instead of growing the file (issue #349).
+    ///
+    /// The staged [`commit`](Self::commit) always may: it publishes its
+    /// allocations with the superblock repoint, so a crash before that leaves a
+    /// file whose root never named them. An immediate append has no repoint, so
+    /// what has to hold instead is that the bytes it overwrites are dead *on the
+    /// disk as it stands* — and for two kinds of session they are not:
+    ///
+    /// - A **paged** file keeps its free space per page type in [`PagedEdit`]
+    ///   rather than in [`free`](Self::free), so drawing from that list would be
+    ///   drawing from the wrong one. Named as its own term rather than left to
+    ///   the argument that the persist term already covers it (`open_rw` refuses
+    ///   a paged file that does not persist): a page-type invariant proved from
+    ///   another file's refusal is exactly the shape that has gone wrong here
+    ///   before (issue #261).
+    /// - A file that **persists** its free-space managers records its holes on
+    ///   disk, and only a commit or [`finalize_persist`](Self::finalize_persist)
+    ///   at close rewrites that record — and `finalize_persist` triggers on the
+    ///   file having *grown*, which an append that spent a hole need not have
+    ///   done. So such an append could leave a manager advertising space a live
+    ///   chunk occupies, through a clean close as much as a crash, and the next
+    ///   session would hand it out over the top.
+    /// - The **SWMR** writer's readers may still be reading a region this session
+    ///   freed; the format forbids reusing it while they are, which is why the C
+    ///   library's own SWMR writer allocates append-only. No test can reach this
+    ///   term today, because a SWMR session refuses every staged edit
+    ///   ([`Error::SwmrStagedUnsupported`]) and so never frees anything. It is
+    ///   here so that lifting that refusal cannot silently enable reuse.
+    ///
+    /// Everything else — the ordinary [`File::open_rw`](crate::File::open_rw)
+    /// session on a default-strategy file — holds its free space in memory alone.
+    /// A region in that list was freed by a commit this session already
+    /// published, so nothing on the disk points at it and nothing on the disk
+    /// claims it is free; a crash at any point of the append leaves it as dead as
+    /// it was.
+    ///
+    /// One window is inherited rather than introduced. A commit whose superblock
+    /// write itself fails leaves [`publish_attempted`](Self::publish_attempted)
+    /// set, which withholds the free-list rollback, so the regions that commit
+    /// freed stay in the list although whether it published is unknowable
+    /// (issue #344). An append can now spend them where only a later commit could
+    /// before. That is the same trade, on a larger surface: doing nothing is
+    /// still the only answer that is never actively wrong.
+    fn immediate_reuse_allowed(&self) -> bool {
+        self.paged.is_none() && self.persist.is_none() && !self.swmr_mode
     }
 
     /// Adopt the fapl's `fsync` cadence. Called once, on the funnel every
@@ -3308,6 +3365,8 @@ impl WriteEngine {
                     superblock,
                     sb_sig_off: *sb_sig_off,
                     paged: paged.as_mut(),
+                    // Planning only reads; nothing is allocated here.
+                    free: None,
                     sync_policy: *sync_policy,
                 };
                 plan_ea_append(
@@ -3324,12 +3383,14 @@ impl WriteEngine {
             };
             let plan = plan_result.map_err(as_inplace_error)?;
             {
+                let reuse = self.immediate_reuse_allowed();
                 let Self {
                     image,
                     superblock,
                     sb_sig_off,
                     paged,
                     located,
+                    free,
                     sync_policy,
                     ..
                 } = self;
@@ -3339,6 +3400,7 @@ impl WriteEngine {
                     superblock,
                     sb_sig_off: *sb_sig_off,
                     paged: paged.as_mut(),
+                    free: reuse.then_some(free),
                     sync_policy: *sync_policy,
                 };
                 apply_ea_append(&mut store, &mut st.loc, &plan, max_phase)
@@ -9064,7 +9126,7 @@ struct FlatDataset {
 /// all this adapter does; every primitive delegates, so the image's own
 /// write-ordering discipline is what applies.
 ///
-/// It carries the session's paged-file state too, so `append_raw` keeps a paged
+/// It carries the session's paged-file state too, so `alloc_raw` keeps a paged
 /// file's pages homogeneous through exactly the rule the staged commit uses
 /// ([`PagedEdit::begin`]). Before issue #198 there were two copies of that state —
 /// one per engine — and the whole-file editor's copy was reachable only from the
@@ -9077,6 +9139,10 @@ struct EditStore<'a> {
     /// borrow rather than a copy: padding recorded here has to reach the manager
     /// rewrite at the next commit or at close.
     paged: Option<&'a mut PagedEdit>,
+    /// The session's reusable free space, when an immediate append may draw from
+    /// it, and `None` when it may not — the gate is
+    /// [`WriteEngine::immediate_reuse_allowed`], which states the two cases.
+    free: Option<&'a mut FreeList>,
     /// The session's `fsync` cadence, carried by value: the append engine's own
     /// ordered barriers ([`apply_ea_append`]) are durability points like the
     /// commit's, and answer to the same policy.
@@ -9088,7 +9154,7 @@ impl EditStore<'_> {
     /// file's tail holds metadata. A plain append on the common non-paged file.
     ///
     /// Raw is the only page type this adapter allocates: see
-    /// [`Store::append_raw`](crate::chunk_index_inplace::Store::append_raw) for why
+    /// [`Store::alloc_raw`](crate::chunk_index_inplace::Store::alloc_raw) for why
     /// an extensible-array index block belongs in a raw page here.
     fn append_into_raw_page(&mut self, bytes: &[u8]) -> Result<u64, Error> {
         if let Some(pg) = self.paged.as_deref_mut() {
@@ -9121,10 +9187,13 @@ impl Store for EditStore<'_> {
     fn length_size(&self) -> u8 {
         self.superblock.length_size
     }
-    fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        self.image.append(bytes)
-    }
-    fn append_raw(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+    fn alloc_raw(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        if let Some(free) = self.free.as_deref_mut() {
+            if let Some(addr) = free.alloc(bytes.len() as u64) {
+                self.image.write_at(addr, bytes)?;
+                return Ok(addr);
+            }
+        }
         self.append_into_raw_page(bytes)
     }
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {

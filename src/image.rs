@@ -360,8 +360,9 @@ pub(crate) trait FileImage: Source + Send + Sync {
 /// # What it gathers
 ///
 /// A commit or an in-place append issues many small writes into a few pages. One
-/// measured in-place append costs five write calls — the chunk at end-of-file,
-/// the superblock's recorded end-of-file, and a patch each to the chunk index,
+/// measured in-place append costs five write calls — the chunk (appended here,
+/// though it may instead be written into freed space, which drops the next
+/// call), the superblock's recorded end-of-file, and a patch each to the chunk index,
 /// the array header and the object header's dataspace dimension — so four small
 /// patches around one payload write, landing in pages the *next* append dirties
 /// again. An append that has to allocate a new extensible-array data block costs

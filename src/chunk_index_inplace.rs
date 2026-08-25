@@ -4,7 +4,8 @@
 //! [`File::open_swmr_writer`](crate::File::open_swmr_writer).
 //!
 //! It grows a one-dimensional, unlimited, Extensible-Array-indexed
-//! dataset *in place*: an appended chunk is written at end-of-file, its record is
+//! dataset *in place*: a new chunk is written at end-of-file or into freed space,
+//! its record is
 //! stored into an element slot of the chunk index, the index grows by appending
 //! new blocks only when a block boundary is crossed (never relocating existing
 //! data), and the dataspace dimension and array-header counts are patched. Writes
@@ -139,37 +140,51 @@ pub(crate) trait Store: Source {
     /// This file's length field width in bytes.
     fn length_size(&self) -> u8;
 
-    /// Append `bytes` at end-of-file, returning their start address.
+    /// Allocate space for `bytes` as *raw* data and write them there, returning
+    /// the address. **Every allocation this engine makes goes through here**,
+    /// chunk data and the extensible-array blocks indexing it alike; it is the
+    /// trait's only allocation primitive.
     ///
-    /// The bytes reach the file's *logical* length at once, so a later in-place
-    /// patch of the region addresses bytes the store already accounts for. They
-    /// do **not** necessarily reach the disk: a session gathers its writes and
-    /// issues them at the next ordering barrier (issue #288). Anything that
-    /// publishes an address into this region to a *lower* address — a pointer, an
-    /// element count, the superblock's end-of-file — must therefore
+    /// A store may serve the allocation out of a region an earlier commit freed
+    /// rather than growing the file (issue #349), or append at end-of-file. The
+    /// address is below the file's *logical* length either way once this returns,
+    /// so a later in-place patch of the region addresses bytes the store already
+    /// accounts for.
+    ///
+    /// What [`apply_ea_append`]'s phase 1 needs is stronger — a chunk an index
+    /// element points at must lie inside the *recorded* end-of-file, which the
+    /// superblock holds and this trait exposes no accessor for. Phase 1 gets
+    /// there in two steps rather than from this contract: an appended region is
+    /// covered by the patch it then issues, and a reused region is covered
+    /// because a free list is populated only by a commit, and a commit leaves the
+    /// recorded end-of-file at the file's length.
+    ///
+    /// The bytes do **not** necessarily reach the disk here: a session gathers
+    /// its writes and issues them at the next ordering barrier (issue #288).
+    /// Anything that publishes an address into this region to a *lower* address —
+    /// a pointer, an element count, the superblock's end-of-file — must
     /// [`sync`](Self::sync) between the two, because gathered writes go out in
-    /// address order and would otherwise publish first. `ea_insert` and the two
-    /// data-block allocators do exactly that.
-    fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error>;
-
-    /// Append `bytes` into a *raw* page. Identical to
-    /// [`append_bytes`](Self::append_bytes) for a non-paged store; on a paged file
-    /// it keeps pages homogeneous by never letting raw and metadata bytes share a
-    /// page (issue #173), padding the tail page first when the page type changes.
+    /// address order and would otherwise publish first; `ea_insert` and the two
+    /// data-block allocators do exactly that. Those barriers are unchanged by
+    /// which address comes back. They exist for the *appended* case, where the
+    /// region sits above the pointer naming it; a reused region below its pointer
+    /// is already written first by that same address order, so the barrier is
+    /// then redundant rather than wrong — and which case applies is not knowable
+    /// at the call site.
     ///
-    /// Everything this engine allocates goes through here, chunk data and the
-    /// extensible-array blocks indexing it alike. An index block is metadata by the
-    /// format's taxonomy, but on a paged file this crate places a chunked dataset's
-    /// index in raw pages beside its chunk data, and the reclaim path
+    /// On a paged file an append keeps pages homogeneous by never letting raw and
+    /// metadata bytes share a page (issue #173), padding the tail page first when
+    /// the page type changes. An index block is metadata by the format's taxonomy,
+    /// but on a paged file this crate places a chunked dataset's index in raw pages
+    /// beside its chunk data, and the reclaim path
     /// (`WriteEngine::chunked_storage_spans`) frees both halves as raw on that
     /// basis. Allocating an index block into a metadata page here would put a span
     /// the reclaim reports as raw inside a metadata page, so a later delete would
     /// advertise metadata-page bytes for raw reuse — the one thing the paged
     /// strategy exists to prevent, and invisible to the reference library, which
-    /// reads a mixed-page file without complaint (issue #198).
-    fn append_raw(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        self.append_bytes(bytes)
-    }
+    /// reads a mixed-page file without complaint (issue #198). That is the same
+    /// reason a reuse must draw from the raw list and no other.
+    fn alloc_raw(&mut self, bytes: &[u8]) -> Result<u64, Error>;
     /// Overwrite `[offset, offset + bytes.len())` in place.
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error>;
     /// Advance the superblock's recorded end-of-file to the store's current
@@ -647,7 +662,7 @@ impl Located {
     }
 
     /// Store `rec` into element slot `e` of the chunk index, allocating new data
-    /// blocks / super blocks at EOF as block boundaries are crossed, and
+    /// blocks / super blocks as block boundaries are crossed, and
     /// re-checksumming the touched block. Works for both a fresh insert (the
     /// block is allocated on first touch) and an in-place update of an existing
     /// element (the block already exists, so it is reused rather than
@@ -710,9 +725,9 @@ impl Located {
             };
             #[cfg(test)]
             alloc_probe::note_data_block();
-            // As in `ensure_super_block`: the fresh block is at end-of-file and
-            // its parent pointer is not, so they need a barrier between them or
-            // an address-ordered flush names a block that is not there yet.
+            // As in `ensure_super_block`: an appended block sits above its parent
+            // pointer, so they need a barrier between them or an address-ordered
+            // flush names a block that is not there yet.
             file.sync()?;
             match region.parent {
                 Parent::IndexDirect { .. } => {
@@ -791,7 +806,7 @@ impl Located {
 
     /// Return the address of super block `sblk_j`, allocating an empty one (all
     /// data-block pointers undefined, plus a zeroed page-init bitmap when its data
-    /// blocks are paged) at EOF if it does not exist yet.
+    /// blocks are paged) if it does not exist yet.
     fn ensure_super_block<F: Store>(
         &self,
         file: &mut F,
@@ -819,13 +834,16 @@ impl Located {
             self.blk_off_size,
             self.client_id,
         );
-        let new_addr = file.append_raw(&aesb)?;
+        let new_addr = file.alloc_raw(&aesb)?;
         #[cfg(test)]
         alloc_probe::note_super_block();
-        // The block exists before anything names it. Its bytes are at
-        // end-of-file and the slot below is in the index block, near the front,
-        // so without this the two are one barrier-free window and a gathering
-        // image issues them in *address* order — the pointer first (issue #288).
+        // The block exists before anything names it. When its bytes were appended
+        // they sit above the slot below, which is in the index block near the
+        // front, so without this the two are one barrier-free window and a
+        // gathering image issues them in *address* order — the pointer first
+        // (issue #288). A block drawn from freed space may land either side of
+        // the slot, and which it is is not knowable here, so the barrier stands
+        // unconditionally; see `Store::alloc_raw`.
         file.sync()?;
 
         let slot_off = self.index_block_addr
@@ -836,7 +854,7 @@ impl Located {
         Ok(new_addr)
     }
 
-    /// Allocate a fresh non-paged data block (`EADB`) at EOF with every element
+    /// Allocate a fresh non-paged data block (`EADB`) with every element
     /// slot undefined, returning its address.
     fn alloc_undef_data_block<F: Store>(
         &self,
@@ -856,10 +874,10 @@ impl Located {
         }
         let cks = jenkins_lookup3(&buf);
         buf.extend_from_slice(&cks.to_le_bytes());
-        file.append_raw(&buf)
+        file.alloc_raw(&buf)
     }
 
-    /// Allocate a fresh *paged* data block (`EADB`) at EOF: a header carrying its
+    /// Allocate a fresh *paged* data block (`EADB`): a header carrying its
     /// own checksum, followed by `dblk_nelmts / page_nelmts` fully-undefined pages
     /// (each `page_nelmts` undefined elements + a checksum).
     fn alloc_undef_paged_data_block<F: Store>(
@@ -889,7 +907,7 @@ impl Located {
             page.extend_from_slice(&page_cks.to_le_bytes());
             buf.extend_from_slice(&page);
         }
-        file.append_raw(&buf)
+        file.alloc_raw(&buf)
     }
 
     /// Width of a filtered element's stored-size field, checked against the record
@@ -1038,7 +1056,7 @@ impl Located {
 }
 
 /// The mutation-free result of planning one in-place Extensible-Array append: the
-/// per-chunk (possibly compressed) blobs to write at end-of-file plus the
+/// per-chunk (possibly compressed) blobs to write plus the
 /// bookkeeping the write phase publishes.
 pub(crate) struct AppendPlan {
     /// Per-chunk (possibly compressed) bytes to write, in element order starting
@@ -1194,23 +1212,30 @@ pub(crate) fn apply_ea_append<F: Store>(
     plan: &AppendPlan,
     max_phase: u8,
 ) -> Result<(), Error> {
-    // Phase 1: new/relocated chunk bytes at EOF, then advance the superblock's
-    // recorded end-of-file to cover them. This must precede the index writes: the
-    // trailing partial chunk's element is *visible* at the old dimension, so once
-    // it is repointed to the relocated chunk that chunk must already lie within the
+    // Phase 1: new/relocated chunk bytes, then advance the superblock's recorded
+    // end-of-file to cover them. This must precede the index writes: the trailing
+    // partial chunk's element is *visible* at the old dimension, so once it is
+    // repointed to the relocated chunk that chunk must already lie within the
     // recorded EOF.
+    //
+    // A chunk served from freed space (issue #349) is inside the recorded EOF
+    // already, so it needs no patch, and issuing one would rewrite the whole
+    // superblock and barrier for it on every batch. Both patches below are
+    // therefore the same rule: rewrite the superblock only where the file grew
+    // past what it records. `recorded_eof` is that value throughout — the
+    // engine's own reads of `file.len()` are what maintain it, since this trait
+    // exposes no accessor for the superblock field itself.
+    let mut recorded_eof = file.len();
     let mut chunk_addrs = Vec::with_capacity(plan.new_chunk_bytes.len());
     for blob in &plan.new_chunk_bytes {
-        chunk_addrs.push((file.append_raw(blob)?, blob.len() as u64));
+        chunk_addrs.push((file.alloc_raw(blob)?, blob.len() as u64));
     }
     file.sync()?;
-    file.patch_superblock_eof()?;
-    file.sync()?;
-    // What the superblock now records. Phase 3 rewrites it only if the element
-    // writes below push past this, which is the *only* thing that phase's patch
-    // is for; an append that allocates no new block would otherwise rewrite the
-    // whole superblock with the bytes it already holds.
-    let recorded_eof = file.len();
+    if file.len() != recorded_eof {
+        file.patch_superblock_eof()?;
+        file.sync()?;
+        recorded_eof = file.len();
+    }
     if max_phase < 2 {
         return Ok(());
     }
@@ -1218,7 +1243,8 @@ pub(crate) fn apply_ea_append<F: Store>(
     // Phase 2: the index element writes — a fresh insert for each new chunk, or an
     // in-place repoint of the trailing element (which only ever points at data
     // whose live prefix reproduces the old view's bytes). This may allocate new EA
-    // blocks past EOF, covered by the phase-3 EOF patch.
+    // blocks past EOF, covered by the phase-3 EOF patch (or draw them from freed
+    // space, in which case there is nothing for it to cover).
     for (k, &(addr, stored_size)) in chunk_addrs.iter().enumerate() {
         let e = plan.n_full + k as u64;
         let rec = ElemRecord {
@@ -1574,6 +1600,14 @@ mod tests {
         /// Blobs appended at end-of-file: the chunk, plus one per fresh index
         /// block. Each fresh block owes a barrier before the pointer naming it.
         appends: Cell<usize>,
+        /// A single below-end-of-file region nothing points at, stood up by
+        /// [`with_free_tail`](Self::with_free_tail), which `alloc_raw` hands out
+        /// before it will append (issue #349). Stands in for a session's free
+        /// list; the engine sees only the address that comes back.
+        free: Option<(u64, u64)>,
+        /// Allocations `alloc_raw` served from that region rather than by
+        /// extending the file.
+        reuses: Cell<usize>,
     }
 
     impl WindowProbeStore {
@@ -1590,7 +1624,36 @@ mod tests {
                 superblock_patches: Cell::new(0),
                 syncs: Cell::new(0),
                 appends: Cell::new(0),
+                free: None,
+                reuses: Cell::new(0),
             }
+        }
+
+        /// Give the store a `len`-byte free region, by growing the image and
+        /// recording the new end-of-file in the superblock before any counting
+        /// starts. That gives the region the two properties the engine can
+        /// observe — inside the recorded end-of-file, and named by nothing.
+        ///
+        /// It sits at the tail, where a *committed* deletion never leaves one
+        /// (a free run reaching end-of-file is truncated away instead, which is
+        /// why the integration tests plant a ceiling object above theirs). The
+        /// engine cannot tell the difference: it reads an address and a length.
+        fn with_free_tail(mut self, len: u64) -> Self {
+            let addr = self.data.len() as u64;
+            self.data
+                .resize(self.data.len() + len.to_usize().unwrap(), 0);
+            self.patch_superblock_eof().unwrap();
+            self.free = Some((addr, len));
+            self
+        }
+
+        /// Extend the image, the fallback `alloc_raw` takes once the free region
+        /// (if any) cannot serve an allocation.
+        fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+            self.appends.set(self.appends.get() + 1);
+            let addr = self.data.len() as u64;
+            self.data.extend_from_slice(bytes);
+            Ok(addr)
         }
 
         fn reset_counters(&self) {
@@ -1600,6 +1663,7 @@ mod tests {
             self.superblock_patches.set(0);
             self.syncs.set(0);
             self.appends.set(0);
+            self.reuses.set(0);
         }
     }
 
@@ -1622,11 +1686,15 @@ mod tests {
         fn length_size(&self) -> u8 {
             self.superblock.length_size
         }
-        fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-            self.appends.set(self.appends.get() + 1);
-            let addr = self.data.len() as u64;
-            self.data.extend_from_slice(bytes);
-            Ok(addr)
+        fn alloc_raw(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+            let len = bytes.len() as u64;
+            if let Some((addr, avail)) = self.free.filter(|&(_, avail)| avail >= len) {
+                self.reuses.set(self.reuses.get() + 1);
+                self.free = (avail > len).then(|| (addr + len, avail - len));
+                self.write_at(addr, bytes)?;
+                return Ok(addr);
+            }
+            self.append_bytes(bytes)
         }
         fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
             let offset = offset.to_usize()?;
@@ -1672,6 +1740,26 @@ mod tests {
         (result.located, datatype)
     }
 
+    /// Every element of the located dataset, read back through the engine's own
+    /// index walk: one unfiltered chunk of `chunk_elems` i32 per indexed slot.
+    fn read_i32s(store: &WindowProbeStore, loc: &Located) -> Vec<i32> {
+        let width = loc.chunk_elems.to_usize().unwrap() * 4;
+        let mut out = Vec::new();
+        for e in 0..loc.num_chunks {
+            let rec = loc.read_element(store, e).unwrap().expect("indexed chunk");
+            let bytes = store.read_exact_at(rec.addr, width).unwrap();
+            out.extend(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(i32::from_le_bytes),
+            );
+        }
+        out
+    }
+
     fn append_i32s(
         store: &mut WindowProbeStore,
         loc: &mut Located,
@@ -1699,7 +1787,7 @@ mod tests {
     /// A fresh Extensible-Array block is separated from the pointer that names
     /// it by a barrier, so the block is on the disk before anything reaches it.
     ///
-    /// The block's bytes go to end-of-file; the slot that points at it lives in
+    /// The block's bytes are allocated fresh; the slot that points at it lives in
     /// the index block or a super block, near the front of the file. Left in one
     /// barrier-free window, an image that gathers its writes issues them in
     /// *address* order — the pointer first — and a failure in between leaves an
@@ -1761,7 +1849,9 @@ mod tests {
     /// writes allocate nothing, and twice when they allocate a block past the
     /// end-of-file phase 1 recorded.
     ///
-    /// Phase 1's patch is unconditional — the chunk bytes always extend the file.
+    /// Phase 1's patch fires here because the chunk bytes extend the file; when
+    /// they are served from freed space instead they do not, which
+    /// [`phase_one_patches_the_superblock_only_when_the_file_grew`] covers.
     /// Phase 3's exists only to cover blocks the element writes added, and an
     /// append that adds none used to rewrite the whole superblock with the bytes
     /// it already held: one wasted write, and one wasted page dirtying, on every
@@ -1802,6 +1892,138 @@ mod tests {
         assert!(
             patches.iter().all(|&p| p <= 2),
             "the sequence defines exactly two such points: {patches:?}"
+        );
+    }
+
+    /// An append whose chunks come out of freed space does not extend the file,
+    /// so phase 1 must not rewrite the superblock: the end-of-file it would
+    /// record is the one already there (issue #349).
+    ///
+    /// The reuse itself is the other half of the assertion. Dropping the patch
+    /// while still appending would understate the end-of-file on every append —
+    /// so this demands the allocation actually came from the free region, and
+    /// that the appends resume, with the patch, once that region is spent.
+    #[test]
+    fn phase_one_patches_the_superblock_only_when_the_file_grew() {
+        // A chunk of 4 i32 is 16 bytes; 64 bytes of hole holds four of them.
+        let mut store = WindowProbeStore::open(build_unlimited(4, 4)).with_free_tail(64);
+        let (mut loc, datatype) = locate(&store);
+
+        let mut rounds = Vec::new();
+        for i in 0..6i32 {
+            store.reset_counters();
+            let base = 4 + i * 4;
+            append_i32s(&mut store, &mut loc, &datatype, base..(base + 4));
+            rounds.push((
+                store.reuses.get(),
+                store.appends.get(),
+                store.superblock_patches.get(),
+            ));
+        }
+
+        for &(reuses, appends, patches) in &rounds {
+            assert_eq!(
+                patches == 0,
+                appends == 0,
+                "the superblock is rewritten exactly when the file grew: {rounds:?}"
+            );
+            assert!(reuses + appends >= 1, "every round allocates: {rounds:?}");
+        }
+        assert!(
+            rounds.iter().any(|&(_, appends, _)| appends == 0),
+            "the first rounds fit the hole, so they must allocate nothing at \
+             end-of-file: {rounds:?}"
+        );
+        assert!(
+            rounds.iter().any(|&(_, appends, _)| appends > 0),
+            "the hole is spent well before the last round: {rounds:?}"
+        );
+
+        // The reused chunks are the dataset's, not scribble.
+        assert_eq!(read_i32s(&store, &loc), (0..28).collect::<Vec<i32>>());
+    }
+
+    /// **Every** allocation the append engine makes is served from freed space
+    /// when a region fits — the extensible-array blocks that index the chunks as
+    /// much as the chunk bytes themselves (issue #349).
+    ///
+    /// Both are raw by this crate's placement convention, which is what lets one
+    /// pool serve them: see [`Store::alloc_raw`]. A run given a hole larger than
+    /// everything it will allocate must therefore extend the file by nothing at
+    /// all, across a sequence long enough to grow the index.
+    #[test]
+    fn a_hole_serves_the_index_blocks_as_well_as_the_chunks() {
+        let mut store = WindowProbeStore::open(build_unlimited(4, 1)).with_free_tail(16 * 1024);
+        let (mut loc, datatype) = locate(&store);
+
+        let mut rounds = Vec::new();
+        for i in 0..40i32 {
+            store.reset_counters();
+            append_i32s(&mut store, &mut loc, &datatype, (4 + i)..(5 + i));
+            rounds.push((store.reuses.get(), store.appends.get()));
+        }
+
+        assert!(
+            rounds.iter().all(|&(_, appends)| appends == 0),
+            "the hole is larger than the whole run, so nothing may reach \
+             end-of-file: {rounds:?}"
+        );
+        assert!(
+            rounds.iter().any(|&(reuses, _)| reuses >= 2),
+            "some append must allocate an index block beside its chunk, or this \
+             says nothing about the blocks: {rounds:?}"
+        );
+        assert_eq!(
+            read_i32s(&store, &loc),
+            (0..44).collect::<Vec<i32>>(),
+            "the reused regions must hold the dataset's elements"
+        );
+    }
+
+    /// Relocating a *partial* trailing chunk into freed space is sound: the
+    /// element that names it is visible at the old dimension, and phase 2
+    /// repoints it to a region whose live prefix reproduces the bytes it already
+    /// showed (issue #349).
+    ///
+    /// This is the one append shape that overwrites an element a reader can
+    /// already see, so it is worth exercising against reuse specifically: the
+    /// rounds below that grow a partial chunk move it to a fresh address inside
+    /// the hole, and the dataset must read back whole every time.
+    #[test]
+    fn a_relocated_partial_tail_may_land_in_freed_space() {
+        const HOLE: u64 = 1024;
+        let mut store = WindowProbeStore::open(build_unlimited(4, 4)).with_free_tail(HOLE);
+        let hole = (store.len() - HOLE)..store.len();
+        let (mut loc, datatype) = locate(&store);
+
+        // (chunks indexed, address of the trailing chunk) after each append.
+        let mut tails = Vec::new();
+        for i in 4..12i32 {
+            append_i32s(&mut store, &mut loc, &datatype, i..(i + 1));
+            let tail = loc.num_chunks - 1;
+            let addr = loc.read_element(&store, tail).unwrap().unwrap().addr;
+            tails.push((loc.num_chunks, addr));
+            assert_eq!(
+                read_i32s(&store, &loc)[..(i as usize + 1)],
+                (0..=i).collect::<Vec<i32>>()[..],
+                "after appending {i} the live elements must all read back"
+            );
+        }
+
+        // Relocation means the *same* chunk moved. Comparing consecutive
+        // addresses would not say that: the probe allocator never repeats an
+        // address, so a run that only ever added fresh chunks would satisfy it.
+        assert!(
+            tails
+                .windows(2)
+                .any(|w| w[0].0 == w[1].0 && w[0].1 != w[1].1),
+            "a partial trailing chunk must have been rewritten to a new address \
+             at least once: {tails:?}"
+        );
+        assert!(
+            tails.iter().all(|&(_, addr)| hole.contains(&addr)),
+            "every tail chunk must have landed in the freed region, or this says \
+             nothing about reuse: {tails:?}"
         );
     }
 

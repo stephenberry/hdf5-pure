@@ -388,3 +388,80 @@ fn a_refused_realignment_leaves_nothing_staged() {
     // The dataset is as it was: the refusal wrote nothing.
     assert_eq!(read_pure(&path, "d"), (0..10).collect::<Vec<i32>>());
 }
+
+/// An immediate append that draws its chunks from freed space (issue #349)
+/// produces a file the reference C library reads in full — the appended
+/// dataset, and the neighbours whose bytes the reuse must not have reached.
+///
+/// The free-space assertion is what stops this from passing vacuously: a C read
+/// succeeds just as well if the append quietly extended end-of-file instead, so
+/// the session is asked to confirm it spent the hole first.
+#[test]
+fn an_append_into_freed_space_stays_c_readable() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("reuse.h5");
+    let payload: Vec<i32> = (4..8196).collect();
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .chunk((1024,))
+            .shape((Extent::resizable(4),))
+            .create("log")
+            .unwrap()
+            .write(&[0i32, 1, 2, 3])
+            .unwrap();
+        // Vacated below. Sized so its hole dominates what the append allocates,
+        // not so it swallows it whole: the appended chunks total more than this
+        // (a partial leading chunk is rewritten too) and the extensible-array
+        // blocks are on top, so some of the append still reaches end-of-file.
+        file.new_dataset::<i32>()
+            .shape((payload.len(),))
+            .create("scratch")
+            .unwrap()
+            .write(&vec![5i32; payload.len()])
+            .unwrap();
+        // Live, and after the hole, so the delete cannot simply truncate.
+        file.new_dataset::<i32>()
+            .shape((3,))
+            .create("ceiling")
+            .unwrap()
+            .write(&[7i32, 8, 9])
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("scratch").unwrap();
+        s.commit().unwrap();
+        let before = s.space_accounting().unwrap().reusable_free_bytes;
+        s.dataset("log").unwrap().append(&payload).unwrap();
+        let after = s.space_accounting().unwrap().reusable_free_bytes;
+        // Most of the hole, rather than a byte count that happens to match the
+        // payload: the point is that the append drew on the free list at all,
+        // and an exact figure would be a coincidence of this fixture's sizes.
+        assert!(
+            after < before / 2,
+            "the append should have spent the hole on its chunks \
+             ({before} -> {after} reusable)"
+        );
+        s.close().unwrap();
+    }
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("log").unwrap().read_raw::<i32>().unwrap(),
+        (0..8196).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        c.dataset("ceiling").unwrap().read_raw::<i32>().unwrap(),
+        vec![7, 8, 9]
+    );
+    assert_c_absent(&c.dataset("scratch").unwrap_err(), "scratch");
+    c.close().unwrap();
+
+    assert_eq!(read_pure(&path, "log"), (0..8196).collect::<Vec<_>>());
+}
