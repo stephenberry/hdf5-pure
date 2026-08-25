@@ -4,8 +4,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::edit::{
     AppendBuilder, AppendGeometry, AppendTarget, EditBacking, MemoryStrategy, SpaceAccounting,
@@ -71,6 +71,78 @@ enum Backend {
     /// keep the `Backend` enum small (a `WriteEngine` is far larger than the
     /// other variants).
     Edit(Box<Mutex<WriteEngine>>),
+}
+
+/// What an operation through a file's write session can do to it, which is what
+/// decides how much of an object handle's memo it invalidates — and, with it,
+/// which edit surface the operation is using.
+///
+/// One variant carries both because they coincide: the *staged* surface is the
+/// one that commits, and a commit is the only thing that moves an object header,
+/// so [`Relocating`](Self::Relocating) is exactly the surface a SWMR writer
+/// refuses. An operation off that surface that could relocate would break the
+/// pairing and would have to say which it was separately.
+#[derive(Clone, Copy)]
+enum Change {
+    /// Rewrites object headers and can move them: a commit. The staging of one
+    /// counts too, though it writes nothing — a pending edit is a header move
+    /// this session has not made yet, and an address is worth no more against
+    /// one than against the commit that will apply it. Invalidates a handle's
+    /// address as well as the header it parsed.
+    ///
+    /// This is the staged surface, which a SWMR writer refuses.
+    Relocating,
+    /// Changes bytes without moving any object header: an immediate
+    /// [`Dataset::append`], which rewrites the dataset's dimension where its
+    /// header stands, and the free-space and status-flag bookkeeping a session's
+    /// teardown rewrites where it stands. Invalidates the parsed header alone,
+    /// which is what lets a handle reached by object reference — the one kind
+    /// with no name to look itself up by — go on appending.
+    InPlace,
+    /// Changes nothing a handle can observe: a durability barrier over writes
+    /// the operations that made them already accounted for, or a question whose
+    /// answer the engine caches. Invalidates no memo.
+    ///
+    /// Distinct from not going through the gate at all, which is what a *read*
+    /// does: these still need the write session, and still need the file to be
+    /// open for writing and unsealed.
+    Nothing,
+}
+
+/// Where an object handle's header sits, and what that answer holds as of.
+///
+/// A handle names its object — by path, or by the address a reference gave it —
+/// and this is a memo of what that name last resolved to. See
+/// [`FileInner::locate`], which takes one, and the two counters it reads.
+#[derive(Clone, Copy)]
+struct Resolution {
+    content_revision: u64,
+    address_revision: u64,
+    address: u64,
+}
+
+/// The pair of revisions read *before* a resolution is worked out, which the
+/// answer is then labelled with.
+///
+/// Splitting the reads from the address is what keeps the order right at every
+/// call site: there is no way to label an address with a revision taken after
+/// it, which would claim a freshness the address does not have. See
+/// [`FileInner::locate`].
+#[derive(Clone, Copy)]
+struct Revisions {
+    content: u64,
+    address: u64,
+}
+
+impl Revisions {
+    /// Label `address` as worked out at these revisions.
+    const fn at(self, address: u64) -> Resolution {
+        Resolution {
+            content_revision: self.content,
+            address_revision: self.address,
+            address,
+        }
+    }
 }
 
 /// A borrowed `Source` view over a [`File`]'s backend, used by the
@@ -512,6 +584,25 @@ struct FileInner {
     /// returns [`Error::FileClosed`]. Reads still work. Only ever set on a
     /// `Backend::Edit` file.
     closed: AtomicBool,
+    /// How many times a write session has been given the chance to change this
+    /// file's bytes, counted so an owned [`Dataset`] handle can tell that the
+    /// object header it parsed no longer says what the file says.
+    ///
+    /// Advanced by every operation that reaches the write engine; see
+    /// [`FileInner::with_engine_mut`], which is the only thing that advances
+    /// either counter. Never advances for a read-only or streaming file, whose
+    /// bytes cannot move under a handle at all.
+    content_revision: AtomicU64,
+    /// How many times a write session has been given the chance to *move* an
+    /// object header, which is the narrower question of whether an address a
+    /// handle is holding still names its object.
+    ///
+    /// [`Change::InPlace`] leaves this alone: an immediate [`Dataset::append`]
+    /// rewrites a dataset's header where it stands, so an address stays good
+    /// across one. That is what lets a handle reached by object reference — the
+    /// one kind with no name to look itself up by — go on appending, while a
+    /// commit ends it.
+    address_revision: AtomicU64,
     /// True for a file opened with [`File::open_swmr_writer`]: no OS lock is held,
     /// the superblock's SWMR-write flag is raised, only immediate
     /// [`Dataset::append`] is permitted (the staged surface is refused), and the
@@ -837,6 +928,119 @@ impl FileInner {
         }
     }
 
+    /// Lock this file's write session for an operation that may change the
+    /// file, and record afterwards that it had the chance to.
+    ///
+    /// Every path that can change the file's bytes — [`File::commit`] and the
+    /// copies, every staged and immediate edit a [`Dataset`] or [`Group`] handle
+    /// makes, and the session teardown — goes through here, so a new entry point
+    /// cannot change the file without classifying what it did. Two write the
+    /// file without passing here, both because no handle can be alive to see it:
+    /// [`FileInner::drop`], which runs when the last `Arc` goes, and
+    /// [`File::refresh`], which takes `&mut self` through `Arc::get_mut` and
+    /// advances the counters itself.
+    ///
+    /// The appender's claim bookkeeping ([`Dataset::claim_for_appender`] and its
+    /// pair) locks the engine directly and rightly notes nothing: it records who
+    /// is appending, not what the file holds — and it must keep working from a
+    /// `Drop` on a sealed file, which this gate refuses.
+    ///
+    /// The counters advance whether `f` succeeded or not, and for a staged edit
+    /// that changes no bytes at all. Both are deliberate: a refused commit can
+    /// still have written and rolled back (issues #316 and #344), and the cost
+    /// of a revision that did not need advancing is one re-read on the next use
+    /// of a handle, where the cost of one that needed advancing and did not is a
+    /// wrong answer.
+    fn with_engine_mut<R>(
+        &self,
+        change: Change,
+        f: impl FnOnce(&mut WriteEngine) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let Backend::Edit(m) = &self.backend else {
+            return Err(Error::ReadOnly);
+        };
+        self.check_mutable(matches!(change, Change::Relocating))?;
+        let out = {
+            let mut engine = m.lock().unwrap_or_else(PoisonError::into_inner);
+            f(&mut engine)
+        };
+        self.note(change);
+        out
+    }
+
+    /// Record that an operation of kind `change` has run against this file.
+    ///
+    /// The address counter moves *first*, against [`revisions`](Self::revisions)
+    /// reading it second. A reader that sees the new content revision has
+    /// therefore already synchronized with this release, so it cannot then read
+    /// an address revision from before it and conclude that its memoized address
+    /// outlived a commit that moved it.
+    fn note(&self, change: Change) {
+        match change {
+            Change::Relocating => {
+                self.address_revision.fetch_add(1, Ordering::Release);
+                self.content_revision.fetch_add(1, Ordering::Release);
+            }
+            Change::InPlace => {
+                self.content_revision.fetch_add(1, Ordering::Release);
+            }
+            Change::Nothing => {}
+        }
+    }
+
+    /// How many times a write session has been given the chance to change this
+    /// file's bytes. A [`Dataset`] handle whose header was parsed at this value
+    /// still holds what the file holds.
+    fn content_revision(&self) -> u64 {
+        self.content_revision.load(Ordering::Acquire)
+    }
+
+    /// How many times a write session has been given the chance to move an
+    /// object header. An address worked out at this value still names its
+    /// object.
+    fn address_revision(&self) -> u64 {
+        self.address_revision.load(Ordering::Acquire)
+    }
+
+    /// Work out where a handle's object header sits now, and say what that
+    /// answer holds as of.
+    ///
+    /// One rule, in the order it is written. An address nothing has moved since
+    /// still names its object, whichever way the handle names it — which is what
+    /// keeps an in-place append anywhere in the file from making every handle
+    /// walk its path again. Past that, a handle opened by `path` looks its
+    /// object up, which follows it wherever a commit put it, and one reached by
+    /// object reference has no name to look up: `memo` held the only address it
+    /// will ever have, and the bytes a relocated header vacates still parse as
+    /// the object that left them, so there is nothing left to read.
+    ///
+    /// Both counters are read *before* the resolution, never after: a value
+    /// taken afterwards could name a state the address predates, and a handle
+    /// that memoized that pairing would go on answering from a header a commit
+    /// had already moved. Taken beforehand, a concurrent change makes the
+    /// pairing merely stale — which the next use notices, so long as it is the
+    /// next *use*. A commit running on another thread between this read and the
+    /// bytes it labels is not ordered against either, so a handle shared across
+    /// threads can still serve one read from a header a concurrent commit had
+    /// moved. What these counters order is a handle against edits already made,
+    /// not against one in flight.
+    fn locate(&self, path: Option<&str>, memo: Resolution) -> Result<Resolution, Error> {
+        let revisions = self.revisions();
+        Ok(revisions.at(match path {
+            _ if revisions.address == memo.address_revision => memo.address,
+            Some(path) => self.resolve_path(path)?,
+            None => return Err(Error::StaleHandle),
+        }))
+    }
+
+    /// The revisions to label a resolution that is about to be worked out with.
+    fn revisions(&self) -> Revisions {
+        Revisions {
+            content: self.content_revision(),
+            address: self.address_revision(),
+        }
+    }
+
     /// A `Source` view over the backend, for the streaming-capable paths.
     pub(crate) fn source(&self) -> SourceView<'_> {
         match &self.backend {
@@ -943,6 +1147,8 @@ impl FileInner {
             file_space_info: None,
             access_properties,
             closed: AtomicBool::new(false),
+            content_revision: AtomicU64::new(0),
+            address_revision: AtomicU64::new(0),
             swmr_write: false,
         };
         file.file_space_info = file.read_file_space_info();
@@ -1011,6 +1217,13 @@ impl FileInner {
                     self.superblock = superblock;
                     self.addr_offset = addr_offset;
                     self.file_space_info = self.read_file_space_info();
+                    // Every byte just moved. `File::refresh` takes `&mut self`
+                    // through `Arc::get_mut`, so no handle can be alive to see
+                    // it — but the counters are the file's statement about its
+                    // own bytes, and leaving them behind here would make that
+                    // statement false.
+                    *self.content_revision.get_mut() += 1;
+                    *self.address_revision.get_mut() += 1;
                     return Ok(());
                 }
                 Err(e) => {
@@ -1210,7 +1423,11 @@ impl FileInner {
     /// MAT-file userblock is accounted for here. A null (`0`) or undefined
     /// (`HADDR_UNDEF`) address, or one whose object header is neither a dataset
     /// nor a group, yields [`FormatError::InvalidObjectReference`].
-    fn object_at_relative(file: &Arc<FileInner>, rel_addr: u64) -> Result<Object, Error> {
+    fn object_at_relative(
+        file: &Arc<FileInner>,
+        revisions: Revisions,
+        rel_addr: u64,
+    ) -> Result<Object, Error> {
         // HADDR_UNDEF and the null address never name a real object. (Relative
         // address 0 is where the superblock sits, not an object header.)
         if rel_addr == u64::MAX || rel_addr == 0 {
@@ -1219,24 +1436,20 @@ impl FileInner {
         let abs = rel_addr
             .checked_add(file.addr_offset)
             .ok_or(FormatError::InvalidObjectReference(rel_addr))?;
+        let at = revisions.at(abs);
         let hdr = file.parse_header(abs)?;
         if has_message(&hdr, MessageType::DataLayout) {
             let chunk_cache = DatasetAccessProperties::new()
                 .resolved_chunk_cache(file.access_properties.chunk_cache);
-            Ok(Object::Dataset(Box::new(Dataset {
-                file: file.clone(),
-                address: abs,
-                header: hdr,
-                chunk_cache: ChunkCache::with_config(chunk_cache),
-                chunk_cache_config: chunk_cache,
-                path: None,
-            })))
+            Ok(Object::Dataset(Box::new(Dataset::new(
+                file.clone(),
+                at,
+                hdr,
+                chunk_cache,
+                None,
+            ))))
         } else if is_group(&hdr) {
-            Ok(Object::Group(Group {
-                file: file.clone(),
-                address: abs,
-                path: None,
-            }))
+            Ok(Object::Group(Group::new(file.clone(), at, None)))
         } else {
             Err(FormatError::InvalidObjectReference(rel_addr).into())
         }
@@ -1740,7 +1953,10 @@ impl std::fmt::Debug for FileInner {
 /// rather than re-reading it. Object handles returned by [`dataset`](Self::dataset),
 /// [`group`](Self::group), and [`root`](Self::root) are **owned** — they keep the
 /// file open for as long as they live and carry no borrow of the `File`, so they
-/// can be stored in a struct, cached, and moved across threads.
+/// can be stored in a struct, cached, cloned, and moved across threads. They stay
+/// usable across a [`commit`](Self::commit), which is what makes caching one
+/// worthwhile; see [`commit`](Self::commit) for the two cases that report
+/// instead.
 #[derive(Clone)]
 pub struct File {
     inner: Arc<FileInner>,
@@ -2081,8 +2297,22 @@ impl File {
     /// [`Dataset::append`]s need no commit.
     ///
     /// Requires a read-write file ([`File::open_rw`]); a read-only file returns
-    /// [`Error::ReadOnly`](crate::Error::ReadOnly). A commit that relocates
-    /// objects invalidates outstanding handles — re-fetch any you keep using.
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    ///
+    /// Outstanding [`Dataset`] and [`Group`] handles stay usable: a commit
+    /// relocates object headers, and each handle looks its object up again by
+    /// path on its first use afterwards, so a long-lived handle answers for the
+    /// file the commit left rather than for the copy it moved away from. Two
+    /// exceptions,
+    /// both of which report rather than answer wrongly. A *read* through a handle
+    /// onto an object the commit deleted fails the way opening it would; its
+    /// write methods still address the file by path, so they stage and the commit
+    /// refuses them. And a handle reached by object reference
+    /// ([`Dataset::dereference`]) has no path to look up, so it returns
+    /// [`Error::StaleHandle`](crate::Error::StaleHandle) — not only after a
+    /// commit but after anything staged, synced or torn down, since only an
+    /// immediate [`Dataset::append`] is known to leave every header where it
+    /// stands. Dereference again from a fresh read.
     ///
     /// The commit is durable when it returns, under the default
     /// [`SyncPolicy::Always`]; under
@@ -2109,7 +2339,7 @@ impl File {
     ///   it. The batch is in the file and stays there; what failed is work the
     ///   commit owed afterwards. The file is valid either way.
     pub fn commit(&self) -> Result<(), Error> {
-        self.with_mirror_session(true, |session| session.commit())
+        self.with_mirror_session(Change::Relocating, |session| session.commit())
     }
 
     /// Copy the object at `src` to `dst` within this file (the in-file
@@ -2126,7 +2356,7 @@ impl File {
     /// Requires a read-write file ([`File::open_rw`]); a read-only file returns
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
-        self.with_mirror_session(true, |session| {
+        self.with_mirror_session(Change::Relocating, |session| {
             session.copy(&normalize_path(src), &normalize_path(dst))
         })
     }
@@ -2146,7 +2376,9 @@ impl File {
     /// Requires a read-write destination ([`File::open_rw`]); a read-only
     /// one returns [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn copy_from(&self, source: &File, src: &str, dst: &str) -> Result<(), Error> {
-        self.with_mirror_session(true, |session| session.copy_from(source, src, dst))
+        self.with_mirror_session(Change::Relocating, |session| {
+            session.copy_from(source, src, dst)
+        })
     }
 
     /// Report whether this file has structural edits staged but not yet applied
@@ -2208,7 +2440,11 @@ impl File {
     /// already been synced.
     #[doc(alias = "fsync")]
     pub fn sync(&self) -> Result<(), Error> {
-        self.with_mirror_session(false, |session| session.force_sync())
+        // A barrier over writes the operations that made them already accounted
+        // for, so it invalidates no handle. Classing it as a change would end
+        // every by-reference handle in the session because the caller asked for
+        // an `fsync`.
+        self.with_mirror_session(Change::Nothing, |session| session.force_sync())
     }
 
     /// Commit any staged edits and seal this file. The exclusive OS lock is
@@ -2216,7 +2452,10 @@ impl File {
     ///
     /// After `close`, a write through any surviving [`Dataset`]/[`Group`] handle
     /// or [`File`] clone returns [`Error::FileClosed`](crate::Error::FileClosed);
-    /// reads still work.
+    /// reads still work. `close` commits, so the one handle a commit ends ends
+    /// here too: one reached by [`Dataset::dereference`] reports
+    /// [`Error::StaleHandle`](crate::Error::StaleHandle) afterwards, where a
+    /// handle opened by path re-resolves and keeps reading.
     pub fn close(self) -> Result<(), Error> {
         if matches!(self.inner.backend, Backend::Edit(_)) {
             // SWMR mode stages nothing — the staged surface is refused — so there
@@ -2226,7 +2465,11 @@ impl File {
             if !swmr {
                 self.commit()?;
             }
-            self.with_mirror_session(false, |session| {
+            // Free-space managers and status flags, both rewritten where they
+            // stand. No object header moves, so a handle that could read through
+            // this file before `close` still can — which is what `close`'s own
+            // documentation promises.
+            self.with_mirror_session(Change::InPlace, |session| {
                 // Immediate appends grow the file past any persisted free-space
                 // managers without running a commit tail, so re-home them here. A
                 // no-op unless this session left them stale.
@@ -2257,26 +2500,22 @@ impl File {
     /// staged edit on a SWMR-writer file.
     fn with_mirror_session<R>(
         &self,
-        staged: bool,
+        change: Change,
         f: impl FnOnce(&mut WriteEngine) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let Backend::Edit(m) = &self.inner.backend else {
-            return Err(Error::ReadOnly);
-        };
-        self.inner.check_mutable(staged)?;
-        let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(&mut session)
+        self.inner.with_engine_mut(change, f)
     }
 
     /// Returns an owned handle to the root group.
     pub fn root(&self) -> Group {
-        Group {
+        let revisions = self.inner.revisions();
+        Group::new(
+            self.inner.clone(),
             // A relocating commit on a read-write file can move the root, so
             // resolve it from the live mirror rather than the cached superblock.
-            address: self.inner.mirror_root_address(),
-            file: self.inner.clone(),
-            path: Some(String::new()),
-        }
+            revisions.at(self.inner.mirror_root_address()),
+            Some(String::new()),
+        )
     }
 
     /// Resolve a path and return an owned [`Dataset`] handle.
@@ -2300,30 +2539,31 @@ impl File {
         path: &str,
         properties: DatasetAccessProperties,
     ) -> Result<Dataset, Error> {
+        let revisions = self.inner.revisions();
         let addr = self.inner.resolve_path(path)?;
         let hdr = self.inner.parse_header(addr)?;
         if !has_message(&hdr, MessageType::DataLayout) {
             return Err(Error::NotADataset(path.to_string()));
         }
         let chunk_cache = properties.resolved_chunk_cache(self.inner.access_properties.chunk_cache);
-        Ok(Dataset {
-            file: self.inner.clone(),
-            address: addr,
-            header: hdr,
-            chunk_cache: ChunkCache::with_config(chunk_cache),
-            chunk_cache_config: chunk_cache,
-            path: Some(normalize_path(path)),
-        })
+        Ok(Dataset::new(
+            self.inner.clone(),
+            revisions.at(addr),
+            hdr,
+            chunk_cache,
+            Some(normalize_path(path)),
+        ))
     }
 
     /// Resolve a path and return an owned [`Group`] handle.
     pub fn group(&self, path: &str) -> Result<Group, Error> {
+        let revisions = self.inner.revisions();
         let addr = self.inner.resolve_path(path)?;
-        Ok(Group {
-            file: self.inner.clone(),
-            address: addr,
-            path: Some(normalize_path(path)),
-        })
+        Ok(Group::new(
+            self.inner.clone(),
+            revisions.at(addr),
+            Some(normalize_path(path)),
+        ))
     }
 
     /// Re-read the file from disk to pick up data appended by a concurrent
@@ -2574,23 +2814,78 @@ impl StagedOp {
 }
 
 /// An owned handle to an HDF5 group.
+///
+/// The handle names the group by its root-relative path and remembers where that
+/// path resolved to. A [`File::commit`] rewrites and relocates object headers,
+/// so the memo is worked out again on the first use after any edit and the
+/// handle goes on answering for the same group — see [`File::commit`] for the
+/// two cases that report instead. Cloning gives a second handle to the same
+/// group.
 pub struct Group {
     file: Arc<FileInner>,
-    address: u64,
+    /// Where this group's object header sits, as of the file revision it was
+    /// resolved at. Re-resolved on first use after an edit could have moved it;
+    /// see [`Group::header_address`]. A group carries no parsed header of its
+    /// own — it re-reads one per call — so the address is the whole memo, and the
+    /// content revision the [`Resolution`] carries beside it names no header this
+    /// handle read and is never read back.
+    state: RwLock<Resolution>,
     /// Root-relative path of this group (e.g. `""` for the root, `"a/b"`), used
     /// to address the group and its children for write operations on a
-    /// read-write file. `None` for a group reached by object reference
-    /// ([`Dataset::dereference`]), which has no resolvable path.
+    /// read-write file, and to find it again after an edit moved it. `None` for
+    /// a group reached by object reference ([`Dataset::dereference`]), which has
+    /// no resolvable path.
     path: Option<String>,
 }
 
+impl Clone for Group {
+    /// Clones share nothing but the open file: the clone is a second handle to
+    /// the same group, resolved as of the same revision.
+    fn clone(&self) -> Self {
+        Self {
+            file: Arc::clone(&self.file),
+            state: RwLock::new(*self.state.read().unwrap_or_else(PoisonError::into_inner)),
+            path: self.path.clone(),
+        }
+    }
+}
+
 impl Group {
-    /// Address of this group's object header (base-adjusted, file-absolute).
-    /// Used to resolve object references that point at this group.
-    pub(crate) fn header_address(&self) -> u64 {
-        self.address
+    /// Build a handle for a group whose header was found at `at`.
+    fn new(file: Arc<FileInner>, at: Resolution, path: Option<String>) -> Self {
+        Self {
+            file,
+            state: RwLock::new(at),
+            path,
+        }
     }
 
+    /// This group's object-header address (base-adjusted, file-absolute), worked
+    /// out again from its path if an edit could have moved it since the memo was
+    /// taken. Also what resolves an object reference that points at this group.
+    ///
+    /// Returns [`Error::StaleHandle`](crate::Error::StaleHandle) for a handle
+    /// that has no path to re-resolve — one an object reference produced — once
+    /// a commit has run under it, and the resolution's own error (a
+    /// `PathNotFound`, say, for a group a commit deleted) when the path no
+    /// longer names anything.
+    pub(crate) fn header_address(&self) -> Result<u64, Error> {
+        let memo = *self.state.read().unwrap_or_else(PoisonError::into_inner);
+        if memo.address_revision == self.file.address_revision() {
+            return Ok(memo.address);
+        }
+        let at = self.file.locate(self.path.as_deref(), memo)?;
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        // Two threads can re-resolve at once. The older answer must not land on
+        // top of the newer one, or the newer handle would go on serving an
+        // address the file has already moved past.
+        if at.address_revision >= state.address_revision {
+            *state = at;
+        }
+        Ok(at.address)
+    }
+    /// Address of this group's object header (base-adjusted, file-absolute).
+    /// Used to resolve object references that point at this group.
     /// List the names of datasets in this group.
     ///
     /// To read from the datasets themselves, prefer
@@ -2656,6 +2951,7 @@ impl Group {
     pub fn iter_datasets(
         &self,
     ) -> Result<impl ExactSizeIterator<Item = (String, Dataset)> + use<>, Error> {
+        let revisions = self.file.revisions();
         let mut members = Vec::new();
         for entry in self.children()? {
             let hdr = self.file.parse_header(entry.object_header_address)?;
@@ -2669,14 +2965,13 @@ impl Group {
             .resolved_chunk_cache(self.file.access_properties.chunk_cache);
         Ok(members.into_iter().map(move |(entry, header)| {
             let path = child_path_of(parent.as_deref(), &entry.name);
-            let dataset = Dataset {
-                file: Arc::clone(&file),
-                address: entry.object_header_address,
+            let dataset = Dataset::new(
+                Arc::clone(&file),
+                revisions.at(entry.object_header_address),
                 header,
-                chunk_cache: ChunkCache::with_config(chunk_cache),
-                chunk_cache_config: chunk_cache,
+                chunk_cache,
                 path,
-            };
+            );
             (entry.name, dataset)
         }))
     }
@@ -2805,6 +3100,7 @@ impl Group {
     pub fn iter_groups(
         &self,
     ) -> Result<impl ExactSizeIterator<Item = (String, Group)> + use<>, Error> {
+        let revisions = self.file.revisions();
         let mut members = Vec::new();
         for entry in self.children()? {
             // A `Group` handle carries no parsed header, so the header that
@@ -2818,11 +3114,11 @@ impl Group {
         let parent = self.path.clone();
         Ok(members.into_iter().map(move |entry| {
             let path = child_path_of(parent.as_deref(), &entry.name);
-            let group = Group {
-                file: Arc::clone(&file),
-                address: entry.object_header_address,
+            let group = Group::new(
+                Arc::clone(&file),
+                revisions.at(entry.object_header_address),
                 path,
-            };
+            );
             (entry.name, group)
         }))
     }
@@ -2847,7 +3143,7 @@ impl Group {
     /// from the map rather than reported as an error. Read
     /// [`attr_datatypes`](Self::attr_datatypes) to see it.
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
-        let hdr = self.file.parse_header(self.address)?;
+        let hdr = self.file.parse_header(self.header_address()?)?;
         self.file.attrs_of(&hdr)
     }
 
@@ -2897,7 +3193,7 @@ impl Group {
     /// a rewrite unchanged, and falls back to the decoded map only where the
     /// bytes are not position-independent.
     pub(crate) fn attr_messages(&self) -> Result<Vec<crate::attribute::AttributeMessage>, Error> {
-        let hdr = self.file.parse_header(self.address)?;
+        let hdr = self.file.parse_header(self.header_address()?)?;
         self.file.attr_messages_of(&hdr)
     }
 
@@ -2918,6 +3214,7 @@ impl Group {
         name: &str,
         properties: DatasetAccessProperties,
     ) -> Result<Dataset, Error> {
+        let revisions = self.file.revisions();
         let address = self
             .child_address(name)?
             .ok_or_else(|| Error::Format(FormatError::PathNotFound(name.to_string())))?;
@@ -2926,26 +3223,26 @@ impl Group {
             return Err(Error::NotADataset(name.to_string()));
         }
         let chunk_cache = properties.resolved_chunk_cache(self.file.access_properties.chunk_cache);
-        Ok(Dataset {
-            file: self.file.clone(),
-            address,
-            header: hdr,
-            chunk_cache: ChunkCache::with_config(chunk_cache),
-            chunk_cache_config: chunk_cache,
-            path: self.child_path(name),
-        })
+        Ok(Dataset::new(
+            self.file.clone(),
+            revisions.at(address),
+            hdr,
+            chunk_cache,
+            self.child_path(name),
+        ))
     }
 
     /// Get a subgroup within this group by name.
     pub fn group(&self, name: &str) -> Result<Group, Error> {
+        let revisions = self.file.revisions();
         let address = self
             .child_address(name)?
             .ok_or_else(|| Error::Format(FormatError::PathNotFound(name.to_string())))?;
-        Ok(Group {
-            file: self.file.clone(),
-            address,
-            path: self.child_path(name),
-        })
+        Ok(Group::new(
+            self.file.clone(),
+            revisions.at(address),
+            self.child_path(name),
+        ))
     }
 
     /// The object-header address of this group's child named `name`.
@@ -2955,7 +3252,7 @@ impl Group {
     /// each member of a large group in turn cost the group once rather than once
     /// per member (issue #228).
     fn child_address(&self, name: &str) -> Result<Option<u64>, Error> {
-        self.file.group_child(self.address, name)
+        self.file.group_child(self.header_address()?, name)
     }
 
     /// The root-relative path of a child named `name`, or `None` if this group
@@ -3100,13 +3397,9 @@ impl Group {
         name: &str,
         f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let Backend::Edit(m) = &self.file.backend else {
-            return Err(Error::ReadOnly);
-        };
-        self.file.check_mutable(true)?;
         let child = self.child_path(name).ok_or(Error::ReadOnly)?;
-        let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(&mut session, &child)
+        self.file
+            .with_engine_mut(Change::Relocating, |session| f(session, &child))
     }
 
     /// Validate that this group can stage an edit to child `name` and return the
@@ -3128,21 +3421,16 @@ impl Group {
     /// unlocked and could have closed the file in the meantime; staging into a
     /// sealed file would otherwise be silently accepted and then dropped.
     fn apply_staged(&self, ops: Vec<StagedOp>) -> Result<(), Error> {
-        self.file.check_staged_writable()?;
-        let Backend::Edit(m) = &self.file.backend else {
-            // `check_staged_writable` accepts only a mirror backend, and a
-            // file's backend is fixed for its lifetime.
-            return Err(Error::ReadOnly);
-        };
-        let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // All or nothing: one call can carry a whole subtree, and each op is
-        // validated as it is staged, so a refusal partway must not leave the
-        // ops before it recorded.
-        session.stage_atomically(|s| {
-            for op in ops {
-                op.apply(s)?;
-            }
-            Ok(())
+        self.file.with_engine_mut(Change::Relocating, |session| {
+            // All or nothing: one call can carry a whole subtree, and each op is
+            // validated as it is staged, so a refusal partway must not leave the
+            // ops before it recorded.
+            session.stage_atomically(|s| {
+                for op in ops {
+                    op.apply(s)?;
+                }
+                Ok(())
+            })
         })
     }
 
@@ -3155,17 +3443,13 @@ impl Group {
         &self,
         f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let Backend::Edit(m) = &self.file.backend else {
-            return Err(Error::ReadOnly);
-        };
-        self.file.check_mutable(true)?;
         let path = self.path.clone().ok_or(Error::ReadOnly)?;
-        let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(&mut session, &path)
+        self.file
+            .with_engine_mut(Change::Relocating, |session| f(session, &path))
     }
 
     fn children(&self) -> Result<Vec<GroupEntry>, Error> {
-        let hdr = self.file.parse_header(self.address)?;
+        let hdr = self.file.parse_header(self.header_address()?)?;
         self.file.group_children(&hdr)
     }
 }
@@ -3174,29 +3458,79 @@ impl Group {
 // Dataset handle
 // ---------------------------------------------------------------------------
 
+/// A [`Dataset`] handle's memo: where its object header sits, what that header
+/// says, and what both hold as of.
+///
+/// The handle names the dataset; this is a memo of what that name resolved to.
+/// See [`Dataset::resolved`].
+struct DatasetState {
+    /// Where the header sits — [`Resolution::address`] is base-adjusted and
+    /// file-absolute — and the revisions the address and the parse hold as of.
+    at: Resolution,
+    header: ObjectHeader,
+}
+
 /// An owned handle to an HDF5 dataset.
+///
+/// The handle names the dataset by its root-relative path and remembers where
+/// that path resolved to and what the header there said. A [`File::commit`]
+/// rewrites and relocates object headers, and an immediate [`append`](Self::append)
+/// rewrites one where it stands, so the memo is worked out again on the first
+/// use after either and the handle goes on answering for the same dataset — see
+/// [`File::commit`] for the two cases that report instead. That covers an edit
+/// made through *another* handle to the same dataset as well as through this
+/// one. Cloning gives a second handle to the same dataset, sharing its chunk
+/// cache.
+///
+/// Three accessors cannot report a handle that no longer resolves, because they
+/// return no `Result`: [`filters`](Self::filters) and
+/// [`filter_pipeline`](Self::filter_pipeline) answer empty, the same answer an
+/// unfiltered dataset gives, and [`is_chunked`](Self::is_chunked) answers
+/// `false`. Every other reader of the header says what went wrong.
 pub struct Dataset {
     file: Arc<FileInner>,
-    /// Address of this dataset's object header (base-adjusted, file-absolute).
-    /// Used to resolve object references that point at this dataset.
-    address: u64,
-    header: ObjectHeader,
+    /// Where this dataset's object header sits and what it says, as of the file
+    /// revision they were read at. Re-taken on first use after the file changes;
+    /// see [`Dataset::resolved`].
+    state: RwLock<Arc<DatasetState>>,
     // Held per-dataset: the chunk index is keyed only by chunk coordinate, so
-    // a file-level cache would alias chunk addresses across datasets.
-    chunk_cache: ChunkCache,
+    // a file-level cache would alias chunk addresses across datasets. Shared
+    // between clones, which are the same dataset: a chunk read through one is
+    // warm for the other, and an edit through either drops it for both.
+    chunk_cache: Arc<ChunkCache>,
     // The effective chunk-cache config for this dataset: the file-wide default
     // or a per-dataset DAPL override. Reported by `chunk_cache_config`.
     chunk_cache_config: ChunkCacheConfig,
     /// Root-relative path of this dataset, used to address it for write
-    /// operations on a read-write file. `None` for a dataset reached by object
-    /// reference ([`Dataset::dereference`]), which has no resolvable path.
+    /// operations on a read-write file, and to find it again after an edit moved
+    /// it. `None` for a dataset reached by object reference
+    /// ([`Dataset::dereference`]), which has no resolvable path.
     path: Option<String>,
 }
 
+impl Clone for Dataset {
+    /// The clone is a second handle to the same dataset, sharing its chunk cache
+    /// and resolved as of the same revision.
+    fn clone(&self) -> Self {
+        Self {
+            file: Arc::clone(&self.file),
+            state: RwLock::new(Arc::clone(
+                &self.state.read().unwrap_or_else(PoisonError::into_inner),
+            )),
+            chunk_cache: Arc::clone(&self.chunk_cache),
+            chunk_cache_config: self.chunk_cache_config,
+            path: self.path.clone(),
+        }
+    }
+}
+
 impl std::fmt::Debug for Dataset {
+    /// Reports the memo as it stands, without re-resolving: a `Debug` that read
+    /// the file could fail, and one that failed would have nothing to print.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
         f.debug_struct("Dataset")
-            .field("messages", &self.header.messages.len())
+            .field("messages", &state.header.messages.len())
             .finish()
     }
 }
@@ -3283,15 +3617,84 @@ fn typed_window_rows(
 }
 
 impl Dataset {
+    /// Build a handle for a dataset whose header was found, and read, at `at`.
+    fn new(
+        file: Arc<FileInner>,
+        at: Resolution,
+        header: ObjectHeader,
+        chunk_cache_config: ChunkCacheConfig,
+        path: Option<String>,
+    ) -> Self {
+        Self {
+            file,
+            state: RwLock::new(Arc::new(DatasetState { at, header })),
+            chunk_cache: Arc::new(ChunkCache::with_config(chunk_cache_config)),
+            chunk_cache_config,
+            path,
+        }
+    }
+
+    /// This dataset's address and parsed header, worked out again if the file
+    /// has changed since the memo was taken.
+    ///
+    /// Returns [`Error::StaleHandle`](crate::Error::StaleHandle) for a handle
+    /// that has no path to re-resolve — one an object reference produced — once
+    /// a commit has run under it, and the resolution's own error (a
+    /// `PathNotFound`, say, for a dataset a commit deleted) when the path no
+    /// longer names anything. A path that now names something other than a
+    /// dataset is [`Error::NotADataset`](crate::Error::NotADataset), the same
+    /// answer opening it afresh would give.
+    fn resolved(&self) -> Result<Arc<DatasetState>, Error> {
+        let live = self.file.content_revision();
+        let memo = {
+            let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+            if state.at.content_revision == live {
+                return Ok(Arc::clone(&state));
+            }
+            state.at
+        };
+        let at = self.file.locate(self.path.as_deref(), memo)?;
+        let header = self.file.parse_header(at.address)?;
+        // Checked *before* it is memoized. A header installed and then refused is
+        // the answer every later call short-circuits on, so this handle would
+        // report `NotADataset` once and then serve the other object's header —
+        // which a commit replacing a dataset with a group at the same path
+        // (issue #305) makes reachable.
+        if !has_message(&header, MessageType::DataLayout) {
+            // Only a path can reach this: an address memo that survived is the
+            // address of the dataset this handle already read there.
+            return Err(Error::NotADataset(self.path.clone().unwrap_or_default()));
+        }
+        Ok(self.install(at, header))
+    }
+
+    /// Memoize `header`, read at `at`, as this handle's resolution.
+    ///
+    /// Drops the chunk cache: an edit that rewrote this header can have moved
+    /// the chunk index and the chunks it names, so what the cache holds belongs
+    /// to the copy the edit replaced.
+    fn install(&self, at: Resolution, header: ObjectHeader) -> Arc<DatasetState> {
+        let fresh = Arc::new(DatasetState { at, header });
+        self.chunk_cache.clear();
+        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
+        // Two threads can re-resolve at once. The older answer must not land on
+        // top of the newer one, or the newer handle would go on serving a header
+        // the file has already moved past.
+        if at.content_revision >= state.at.content_revision {
+            *state = Arc::clone(&fresh);
+        }
+        fresh
+    }
+
     /// Address of this dataset's object header (base-adjusted, file-absolute).
     /// Used to resolve object references that point at this dataset.
-    pub(crate) fn header_address(&self) -> u64 {
-        self.address
+    pub(crate) fn header_address(&self) -> Result<u64, Error> {
+        Ok(self.resolved()?.at.address)
     }
 
     /// Append `data` to this dataset in place, growing it along its first
-    /// (unlimited) dimension, and refresh this handle so subsequent reads observe
-    /// the new length.
+    /// (unlimited) dimension. Every handle onto the dataset reads the new length
+    /// afterwards, this one included.
     ///
     /// The file must have been opened for writing with [`File::open_rw`];
     /// a read-only file returns
@@ -3352,11 +3755,11 @@ impl Dataset {
     /// edits, and otherwise by the object-header address the handle was reached
     /// through — which is what lets a handle obtained by object reference append
     /// at all.
-    fn append_target(&self) -> AppendTarget<'_> {
-        match &self.path {
+    fn append_target(&self) -> Result<AppendTarget<'_>, Error> {
+        Ok(match &self.path {
             Some(path) => AppendTarget::Path(path),
-            None => AppendTarget::Header(self.address),
-        }
+            None => AppendTarget::Header(self.resolved()?.at.address),
+        })
     }
 
     /// A [`BufferedAppender`] over this dataset: appended elements are held in
@@ -3422,19 +3825,10 @@ impl Dataset {
     /// opposite case — a caller whose bytes are cheaper to build per batch — so
     /// this hands the engine one builder and lets it batch the plan.
     pub(crate) fn append_prebuilt(&mut self, b: &AppendBuilder) -> Result<(), Error> {
-        let Backend::Edit(m) = &self.file.backend else {
-            return Err(Error::ReadOnly);
-        };
-        self.file.check_mutable(false)?;
-        {
-            let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            engine.append_inplace_gathered(self.append_target(), b, 4)?;
-        }
-        self.header = self.file.parse_header(self.address)?;
-        // Same staleness rule as `append_batches`: the append extended the chunk
-        // index this handle may have cached.
-        self.chunk_cache.clear();
-        Ok(())
+        let target = self.append_target()?;
+        self.file.with_engine_mut(Change::InPlace, |engine| {
+            engine.append_inplace_gathered(target, b, 4)
+        })
     }
 
     /// Stage an append and commit it in the same lock, used by
@@ -3454,12 +3848,7 @@ impl Dataset {
                  name it; re-open the dataset by path",
         ))?;
         self.check_staged_edit()?;
-        let Backend::Edit(m) = &self.file.backend else {
-            return Err(Error::ReadOnly);
-        };
-        self.file.check_mutable(true)?;
-        {
-            let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.file.with_engine_mut(Change::Relocating, |engine| {
             if engine.has_staged_edits() {
                 // The same variant the engine's own two staged-conflict refusals
                 // use (`append_prepare`), so a caller catching that one to fall
@@ -3484,28 +3873,17 @@ impl Dataset {
                     s.stage_dataset_append(&path, b)?;
                     s.commit()
                 })
-            })?;
-        }
-        // A commit rewrites and *relocates* object headers, so unlike every other
-        // `with_session_mut` caller this handle's cached address is stale as well
-        // as its header. Re-resolve by path before touching either; parsing the
-        // vacated address would read whatever the commit left there.
-        self.address = self.file.resolve_path(&path)?;
-        self.header = self.file.parse_header(self.address)?;
-        self.chunk_cache.clear();
-        Ok(())
+            })
+        })
     }
 
     /// Fetch (locating on first use) this dataset's append geometry from the
     /// write session, which also applies every refusal that does not depend on
     /// the bytes being appended.
     pub(crate) fn append_geometry(&self) -> Result<AppendGeometry, Error> {
-        let Backend::Edit(m) = &self.file.backend else {
-            return Err(Error::ReadOnly);
-        };
-        self.file.check_mutable(false)?;
-        let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        engine.append_geometry(self.append_target())
+        let target = self.append_target()?;
+        self.file
+            .with_engine_mut(Change::Nothing, |engine| engine.append_geometry(target))
     }
 
     /// Immediate in-place append, driven batch by batch. The call is split into
@@ -3526,9 +3904,6 @@ impl Dataset {
         total_elems: u64,
         fill: impl Fn(&mut AppendBuilder, std::ops::Range<usize>),
     ) -> Result<(), Error> {
-        let Backend::Edit(m) = &self.file.backend else {
-            return Err(Error::ReadOnly);
-        };
         // Atomic refusal before any batch: a filtered append must start
         // chunk-aligned (the engine re-checks per batch as a backstop). The
         // appended length is unconstrained — an unaligned remainder is always the
@@ -3541,30 +3916,27 @@ impl Dataset {
                  BufferedAppender, which keeps the on-disk length chunk-aligned",
             ));
         }
+        // Worked out once for the whole call: every batch names the same
+        // dataset, and an in-place append does not move it.
+        let target = self.append_target()?;
         let mut dim = g.current_dim;
         let mut done = 0u64;
         loop {
             // An empty append still runs one (empty) engine call, so datatype
             // validation happens whether or not there are elements.
-            self.file.check_mutable(false)?;
             let to_boundary = (g.chunk_elems - dim % g.chunk_elems) % g.chunk_elems;
             let take = (total_elems - done).min(to_boundary.saturating_add(g.full_batch_elems));
             let mut b = AppendBuilder::new();
             fill(&mut b, done.to_usize()?..(done + take).to_usize()?);
-            {
-                let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                engine.append_inplace_gathered(self.append_target(), &b, 4)?;
-            }
+            self.file.with_engine_mut(Change::InPlace, |engine| {
+                engine.append_inplace_gathered(target, &b, 4)
+            })?;
             dim += take;
             done += take;
             if done >= total_elems {
                 break;
             }
         }
-        self.header = self.file.parse_header(self.address)?;
-        // Same staleness rule as `with_session_mut`: the append repointed or
-        // extended the chunk index this handle may have cached.
-        self.chunk_cache.clear();
         Ok(())
     }
 
@@ -3580,9 +3952,7 @@ impl Dataset {
         self.check_staged_edit()?;
         let mut builder = DatasetBuilder::new("");
         T::write_into(&mut builder, data);
-        self.with_session_mut(true, |session, path| {
-            session.stage_dataset_write(path, builder)
-        })
+        self.with_session_mut(|session, path| session.stage_dataset_write(path, builder))
     }
 
     /// Overwrite this dataset's values through its full [`DatasetBuilder`],
@@ -3651,9 +4021,7 @@ impl Dataset {
         self.check_staged_edit()?;
         let mut builder = DatasetBuilder::new("");
         build(&mut builder);
-        self.with_session_mut(true, |session, path| {
-            session.stage_dataset_write(path, builder)
-        })
+        self.with_session_mut(|session, path| session.stage_dataset_write(path, builder))
     }
 
     /// Stage an append to this dataset applied on [`File::commit`] — the staged,
@@ -3680,9 +4048,7 @@ impl Dataset {
         self.check_staged_edit()?;
         let mut builder = AppendBuilder::new();
         build(&mut builder);
-        self.with_session_mut(true, |session, path| {
-            session.stage_dataset_append(path, builder)
-        })
+        self.with_session_mut(|session, path| session.stage_dataset_append(path, builder))
     }
 
     /// Add or update a compact attribute on this dataset, staged until
@@ -3691,17 +4057,13 @@ impl Dataset {
     /// The file must have been opened with [`File::open_rw`], else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn set_attr(&mut self, name: &str, value: AttrValue) -> Result<(), Error> {
-        self.with_session_mut(true, |session, path| {
-            session.set_dataset_attr(path, name, value)
-        })
+        self.with_session_mut(|session, path| session.set_dataset_attr(path, name, value))
     }
 
     /// Remove a compact attribute from this dataset, staged until
     /// [`File::commit`]. See [`set_attr`](Self::set_attr) for the file-mode rules.
     pub fn remove_attr(&mut self, name: &str) -> Result<(), Error> {
-        self.with_session_mut(true, |session, path| {
-            session.remove_dataset_attr(path, name)
-        })
+        self.with_session_mut(|session, path| session.remove_dataset_attr(path, name))
     }
 
     /// Gate a staged edit on this dataset *without* taking the session lock:
@@ -3731,7 +4093,7 @@ impl Dataset {
         // contradictory records of where the data lives, and the reference
         // library still reading the external files it had not touched. See
         // [`has_external_storage`](Self::has_external_storage).
-        if self.has_external_storage() {
+        if self.has_external_storage()? {
             return Err(Error::EditUnsupported(
                 "this dataset's elements live in external files (H5Pset_external), which this \
 engine does not write; writing them into the HDF5 file would leave it disagreeing with \
@@ -3749,24 +4111,11 @@ the same commit to replace it",
     /// handle has no resolvable path (reached by object reference).
     fn with_session_mut<R>(
         &mut self,
-        staged: bool,
         f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let Backend::Edit(m) = &self.file.backend else {
-            return Err(Error::ReadOnly);
-        };
-        self.file.check_mutable(staged)?;
         let path = self.path.clone().ok_or(Error::ReadOnly)?;
-        let out = {
-            let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            f(&mut session, &path)?
-        };
-        self.header = self.file.parse_header(self.address)?;
-        // An append relocates the trailing chunk and grows the chunk index, so
-        // this handle's cached index and retained chunks are stale; drop them
-        // so the next read re-walks the live index.
-        self.chunk_cache.clear();
-        Ok(out)
+        self.file
+            .with_engine_mut(Change::Relocating, |session| f(session, &path))
     }
 
     /// The effective raw chunk-cache configuration for this dataset.
@@ -3785,9 +4134,15 @@ the same commit to replace it",
     /// [`FileAccessProperties::with_chunk_cache`]) is taking effect: after a
     /// chunked read, an enabled cache reports a loaded index and retained
     /// chunks; a disabled one (or one over its budget) reports fewer or none.
-    /// The cache is per-handle, so a freshly opened [`Dataset`] reports an empty
-    /// snapshot until its first read.
+    /// The cache is per-handle — though clones of one handle share it — so a
+    /// freshly opened [`Dataset`] reports an empty snapshot until its first read.
     pub fn chunk_cache_stats(&self) -> ChunkCacheStats {
+        // Notice any edit first, which is what drops the chunks it invalidated.
+        // A snapshot taken before that would count chunks no read will ever be
+        // served, and this exists to say what the cache is holding *for* a read.
+        // An unresolvable handle has no live cache to report, and an empty
+        // snapshot is the truthful answer for one.
+        let _ = self.resolved();
         self.chunk_cache.stats()
     }
 
@@ -3817,7 +4172,9 @@ the same commit to replace it",
 
     /// Whether the dataset uses chunked storage (as opposed to contiguous or
     /// compact). Filtered datasets are always chunked. Returns `false` for a
-    /// dataset with no data-layout message or a non-chunked layout.
+    /// dataset with no data-layout message, for a non-chunked layout, and — like
+    /// the other accessors that return no `Result` — for a handle that can no
+    /// longer be resolved.
     pub fn is_chunked(&self) -> bool {
         matches!(self.data_layout(), Ok(DataLayout::Chunked { .. }))
     }
@@ -4015,13 +4372,15 @@ the same commit to replace it",
     /// legacy `0x0004` — so files from this crate, the reference C library, and
     /// h5py are all handled.
     pub(crate) fn defined_fill_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
-        let msg = self
+        let state = self.resolved()?;
+        let msg = state
             .header
             .messages
             .iter()
             .find(|m| m.msg_type == MessageType::FillValue)
             .or_else(|| {
-                self.header
+                state
+                    .header
                     .messages
                     .iter()
                     .find(|m| m.msg_type == MessageType::FillValueOld)
@@ -4046,13 +4405,15 @@ the same commit to replace it",
     /// a value nothing ever put there. `fill_value` still reports the declared
     /// value, because it *is* declared; see [`fill_value_is_written`].
     fn fill_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
-        let msg = self
+        let state = self.resolved()?;
+        let msg = state
             .header
             .messages
             .iter()
             .find(|m| m.msg_type == MessageType::FillValue)
             .or_else(|| {
-                self.header
+                state
+                    .header
                     .messages
                     .iter()
                     .find(|m| m.msg_type == MessageType::FillValueOld)
@@ -4529,7 +4890,7 @@ the same commit to replace it",
     /// [`Group::attrs`] for what that means for matching on it, and prefer the
     /// [`AttrValue`] accessors.
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
-        self.file.attrs_of(&self.header)
+        self.file.attrs_of(&self.resolved()?.header)
     }
 
     /// The exact on-disk [`Datatype`] of every attribute on this dataset, keyed
@@ -4553,7 +4914,7 @@ the same commit to replace it",
     /// See [`Group::attr_messages`] for why repack reads these rather than the
     /// decoded map.
     pub(crate) fn attr_messages(&self) -> Result<Vec<crate::attribute::AttributeMessage>, Error> {
-        self.file.attr_messages_of(&self.header)
+        self.file.attr_messages_of(&self.resolved()?.header)
     }
 
     /// Returns the exact HDF5 datatype, including compound field offsets and
@@ -4564,7 +4925,8 @@ the same commit to replace it",
     /// `create_dataset(..., dtype=f["t"])` — is stored as a reference to the
     /// datatype's own object header and is resolved to the type it names.
     pub fn datatype(&self) -> Result<Datatype, Error> {
-        let msg = find_message(&self.header, MessageType::Datatype)?;
+        let state = self.resolved()?;
+        let msg = find_message(&state.header, MessageType::Datatype)?;
         let (dt, _) = Datatype::parse(&self.file.message_body(msg)?)?;
         Ok(dt)
     }
@@ -4577,12 +4939,14 @@ the same commit to replace it",
     /// inline loses the link every C-library reader reports by name, and the
     /// address is what says which committed object to name instead.
     pub(crate) fn committed_datatype_address(&self) -> Result<Option<u64>, Error> {
-        let msg = find_message(&self.header, MessageType::Datatype)?;
+        let state = self.resolved()?;
+        let msg = find_message(&state.header, MessageType::Datatype)?;
         self.file.shared_target_address(msg)
     }
 
     pub(crate) fn dataspace(&self) -> Result<Dataspace, Error> {
-        let msg = find_message(&self.header, MessageType::Dataspace)?;
+        let state = self.resolved()?;
+        let msg = find_message(&state.header, MessageType::Dataspace)?;
         Ok(Dataspace::parse(
             &self.file.message_body(msg)?,
             self.file.length_size(),
@@ -4590,7 +4954,8 @@ the same commit to replace it",
     }
 
     pub(crate) fn data_layout(&self) -> Result<DataLayout, Error> {
-        let msg = find_message(&self.header, MessageType::DataLayout)?;
+        let state = self.resolved()?;
+        let msg = find_message(&state.header, MessageType::DataLayout)?;
         Ok(DataLayout::parse(
             &msg.data,
             self.file.offset_size(),
@@ -4598,8 +4963,14 @@ the same commit to replace it",
         )?)
     }
 
+    /// A handle that can no longer be resolved reports no pipeline, the same
+    /// answer an unfiltered dataset gives: this feeds the two infallible
+    /// accessors ([`filters`](Self::filters) and
+    /// [`filter_pipeline`](Self::filter_pipeline)), which have no way to say
+    /// why. Every caller that *can* say uses a `Result` reader instead.
     pub(crate) fn filter_pipeline_parsed(&self) -> Option<FilterPipeline> {
-        let msg = self
+        let state = self.resolved().ok()?;
+        let msg = state
             .header
             .messages
             .iter()
@@ -4618,11 +4989,13 @@ the same commit to replace it",
     /// safe answer is to refuse: [`read_layout`](Self::read_layout) refuses a
     /// read of one rather than answering its fill value, and `repack` refuses to
     /// reproduce it without its data.
-    pub(crate) fn has_external_storage(&self) -> bool {
-        self.header
+    pub(crate) fn has_external_storage(&self) -> Result<bool, Error> {
+        Ok(self
+            .resolved()?
+            .header
             .messages
             .iter()
-            .any(|m| m.msg_type == MessageType::ExternalDataFiles)
+            .any(|m| m.msg_type == MessageType::ExternalDataFiles))
     }
 
     /// The data layout to read element bytes through, as opposed to the one
@@ -4637,7 +5010,7 @@ the same commit to replace it",
     /// — while every path that turns a layout into bytes comes through here and
     /// refuses.
     fn read_layout(&self) -> Result<DataLayout, Error> {
-        if self.has_external_storage() {
+        if self.has_external_storage()? {
             return Err(FormatError::UnsupportedExternalStorage.into());
         }
         self.data_layout()
@@ -4728,16 +5101,20 @@ the same commit to replace it",
     /// if it has one. Repack reuses this verbatim so that every filter — including
     /// ones this crate cannot itself apply (ZFP, SZIP, unknown) — is reproduced
     /// byte-for-byte in the repacked file's pipeline message.
-    pub(crate) fn filter_pipeline_message_bytes(&self) -> Option<Vec<u8>> {
-        let msg = self
+    pub(crate) fn filter_pipeline_message_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
+        let state = self.resolved()?;
+        let Some(msg) = state
             .header
             .messages
             .iter()
-            .find(|m| m.msg_type == MessageType::FilterPipeline)?;
+            .find(|m| m.msg_type == MessageType::FilterPipeline)
+        else {
+            return Ok(None);
+        };
         // A shared pipeline message's record body is an address, not a pipeline;
         // its resolved content is what a copy must carry. The content itself is
         // position-independent, so copying it verbatim stays faithful.
-        Some(self.file.message_body(msg).ok()?.into_owned())
+        Ok(Some(self.file.message_body(msg)?.into_owned()))
     }
 
     /// Read the dataset's exact unfiltered element bytes.
@@ -4990,10 +5367,15 @@ the same commit to replace it",
             }
             .into());
         }
+        // Read after the element bytes the addresses came out of, which is the
+        // one place these could be taken too late: a commit landing between that
+        // read and this one would move the headers the addresses name, and a
+        // handle labelled with the later revisions would call them current.
+        let revisions = self.file.revisions();
         let mut out = Vec::with_capacity(raw.len() / elem_size);
         for chunk in raw.chunks_exact(elem_size) {
             let addr = u64::from_le_bytes(chunk[..8].try_into().expect("chunk has >= 8 bytes"));
-            out.push(FileInner::object_at_relative(&self.file, addr)?);
+            out.push(FileInner::object_at_relative(&self.file, revisions, addr)?);
         }
         Ok(out)
     }
@@ -5108,6 +5490,534 @@ mod tests {
     use super::*;
     use crate::FileBuilder;
     use std::sync::atomic::AtomicUsize;
+
+    // -----------------------------------------------------------------------
+    // Handle re-validation across an edit (issue #351)
+    // -----------------------------------------------------------------------
+
+    /// A file with two chunked datasets whose trailing chunk is partial, one
+    /// contiguous dataset, and one subgroup.
+    fn revalidation_fixture(path: &std::path::Path) {
+        let mut b = FileBuilder::new();
+        for ds in ["log", "other"] {
+            b.create_dataset(ds)
+                .with_i32_data(&[0, 1])
+                .with_shape(&[2])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[4]);
+        }
+        b.create_dataset("plain").with_i32_data(&[7, 8, 9]);
+        let g = b.create_group("g");
+        b.add_group(g.finish());
+        b.write(path).unwrap();
+    }
+
+    /// The issue itself: a handle taken before a commit goes on answering for
+    /// the object after it, rather than for the copy the commit left behind.
+    #[test]
+    fn a_handle_follows_its_object_across_a_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("follow.h5");
+        revalidation_fixture(&path);
+
+        let file = File::open_rw(&path).unwrap();
+        let mut ds = file.dataset("plain").unwrap();
+        let group = file.group("g").unwrap();
+
+        // Both edits relocate an object header: the dataset's own, and — since
+        // the new child is linked into it — the group's.
+        ds.set_attr("units", AttrValue::AsciiString("m".into()))
+            .unwrap();
+        group
+            .create_dataset("child", |b| {
+                b.with_i32_data(&[4, 5]);
+            })
+            .unwrap();
+        file.commit().unwrap();
+
+        assert_eq!(
+            sorted(ds.attrs()),
+            vec![r#"units=AsciiString("m")"#.to_string()],
+            "the dataset handle must report the attribute the commit added"
+        );
+        assert_eq!(
+            group.datasets().unwrap(),
+            vec!["child".to_string()],
+            "the group handle must report the child the commit added"
+        );
+        assert_eq!(ds.read_i32().unwrap(), vec![7, 8, 9]);
+        assert_eq!(
+            group.dataset("child").unwrap().read_i32().unwrap(),
+            vec![4, 5]
+        );
+        file.close().unwrap();
+    }
+
+    /// Two handles on one dataset are two views of one object, not two objects:
+    /// an append through either is what the other reads next, chunk cache and
+    /// all. The appended elements land in a chunk the reader already holds, so a
+    /// retained one would answer with what stood there before.
+    #[test]
+    fn an_append_through_one_handle_is_what_another_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two_handles.h5");
+        revalidation_fixture(&path);
+
+        let file = File::open_rw(&path).unwrap();
+        let reader = file.dataset("log").unwrap();
+        let mut writer = file.dataset("log").unwrap();
+
+        assert_eq!(reader.read_i32().unwrap(), vec![0, 1]);
+        assert!(
+            reader.chunk_cache_stats().cached_chunks() > 0,
+            "the read must leave the partial trailing chunk cached, or this \
+             test cannot tell a retained chunk from a re-read one"
+        );
+
+        writer.append(&[2i32, 3]).unwrap();
+
+        assert_eq!(
+            reader.chunk_cache_stats().cached_chunks(),
+            0,
+            "the snapshot must report what the cache holds for a read, and the \
+             append left it holding nothing a read will be served"
+        );
+        assert_eq!(reader.shape().unwrap(), vec![4]);
+        assert_eq!(reader.read_i32().unwrap(), vec![0, 1, 2, 3]);
+        file.close().unwrap();
+    }
+
+    /// A clone is a second handle to the same object, and follows it the same
+    /// way. It shares the chunk cache, so the edit that drops one drops both.
+    #[test]
+    fn a_clone_is_a_second_handle_to_the_same_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clone.h5");
+        revalidation_fixture(&path);
+
+        let file = File::open_rw(&path).unwrap();
+        let mut ds = file.dataset("log").unwrap();
+        let copy = ds.clone();
+        let root = file.root();
+        let root_copy = root.clone();
+
+        assert_eq!(copy.read_i32().unwrap(), vec![0, 1]);
+        assert!(copy.chunk_cache_stats().cached_chunks() > 0);
+        assert_eq!(
+            ds.chunk_cache_stats().cached_chunks(),
+            copy.chunk_cache_stats().cached_chunks(),
+            "clones share one cache: a chunk read through either is warm for both"
+        );
+
+        ds.append(&[2i32, 3]).unwrap();
+        assert_eq!(copy.read_i32().unwrap(), vec![0, 1, 2, 3]);
+
+        root.create_group("later").unwrap();
+        file.commit().unwrap();
+        assert!(
+            root_copy.groups().unwrap().contains(&"later".to_string()),
+            "a cloned group handle follows its group across a commit too"
+        );
+        file.close().unwrap();
+    }
+
+    /// A handle to an object a commit deleted has nothing to answer for. The
+    /// bytes it vacated still parse as the dataset that left them, so reading
+    /// them would answer with data no longer in the file.
+    #[test]
+    fn a_handle_to_a_deleted_object_refuses_rather_than_reading_what_it_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deleted.h5");
+        revalidation_fixture(&path);
+
+        let file = File::open_rw(&path).unwrap();
+        let ds = file.dataset("plain").unwrap();
+        assert_eq!(ds.read_i32().unwrap(), vec![7, 8, 9]);
+
+        file.root().delete("plain").unwrap();
+        file.commit().unwrap();
+
+        assert!(
+            matches!(
+                ds.read_i32(),
+                Err(Error::Format(FormatError::PathNotFound(ref p))) if p == "plain"
+            ),
+            "reading a deleted dataset must fail the way opening it does, got {:?}",
+            ds.read_i32()
+        );
+        file.close().unwrap();
+    }
+
+    /// A handle reached by object reference has no name to look itself up by, so
+    /// it pins to the address the reference gave it. An immediate append leaves
+    /// that address alone and it keeps reading; a commit can move the header and
+    /// it stops.
+    #[test]
+    fn a_reference_handle_reads_until_a_commit_could_have_moved_its_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("by_ref.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("log")
+            .with_i32_data(&[0, 1])
+            .with_shape(&[2])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[4]);
+        b.create_dataset("refs").with_path_references(&["log"]);
+        b.write(&path).unwrap();
+
+        let file = File::open_rw(&path).unwrap();
+        let mut by_ref = match file
+            .dataset("refs")
+            .unwrap()
+            .dereference()
+            .unwrap()
+            .remove(0)
+        {
+            Object::Dataset(ds) => *ds,
+            other => panic!("expected a dataset, got {other:?}"),
+        };
+        assert_eq!(by_ref.read_i32().unwrap(), vec![0, 1]);
+
+        // An in-place append rewrites the header where it stands, so the address
+        // is still the object's and the handle reads its own new elements.
+        by_ref.append(&[2i32, 3]).unwrap();
+        assert_eq!(by_ref.read_i32().unwrap(), vec![0, 1, 2, 3]);
+
+        // A commit can put the header somewhere else, and nothing on disk marks
+        // the bytes it vacated as dead.
+        file.root().create_group("g").unwrap();
+        file.commit().unwrap();
+        assert!(
+            matches!(by_ref.read_i32(), Err(Error::StaleHandle)),
+            "unexpected: {:?}",
+            by_ref.read_i32()
+        );
+
+        // And the recovery the error names: dereference again, against the file
+        // the commit left.
+        let fresh = match file
+            .dataset("refs")
+            .unwrap()
+            .dereference()
+            .unwrap()
+            .remove(0)
+        {
+            Object::Dataset(ds) => *ds,
+            other => panic!("expected a dataset, got {other:?}"),
+        };
+        assert_eq!(fresh.read_i32().unwrap(), vec![0, 1, 2, 3]);
+        file.close().unwrap();
+    }
+
+    /// The counters are what every handle trusts, so every entry point that
+    /// reaches the write engine has to declare what it does to them. This is
+    /// that declaration, written out entry point by entry point and checked
+    /// against the code: a [`Change::Relocating`] advances both counters, an
+    /// [`Change::InPlace`] only the content one, and a [`Change::Nothing`]
+    /// neither.
+    ///
+    /// The table is the point. An entry point classified too weakly leaves a
+    /// handle memoizing a header it moved; one classified too strongly ends
+    /// every by-reference handle in the session for nothing — which is what
+    /// `File::sync` did until its line was written here.
+    #[test]
+    fn every_write_entry_point_declares_what_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        type Step = (&'static str, Change, fn(&File));
+        let steps: Vec<Step> = vec![
+            ("File::sync", Change::Nothing, |f| {
+                f.sync().unwrap();
+            }),
+            ("Dataset::chunk_cache_stats", Change::Nothing, |f| {
+                let _ = f.dataset("log").unwrap().chunk_cache_stats();
+            }),
+            ("BufferedAppender::new", Change::Nothing, |f| {
+                let mut ds = f.dataset("log").unwrap();
+                let app = ds.buffered_appender().unwrap();
+                app.discard();
+            }),
+            ("Dataset::append", Change::InPlace, |f| {
+                f.dataset("log").unwrap().append(&[9i32]).unwrap();
+            }),
+            ("Dataset::append_raw", Change::InPlace, |f| {
+                f.dataset("log")
+                    .unwrap()
+                    .append_raw(&7i32.to_le_bytes())
+                    .unwrap();
+            }),
+            ("BufferedAppender::flush", Change::InPlace, |f| {
+                let mut ds = f.dataset("log").unwrap();
+                let mut app = ds.buffered_appender().unwrap();
+                app.append(&[5i32, 6, 7, 8]).unwrap();
+                app.flush().unwrap();
+            }),
+            ("Dataset::write", Change::Relocating, |f| {
+                f.dataset("plain").unwrap().write(&[1i32, 2, 3]).unwrap();
+            }),
+            ("Dataset::set_attr", Change::Relocating, |f| {
+                f.dataset("plain")
+                    .unwrap()
+                    .set_attr("a", AttrValue::I32(1))
+                    .unwrap();
+            }),
+            ("Dataset::remove_attr", Change::Relocating, |f| {
+                let mut ds = f.dataset("plain").unwrap();
+                ds.set_attr("gone", AttrValue::I32(1)).unwrap();
+                f.commit().unwrap();
+                ds.remove_attr("gone").unwrap();
+            }),
+            ("Dataset::write_staged", Change::Relocating, |f| {
+                f.dataset("plain")
+                    .unwrap()
+                    .write_staged(|b| {
+                        b.with_i32_data(&[4, 5, 6]);
+                    })
+                    .unwrap();
+            }),
+            ("Dataset::append_staged", Change::Relocating, |f| {
+                f.dataset("log")
+                    .unwrap()
+                    .append_staged(|b| {
+                        b.append_i32(&[3]);
+                    })
+                    .unwrap();
+            }),
+            ("Group::create_group", Change::Relocating, |f| {
+                f.root().create_group("fresh").unwrap();
+            }),
+            ("Group::create_dataset", Change::Relocating, |f| {
+                f.root()
+                    .create_dataset("made", |b| {
+                        b.with_i32_data(&[1]);
+                    })
+                    .unwrap();
+            }),
+            ("Group::delete", Change::Relocating, |f| {
+                f.root().delete("plain").unwrap();
+            }),
+            ("Group::set_attr", Change::Relocating, |f| {
+                f.root().set_attr("a", AttrValue::I32(1)).unwrap();
+            }),
+            ("Group::remove_attr", Change::Relocating, |f| {
+                f.root().set_attr("gone", AttrValue::I32(1)).unwrap();
+                f.commit().unwrap();
+                f.root().remove_attr("gone").unwrap();
+            }),
+            ("Group::create_group_with", Change::Relocating, |f| {
+                f.root()
+                    .create_group_with("built", |g| {
+                        g.set_attr("a", AttrValue::I32(1));
+                    })
+                    .unwrap();
+            }),
+            ("File::copy", Change::Relocating, |f| {
+                f.copy("plain", "copied").unwrap();
+            }),
+            ("File::commit", Change::Relocating, |f| {
+                f.root().create_group("committed").unwrap();
+                f.commit().unwrap();
+            }),
+        ];
+
+        let revisions = |f: &File| (f.inner.content_revision(), f.inner.address_revision());
+        let declared = |c: Change| match c {
+            Change::Relocating => "Relocating",
+            Change::InPlace => "InPlace",
+            Change::Nothing => "Nothing",
+        };
+        for (name, change, step) in steps {
+            let path = dir.path().join(format!("{}.h5", name.replace("::", "_")));
+            revalidation_fixture(&path);
+            let file = File::open_rw(&path).unwrap();
+            let before = revisions(&file);
+            step(&file);
+            let after = revisions(&file);
+            let observed = match (after.0 > before.0, after.1 > before.1) {
+                (true, true) => "Relocating",
+                (true, false) => "InPlace",
+                (false, false) => "Nothing",
+                (false, true) => "an address move with no content change",
+            };
+            assert_eq!(
+                observed,
+                declared(change),
+                "{name} is declared here as one thing and behaves as another \
+                 ({before:?} -> {after:?})"
+            );
+            file.close().unwrap();
+        }
+
+        // `close` consumes the file, so it cannot be a row above. It is two
+        // operations: the commit it makes, which relocates like any other, and
+        // the teardown, which re-homes free space and releases status flags
+        // where they stand. Both counters therefore move, and the content one
+        // moves twice.
+        let path = dir.path().join("File_close.h5");
+        revalidation_fixture(&path);
+        let file = File::open_rw(&path).unwrap();
+        let before = revisions(&file);
+        let by_path = file.dataset("plain").unwrap();
+        let by_ref = {
+            let mut b = FileBuilder::new();
+            b.create_dataset("d").with_i32_data(&[1, 2]);
+            b.create_dataset("refs").with_path_references(&["d"]);
+            let refs_path = dir.path().join("File_close_refs.h5");
+            b.write(&refs_path).unwrap();
+            let refs = File::open_rw(&refs_path).unwrap();
+            let handle = match refs
+                .dataset("refs")
+                .unwrap()
+                .dereference()
+                .unwrap()
+                .remove(0)
+            {
+                Object::Dataset(ds) => *ds,
+                other => panic!("expected a dataset, got {other:?}"),
+            };
+            refs.close().unwrap();
+            handle
+        };
+        // `close` consumes its `File`; the counters live on the shared inner
+        // state every handle holds, so read them back through one of those.
+        let inner = Arc::clone(&file.inner);
+        file.close().unwrap();
+        let after = (inner.content_revision(), inner.address_revision());
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (2, 1),
+            "File::close is a Relocating commit and an InPlace teardown"
+        );
+        assert_eq!(
+            by_path.read_i32().unwrap(),
+            vec![7, 8, 9],
+            "`close` promises reads through surviving handles still work"
+        );
+        assert!(
+            matches!(by_ref.read_i32(), Err(Error::StaleHandle)),
+            "the one handle that cannot follow the commit `close` makes: {:?}",
+            by_ref.read_i32()
+        );
+    }
+
+    /// What the *second* counter buys, which nothing else pins: an edit that
+    /// moves no object header leaves a by-reference handle — the one kind that
+    /// cannot look itself up again — still able to read. Collapse the two
+    /// counters into one and every case here becomes `StaleHandle`.
+    #[test]
+    fn an_edit_that_moves_no_header_leaves_a_reference_handle_reading() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Named for the same reason `Step` above is: a bare tuple of a name and
+        // a function pointer reads as noise at the call site.
+        type Case = (&'static str, fn(&File));
+        let cases: Vec<Case> = vec![
+            (
+                "an append through another handle to the same dataset",
+                |f| {
+                    f.dataset("log").unwrap().append(&[9i32]).unwrap();
+                },
+            ),
+            ("an append to a different dataset", |f| {
+                f.dataset("other").unwrap().append(&[9i32]).unwrap();
+            }),
+            ("a durability barrier", |f| {
+                f.sync().unwrap();
+            }),
+        ];
+
+        for (name, edit) in cases {
+            let path = dir.path().join(format!("{}.h5", name.replace(' ', "_")));
+            let mut b = FileBuilder::new();
+            for ds in ["log", "other"] {
+                b.create_dataset(ds)
+                    .with_i32_data(&[0, 1])
+                    .with_shape(&[2])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[4]);
+            }
+            b.create_dataset("refs").with_path_references(&["log"]);
+            b.write(&path).unwrap();
+
+            let file = File::open_rw(&path).unwrap();
+            let by_ref = match file
+                .dataset("refs")
+                .unwrap()
+                .dereference()
+                .unwrap()
+                .remove(0)
+            {
+                Object::Dataset(ds) => *ds,
+                other => panic!("expected a dataset, got {other:?}"),
+            };
+            assert_eq!(by_ref.read_i32().unwrap(), vec![0, 1], "{name}: before");
+            edit(&file);
+            assert!(
+                by_ref.read_i32().is_ok(),
+                "{name} moves no object header, so it must not end a handle that \
+                 names its dataset by address: {:?}",
+                by_ref.read_i32()
+            );
+            file.close().unwrap();
+        }
+    }
+
+    /// A commit can put something else at a handle's path — issue #305 makes a
+    /// dataset and a group interchangeable in one commit. The refusal has to
+    /// hold on *every* call: a header memoized and then refused is the answer
+    /// each later call short-circuits on, and this handle would go on serving
+    /// the other object's header without an error.
+    #[test]
+    fn a_handle_whose_path_becomes_a_group_keeps_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaced.h5");
+        revalidation_fixture(&path);
+
+        let file = File::open_rw(&path).unwrap();
+        let ds = file.dataset("plain").unwrap();
+        assert_eq!(ds.read_i32().unwrap(), vec![7, 8, 9]);
+
+        file.root().delete("plain").unwrap();
+        file.root()
+            .create_group_with("plain", |g| {
+                g.set_attr("i_am_a_group", AttrValue::I32(42));
+            })
+            .unwrap();
+        file.commit().unwrap();
+
+        for call in 1..=3 {
+            assert!(
+                matches!(ds.attrs(), Err(Error::NotADataset(ref p)) if p == "plain"),
+                "call {call} answered {:?}",
+                ds.attrs()
+            );
+            assert!(matches!(ds.read_i32(), Err(Error::NotADataset(_))));
+            assert!(matches!(ds.shape(), Err(Error::NotADataset(_))));
+        }
+        file.close().unwrap();
+    }
+
+    /// A read-only file cannot change under a handle, so nothing a reader does
+    /// may move the counters — and no handle on one ever pays to re-resolve.
+    #[test]
+    fn reading_never_moves_the_file_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.h5");
+        revalidation_fixture(&path);
+
+        let file = File::open(&path).unwrap();
+        let _ = read_everything(&file);
+        let ds = file.dataset("log").unwrap();
+        let _ = ds.read_i32().unwrap();
+        let _ = ds.attrs().unwrap();
+        let _ = ds.layout().unwrap();
+        let _ = file.root().groups().unwrap();
+        assert_eq!(
+            (file.inner.content_revision(), file.inner.address_revision()),
+            (0, 0),
+            "a read must not tell every handle its memo has expired"
+        );
+    }
 
     /// Read everything a read-write file can serve through the paired read
     /// paths, as comparable text.
@@ -5319,7 +6229,13 @@ mod tests {
         // stored base-relative (absolute minus the userblock base) and, for this
         // single-child file, appears exactly once in the bytes. The link lives in
         // the root object header's chunk-0.
-        let stored = file.root().group("child").unwrap().address - UB;
+        let stored = file
+            .root()
+            .group("child")
+            .unwrap()
+            .header_address()
+            .unwrap()
+            - UB;
         let needle = stored.to_le_bytes();
         let matches: Vec<usize> = bytes
             .windows(8)
@@ -5340,7 +6256,7 @@ mod tests {
         // the checksum first. Mirrors the chunk-0 extent from `parse_v2`.
         #[cfg(feature = "checksum")]
         {
-            let root_addr = file.root().address as usize;
+            let root_addr = file.root().header_address().unwrap() as usize;
             assert_eq!(&bytes[root_addr..root_addr + 4], b"OHDR");
             let flags = bytes[root_addr + 5];
             let mut pos = root_addr + 6;
@@ -5430,7 +6346,7 @@ mod tests {
             // address is needed to recompute it.
             let header_addr = {
                 let file = File::from_bytes(bytes.clone()).unwrap();
-                file.dataset("t").unwrap().header_address() as usize
+                file.dataset("t").unwrap().header_address().unwrap() as usize
             };
 
             // The layout message's size field: the dataset's byte length, which
@@ -6175,7 +7091,11 @@ mod tests {
 
             for (name, ds) in &iterated {
                 let opened = group.dataset(name).unwrap();
-                assert_eq!(ds.header_address(), opened.header_address(), "{name}");
+                assert_eq!(
+                    ds.header_address().unwrap(),
+                    opened.header_address().unwrap(),
+                    "{name}"
+                );
                 assert_eq!(ds.shape().unwrap(), opened.shape().unwrap(), "{name}");
                 assert_eq!(ds.read_i32().unwrap(), opened.read_i32().unwrap(), "{name}");
             }
@@ -6200,8 +7120,8 @@ mod tests {
 
         for (name, group) in &iterated {
             assert_eq!(
-                group.header_address(),
-                root.group(name).unwrap().header_address(),
+                group.header_address().unwrap(),
+                root.group(name).unwrap().header_address().unwrap(),
                 "{name}"
             );
             let mut inner = group

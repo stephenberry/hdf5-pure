@@ -70,6 +70,25 @@ file.commit().unwrap(); // apply everything in place
 
 After a successful `commit()`, the staged set is cleared and the open file can be reused for further edits.
 
+### Handles across a commit
+
+`Dataset` and `Group` handles stay usable across `commit()`. A commit relocates object headers, and each handle looks its object up again by path on its next use, so a handle held in a struct or a cache keeps answering for the file the commit left rather than for the copy it moved away from — the same for an edit made through *another* handle to the same object. Both types are `Clone`.
+
+```rust
+let file = File::open_rw("output.h5").unwrap();
+let mut signal = file.dataset("run2/signal").unwrap();
+
+signal.set_attr("units", AttrValue::AsciiString("V".into())).unwrap();
+file.commit().unwrap();
+
+assert!(signal.attrs().unwrap().contains_key("units")); // same handle, new file
+```
+
+Two cases report rather than answer:
+
+- **Reading** through a handle onto an object the commit **deleted** fails the way opening it by name would (`FormatError::PathNotFound`). The bytes a deleted object leaves behind still parse as the object that left them, so reading them would answer with data no longer in the file. Its write methods address the file by path as they always did, so they still stage, and the commit refuses them.
+- A handle reached by **object reference** (`Dataset::dereference`) knows only an object-header address and has no path to look up, so it returns `Error::StaleHandle` once anything that could have moved that header has run — a commit, a staged edit, a `sync`, a `close`. Dereference again from a fresh read. An immediate `append` moves no header, so such a handle keeps reading and appending across one.
+
 ## Operations
 
 | Method | Effect | HDF5 analog |

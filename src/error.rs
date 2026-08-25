@@ -1007,6 +1007,20 @@ pub enum Error {
     /// refused; reads through surviving handles still work. Re-open the file to
     /// modify it again.
     FileClosed,
+    /// A [`crate::Dataset`] / [`crate::Group`] handle reached by object
+    /// reference ([`crate::Dataset::dereference`]) was used after the file
+    /// changed under it.
+    ///
+    /// Such a handle knows only the object-header address the reference gave
+    /// it, and an edit can rewrite and relocate object headers, so there is no
+    /// name left to look the object up by. Every handle opened by *path*
+    /// re-resolves itself instead and never reports this. Dereference again from
+    /// a fresh read to get a handle onto the current file.
+    ///
+    /// An immediate [`crate::Dataset::append`] rewrites a header where it stands
+    /// and does not end such a handle; a commit does, as does staging one,
+    /// [`crate::File::sync`], and [`crate::File::close`].
+    StaleHandle,
     /// A staged edit (`write` / `set_attr` / `create_*` / `delete` / `copy` /
     /// `commit`) was requested on a file opened with
     /// [`crate::File::open_swmr_writer`], which permits only immediate
@@ -1121,6 +1135,11 @@ impl fmt::Display for Error {
             Error::ReadOnly => write!(
                 f,
                 "cannot write to a read-only file; open it with File::open_rw"
+            ),
+            Error::StaleHandle => write!(
+                f,
+                "this handle was reached by object reference and the file has changed since; \
+                 it has no path to re-resolve, so dereference again"
             ),
             Error::FileClosed => write!(
                 f,
