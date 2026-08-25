@@ -681,8 +681,10 @@ fn numeric_scalar_attr(name: &str, datatype: Datatype, raw_data: &[u8]) -> Attri
 /// the width `datatype` declares.
 ///
 /// `to_le_bytes` is the element's own encoder — `i16::to_le_bytes` and friends —
-/// so the bytes written can only be as wide as the type they came from, and the
-/// datatype beside them says the same width.
+/// so the bytes written can only be as wide as the type they came from. Each
+/// call pairs that encoder with the datatype constructor of the same width,
+/// which is what makes the width a message declares and the width its bytes
+/// occupy the same number.
 fn numeric_array_attr<T: Copy, const N: usize>(
     name: &str,
     datatype: Datatype,
@@ -1273,9 +1275,9 @@ pub enum AttrValue {
 /// One logical value has several representations here. A single string is a
 /// [`String`](AttrValue::String) or an [`AsciiString`](AttrValue::AsciiString)
 /// depending on charset, and a one-element array of either carries the same
-/// thing; an integer spans eight widths. Code that only wants the value should
-/// not have to enumerate those, so each accessor spans every variant that can
-/// carry the shape it names and returns `None` for the rest.
+/// thing; an integer spans four widths at two signednesses. Code that only wants
+/// the value should not have to enumerate those, so each accessor spans every
+/// variant that can carry the shape it names and returns `None` for the rest.
 ///
 /// The prefix states the cost. `as_*` borrows or copies; `to_*` allocates,
 /// which the numeric plurals must do because the narrower widths have no
