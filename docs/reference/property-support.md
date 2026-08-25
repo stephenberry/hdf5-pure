@@ -77,11 +77,10 @@ Selected through the `File` open-mode constructor, with memory budgets and locki
 | Dirty-data and parallel: `min_clean_fraction`, `dirty_bytes_threshold`, `metadata_write_strategy` | 3 | **Never.** This cache holds only bytes read; there is no dirty entry to keep clean, flush, or write. A read-write session drops the ranges its writes overlap rather than flushing them, which `MetadataCacheStats::invalidations` counts. |
 | Diagnostics: `version`, `rpt_fcn_enabled`, `open_trace_file`, `close_trace_file`, `trace_file_name` | 5 | No. `version` is C ABI evolution, and the rest are a trace-file facility this crate has no counterpart to. What they were for is answered by `File::metadata_cache_stats`. |
 | Initial sizing: `set_initial_size`, `initial_size` | 2 | No effect to have. There is no preallocated arena: entries are allocated as reads admit them, so the initial size *is* zero and the maximum is the only bound. |
-| `evictions_enabled` | 1 | Expressible already, as a budget larger than the file's metadata. A separate flag would be a second way to say it, and one that silently uncaps memory. |
+| `evictions_enabled` | 1 | Expressible already, as a budget larger than the metadata a session reads. A separate flag would be a second way to say it, and one that silently uncaps memory. |
 
 **Adaptive resize is the one substantive gap, and leaving it out is deliberate.** The algorithm grows the cache when an epoch's hit rate falls below `lower_hr_threshold` and shrinks it when the rate rises above `upper_hr_threshold` or entries age out, so that a caller does not have to pick a size. Picking one is cheap here: since [#367](https://github.com/stephenberry/hdf5-pure/issues/367) the store is indexed rather than scanned, so a hit costs about the same at 65,000 entries as at 1,000 (161 ns against 136 ns, measured), and an over-generous budget costs memory and nothing else. The advice the algorithm would arrive at — set it generously — is one line, and `File::metadata_cache_stats` is what confirms it landed. Note also the direction it runs in: a low hit rate makes it hold *more*. Before #367 that was the wrong direction on this store, which is why the two issues were taken in that order.
 
-Eviction is strict LRU, as it is for the chunk cache, so there is no `rdcc_w0`-style preemption dial either.
 
 ## Dataset-access properties (`dapl`)
 

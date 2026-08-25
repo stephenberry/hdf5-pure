@@ -9179,6 +9179,10 @@ impl crate::source::Source for EditStore<'_> {
         self.image.read_metadata_at(offset, len)
     }
 
+    // Forwarded because this is a `Source` wrapper over the image and the
+    // trait requires it, not because anything asks yet: `File`'s own accessor
+    // reaches the image directly. A wrapper that answered `None` for a live
+    // cache is the failure that rule exists to prevent.
     fn metadata_cache_stats(&self) -> Option<crate::source::MetadataCacheStats> {
         self.image.metadata_cache_stats()
     }

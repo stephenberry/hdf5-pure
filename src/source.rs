@@ -220,6 +220,10 @@ impl MetadataCacheStats {
     }
 
     /// Entries currently held.
+    ///
+    /// Against [`bytes`](Self::bytes) this is the mean entry size, which is what
+    /// says whether a few large reads are spending the budget; pair it with
+    /// [`oversize_reads`](Self::oversize_reads) to see the ones already refused.
     pub const fn entries(&self) -> usize {
         self.entries
     }
@@ -230,7 +234,11 @@ impl MetadataCacheStats {
         self.bytes
     }
 
-    /// Every metadata read that reached the cache, eligible or not.
+    /// Every metadata read through this source: hits, misses, and reads too
+    /// large to admit.
+    ///
+    /// The last of those three is not in [`hit_rate`](Self::hit_rate)'s
+    /// denominator, so `hits() / reads()` is a different figure and a lower one.
     pub const fn reads(&self) -> u64 {
         self.hits
             .saturating_add(self.misses)
@@ -333,9 +341,9 @@ pub trait Source {
     /// sources cache nothing.
     ///
     /// A wrapper that forwards `read_metadata_at` to an inner source must
-    /// forward this too. Leaving it defaulted would have it report an empty
-    /// cache for a full one, which reads as "caching is off" rather than as the
-    /// missing forward it is.
+    /// forward this too. Leaving it defaulted would have it report *no* cache
+    /// where there is a full one, which reads as "caching is off" rather than as
+    /// the missing forward it is.
     fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
         None
     }
@@ -564,9 +572,7 @@ pub(crate) struct MetadataReadCache {
     /// offset an entry that overlaps it can start. It only grows, so the window
     /// it gives can be wider than needed but never too narrow.
     longest_entry: usize,
-    /// Cumulative counters, reported as [`MetadataCacheStats`]. They are what a
-    /// caller has to judge a budget by, the budget being a number chosen before
-    /// any read has happened.
+    /// Cumulative counters, reported as [`MetadataCacheStats`].
     hits: u64,
     misses: u64,
     oversize_reads: u64,
@@ -604,10 +610,8 @@ impl MetadataReadCache {
     ///
     /// Both call sites that have a metadata cache — [`MetadataCachingSource`]
     /// and `crate::image::HandleImage` — go through here rather than each
-    /// repeating the admission rule, so which reads are eligible and what the
-    /// counters mean have one definition. They differ only in what `read` does,
-    /// which is why it is a closure: the wrapper defers to an inner source, the
-    /// image reads its own handle with pending writes overlaid.
+    /// repeating the admission rule and its five counters; they differ only in
+    /// what `read` does, which is why it is a closure.
     ///
     /// The lock is taken up to twice and never held across `read`. A metadata
     /// read is file I/O, and serializing every one of them behind this mutex
@@ -1270,6 +1274,19 @@ mod tests {
         // `max_entry_bytes`, and folding them in would report the cache at 25%
         // rather than saying which knob is turning them away.
         assert_eq!(stats.hit_rate(), Some(0.5));
+
+        // The other half of the same rule. `with_max_entry_bytes` can name a cap
+        // above the whole budget, and a read between the two would pass the entry
+        // check only for `insert` to refuse it every time -- a permanent miss
+        // reported as an ordinary one. The budget turns it away up front instead.
+        let lopsided = MetadataCacheConfig::new(128).with_max_entry_bytes(512);
+        let source = MetadataCachingSource::new(ramp(4096), lopsided);
+        source.read_metadata_at(0, 256).unwrap();
+        source.read_metadata_at(0, 256).unwrap();
+        let stats = source.metadata_cache_stats().unwrap();
+        assert_eq!(stats.oversize_reads(), 2);
+        assert_eq!(stats.misses(), 0);
+        assert_eq!(stats.hit_rate(), None);
     }
 
     #[cfg(feature = "std")]
@@ -1314,11 +1331,12 @@ mod tests {
         assert_eq!(replaced.invalidations(), 0);
 
         cache.insert(128, 64, vec![3u8; 64], BUDGET);
-        assert_eq!(cache.stats().evictions(), 1, "the budget forced this one");
-        assert_eq!(cache.stats().invalidations(), 0);
+        let evicted = cache.stats();
+        assert_eq!(evicted.evictions(), 1, "the budget forced this one");
+        assert_eq!(evicted.invalidations(), 0);
         // The least recently used of the three went, leaving [0, 64) and
         // [128, 192).
-        assert_eq!(cache.stats().entries(), 2);
+        assert_eq!(evicted.entries(), 2);
 
         // A write across [32, 160) reaches into both survivors: one starts
         // before it, the other after.
@@ -1372,6 +1390,11 @@ mod tests {
             "an all-zero snapshot would read as a cache that is on and idle"
         );
         source.reset_metadata_cache_stats();
+        assert_eq!(
+            source.metadata_cache_stats(),
+            None,
+            "and resetting one there is nothing to reset does not conjure one"
+        );
     }
 
     #[cfg(feature = "std")]

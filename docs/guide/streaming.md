@@ -90,7 +90,46 @@ The chunk cache configured here is the file-wide default; it applies to every da
 | `ChunkCacheConfig` (file-wide) | `H5Pset_cache` raw-data settings | Decompressed chunk bytes and retained chunk indexes, as the default for all datasets |
 | `ChunkCacheConfig` (per dataset) | `H5Pset_chunk_cache` | Same, overridden for one dataset |
 
-### Checking whether the budget was right
+### Per-dataset overrides
+
+To override the chunk cache for a single dataset, open it with `dataset_with_options(name, DatasetAccessProperties)`. This is the analogue of HDF5's per-dataset access property list (`H5Pset_chunk_cache`). The override replaces the file-wide default for that one dataset; other datasets keep the default. A dataset that is read once front-to-back, for instance, gains nothing from caching its decompressed chunks, so you can disable the cache with `ChunkCacheConfig::disabled()`:
+
+```rust
+use hdf5_pure::{ChunkCacheConfig, DatasetAccessProperties, File};
+
+let file = File::open("data.h5").unwrap();
+// This dataset is read once front-to-back: skip caching its decompressed chunks.
+let dapl = DatasetAccessProperties::new().with_chunk_cache(ChunkCacheConfig::disabled());
+let ds = file.dataset_with_options("scan", dapl).unwrap();
+let values = ds.read_f64().unwrap();
+```
+
+`dataset_with_options` is available on both `File` and `Group`. `Dataset::chunk_cache_config()` reports the effective `ChunkCacheConfig` for an opened dataset (the analogue of `H5Pget_chunk_cache`): the per-dataset override when one was supplied, otherwise the file-wide default.
+
+!!! tip
+    `DatasetAccessProperties::new()` inherits every file-wide access default, so you only set what you want to change.
+
+## Confirming cache behavior
+
+### The chunk cache
+
+To confirm a cache is behaving as configured, `Dataset::chunk_cache_stats()` returns a read-only `ChunkCacheStats` snapshot taken after a read. It reports whether the parsed index is loaded (`index_loaded()`), how many decompressed chunks are retained (`cached_chunks()`), and how many bytes of chunk data are retained (`cached_bytes()`).
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open("data.h5").unwrap();
+let ds = file.dataset("signal").unwrap();
+let _ = ds.read_f64().unwrap();
+let stats = ds.chunk_cache_stats();
+// "signal" here is a chunked dataset, so chunks are retained for reuse;
+// a contiguous or compact dataset has no chunk cache and reports zero.
+assert!(stats.cached_chunks() > 0);
+```
+
+The counts are a point-in-time view and change as further reads populate or evict chunks. A disabled cache, or one over its byte or slot budget, reports fewer or no retained chunks.
+
+### The metadata cache
 
 A cache budget is a number chosen before a single read has happened. `File::metadata_cache_stats` reports what it bought, so the next number is measured rather than guessed. It is the counterpart of HDF5's `H5Fget_mdc_hit_rate` and `H5Fget_mdc_size`, and returns `None` when the open has no metadata cache to report on.
 
@@ -118,49 +157,12 @@ Which figure to read depends on what you are asking:
 
 - **`hit_rate`** is the headline: the fraction of eligible reads served without touching the file. `None` means no eligible read has happened yet, which is not the same as a cache that has missed everything.
 - **`evictions`** is what says a larger budget would help. A disappointing hit rate *with* evictions is a budget too small for the working set; the same hit rate with none is a workload that does not revisit metadata, and raising the budget will not change it.
-- **`oversize_reads`** counts reads turned away for exceeding `max_entry_bytes` before the cache saw them. A file with large fractal heaps or index blocks can be missing from the cache entirely for this reason while the hit rate looks healthy.
+- **`oversize_reads`** counts reads turned away, for exceeding `max_entry_bytes` or the budget itself, before the cache saw them. A file with large fractal heaps or index blocks can be missing from the cache entirely for this reason while the hit rate looks healthy.
 - **`invalidations`** applies to a read-write session: entries dropped because a write overlapped them. Approaching the miss count, it means the session is rewriting the metadata it is caching.
 
 `reset_metadata_cache_stats` clears the counters and evicts nothing, so occupancy carries across it.
 
-Set the budget generously. The store is indexed rather than searched, so a hit costs about the same whether it holds a thousand entries or sixty thousand (136 ns against 161 ns, measured), and an over-large budget costs memory and nothing else. That is also why the crate models the memory budget of `H5AC_cache_config_t` and not its adaptive-resize policy, which exists to spare a caller a choice that is cheap to get right here; see the [property-support reference](../reference/property-support.md#the-metadata-cache-h5pset_mdc_config) for the field-by-field map.
-
-### Per-dataset overrides
-
-To override the chunk cache for a single dataset, open it with `dataset_with_options(name, DatasetAccessProperties)`. This is the analogue of HDF5's per-dataset access property list (`H5Pset_chunk_cache`). The override replaces the file-wide default for that one dataset; other datasets keep the default. A dataset that is read once front-to-back, for instance, gains nothing from caching its decompressed chunks, so you can disable the cache with `ChunkCacheConfig::disabled()`:
-
-```rust
-use hdf5_pure::{ChunkCacheConfig, DatasetAccessProperties, File};
-
-let file = File::open("data.h5").unwrap();
-// This dataset is read once front-to-back: skip caching its decompressed chunks.
-let dapl = DatasetAccessProperties::new().with_chunk_cache(ChunkCacheConfig::disabled());
-let ds = file.dataset_with_options("scan", dapl).unwrap();
-let values = ds.read_f64().unwrap();
-```
-
-`dataset_with_options` is available on both `File` and `Group`. `Dataset::chunk_cache_config()` reports the effective `ChunkCacheConfig` for an opened dataset (the analogue of `H5Pget_chunk_cache`): the per-dataset override when one was supplied, otherwise the file-wide default.
-
-!!! tip
-    `DatasetAccessProperties::new()` inherits every file-wide access default, so you only set what you want to change.
-
-## Confirming cache behavior
-
-To confirm a cache is behaving as configured, `Dataset::chunk_cache_stats()` returns a read-only `ChunkCacheStats` snapshot taken after a read. It reports whether the parsed index is loaded (`index_loaded()`), how many decompressed chunks are retained (`cached_chunks()`), and how many bytes of chunk data are retained (`cached_bytes()`).
-
-```rust
-use hdf5_pure::File;
-
-let file = File::open("data.h5").unwrap();
-let ds = file.dataset("signal").unwrap();
-let _ = ds.read_f64().unwrap();
-let stats = ds.chunk_cache_stats();
-// "signal" here is a chunked dataset, so chunks are retained for reuse;
-// a contiguous or compact dataset has no chunk cache and reports zero.
-assert!(stats.cached_chunks() > 0);
-```
-
-The counts are a point-in-time view and change as further reads populate or evict chunks. A disabled cache, or one over its byte or slot budget, reports fewer or no retained chunks.
+Set the budget generously; the [property-support reference](../reference/property-support.md#the-metadata-cache-h5pset_mdc_config) covers why `H5AC_cache_config_t`'s adaptive-resize policy is not modeled, field by field.
 
 ## Writing without buffering
 

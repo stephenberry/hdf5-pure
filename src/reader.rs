@@ -2680,8 +2680,6 @@ impl File {
     /// }
     ///
     /// let stats = file.metadata_cache_stats().expect("the budget enabled a cache");
-    /// // Evictions with a low hit rate is the case for a larger budget. A low
-    /// // hit rate without them is not, and raising it would not help.
     /// println!("{:?} over {} reads, {} evicted", stats.hit_rate(), stats.reads(), stats.evictions());
     /// # Ok(())
     /// # }
