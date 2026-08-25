@@ -57,6 +57,7 @@ The element type of a dataset comes from the setter you call:
 | `with_f32_data` | IEEE 32-bit float |
 | `with_i8_data` / `with_i16_data` / `with_i32_data` / `with_i64_data` | Signed integers (8/16/32/64-bit) |
 | `with_u8_data` / `with_u16_data` / `with_u32_data` / `with_u64_data` | Unsigned integers (8/16/32/64-bit) |
+| `with_ascii_strings` / `with_strings` | Fixed-width strings, ASCII or UTF-8 |
 
 This is the common subset. Compound, enumeration, array, complex, and object-reference datatypes have their own setters; see [compound and complex types](compound-types.md) for those.
 
@@ -79,6 +80,27 @@ store(&mut fb, "counts", &[1u32, 2, 3]);
 ```
 
 See [Generic I/O](generic-io.md) for the full `with_data` / `read::<T>()` round trip and the list of types implementing `H5Element`.
+
+## Strings
+
+`with_ascii_strings(&[&str])` writes a fixed-width string dataset, sizing the datatype to the longest value and zero-padding the rest. `with_strings` is the same under a UTF-8 charset rather than ASCII. Both return a `Result`, because not every value has a fixed-width HDF5 type to be stored in.
+
+```rust
+use hdf5_pure::FileBuilder;
+
+let mut fb = FileBuilder::new();
+fb.create_dataset("station")
+    .with_ascii_strings(&["north", "s", "east"])
+    .unwrap();
+```
+
+`with_ascii_strings_sized(&[&str], width)` and `with_strings_sized` declare the width instead of deriving it. Reach for those when the values in hand are not all the values the dataset will hold: a dataset can be extended, and a width taken from the first batch leaves a later, longer string with nowhere to go. A value that does not fit the declared width is refused with `FormatError::FixedStringTooLong` rather than stored as a truncated prefix, and a width of zero with `FormatError::ZeroFixedStringWidth`, since no HDF5 string datatype may be zero bytes wide.
+
+The same values written as an attribute (`AttrValue::AsciiString`, `AttrValue::AsciiStringArray`) reach the file under the same encoding, so a value does not change shape by moving between the two.
+
+For strings that should not share a width at all, `with_vlen_strings` writes a variable-length dataset whose payloads live in the file's global heap. Either kind reads back through `Dataset::read_string`, which dispatches on the datatype and trims the padding for you. See [Variable-length strings](vlen-strings.md).
+
+Other paddings (`NULLTERM`, `SPACEPAD`, as `H5T_C_S1` and `H5T_FORTRAN_S1` carry) are left to `with_raw_data` with a hand-built `Datatype::String`.
 
 ## Attributes
 

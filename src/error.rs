@@ -495,6 +495,28 @@ pub enum FormatError {
         /// The heap address space, in bytes.
         limit: u64,
     },
+    /// A fixed-width string dataset was asked for a declared width of zero. No
+    /// HDF5 string datatype may be zero bytes wide: libhdf5 refuses one with
+    /// "invalid datatype size", and it does so while *iterating* the object's
+    /// members, so one such type takes its neighbours down with it.
+    ///
+    /// Only an explicitly requested width raises this. A width *derived* from
+    /// the values — every one of them empty — is one byte rather than zero,
+    /// since the empty string is representable and it was only the datatype
+    /// that was not.
+    ZeroFixedStringWidth,
+    /// An element handed to a fixed-width string dataset is longer than the
+    /// width declared for it. Storing a prefix would read back later as a value
+    /// the caller never wrote, and with no error to say so, which is why this
+    /// refuses rather than truncates.
+    FixedStringTooLong {
+        /// Position of the offending element among the values passed.
+        index: usize,
+        /// That element's length in bytes.
+        len: usize,
+        /// The declared width, in bytes.
+        width: u32,
+    },
 }
 
 /// The largest message a version 2 object header can describe: its per-message
@@ -960,6 +982,19 @@ impl fmt::Display for FormatError {
                     f,
                     "these attributes need more than the {limit}-byte address space of a dense \
                      attribute heap"
+                )
+            }
+            FormatError::ZeroFixedStringWidth => {
+                write!(
+                    f,
+                    "a fixed-width string datatype must be at least one byte wide"
+                )
+            }
+            FormatError::FixedStringTooLong { index, len, width } => {
+                write!(
+                    f,
+                    "string element {index} is {len} bytes, past the {width}-byte width declared \
+                     for the dataset"
                 )
             }
         }
