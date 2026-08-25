@@ -1456,3 +1456,127 @@ fn a_paged_tail_conserves_free_space_across_layouts() {
         );
     }
 }
+
+/// Build `name` as a rank-1, unlimited, chunked i32 dataset of length zero.
+fn create_log(session: &File, name: &str) {
+    session
+        .root()
+        .create_dataset(name, |b| {
+            b.with_i32_data(&[])
+                .with_shape(&[0])
+                .with_chunks(&[1024])
+                .with_maxshape(&[u64::MAX]);
+        })
+        .unwrap();
+    session.commit().unwrap();
+}
+
+/// An immediate [`Dataset::append`] must allocate its chunks out of the free
+/// space a prior commit left, exactly as `create_dataset` + `commit` does
+/// (issue #349). Before the fix the append always extended end-of-file, so the
+/// replacement dataset doubled the file rather than moving into the hole its
+/// predecessor vacated.
+#[test]
+fn immediate_append_reuses_a_freed_hole() {
+    let payload: Vec<i32> = (0..16384).collect();
+    let path = temp_path("hdf5_pure_fs_immediate_append_reuse.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.write(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    create_log(&session, "log");
+    session.dataset("log").unwrap().append(&payload).unwrap();
+    let after_first = std::fs::metadata(&path).unwrap().len();
+
+    // A ceiling above the churned region: without a live object after it, the
+    // deletion below leaves a free run reaching end-of-file that the commit
+    // truncates away, and the test would pass on truncation rather than on reuse.
+    session
+        .root()
+        .create_dataset("ceiling", |b| {
+            b.with_i32_data(&[9, 9, 9]);
+        })
+        .unwrap();
+    session.commit().unwrap();
+
+    session.root().delete("log").unwrap();
+    session.commit().unwrap();
+    let freed = session.space_accounting().unwrap().reusable_free_bytes;
+    assert!(
+        freed >= payload.len() as u64 * 4,
+        "the deleted dataset's chunks should be reusable (only {freed} bytes are)"
+    );
+
+    create_log(&session, "log2");
+    session.dataset("log2").unwrap().append(&payload).unwrap();
+    session.close().unwrap();
+    let after_second = std::fs::metadata(&path).unwrap().len();
+
+    assert!(
+        after_second < after_first + freed / 2,
+        "the second append should have moved into the {freed}-byte hole, not \
+         extended the file (was {after_first}, now {after_second})"
+    );
+    assert_eof_matches_file(&path);
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("log2").unwrap().read_i32().unwrap(), payload);
+    // Reuse must not have written over either survivor.
+    assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), [1, 2, 3]);
+    assert_eq!(
+        file.dataset("ceiling").unwrap().read_i32().unwrap(),
+        [9, 9, 9]
+    );
+}
+
+/// A file that **persists** its free-space managers is the one case an immediate
+/// append must keep extending end-of-file (issue #349).
+///
+/// Its holes are recorded on disk, and only a commit or the close-time rewrite
+/// updates that record. An append has neither: it publishes through its own four
+/// phases and never repoints the superblock, so an append that consumed a
+/// persisted hole and then lost its process would leave a manager offering space
+/// a live chunk occupies, and the next session would allocate over the top of it.
+/// The staged `append_staged` + `commit` remains the way to reuse here.
+///
+/// Asserted as "the persisted free space is still there afterwards" rather than
+/// as a file-size comparison, because it is the *manager* staying truthful that
+/// the carve-out is about.
+#[test]
+fn a_persisting_file_appends_at_end_of_file() {
+    let payload: Vec<i32> = (0..16384).collect();
+    let path = temp_path("hdf5_pure_fs_immediate_append_persisting.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.create_dataset("scratch")
+        .with_i32_data(&vec![7; payload.len()]);
+    b.create_dataset("ceiling").with_i32_data(&[9, 9, 9]);
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.write(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    session.root().delete("scratch").unwrap();
+    session.commit().unwrap();
+    // After the commit that creates the dataset, so the staged path's own
+    // (legitimate) reuse is not counted against the append.
+    create_log(&session, "log");
+    let freed = session.space_accounting().unwrap().reusable_free_bytes;
+    assert!(freed >= payload.len() as u64 * 4, "expected a sizable hole");
+
+    session.dataset("log").unwrap().append(&payload).unwrap();
+    assert_eq!(
+        session.space_accounting().unwrap().reusable_free_bytes,
+        freed,
+        "an immediate append must not spend free space the on-disk managers \
+         still advertise"
+    );
+    session.close().unwrap();
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("log").unwrap().read_i32().unwrap(), payload);
+    let persisted: u64 = file.persisted_free_space().iter().map(|(_, l)| l).sum();
+    assert!(
+        persisted >= freed,
+        "the managers must still describe the untouched hole ({persisted} of {freed})"
+    );
+}

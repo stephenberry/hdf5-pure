@@ -91,6 +91,19 @@
 //! reader follows, which is defined in terms of the header counts rather than the
 //! dimension.
 //!
+//! Inside the engine there is one shape these sweeps cannot reach: an append
+//! that allocates out of *freed* space rather than at end-of-file (issue #349).
+//! A session's free list is populated only by its own commits, and
+//! [`Recording::of`] reads the base file before the window and requires the
+//! session to open inside it — so reaching that branch means bringing a whole
+//! `commit` into the recorded window, which would undo the positioning this
+//! module's own [`WARMUP_ROUNDS`] and [`Recording::assert_positioned`] exist to
+//! guarantee. What the sweeps would be looking for is closed by argument
+//! instead: the barriers are there because an *appended* region sits above the
+//! pointer naming it, and a reused region either sits above it too — the same
+//! case — or below it, where address-ordered gathering already issues the
+//! content first. See [`Store::alloc_raw`](crate::chunk_index_inplace::Store::alloc_raw).
+//!
 //! Outside this engine, nothing is covered: dense attribute heaps, the
 //! Fixed-Array and v2 B-tree chunk indexes, filtered and variable-length chunk
 //! writes, and group link-table growth all publish low-address pointers to

@@ -695,3 +695,65 @@ fn discard_abandons_the_buffer_but_not_what_was_written() {
     }
     assert_eq!(read_i32(&p), (0..4).collect::<Vec<_>>());
 }
+
+/// A `BufferedAppender`'s writes draw on freed space like any other immediate
+/// append (issue #349). It reaches the engine through `Dataset::append`, so this
+/// is true by construction — but the fix's changelog entry names this type, and
+/// a named behaviour is worth an assertion.
+#[test]
+fn a_buffered_appender_writes_into_freed_space() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("d.h5");
+    build(&p, 0, 1024, false);
+    let payload: Vec<i32> = (0..16384).collect();
+
+    let session = File::open_rw(&p).unwrap();
+    // A dataset to vacate, and a live one above it so the deletion leaves a hole
+    // rather than a trailing run the commit truncates away.
+    session
+        .root()
+        .create_dataset("scratch", |b| {
+            b.with_i32_data(&payload);
+        })
+        .unwrap();
+    session
+        .root()
+        .create_dataset("ceiling", |b| {
+            b.with_i32_data(&[9, 9, 9]);
+        })
+        .unwrap();
+    session.commit().unwrap();
+    session.root().delete("scratch").unwrap();
+    session.commit().unwrap();
+
+    let before = session.space_accounting().unwrap().reusable_free_bytes;
+    assert!(
+        before >= payload.len() as u64 * 4,
+        "expected a sizable hole"
+    );
+    {
+        let mut ds = session.dataset("d").unwrap();
+        let mut app = ds.buffered_appender().unwrap();
+        for batch in payload.chunks(100) {
+            app.append(batch).unwrap();
+        }
+        app.finish().unwrap();
+    }
+    let after = session.space_accounting().unwrap().reusable_free_bytes;
+    assert!(
+        after < before / 2,
+        "the buffered appender should have spent the hole ({before} -> {after})"
+    );
+    session.close().unwrap();
+
+    assert_eq!(read_i32(&p), payload);
+    assert_eq!(
+        File::open(&p)
+            .unwrap()
+            .dataset("ceiling")
+            .unwrap()
+            .read_i32()
+            .unwrap(),
+        [9, 9, 9]
+    );
+}
