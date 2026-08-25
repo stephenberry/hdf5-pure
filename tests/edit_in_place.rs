@@ -5256,12 +5256,12 @@ fn a_group_and_a_dataset_replace_each_other() {
             file.dataset("g").unwrap().read_i32().unwrap(),
             vec![4, 5, 6]
         );
-        // `File::group` hands back a handle for any resolvable path without
-        // checking the object's kind, so the group-ness of `g` is judged by
-        // what the handle can do rather than by whether it exists.
+        // `g` names a dataset now, so opening it as a group is refused at the
+        // lookup (issue #352) rather than handed back as a handle whose calls
+        // fail one at a time.
         assert!(
-            file.group("g").unwrap().iter_datasets().is_err(),
-            "`g` still reads as a group"
+            matches!(file.group("g"), Err(Error::NotAGroup(_))),
+            "`g` still opens as a group"
         );
         assert!(file.dataset("g/inner").is_err());
         assert!(file.group("g/sub").is_err());

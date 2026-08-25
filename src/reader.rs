@@ -2303,11 +2303,13 @@ impl File {
     /// relocates object headers, and each handle looks its object up again by
     /// path on its first use afterwards, so a long-lived handle answers for the
     /// file the commit left rather than for the copy it moved away from. Two
-    /// exceptions,
-    /// both of which report rather than answer wrongly. A *read* through a handle
-    /// onto an object the commit deleted fails the way opening it would; its
-    /// write methods still address the file by path, so they stage and the commit
-    /// refuses them. And a handle reached by object reference
+    /// exceptions, both of which report rather than answer wrongly. A *read*
+    /// through a handle onto an object the commit deleted — or replaced with one
+    /// of a different kind, which is
+    /// [`Error::NotADataset`](crate::Error::NotADataset) or
+    /// [`Error::NotAGroup`](crate::Error::NotAGroup) — fails the way opening it
+    /// would; its write methods still address the file by path, so they stage
+    /// and the commit refuses them. And a handle reached by object reference
     /// ([`Dataset::dereference`]) has no path to look up, so it returns
     /// [`Error::StaleHandle`](crate::Error::StaleHandle) — not only after a
     /// commit but after anything staged, synced or torn down, since only an
