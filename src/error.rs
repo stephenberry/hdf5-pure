@@ -988,10 +988,9 @@ pub enum Error {
     /// nothing at all is
     /// [`FormatError::PathNotFound`](crate::FormatError::PathNotFound) instead.
     NotAGroup(String),
-    /// The object at the given path is not a committed (`H5Tcommit`) datatype.
-    /// A dataset carries a datatype message of its own, so this is what a
-    /// by-name datatype lookup reaching one reports rather than that dataset's
-    /// element type.
+    /// The child of the given name is not a committed (`H5Tcommit`) datatype. A
+    /// name that resolves to nothing at all is
+    /// [`FormatError::PathNotFound`](crate::FormatError::PathNotFound) instead.
     NotANamedDatatype(String),
     /// A required header message was not found.
     MissingMessage(crate::message_type::MessageType),

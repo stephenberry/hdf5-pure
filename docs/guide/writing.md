@@ -140,7 +140,7 @@ builder
 
 The naming object still declares its own element type, and the two must agree — `with_i32_data` above against a committed i32. A dataset naming a type it does not match, or a path the file commits nothing at, fails the write rather than producing a file whose element bytes and declared type disagree.
 
-Committed datatypes survive [`repack`](repack.md), but cannot be added to an existing file in place: the in-place engine appends into a fixed layout with nowhere to put the new object. Read them back with `Group::named_datatypes` and `Group::named_datatype`. A name that reaches anything else — a dataset, whose object header carries its element type — is `Error::NotANamedDatatype` rather than that type.
+Committed datatypes survive [`repack`](repack.md), but cannot be added to an existing file in place: the in-place engine appends into a fixed layout with nowhere to put the new object. Read them back with `Group::named_datatypes` and `Group::named_datatype`. A name that reaches anything else, a dataset included, is `Error::NotANamedDatatype`.
 
 ## Empty and zero-dimension datasets
 

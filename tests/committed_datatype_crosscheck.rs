@@ -1059,10 +1059,11 @@ fn an_in_place_edit_refuses_a_committed_datatype() {
 /// committed type, so both names produced the same value, and nothing in the
 /// result said which object had been asked for.
 ///
-/// The classification is taken from `H5O_get_info_by_name`, which is what
-/// `H5Topen` itself gates on, rather than from a list written here: this crate
-/// and the reference library must sort the same file the same way, and only one
-/// of them is ground truth.
+/// The classification is taken from `H5O_get_info_by_name` rather than from a
+/// list written here: it and the `H5O_obj_type` that `H5Topen` gates on bottom
+/// out in the same `H5O__obj_class_real`. This crate and the reference library
+/// must classify the same file the same way, and only one of them is ground
+/// truth.
 #[test]
 fn only_what_the_c_library_calls_a_named_datatype_is_accepted() {
     let _c = c_lib_guard();
@@ -1081,9 +1082,10 @@ fn only_what_the_c_library_calls_a_named_datatype_is_accepted() {
     let ours = File::open(&path).expect("hdf5-pure opens the fixture");
     let root = ours.root();
 
-    let mut named = Vec::new();
+    let (mut named, mut kinds) = (Vec::new(), Vec::new());
     for name in &names {
         let c_says = c_file.loc_type_by_name(name).expect("C library classifies");
+        kinds.push(c_says);
         let got = root.named_datatype(name);
         if c_says == hdf5::LocationType::NamedDatatype {
             named.push(name.clone());
@@ -1106,9 +1108,16 @@ fn only_what_the_c_library_calls_a_named_datatype_is_accepted() {
         }
     }
 
-    // The fixture is only worth this much if it holds all three classes, and the
-    // listing has to agree with the per-name answers above.
-    assert!(names.len() > named.len(), "the fixture holds only types");
-    assert_eq!(root.named_datatypes().unwrap(), named);
+    // The fixture is only worth this much if it holds every class the C library
+    // distinguishes: a check written as "is not a dataset" passes a file with no
+    // group in it. And the listing has to agree with the per-name answers above.
+    for kind in [
+        hdf5::LocationType::Dataset,
+        hdf5::LocationType::Group,
+        hdf5::LocationType::NamedDatatype,
+    ] {
+        assert!(kinds.contains(&kind), "the fixture holds no {kind:?}");
+    }
     assert_eq!(named, ["mytype"]);
+    assert_eq!(root.named_datatypes().unwrap(), named);
 }

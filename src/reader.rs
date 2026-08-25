@@ -3104,9 +3104,7 @@ impl Group {
     /// `name` must be one [`named_datatypes`](Self::named_datatypes) returned: a
     /// name that reaches nothing fails with [`FormatError::PathNotFound`], and
     /// one that reaches an object of another kind fails with
-    /// [`Error::NotANamedDatatype`], the way `H5Topen` does. A dataset is the
-    /// case worth naming: its object header carries a datatype message of its
-    /// own, its element type, and that is not what this returns.
+    /// [`Error::NotANamedDatatype`], the way `H5Topen` does.
     pub fn named_datatype(&self, name: &str) -> Result<Datatype, Error> {
         Ok(self.named_datatype_at(name)?.0)
     }
@@ -3119,9 +3117,9 @@ impl Group {
     /// being reachable by that name. A header that stores no count has exactly
     /// one reference, which is what the format means by omitting the message.
     ///
-    /// `name` is classified as [`named_datatype`](Self::named_datatype)
-    /// classifies it, so a name reaching another kind of object is
-    /// [`Error::NotANamedDatatype`] rather than that object's own count.
+    /// A name reaching anything but a committed datatype is
+    /// [`Error::NotANamedDatatype`], as for
+    /// [`named_datatype`](Self::named_datatype).
     pub fn named_datatype_references(&self, name: &str) -> Result<u32, Error> {
         let (_, hdr) = self.named_datatype_header(name)?;
         let Ok(msg) = find_message(&hdr, MessageType::ObjectReferenceCount) else {
@@ -3138,27 +3136,23 @@ impl Group {
         Ok(u32::from_le_bytes([body[1], body[2], body[3], body[4]]))
     }
 
-    /// The link entry for a child of this group, by name.
-    fn child_entry(&self, name: &str) -> Result<GroupEntry, Error> {
-        self.children()?
-            .into_iter()
-            .find(|e| e.name == name)
-            .ok_or_else(|| Error::Format(FormatError::PathNotFound(name.to_string())))
-    }
-
     /// The object header of a child that is a committed datatype, and its
     /// address.
     ///
     /// The one place the by-name datatype lookups classify what they reached, so
     /// that a child this refuses cannot be one
-    /// [`named_datatypes`](Self::named_datatypes) would list.
+    /// [`named_datatypes`](Self::named_datatypes) would list. Reached the way
+    /// [`group`](Self::group) and [`dataset`](Self::dataset) reach theirs, which
+    /// looks the one name up rather than enumerating the group to find it.
     fn named_datatype_header(&self, name: &str) -> Result<(u64, ObjectHeader), Error> {
-        let entry = self.child_entry(name)?;
-        let hdr = self.file.parse_header(entry.object_header_address)?;
+        let address = self
+            .child_address(name)?
+            .ok_or_else(|| Error::Format(FormatError::PathNotFound(name.to_string())))?;
+        let hdr = self.file.parse_header(address)?;
         if !is_named_datatype(&hdr) {
             return Err(Error::NotANamedDatatype(name.to_string()));
         }
-        Ok((entry.object_header_address, hdr))
+        Ok((address, hdr))
     }
 
     /// The datatype a committed child object holds, and the address of the object
@@ -5598,12 +5592,14 @@ fn has_message(header: &ObjectHeader, msg_type: MessageType) -> bool {
 /// The listing and the by-name lookups share this one predicate so they cannot
 /// disagree about the same child.
 ///
-/// The reference library classifies in the same order, most specific last
-/// (`H5O__obj_class_real` walks its table in reverse: group, then dataset, then
-/// datatype), and this is what `H5Topen` gates on. It reads "is a dataset" as a
-/// datatype beside a *dataspace* where this reads it as a datatype beside a data
-/// layout; every dataset either library writes carries both, so the two rules
-/// part only on a header missing one of them.
+/// The conjunction encodes the precedence the reference library gets from its
+/// ordering: `H5O__obj_class_real` walks `H5O_obj_class_g` in reverse, so it
+/// asks group, then dataset, then datatype, and that is what `H5Topen` gates on.
+/// Two terms are read differently here. It calls a header a dataset for a
+/// datatype beside a *dataspace* where this reads a datatype beside a data
+/// layout, and a group for a symbol table or link info where this counts a bare
+/// link message as well. Every object either library writes carries the messages
+/// that make those agree, so the rules part only on a malformed header.
 fn is_named_datatype(header: &ObjectHeader) -> bool {
     has_message(header, MessageType::Datatype)
         && !has_message(header, MessageType::DataLayout)
@@ -6330,9 +6326,9 @@ mod tests {
     /// Two of these cannot be produced by any writer, here or in the reference
     /// library, which is why this is a predicate test and not another fixture. A
     /// header carrying links *and* a datatype is a group to the C library, which
-    /// tests for a group before a datatype (`H5O__obj_class_real` walks its
-    /// table most-specific-last); a header carrying neither is no object class
-    /// at all, and must not become a datatype by default.
+    /// asks whether it is a group before asking whether it is a datatype; a
+    /// header carrying neither is no object class at all, and must not become a
+    /// datatype by default.
     #[test]
     fn a_committed_datatype_is_a_datatype_that_is_neither_dataset_nor_group() {
         for (label, types, expected) in [
@@ -6367,10 +6363,6 @@ mod tests {
     /// a datatype message. Every dataset does — its element type — so a dataset
     /// answered, and the two entry points disagreed with the
     /// `named_datatypes()` listing about the same child.
-    ///
-    /// The sharp case is a dataset whose element type *is* the committed one:
-    /// `named_datatype` then returned the same value for the dataset's name as
-    /// for the type's, so nothing in the answer said which had been asked for.
     #[test]
     fn a_child_that_is_not_a_committed_datatype_is_refused_by_name() {
         let mut b = FileBuilder::new();
