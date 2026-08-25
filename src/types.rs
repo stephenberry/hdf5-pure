@@ -364,22 +364,23 @@ fn unsigned_attr_value(values: Vec<u64>, scalar: bool, width: u32) -> Option<Att
 ///
 /// A scalar with no elements is `None` too, which is the same answer the caller
 /// gives for a numeric attribute holding fewer bytes than its dataspace
-/// promises: no value would be truthful.
+/// promises: no value would be truthful. It is taken from the first element
+/// without building a vector, since most attributes are scalars and the one
+/// element is the whole value.
 fn narrow_elements<S: Copy, T: TryFrom<S>>(
     values: &[S],
     scalar: bool,
     one: fn(T) -> AttrValue,
     many: fn(Vec<T>) -> AttrValue,
 ) -> Option<AttrValue> {
+    if scalar {
+        return Some(one(T::try_from(*values.first()?).ok()?));
+    }
     let narrowed: Vec<T> = values
         .iter()
         .map(|&v| T::try_from(v).ok())
         .collect::<Option<Vec<T>>>()?;
-    if scalar {
-        Some(one(narrowed.into_iter().next()?))
-    } else {
-        Some(many(narrowed))
-    }
+    Some(many(narrowed))
 }
 
 /// Which family of `AttrValue` variants a variable-length string attribute
