@@ -1190,9 +1190,13 @@ pub(crate) fn patch_vl_refs_masked(
 /// The upper end is the datatype message's own 4-byte size field: no fixed-width
 /// string element can be wider than [`u32::MAX`], so a longer `len` saturates
 /// there rather than wrapping to a small width whose elements would each store a
-/// truncated prefix. Saturating is not itself the answer for such a value —
-/// [`encode_fixed_strings`] then finds it longer than the width and refuses it,
-/// which is the whole handling of a string HDF5 has no fixed-width type for.
+/// truncated prefix. Saturating is not itself an answer for such a value, only a
+/// refusal to corrupt one; what refuses it differs by caller. A dataset's values
+/// then meet [`encode_fixed_strings`], which finds each one longer than the width
+/// and reports it. An attribute never gets that far — the whole message is
+/// capped at [`OBJECT_HEADER_MESSAGE_MAX`](crate::OBJECT_HEADER_MESSAGE_MAX),
+/// which is `u16::MAX` against this `u32::MAX`, so the size check refuses it
+/// long before a width could saturate.
 fn fixed_string_size(len: usize) -> NonZeroU32 {
     // The `unwrap_or` is the empty-string rule above: zero bytes still take one.
     NonZeroU32::new(u32::try_from(len).unwrap_or(u32::MAX)).unwrap_or(NonZeroU32::MIN)
