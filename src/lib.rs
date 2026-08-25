@@ -260,7 +260,7 @@ pub use file_lock::FileLocking;
 
 pub use chunk_cache::{ChunkCacheConfig, ChunkCacheStats};
 
-pub use source::MetadataCacheConfig;
+pub use source::{MetadataCacheConfig, MetadataCacheStats};
 
 #[cfg(feature = "std")]
 pub use vl_data::VlenStringReadOptions;

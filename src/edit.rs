@@ -9178,6 +9178,14 @@ impl crate::source::Source for EditStore<'_> {
     ) -> Result<Vec<u8>, crate::error::FormatError> {
         self.image.read_metadata_at(offset, len)
     }
+
+    fn metadata_cache_stats(&self) -> Option<crate::source::MetadataCacheStats> {
+        self.image.metadata_cache_stats()
+    }
+
+    fn reset_metadata_cache_stats(&self) {
+        self.image.reset_metadata_cache_stats();
+    }
 }
 
 impl Store for EditStore<'_> {
