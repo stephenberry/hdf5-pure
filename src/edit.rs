@@ -14237,6 +14237,13 @@ mod tests {
     /// The comparison is against this same engine with the gathering turned off,
     /// rather than against a recorded number: how many writes a commit needs is
     /// an implementation detail that should be free to fall further.
+    ///
+    /// The figures recorded in the comments below are also quoted in prose this
+    /// test does not check, at twice the datasets: `docs/guide/editing.md` and
+    /// `PendingWrites`'s own documentation both describe this workload at eight,
+    /// where the appends make 184 write calls and issue 184 while the commit
+    /// makes 24 and issues 4. A change that moves the numbers here moves those
+    /// too (issue #346).
     #[test]
     fn gathering_writes_costs_fewer_of_them_and_changes_no_byte() {
         use tempfile::tempdir;
