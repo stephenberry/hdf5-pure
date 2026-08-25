@@ -2556,9 +2556,17 @@ impl File {
     }
 
     /// Resolve a path and return an owned [`Group`] handle.
+    ///
+    /// Returns [`Error::NotAGroup`] if the path names an object that is not a
+    /// group, the way [`dataset`](Self::dataset) returns
+    /// [`Error::NotADataset`] for the mirror case, and
+    /// [`FormatError::PathNotFound`] if it names nothing.
     pub fn group(&self, path: &str) -> Result<Group, Error> {
         let revisions = self.inner.revisions();
         let addr = self.inner.resolve_path(path)?;
+        if !is_group(&self.inner.parse_header(addr)?) {
+            return Err(Error::NotAGroup(path.to_string()));
+        }
         Ok(Group::new(
             self.inner.clone(),
             revisions.at(addr),
@@ -2868,13 +2876,21 @@ impl Group {
     /// that has no path to re-resolve — one an object reference produced — once
     /// a commit has run under it, and the resolution's own error (a
     /// `PathNotFound`, say, for a group a commit deleted) when the path no
-    /// longer names anything.
+    /// longer names anything. A commit that replaces this group with a dataset
+    /// of the same name (issue #305) leaves the path naming something that is
+    /// not a group, and that is [`Error::NotAGroup`](crate::Error::NotAGroup).
     pub(crate) fn header_address(&self) -> Result<u64, Error> {
         let memo = *self.state.read().unwrap_or_else(PoisonError::into_inner);
         if memo.address_revision == self.file.address_revision() {
             return Ok(memo.address);
         }
         let at = self.file.locate(self.path.as_deref(), memo)?;
+        // Checked before it is memoized. The short-circuit above does not
+        // re-check, so an address installed and then refused would be the
+        // answer every later call returns without looking at it again.
+        if !is_group(&self.file.parse_header(at.address)?) {
+            return Err(Error::NotAGroup(self.path.clone().unwrap_or_default()));
+        }
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
         // Two threads can re-resolve at once. The older answer must not land on
         // top of the newer one, or the newer handle would go on serving an
@@ -2884,8 +2900,7 @@ impl Group {
         }
         Ok(at.address)
     }
-    /// Address of this group's object header (base-adjusted, file-absolute).
-    /// Used to resolve object references that point at this group.
+
     /// List the names of datasets in this group.
     ///
     /// To read from the datasets themselves, prefer
@@ -3233,11 +3248,18 @@ impl Group {
     }
 
     /// Get a subgroup within this group by name.
+    ///
+    /// Returns [`Error::NotAGroup`] if the child is not a group, the way
+    /// [`dataset`](Self::dataset) returns [`Error::NotADataset`] for the mirror
+    /// case, and [`FormatError::PathNotFound`] if there is no such child.
     pub fn group(&self, name: &str) -> Result<Group, Error> {
         let revisions = self.file.revisions();
         let address = self
             .child_address(name)?
             .ok_or_else(|| Error::Format(FormatError::PathNotFound(name.to_string())))?;
+        if !is_group(&self.file.parse_header(address)?) {
+            return Err(Error::NotAGroup(name.to_string()));
+        }
         Ok(Group::new(
             self.file.clone(),
             revisions.at(address),
@@ -6017,6 +6039,117 @@ mod tests {
             (0, 0),
             "a read must not tell every handle its memo has expired"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Opening an object as the wrong kind (issue #352)
+    // -----------------------------------------------------------------------
+
+    /// The issue: a by-name group lookup took whatever the name resolved to.
+    /// `H5Gopen` fails on a non-group, and so must this — at the lookup, where
+    /// the caller can act on it, rather than at some later call on a handle that
+    /// was never a group.
+    ///
+    /// The refusal matters most on the calls that did *not* fail: `attrs()`
+    /// through such a handle answered with the dataset's attributes, which is a
+    /// wrong answer rather than an error.
+    #[test]
+    fn opening_a_dataset_as_a_group_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong_kind.h5");
+        revalidation_fixture(&path);
+        let file = File::open(&path).unwrap();
+
+        // Both by-name forms: from the file by path, and from a group by child
+        // name. Each has its own lookup, and each was missing the check.
+        assert!(
+            matches!(file.group("plain"), Err(Error::NotAGroup(ref p)) if p == "plain"),
+            "File::group answered {:?}",
+            file.group("plain").map(|_| "a group"),
+        );
+        assert!(
+            matches!(file.root().group("plain"), Err(Error::NotAGroup(ref n)) if n == "plain"),
+            "Group::group answered {:?}",
+            file.root().group("plain").map(|_| "a group"),
+        );
+
+        // A name that resolves to nothing stays distinct from one that resolves
+        // to the wrong kind: the second reports what is there.
+        assert!(matches!(
+            file.group("absent"),
+            Err(Error::Format(FormatError::PathNotFound(_)))
+        ));
+        assert!(matches!(
+            file.root().group("absent"),
+            Err(Error::Format(FormatError::PathNotFound(_)))
+        ));
+
+        // And a real group still opens, by either form and at either depth.
+        assert!(file.group("g").is_ok());
+        assert!(file.root().group("g").is_ok());
+        assert!(file.group("g").unwrap().datasets().is_ok());
+    }
+
+    /// A committed datatype is neither a dataset nor a group, so it separates
+    /// "is a group" from "is not a dataset" — a check written as the latter
+    /// would let this one through.
+    #[test]
+    fn opening_a_named_datatype_as_a_group_is_refused() {
+        let mut b = FileBuilder::new();
+        b.commit_datatype("mytype", crate::make_i32_type());
+        let file = File::from_bytes(b.finish().unwrap()).unwrap();
+
+        assert_eq!(file.root().named_datatypes().unwrap(), vec!["mytype"]);
+        assert!(matches!(file.group("mytype"), Err(Error::NotAGroup(_))));
+        assert!(matches!(
+            file.root().group("mytype"),
+            Err(Error::NotAGroup(_))
+        ));
+    }
+
+    /// The mirror of [`a_handle_whose_path_becomes_a_group_keeps_refusing`]: a
+    /// commit can leave a live group handle's path naming a dataset (issue
+    /// #305), which is the one way past the lookup check above. The handle
+    /// re-resolves, finds the wrong kind, and reports it on every call rather
+    /// than serving the dataset's header as a group's.
+    #[test]
+    fn a_group_handle_whose_path_becomes_a_dataset_keeps_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaced_group.h5");
+        revalidation_fixture(&path);
+
+        let file = File::open_rw(&path).unwrap();
+        let group = file.group("g").unwrap();
+        assert!(group.datasets().unwrap().is_empty());
+
+        file.root().delete("g").unwrap();
+        file.root()
+            .create_dataset("g", |b| {
+                b.with_i32_data(&[7]);
+            })
+            .unwrap();
+        file.commit().unwrap();
+
+        for call in 1..=3 {
+            // `attrs` first and every time round: it is the call that answered
+            // with the dataset's attributes instead of failing.
+            assert!(
+                matches!(group.attrs(), Err(Error::NotAGroup(ref p)) if p == "g"),
+                "call {call} answered {:?}",
+                group.attrs()
+            );
+            assert!(matches!(group.datasets(), Err(Error::NotAGroup(_))));
+            assert!(matches!(group.groups(), Err(Error::NotAGroup(_))));
+            assert!(matches!(
+                group.dataset("anything"),
+                Err(Error::NotAGroup(_))
+            ));
+        }
+
+        // The path still names something, and that something still opens as
+        // what it now is.
+        assert_eq!(file.dataset("g").unwrap().read_i32().unwrap(), vec![7]);
+        file.close().unwrap();
     }
 
     /// Read everything a read-write file can serve through the paired read
