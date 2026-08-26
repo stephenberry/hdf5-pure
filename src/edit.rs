@@ -161,10 +161,11 @@
 //! space of the page type it is placing, so reuse cannot make metadata and raw
 //! data share a page — except from pages that are *wholly* free, which hold
 //! nothing of either type to be mixed with and so may be opened for whichever
-//! type asks ([`PagedEdit::alloc_typed`]). Every free-space rewrite a paged
-//! commit performs is placed through that same allocator where anything fits,
-//! rather than into a page of its own, which is what keeps a delete-and-recreate
-//! workload from growing a page per commit (issue #286).
+//! type asks ([`PagedEdit::alloc_typed`]). The free-space rewrite a commit
+//! performs is placed through the same allocator where anything fits, rather than
+//! at end-of-file (which on a paged file costs a page of its own), and that is
+//! what keeps a delete-and-recreate workload from growing by a tail per commit
+//! (issue #286 for the paged tail, issue #358 for the flat one).
 //!
 //! Reclaim is best-effort and conservative. Contiguous and chunked datasets
 //! (chunk index plus chunk data) and whole group subtrees are reclaimed; a
@@ -195,10 +196,11 @@
 //! at), and each commit rewrites those managers, so freed regions survive
 //! close/reopen and are reused across sessions — by this crate and the reference
 //! C library alike. A persisting commit *retains* freed space (recording it on
-//! disk) rather than truncating it; the blocks holding the managers are appended
-//! past all live data and the superblock is repointed last, so a crash before the
-//! repoint leaves the prior file wholly intact. Whole-file compaction that
-//! reclaims every hole at once is still the separate repack path.
+//! disk) rather than truncating it; the blocks holding the managers go into space
+//! an earlier commit freed, or past all live data when none fits, and the
+//! superblock is repointed last, so a crash before the repoint leaves the prior
+//! file wholly intact. Whole-file compaction that reclaims every hole at once is
+//! still the separate repack path.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -242,7 +244,7 @@ use crate::filters::{ChunkContext, FilterScratch, compress_chunk_with, decompres
 use crate::free_space::FreeList;
 use crate::free_space_manager::{
     self, FreeSection, FsmHeader, PageType, PagedManagerPlan, SECT_CLASS_SIMPLE, align_up,
-    free_sections, fshd_len, plan_paged_managers, serialize_file_fsm,
+    file_fsm_blocks_len, free_sections, fshd_len, plan_paged_managers, serialize_file_fsm,
 };
 use crate::group_v2::resolve_group_entries_from_source;
 use crate::image::{FileImage, HandleImage, MirrorImage, WriteBuffering};
@@ -2921,10 +2923,12 @@ impl WriteEngine {
     /// for detecting pending work.
     ///
     /// On a paged file (`H5F_FSPACE_STRATEGY_PAGE`) the reported regions are the
-    /// union of the per-page-type managers. They are recorded and handed back to
-    /// the reference library, but a commit does not draw on them: a hole belongs
-    /// to one page type, and reusing it for the other kind of allocation would
-    /// re-mix its page, so such a commit appends instead.
+    /// union of the per-page-type managers, which a commit draws on under the rule
+    /// paging exists for: an allocation takes a hole of the page type it is placing,
+    /// or whole pages that are free of both, so reuse never re-mixes a page
+    /// (issue #261). Space whose page type this file does not settle is recorded
+    /// and handed back to the reference library but never spent, and is excluded
+    /// from the reusable figure.
     ///
     /// ```no_run
     /// use hdf5_pure::File;
@@ -3115,27 +3119,34 @@ impl WriteEngine {
         self.image.sync_all()
     }
 
-    /// Rewrite the on-disk free-space managers into canonical (manager-at-tail)
-    /// shape for a file that persists them, if this session left them stale.
+    /// Rewrite the on-disk free-space managers for a file that persists them, if
+    /// this session left them stale.
     ///
-    /// Immediate in-place appends grow the file at end-of-file, which pushes the
-    /// managers into the middle of it with live data after them. A staged
-    /// [`commit`](Self::commit) re-homes them as part of its tail, but a session
+    /// Immediate in-place appends grow the file past the managers, leaving them
+    /// describing a length the file no longer has. A staged
+    /// [`commit`](Self::commit) rewrites them as part of its tail, but a session
     /// that only appends never runs one, so [`File::close`](crate::File::close)
     /// and `FileInner::drop` call this instead. It is the same tail the commit
-    /// writes — appended past everything live, with the superblock repoint as the
+    /// writes — placed in space an earlier commit freed, or appended past
+    /// everything live when none fits, with the superblock repoint as the
     /// crash-atomic linearization point — with nothing to free and the root
     /// unchanged.
+    ///
+    /// Where those blocks end up is not something a reader has to care about, and
+    /// after this change usually is not end-of-file: a file with free space to
+    /// spend has its managers inside it, above and below live data alike. What has
+    /// to hold is that they describe the file as it now stands, which is what makes
+    /// this call's own writes the last the session issues.
     ///
     /// A no-op for a non-persisting file, and skipped when the file has not grown
     /// past the managers since they were last written, so an unchanged session
     /// never grows the file.
     ///
     /// If a session that grew the file ends without `close` or `drop` running (a
-    /// true crash — `SIGKILL`, power loss), the managers are left mid-file. Every
-    /// append was durable and crash-atomic, so no data is lost, and both this
-    /// crate and the reference C library reopen the file and read it correctly;
-    /// the managers are simply non-canonical until a clean rewrite.
+    /// true crash — `SIGKILL`, power loss), the managers are left describing the
+    /// shorter file. Every append was durable and crash-atomic, so no data is lost,
+    /// and both this crate and the reference C library reopen the file and read it
+    /// correctly; the managers simply under-report until a clean rewrite.
     pub(crate) fn finalize_persist(&mut self) -> Result<(), Error> {
         if self.persist.is_none() || self.image.len() == self.fsm_len {
             return Ok(());
@@ -5202,7 +5213,8 @@ impl WriteEngine {
         retain_disjoint_in_bounds(&mut to_free, self.image.len());
 
         // A persisting file keeps its freed space recorded on disk rather than
-        // truncating it away, so its commit takes a different, append-only tail.
+        // truncating it away, so its commit takes a different tail: one that
+        // rewrites the on-disk managers rather than only repointing the superblock.
         if self.persist.is_some() {
             self.commit_persisting(new_root, to_free)?;
             return self.repoint_stored_references(&relocations);
@@ -5330,11 +5342,19 @@ impl WriteEngine {
     /// The post-commit free list (this commit's vacated regions plus the now-dead
     /// old free-space-manager and extension blocks) is serialized into a fresh
     /// `FSHD`/`FSSE` pair and a rewritten superblock-extension File Space Info
-    /// message, all appended at the current end-of-file. Nothing live or
-    /// still-referenced is overwritten: the new blocks sit strictly past the old
-    /// ones, and the superblock — repointed last — is the linearization point. A
-    /// crash before it leaves the prior file (root, extension, and managers)
-    /// wholly intact.
+    /// message. The three are written as one contiguous tail, placed in space an
+    /// *earlier* commit freed where it fits ([`flat_tail_layout`](Self::flat_tail_layout))
+    /// and appended at end-of-file where it does not. Nothing live or
+    /// still-referenced is overwritten either way, and the superblock — repointed
+    /// last — is the linearization point, so a crash before it leaves the prior
+    /// file (root, extension, and managers) wholly intact.
+    ///
+    /// The tail used to always append. Every commit then grew the file by one
+    /// tail and freed its predecessor's, so a delete-and-recreate workload grew
+    /// without bound while reporting all of that as reusable — the same defect
+    /// [`commit_persisting_paged`](Self::commit_persisting_paged) had for its own
+    /// tail (issue #286), on the strategy the paged one was measured against
+    /// (issue #358).
     fn commit_persisting(
         &mut self,
         new_root: u64,
@@ -5362,23 +5382,6 @@ impl WriteEngine {
             )
         };
 
-        // The free list the new managers will record: this commit's vacated
-        // regions plus the superseded FSM/extension blocks (dead once we
-        // repoint), coalesced. Built in a temp so `self.free` and the on-disk old
-        // blocks stay untouched until after the superblock repoint.
-        let mut post = self.free.clone();
-        for &(a, l, _) in &to_free {
-            post.free(a, l);
-        }
-        for &(a, l) in &old_blocks {
-            post.free(a, l);
-        }
-        let sections: Vec<FreeSection> = post
-            .sections()
-            .into_iter()
-            .map(|(addr, size)| FreeSection { addr, size })
-            .collect();
-
         let old_ext_rel = self
             .superblock
             .superblock_extension_address
@@ -5398,29 +5401,47 @@ impl WriteEngine {
             build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &placeholder)?)?
                 .len() as u64;
 
-        let ext_addr = self.image.len();
+        // Place the tail — the rewritten extension and the manager blocks — in a
+        // hole an *earlier* commit freed where one fits, and at end-of-file where
+        // none does. `self.free` holds only durable free space (this commit's own
+        // frees stay in `to_free` until the repoint), so a reused span holds bytes
+        // already unreachable from the on-disk root, which is the guarantee
+        // [`reserve`](Self::reserve) rests on too.
+        let (post, placed_at, tail_len) = self.flat_tail_layout(&to_free, &old_blocks, ext_len, os);
+        let reused = placed_at.is_some();
+        let ext_addr = placed_at.unwrap_or_else(|| self.image.len());
+        let sections = free_sections(&post);
         let fshd_addr = ext_addr + ext_len;
+        let fsse_addr = fshd_addr + fshd_len(os);
+        // A reused tail sits inside the file, which keeps the end-of-file where
+        // this commit's writes left it; an appended one ends the file.
+        let final_eof = if reused {
+            self.image.len()
+        } else {
+            ext_addr + tail_len
+        };
 
         // Build the real extension and the FSM blocks. With no free space to
         // record we still refresh the extension (persist on, managers undefined).
-        let (ext_oh, fsm_blocks, final_eof) = if sections.is_empty() {
+        let (ext_oh, fsm_blocks) = if sections.is_empty() {
             let info = FileSpaceInfo::persistent_empty(strategy, threshold, page_size);
             let ext_oh =
                 build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?)?;
-            let final_eof = ext_addr + ext_oh.len() as u64;
-            (ext_oh, None, final_eof)
+            (ext_oh, None)
         } else {
-            let fsse_addr = fshd_addr + fshd_len(os);
             // `eoa_pre_fsm` is the end-of-allocation before the free-space-manager
             // section blocks (`FSHD`/`FSSE`) were allocated: a consumer may shrink
-            // back to here and rebuild them. It points at the FSHD, not the
-            // extension — the extension sits below it and persists, so shrinking
-            // leaves the superblock and its extension pointer valid (only the
-            // manager blocks, which are rewritten every commit, are discarded).
-            // This matches the C library's convention of keeping the superblock
-            // extension stable across closes, and is the value `H5Fget_freespace`
-            // accounts for correctly (verified in the crosscheck).
-            let eoa_pre_fsm = fshd_addr;
+            // back to here and rebuild them. For an appended tail that is the FSHD,
+            // not the extension — the extension sits below it and persists, so
+            // shrinking leaves the superblock and its extension pointer valid (only
+            // the manager blocks, which are rewritten every commit, are discarded).
+            // A tail placed *inside* the file gave the allocation back nothing to
+            // shrink, so it records the end-of-allocation itself. Either way it is
+            // defined, which a persisting file's message must be or an
+            // assertion-enabled libhdf5 aborts on open (issue #178), and is the
+            // value `H5Fget_freespace` accounts for correctly (verified in the
+            // crosscheck).
+            let eoa_pre_fsm = if reused { final_eof } else { fshd_addr };
             let info = FileSpaceInfo::persistent_single_manager(
                 strategy,
                 threshold,
@@ -5430,29 +5451,32 @@ impl WriteEngine {
             );
             let ext_oh =
                 build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?)?;
-            debug_assert_eq!(
-                ext_oh.len() as u64,
-                ext_len,
-                "extension length must be stable across the placeholder and real messages"
-            );
             let (fshd, fsse) =
                 serialize_file_fsm(&sections, fshd_addr, fsse_addr, os, SECT_CLASS_SIMPLE);
-            let final_eof = fsse_addr + fsse.len() as u64;
-            (ext_oh, Some((fshd, fsse)), final_eof)
+            (ext_oh, Some((fshd, fsse)))
         };
+        // Both forms of the message carry the same twelve manager slots, so either
+        // one measures what the placeholder did. The tail was reserved for that
+        // length, and the manager blocks are placed after it.
+        debug_assert_eq!(
+            ext_oh.len() as u64,
+            ext_len,
+            "extension length must be stable across the placeholder and real messages"
+        );
 
-        // Append the extension, then the FSM blocks, at end-of-file. They are
-        // unreferenced until the superblock repoint, so a crash here is harmless.
-        let written_ext = self.append(&ext_oh)?;
-        debug_assert_eq!(written_ext, ext_addr);
-        let mut new_old_blocks = vec![(ext_addr, ext_oh.len() as u64)];
+        // Write the extension, then the FSM blocks. Both forms are safe against a
+        // crash here: an appended tail is past everything live, a reused one sits
+        // in space an earlier commit freed, and neither is referenced until the
+        // repoint below.
+        let region = (ext_addr, tail_len);
+        self.write_tail_block(region, ext_addr, &ext_oh)?;
         if let Some((fshd, fsse)) = fsm_blocks {
-            let wf = self.append(&fshd)?;
-            debug_assert_eq!(wf, fshd_addr);
-            new_old_blocks.push((fshd_addr, fshd.len() as u64));
-            let ws = self.append(&fsse)?;
-            new_old_blocks.push((ws, fsse.len() as u64));
+            self.write_tail_block(region, fshd_addr, &fshd)?;
+            self.write_tail_block(region, fsse_addr, &fsse)?;
         }
+        // Exactly the bytes written, contiguous from the extension, which is what
+        // the next commit supersedes.
+        let new_old_blocks = vec![(ext_addr, tail_len)];
 
         // Barrier, then repoint the superblock (root, eof, and the new extension)
         // — the linearization point — and sync it.
@@ -5480,10 +5504,121 @@ impl WriteEngine {
             page_size,
             old_blocks: new_old_blocks,
         });
-        // The managers now sit at the tail, so nothing is owed until the file
-        // grows past them again.
+        // The managers describe the file at this length, so nothing is owed until
+        // it grows past them again.
         self.fsm_len = self.image.len();
         Ok(())
+    }
+
+    /// The free space a flat persisting commit is about to record: the session's
+    /// durable list plus the regions this commit vacated and the superseded
+    /// extension and manager blocks, which are dead once the superblock is
+    /// repointed.
+    ///
+    /// Returned as a temporary rather than folded into the session, for the reason
+    /// [`paged_post_free`](Self::paged_post_free) does the same: every region
+    /// gathered here is still *live* until that repoint, and everything in between
+    /// can fail, so a session that believed them free after a failed commit would
+    /// hand them out over the objects still occupying them.
+    ///
+    /// Called once to *size* the tail and again for each round its placement takes
+    /// to settle, since what remains free depends on the space the tail has drawn
+    /// for itself ([`flat_tail_layout`](Self::flat_tail_layout)).
+    fn flat_post_free(
+        &self,
+        to_free: &[(u64, u64, PageType)],
+        old_blocks: &[(u64, u64)],
+    ) -> FreeList {
+        let mut post = self.free.clone();
+        // A flat file keeps one list for the whole of it, so the page type each
+        // freed region carries for the paged path is not consulted here.
+        for &(a, l, _) in to_free {
+            post.free(a, l);
+        }
+        for &(a, l) in old_blocks {
+            post.free(a, l);
+        }
+        post
+    }
+
+    /// Reserve free space for a flat persisting commit's tail, returning the free
+    /// list the tail leaves behind, the address it got — `None` when nothing
+    /// reusable fits, which is the caller's cue to append — and its length, which
+    /// the caller needs either way.
+    ///
+    /// The reservation and the length define each other, exactly as they do for the
+    /// paged tail ([`tail_layout`](Self::tail_layout)): drawing bytes out of the
+    /// free list changes the very sections the manager blocks record, and a
+    /// different section set is a different length. This proposes a length, sizes
+    /// the blocks against the list as it stands once that length is taken, and
+    /// accepts any plan that *fits*. A longer plan is refused — it would write past
+    /// the reservation into live bytes — and the proposal becomes the length that
+    /// plan asked for, which is the natural next candidate.
+    ///
+    /// A plan **shorter** than its reservation is accepted, and the reservation
+    /// rather than the plan is what the tail extent covers, so those spare bytes
+    /// are freed with the rest of the tail when the next commit supersedes it.
+    /// Rejecting them instead is what the paged tail does, and it can afford to:
+    /// its fallback is a fresh page, recorded in full. Here the fallback is
+    /// end-of-file, and the two lengths genuinely need not meet — best fit picks a
+    /// different hole as the proposal crosses a hole's size, and the pair can
+    /// oscillate by one section record indefinitely. Measured on the workload
+    /// `persisting_churn_reaches_a_steady_size` runs, insisting on an exact fit sent
+    /// about one commit in eight to end-of-file, which is the growth this exists to
+    /// stop.
+    ///
+    /// What that costs is bounded and small: a commit that takes spare bytes and is
+    /// then the last of its session leaves them behind, since a reopened session
+    /// reconstructs the tail extent from the blocks themselves
+    /// ([`load_persisted_free_space`](Self::load_persisted_free_space)) and cannot
+    /// see a reservation that outlived the process. The spare is a section record
+    /// and, where the reservation emptied a size group, that group's own header
+    /// too — tens of bytes, once per session, against a whole tail on one commit in
+    /// eight.
+    ///
+    /// Iteration is capped rather than trusted to converge: the length is a step
+    /// function of the section set, so a proposal can in principle keep growing.
+    /// Appending is always available and always correct, so giving up costs space
+    /// rather than a guarantee — and the cap bounds the work, since each round
+    /// clones the free list and sizes the section list for real.
+    ///
+    /// Draws from `self.free` before anything is written, which
+    /// [`commit`](Self::commit) puts back if the attempt then fails. The one caller
+    /// that does not snapshot is [`finalize_persist`](Self::finalize_persist), whose
+    /// failure leaves this session's list short by the reservation — in memory only,
+    /// on a session already being torn down, with the on-disk managers unchanged.
+    fn flat_tail_layout(
+        &mut self,
+        to_free: &[(u64, u64, PageType)],
+        old_blocks: &[(u64, u64)],
+        ext_len: u64,
+        os: u8,
+    ) -> (FreeList, Option<u64>, u64) {
+        /// Enough rounds for the section set to settle after a reservation shrinks
+        /// it, without letting a proposal that keeps growing spin.
+        const ROUNDS: usize = 4;
+
+        // The first proposal: what the tail would measure with nothing reserved.
+        // A manager block's length depends only on the sections it records, never
+        // on where it sits. It is also the answer for a tail that ends up appended,
+        // since every round hands its reservation back before this returns.
+        let probe = self.flat_post_free(to_free, old_blocks);
+        let appended_len = ext_len + file_fsm_blocks_len(&free_sections(&probe), os);
+        let mut proposed = appended_len;
+
+        for _ in 0..ROUNDS {
+            let Some(at) = self.free.alloc(proposed) else {
+                break;
+            };
+            let post = self.flat_post_free(to_free, old_blocks);
+            let len = ext_len + file_fsm_blocks_len(&free_sections(&post), os);
+            if len <= proposed {
+                return (post, Some(at), proposed);
+            }
+            self.free.free(at, proposed);
+            proposed = len;
+        }
+        (probe, None, appended_len)
     }
 
     /// Commit tail for a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`, issue
@@ -5561,8 +5696,10 @@ impl WriteEngine {
         // ordinary run of metadata, in a hole an *earlier* commit freed where one
         // fits. That is what stops a file under delete-and-recreate churn from
         // growing: every commit frees its predecessor's tail exactly, so in the
-        // steady state each tail lands in the hole the one before it left, and the
-        // file never has to open a page for it (issue #286). `pg`'s lists hold only
+        // steady state a tail lands in a hole an earlier one vacated — the one two
+        // commits back, since a tail is freed into `pg`'s lists only at the repoint
+        // that follows its successor — and the file never has to open a page for it
+        // (issue #286). `pg`'s lists hold only
         // durable free space — this commit's own frees stay in `to_free` until the
         // repoint — so the bytes overwritten are already unreachable from the
         // on-disk root, the guarantee [`reserve`](Self::reserve) relies on.
@@ -5691,8 +5828,8 @@ impl WriteEngine {
             page_size,
             old_blocks: new_old_blocks,
         });
-        // The managers now sit at the tail, so nothing is owed until the file
-        // grows past them again.
+        // The managers describe the file at this length, so nothing is owed until
+        // it grows past them again.
         self.fsm_len = self.image.len();
         Ok(())
     }
@@ -5871,19 +6008,19 @@ impl WriteEngine {
         None
     }
 
-    /// Write one block of a paged commit's tail at the address its plan gave it,
-    /// which is either the current end-of-file (the tail is being appended) or
-    /// inside `region` — the span reserved from the free lists — when the tail is
-    /// being reused into space an earlier commit left.
+    /// Write one block of a persisting commit's tail — paged or flat — at the
+    /// address its layout gave it, which is either the current end-of-file (the
+    /// tail is being appended) or inside `region`, the span reserved from the free
+    /// lists, when the tail is being reused into space an earlier commit left.
     ///
     /// The region is checked rather than asserted, for the reason
     /// [`place`](Self::place) checks its own reservation: a reused span is followed
     /// by live bytes, so a block running past it would silently destroy a
     /// neighboring object, and this is the one write in a commit that lands in the
-    /// middle of a live file. `blocks_len` is derived from the same plan that
-    /// placed these blocks, so the two cannot disagree today; the comparison is
-    /// what keeps that true if the plan ever learns a length this sizing does not
-    /// model.
+    /// middle of a live file. The region's length is derived from the same layout
+    /// that placed these blocks, so the two cannot disagree today; the comparison
+    /// is what keeps that true if a layout ever learns a length this sizing does
+    /// not model.
     fn write_tail_block(
         &mut self,
         region: (u64, u64),
@@ -5893,7 +6030,7 @@ impl WriteEngine {
         let (start, len) = region;
         if addr < start || addr + bytes.len() as u64 > start + len {
             return Err(Error::Format(FormatError::SerializationError(format!(
-                "a paged commit's tail reserved [{start}, {}) but placed {} bytes at {addr}",
+                "a commit's tail reserved [{start}, {}) but placed {} bytes at {addr}",
                 start + len,
                 bytes.len()
             ))));
@@ -12595,6 +12732,106 @@ mod tests {
             placed > 0,
             "the sweep must reach holes the tail can actually use, or it asserts \
              nothing about placement"
+        );
+    }
+
+    /// A flat commit's tail removes from the free list exactly the bytes its
+    /// recorded extent covers — no more, and nothing at all when it declines to
+    /// place itself.
+    ///
+    /// The flat tail accepts a plan *shorter* than its reservation where the paged
+    /// one refuses ([`WriteEngine::flat_tail_layout`] says why), so this is the
+    /// invariant that keeps those spare bytes from leaking: what the layout hands
+    /// back as the tail's length is the whole reservation, which the commit records
+    /// as the extent to free when the next one supersedes it. Returning the plan's
+    /// length instead would retire the difference from the free list with nothing
+    /// recording it — issue #286 again, a few bytes at a time.
+    ///
+    /// Swept over hole sizes rather than a chosen one, for the reason the paged
+    /// sweep gives: the length the tail proposes is a property of the file and its
+    /// free list, and best fit takes a hole of exactly that length outright, which
+    /// drops a section from the managers and is what makes the plan come out
+    /// shorter than the reservation in the first place.
+    #[test]
+    fn a_flat_tail_takes_exactly_the_extent_it_records() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        /// Any plausible extension length exercises the same arithmetic; the real
+        /// one is settled by the commit, which is not what is under test here.
+        const EXT_LEN: u64 = 100;
+        /// Any address does: the layout only ever asks the free list for a length.
+        const HOLE_AT: u64 = 512;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("flat_tail_exact.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..4000).collect::<Vec<i32>>())
+            .with_shape(&[4000]);
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+        b.write(&path).unwrap();
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        let os = s.superblock.offset_size;
+
+        let free_total =
+            |s: &WriteEngine| -> u64 { s.free.sections().into_iter().map(|(_, len)| len).sum() };
+
+        let (mut placed, mut declined, mut with_slack) = (0usize, 0usize, 0usize);
+        for hole in 120..420u64 {
+            s.free = FreeList::new();
+            s.free.free(HOLE_AT, hole);
+            let free_before = free_total(&s);
+            let (post, at, tail_len) = s.flat_tail_layout(&[], &[], EXT_LEN, os);
+            let free_after = free_total(&s);
+            // The blocks the commit will write into the extent it was handed. A hole
+            // consumed outright drops a section from the managers, so this comes out
+            // shorter than the extent for some hole sizes and the difference is what
+            // the extent has to cover.
+            let written = EXT_LEN + file_fsm_blocks_len(&free_sections(&post), os);
+            match at {
+                Some(at) => {
+                    placed += 1;
+                    assert_eq!(
+                        free_before - free_after,
+                        tail_len,
+                        "hole {hole}: the tail took {} bytes at {at} for an extent of \
+                         {tail_len}",
+                        free_before - free_after
+                    );
+                    if written < tail_len {
+                        with_slack += 1;
+                    }
+                }
+                None => {
+                    declined += 1;
+                    assert_eq!(
+                        free_after, free_before,
+                        "hole {hole}: a tail that declines to place itself must hand \
+                         back everything it tried"
+                    );
+                    assert_eq!(
+                        tail_len, written,
+                        "hole {hole}: a tail with nowhere to go is appended, and the \
+                         length it reports is what it will write there"
+                    );
+                }
+            }
+        }
+        assert!(
+            placed > 0,
+            "the sweep must reach holes the tail can actually use, or it asserts \
+             nothing about placement"
+        );
+        assert!(
+            declined > 0,
+            "the sweep must reach holes too small for the tail, or the rule about \
+             handing back a failed attempt is never exercised"
+        );
+        assert!(
+            with_slack > 0,
+            "the sweep must reach a hole the tail does not fill exactly, or the \
+             rule about spare bytes is never exercised"
         );
     }
 

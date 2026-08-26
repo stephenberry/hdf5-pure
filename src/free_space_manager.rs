@@ -253,6 +253,22 @@ pub(crate) fn serialize_file_fsm(
     (fshd, fsse)
 }
 
+/// The bytes one file free-space manager's blocks (`FSHD` + `FSSE`) take to record
+/// `sections`, or none at all for an empty list — a file with nothing free records
+/// no manager and leaves the message's addresses undefined.
+///
+/// The flat counterpart of [`plan_paged_managers`], which answers the same question
+/// for a paged file's several managers and places them as well. Both depend only on
+/// the sections' count and sizes, never on their addresses, which is what lets a
+/// commit size its tail before it knows where the tail will sit.
+pub(crate) fn file_fsm_blocks_len(sections: &[FreeSection], offset_size: u8) -> u64 {
+    if sections.is_empty() {
+        return 0;
+    }
+    let sizes: Vec<u64> = sections.iter().map(|s| s.size).collect();
+    fshd_len(offset_size) + fsse_len(&sizes, offset_size)
+}
+
 /// The fixed serialized byte length of an `FSHD` header for the given offset size
 /// (82 bytes for standard 8-byte offsets).
 pub(crate) fn fshd_len(offset_size: u8) -> u64 {

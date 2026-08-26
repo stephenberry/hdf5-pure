@@ -99,6 +99,8 @@ Passing `persist = true` records that freed space should be tracked on disk acro
 
 `File::persisted_free_space()` returns the tracked free regions as `(address, length)` pairs sorted by address, and a read-write session seeds its free list from them so reuse spans sessions rather than just the open session.
 
+Every commit rewrites those manager blocks, and they are themselves placed in free space where any fits, so a file under delete-and-recreate churn settles at a steady size instead of gaining a set of managers per commit.
+
 ```rust
 use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
 

@@ -9,7 +9,7 @@
 
 use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
 use hdf5_pure::{
-    AttrValue, File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy,
+    AttrValue, File, FileAccessProperties, FileBuilder, FileSpaceStrategy, Layout, MemoryStrategy,
 };
 
 /// Open with the bounded engine demanded rather than merely preferred: these
@@ -224,6 +224,135 @@ fn c_library_reads_our_persisted_free_space() {
     assert!(
         free_c >= 1600,
         "C library loads our free-space managers and reports the freed space (got {free_c})"
+    );
+}
+
+#[test]
+fn c_library_reads_managers_we_placed_mid_file() {
+    let _c = c_lib_guard();
+    // The test above makes free space and stops, so its managers are written at
+    // end-of-file — the only place they could go on a file that had no free space
+    // yet. Once a file *has* free space, a commit places them in it (issue #358),
+    // and the C library has to find the extension and the managers at addresses
+    // below live data, and to accept an `eoa_fsm_fsalloc` that is the whole file
+    // rather than the start of the manager blocks. Several commits, so the last
+    // set of managers is one that moved into space a previous set vacated.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ours_persisted_mid_file.h5");
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("a").with_i32_data(&[1; 100]);
+    // Freed below, and large enough that every tail these commits write fits in
+    // what it leaves however the free list fragments.
+    b.create_dataset("big").with_i32_data(&[7; 4000]);
+    b.create_dataset("c").with_i32_data(&[3; 100]);
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.write(&path).unwrap();
+    let mut sizes = Vec::new();
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("big").unwrap();
+        s.commit().unwrap();
+        for i in 0..4 {
+            s.root().set_attr("n", AttrValue::I64(i)).unwrap();
+            s.commit().unwrap();
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+        // A dataset larger than every hole, so it is written past everything and
+        // the managers this commit rewrites — drawn from holes below it — end up
+        // with live data above them whichever hole they land in.
+        s.root()
+            .create_dataset("above", |b| {
+                b.with_i32_data(&[5; 8000]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+    assert_eq!(
+        sizes[1],
+        *sizes.last().unwrap(),
+        "each rewrite of the managers should land in space an earlier one left, \
+         leaving the file the size it was (sizes {sizes:?})"
+    );
+
+    let ours = File::open(&path).unwrap();
+    let managers: Vec<u64> = ours
+        .file_space_info()
+        .expect("a persisting file records its managers")
+        .manager_addrs
+        .iter()
+        .copied()
+        .filter(|&a| a != u64::MAX)
+        .collect();
+    assert!(!managers.is_empty(), "the file has free space to record");
+    let Layout::Contiguous {
+        address: Some(above),
+        ..
+    } = ours.dataset("above").unwrap().layout().unwrap()
+    else {
+        panic!("`above` is a contiguous dataset with allocated storage");
+    };
+    for m in &managers {
+        assert!(
+            *m < above,
+            "a manager at {m} should sit in a hole below the data appended after \
+             it, at {above}"
+        );
+    }
+    let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+    drop(ours);
+
+    // The C library reads the same file: survivors byte-exact, and its own
+    // free-space total — which it can only get by parsing the managers we placed
+    // mid-file — agrees with ours to the byte.
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("a").unwrap().read_raw::<i32>().unwrap(),
+        vec![1; 100]
+    );
+    assert_eq!(
+        f.dataset("c").unwrap().read_raw::<i32>().unwrap(),
+        vec![3; 100]
+    );
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert_eq!(
+        free_c as u64, total_ours,
+        "the C library's free-space total must match the managers we wrote"
+    );
+    drop(f);
+
+    // And *writes* to it. This is the path that consumes `eoa_fsm_fsalloc`: a
+    // read-write open loads the free-space managers, frees the blocks holding
+    // them, and takes the file's end-of-allocation back to that recorded value —
+    // which a reused tail records as the whole file rather than as its own start.
+    // Reading proves the C library parses what we wrote; only this proves it acts
+    // on it without losing the file.
+    {
+        let f = hdf5::File::open_rw(&path).unwrap();
+        f.new_dataset::<i32>()
+            .shape((30,))
+            .create("added")
+            .unwrap()
+            .write(&(0..30).collect::<Vec<i32>>())
+            .unwrap();
+        f.close().unwrap();
+    }
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("c").unwrap().read_raw::<i32>().unwrap(),
+        vec![3; 100]
+    );
+    assert_eq!(
+        f.dataset("added").unwrap().read_raw::<i32>().unwrap(),
+        (0..30).collect::<Vec<i32>>()
+    );
+    drop(f);
+    // Our own reader survives the C library's rewrite of the same file.
+    let ours = File::open(&path).unwrap();
+    assert_eq!(ours.dataset("c").unwrap().read_i32().unwrap(), vec![3; 100]);
+    assert_eq!(
+        ours.dataset("above").unwrap().read_i32().unwrap(),
+        vec![5; 8000]
     );
 }
 
