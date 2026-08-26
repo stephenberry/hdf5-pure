@@ -16,7 +16,7 @@ use core::num::NonZeroUsize;
 use crate::chunk_grid::{ChunkGrid, GridOrder};
 use crate::convert::{TryToUsize, nonzero_usize_from};
 use crate::error::FormatError;
-use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
+use crate::extensible_array::{DataBlockGeom, EaGeometry, ExtensibleArrayHeader, SuperBlockGeom};
 use crate::fill_value::FillPattern;
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
@@ -1668,7 +1668,13 @@ pub(crate) fn build_eadb(
     write_ea_addr(&mut buf, ea_address, offset_size);
     buf.extend_from_slice(&block_offset_rel.to_le_bytes()[..blk_off_size]);
 
-    if dblk_nelmts <= page_nelmts {
+    // The paging boundary has one definition; the counts here are already
+    // `usize` loop bounds, so the page arithmetic below stays in that width.
+    let blocks = DataBlockGeom {
+        dblk_nelmts: dblk_nelmts as u64,
+        page_nelmts: page_nelmts as u64,
+    };
+    if !blocks.is_paged() {
         // Non-paged: elements inline, single checksum.
         for slot in 0..dblk_nelmts {
             if let Some(chunk) = slots.at(elem_start + slot) {
@@ -1783,53 +1789,30 @@ pub(crate) struct EaStats {
 /// On-disk byte size of one non-paged Extensible Array data block (`EADB`)
 /// holding `dblk_nelmts` element slots.
 pub(crate) fn eadb_size(
-    dblk_nelmts: u64,
+    blocks: DataBlockGeom,
     elem_size: usize,
-    page_nelmts: u64,
     offset_size: u8,
     blk_off_size: usize,
 ) -> u64 {
-    let prefix = 4 + 1 + 1 + offset_size as usize + blk_off_size;
-    if dblk_nelmts <= page_nelmts {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "data block element count derived from the in-memory write request; bounded by addressable memory"
-        )]
-        let nelmts = dblk_nelmts as usize;
-        (prefix + nelmts * elem_size + 4) as u64
+    let prefix = (4 + 1 + 1 + offset_size as u64) + blk_off_size as u64;
+    if blocks.is_paged() {
+        // Paged: the header carries its own checksum, then full pages follow.
+        prefix + 4 + blocks.npages() * (blocks.page_nelmts * elem_size as u64 + 4)
     } else {
-        // Paged: header carries its own checksum, then full pages follow.
-        let npages = dblk_nelmts / page_nelmts;
-        (prefix + 4) as u64 + npages * (page_nelmts * elem_size as u64 + 4)
+        prefix + blocks.dblk_nelmts * elem_size as u64 + 4
     }
 }
 
-/// On-disk byte size of one Extensible Array super block (`EASB`) with `ndblks`
-/// data-block pointers and (when its data blocks are paged) a page-init bitmap.
-pub(crate) fn aesb_size(
-    ndblks: u64,
-    dblk_nelmts: u64,
-    page_nelmts: u64,
-    offset_size: u8,
-    blk_off_size: usize,
-) -> u64 {
-    let os = offset_size as usize;
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "data block and page counts derived from the in-memory write request; bounded by addressable memory"
-    )]
-    let bitmap = if dblk_nelmts > page_nelmts {
-        let npages = dblk_nelmts / page_nelmts;
-        ndblks as usize * npages.div_ceil(8) as usize
-    } else {
-        0
-    };
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "data block count derived from the in-memory write request; bounded by addressable memory"
-    )]
-    let ndblks_usize = ndblks as usize;
-    (4 + 1 + 1 + os + blk_off_size + bitmap + ndblks_usize * os + 4) as u64
+/// On-disk byte size of one Extensible Array super block (`EASB`): its header,
+/// the page-init bitmap when its data blocks are paged, its data-block
+/// addresses, and its checksum.
+///
+/// Computed in `u64` throughout, so the block and page counts are never narrowed
+/// to a 32-bit `usize` before being multiplied.
+pub(crate) fn aesb_size(geom: SuperBlockGeom, offset_size: u8, blk_off_size: usize) -> u64 {
+    let os = offset_size as u64;
+    let header = 4 + 1 + 1 + os + blk_off_size as u64;
+    header + geom.bitmap_size() + geom.ndblks * os + 4
 }
 
 /// Compute the six Extensible Array header statistics for an array holding
@@ -1861,24 +1844,28 @@ pub(crate) fn ea_compute_stats(
     let mut elem = idx_blk_elmts;
     for &dn in &geom.direct_dblk_nelmts {
         if occupancy.any_occupied(elem, dn) {
+            let blocks = DataBlockGeom {
+                dblk_nelmts: dn,
+                page_nelmts,
+            };
             s.ndata_blks += 1;
-            s.data_blk_size += eadb_size(dn, elem_size, page_nelmts, offset_size, blk_off_size);
+            s.data_blk_size += eadb_size(blocks, elem_size, offset_size, blk_off_size);
             s.nelmts += dn;
         }
         elem += dn;
     }
     for j in 0..geom.nsblk_addrs {
-        let (ndblks, dn) = geom.sblks[geom.first_indirect_sblk + j];
+        let sb = geom.super_block_at(j, page_nelmts);
+        let (ndblks, dn) = (sb.ndblks, sb.blocks.dblk_nelmts);
         let span = ndblks * dn;
         if occupancy.any_occupied(elem, span) {
             s.nsuper_blks += 1;
-            s.super_blk_size += aesb_size(ndblks, dn, page_nelmts, offset_size, blk_off_size);
+            s.super_blk_size += aesb_size(sb, offset_size, blk_off_size);
             let mut le = elem;
             for _ in 0..ndblks {
                 if occupancy.any_occupied(le, dn) {
                     s.ndata_blks += 1;
-                    s.data_blk_size +=
-                        eadb_size(dn, elem_size, page_nelmts, offset_size, blk_off_size);
+                    s.data_blk_size += eadb_size(sb.blocks, elem_size, offset_size, blk_off_size);
                     s.nelmts += dn;
                 }
                 le += dn;
@@ -2174,19 +2161,11 @@ pub fn build_extensible_array_at(
 
         // Past the early-out this super block holds real data, so its block
         // counts are bounded by the (usize) chunk count and narrow safely.
-        let is_paged = dblk_nelmts > page_nelmts as u64;
-        let npages = if is_paged {
-            dblk_nelmts / page_nelmts as u64
-        } else {
-            0
-        };
+        let sb = geom.super_block_at(j, page_nelmts as u64);
+        let is_paged = sb.blocks.is_paged();
+        let npages = sb.blocks.npages();
         let sb_block_offset = elem_cursor - inline as u64;
-        let bitmap_size = if is_paged {
-            (ndblks * npages.div_ceil(8)).to_usize()?
-        } else {
-            0
-        };
-        let mut page_bitmap = vec![0u8; bitmap_size];
+        let mut page_bitmap = vec![0u8; sb.bitmap_size().to_usize()?];
 
         let mut sb_dblk_addrs: Vec<u64> = Vec::with_capacity(ndblks.to_usize()?);
         let mut local_elem = elem_cursor;

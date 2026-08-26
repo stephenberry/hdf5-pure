@@ -185,6 +185,24 @@ pub(crate) struct EaGeometry {
 }
 
 impl EaGeometry {
+    /// The shape of the super block reached by the `j`-th super-block pointer in
+    /// the index block, in an array whose pages hold `page_nelmts` elements.
+    ///
+    /// `j` indexes the *pointers*, not [`sblks`](Self::sblks): the first
+    /// `first_indirect_sblk` super blocks are stored directly in the index block
+    /// and have no pointer, which is the offset every caller was applying by
+    /// hand before this existed.
+    pub(crate) fn super_block_at(&self, j: usize, page_nelmts: u64) -> SuperBlockGeom {
+        let (ndblks, dblk_nelmts) = self.sblks[self.first_indirect_sblk + j];
+        SuperBlockGeom {
+            ndblks,
+            blocks: DataBlockGeom {
+                dblk_nelmts,
+                page_nelmts,
+            },
+        }
+    }
+
     /// Derive the geometry from a parsed header.
     pub fn from_header(h: &ExtensibleArrayHeader) -> Self {
         let min_dblk = h.min_dblk_nelmts as u64;
@@ -230,6 +248,75 @@ impl EaGeometry {
             nsblk_addrs,
             first_indirect_sblk: sup_blk_min,
         }
+    }
+}
+
+/// How one Extensible Array data block is paged: the elements it holds, against
+/// the elements that fill one page.
+///
+/// A data block holding more than one page's worth of elements is stored as a
+/// sequence of individually-checksummed pages. A block holding *exactly* one
+/// page's worth is not paged — the boundary is strictly greater, matching
+/// libhdf5's `H5EA__dblock_alloc`.
+///
+/// Separate from [`SuperBlockGeom`] because that is the whole dependency: a
+/// direct data block, whose address sits in the index block and which has no
+/// super block at all, is paged by the same rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DataBlockGeom {
+    /// Elements the data block holds.
+    pub(crate) dblk_nelmts: u64,
+    /// Elements that fill one page.
+    pub(crate) page_nelmts: u64,
+}
+
+impl DataBlockGeom {
+    /// Whether the block is stored as pages.
+    pub(crate) const fn is_paged(self) -> bool {
+        self.dblk_nelmts > self.page_nelmts
+    }
+
+    /// Pages in the block, or zero when it is not paged.
+    pub(crate) const fn npages(self) -> u64 {
+        if self.is_paged() {
+            self.dblk_nelmts / self.page_nelmts
+        } else {
+            0
+        }
+    }
+}
+
+/// The shape of one Extensible Array super block (`EASB`): the data blocks it
+/// points at, and how those blocks are paged.
+///
+/// A super block whose data blocks are paged carries a page-init bitmap between
+/// its header and its data-block addresses; one whose blocks are not carries no
+/// bitmap at all. [`DataBlockGeom::is_paged`] therefore decides the *position* of
+/// every data-block address in the block rather than merely a size, and every
+/// reader of an `EASB` has to agree with every writer about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SuperBlockGeom {
+    /// Data-block pointers the super block holds.
+    pub(crate) ndblks: u64,
+    /// How each of those data blocks is paged.
+    pub(crate) blocks: DataBlockGeom,
+}
+
+impl SuperBlockGeom {
+    /// Byte size of the page-init bitmap, zero when the data blocks are not
+    /// paged.
+    ///
+    /// One bit per page per data block. The bits are a contiguous stream indexed
+    /// by `dblk_local * npages + page`; the per-block round-up to a whole byte is
+    /// over-allocation rather than alignment, so block *k*'s bits do not in
+    /// general start at byte `k * ceil(npages / 8)`.
+    ///
+    /// Computed in `u64`, and narrowed by whichever caller needs a `usize`,
+    /// rather than narrowing the operands first. The product cannot overflow
+    /// where this is called: `bitmap_size <= ndblks * dblk_nelmts`, and every
+    /// caller has already computed that product or the enclosing block's length.
+    pub(crate) const fn bitmap_size(self) -> u64 {
+        self.ndblks * self.blocks.npages().div_ceil(8)
     }
 }
 
@@ -712,22 +799,16 @@ fn read_super_block(
     // addresses. Its size is `ndblks * ceil(npages / 8)` bytes, and it is a
     // contiguous bit stream indexed by `db_local_idx * npages + page`.
     let page_nelmts = 1usize << header.max_dblk_nelmts_bits;
-    let is_paged = nelmts_per_dblk > page_nelmts;
-    let npages = if is_paged {
-        nelmts_per_dblk / page_nelmts
-    } else {
-        0
+    let sb = SuperBlockGeom {
+        ndblks: ndblks as u64,
+        blocks: DataBlockGeom {
+            dblk_nelmts: nelmts_per_dblk as u64,
+            page_nelmts: page_nelmts as u64,
+        },
     };
-    let bitmap_size = if is_paged {
-        ndblks
-            .checked_mul(npages.div_ceil(8))
-            .ok_or(FormatError::OffsetOverflow {
-                offset: ndblks as u64,
-                length: npages.div_ceil(8) as u64,
-            })?
-    } else {
-        0
-    };
+    let is_paged = sb.blocks.is_paged();
+    let npages = sb.blocks.npages().to_usize()?;
+    let bitmap_size = sb.bitmap_size().to_usize()?;
 
     // The whole super block -- header, bitmap, every data-block pointer, and
     // the checksum over them -- is fixed by the geometry, so it is bounded
@@ -895,9 +976,11 @@ pub(crate) fn extensible_array_index_spans<S: Source + ?Sized>(
         spans.push((
             addr,
             eadb_size(
-                dblk_nelmts,
+                DataBlockGeom {
+                    dblk_nelmts,
+                    page_nelmts,
+                },
                 elem_size,
-                page_nelmts,
                 offset_size,
                 blk_off_size,
             ),
@@ -909,17 +992,12 @@ pub(crate) fn extensible_array_index_spans<S: Source + ?Sized>(
         if is_undefined_addr(addr, offset_size) {
             continue;
         }
-        let (ndblks, dblk_nelmts) = geom.sblks[geom.first_indirect_sblk + j];
-        spans.push((
-            addr,
-            aesb_size(ndblks, dblk_nelmts, page_nelmts, offset_size, blk_off_size),
-        ));
+        let sb = geom.super_block_at(j, page_nelmts);
+        spans.push((addr, aesb_size(sb, offset_size, blk_off_size)));
         easb_data_block_spans(
             source,
             addr,
-            ndblks,
-            dblk_nelmts,
-            page_nelmts,
+            sb,
             offset_size,
             blk_off_size,
             elem_size,
@@ -935,13 +1013,10 @@ pub(crate) fn extensible_array_index_spans<S: Source + ?Sized>(
 /// reading (header, optional page-init bitmap, then `ndblks` data-block
 /// addresses), emitting an extent for each defined address.
 #[cfg(feature = "std")]
-#[allow(clippy::too_many_arguments)]
 fn easb_data_block_spans<S: Source + ?Sized>(
     source: &S,
     sb_addr: u64,
-    ndblks: u64,
-    dblk_nelmts: u64,
-    page_nelmts: u64,
+    sb: SuperBlockGeom,
     offset_size: u8,
     blk_off_size: usize,
     elem_size: usize,
@@ -954,46 +1029,27 @@ fn easb_data_block_spans<S: Source + ?Sized>(
     // The whole super block in one read: its checksum covers all of it, and the
     // addresses read out of it become free space, so one that fails is refused
     // rather than reclaimed from.
-    let sb_len =
-        aesb_size(ndblks, dblk_nelmts, page_nelmts, offset_size, blk_off_size).to_usize()?;
-    let sb = source.read_metadata_at(sb_addr, sb_len)?;
-    if &sb[..4] != b"EASB" {
+    let sb_len = aesb_size(sb, offset_size, blk_off_size).to_usize()?;
+    let block = source.read_metadata_at(sb_addr, sb_len)?;
+    if &block[..4] != b"EASB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array super block signature".into(),
         ));
     }
-    crate::checksum::verify_trailing(&sb)?;
+    crate::checksum::verify_trailing(&block)?;
 
-    // When the super block's data blocks are paged, a page-init bitmap of
-    // `ndblks * ceil(npages / 8)` bytes precedes the data-block addresses.
-    let bitmap_size = if dblk_nelmts > page_nelmts {
-        let npages = (dblk_nelmts / page_nelmts).to_usize()?;
-        ndblks
-            .to_usize()?
-            .checked_mul(npages.div_ceil(8))
-            .ok_or(FormatError::OffsetOverflow {
-                offset: ndblks,
-                length: npages as u64,
-            })?
-    } else {
-        0
-    };
-    let mut pos = sb_header + bitmap_size;
-    for _ in 0..ndblks {
-        let addr = read_offset(&sb, pos, offset_size)?;
+    // A paged super block carries its page-init bitmap between the header and
+    // the data-block addresses; `bitmap_size` is zero when it does not.
+    let mut pos = sb_header + sb.bitmap_size().to_usize()?;
+    for _ in 0..sb.ndblks {
+        let addr = read_offset(&block, pos, offset_size)?;
         pos += os;
         if is_undefined_addr(addr, offset_size) {
             continue;
         }
         spans.push((
             addr,
-            eadb_size(
-                dblk_nelmts,
-                elem_size,
-                page_nelmts,
-                offset_size,
-                blk_off_size,
-            ),
+            eadb_size(sb.blocks, elem_size, offset_size, blk_off_size),
         ));
     }
     Ok(())
@@ -1310,22 +1366,16 @@ fn read_super_block_from_source<S: Source + ?Sized>(
     let sb_header_size = 4 + 1 + 1 + os + blk_off_size;
 
     let page_nelmts = 1usize << header.max_dblk_nelmts_bits;
-    let is_paged = nelmts_per_dblk > page_nelmts;
-    let npages = if is_paged {
-        nelmts_per_dblk / page_nelmts
-    } else {
-        0
+    let sb = SuperBlockGeom {
+        ndblks: ndblks as u64,
+        blocks: DataBlockGeom {
+            dblk_nelmts: nelmts_per_dblk as u64,
+            page_nelmts: page_nelmts as u64,
+        },
     };
-    let bitmap_size = if is_paged {
-        ndblks
-            .checked_mul(npages.div_ceil(8))
-            .ok_or(FormatError::OffsetOverflow {
-                offset: ndblks as u64,
-                length: npages.div_ceil(8) as u64,
-            })?
-    } else {
-        0
-    };
+    let is_paged = sb.blocks.is_paged();
+    let npages = sb.blocks.npages().to_usize()?;
+    let bitmap_size = sb.bitmap_size().to_usize()?;
 
     // Header + (optional) page-init bitmap + data-block addresses + checksum.
     let addr_bytes = ndblks.checked_mul(os).ok_or(FormatError::OffsetOverflow {
@@ -1399,6 +1449,48 @@ fn read_super_block_from_source<S: Source + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The paged/not-paged boundary, which decides whether an `EASB` carries a
+    /// page-init bitmap at all — so a reader and a writer that disagree by one
+    /// element disagree about the position of every data-block address after it.
+    ///
+    /// Strictly greater, not greater-or-equal: a data block holding exactly one
+    /// page's worth of elements is *not* paged, matching libhdf5's
+    /// `H5EA__dblock_alloc`.
+    #[test]
+    fn a_data_block_is_paged_only_past_a_full_page() {
+        let at = |dblk_nelmts| DataBlockGeom {
+            dblk_nelmts,
+            page_nelmts: 16,
+        };
+        assert!(!at(15).is_paged(), "under a page");
+        assert!(!at(16).is_paged(), "exactly a page is not paged");
+        assert!(at(17).is_paged(), "past a page");
+        assert_eq!(at(16).npages(), 0, "a block that is not paged has no pages");
+        assert_eq!(at(32).npages(), 2);
+    }
+
+    /// The bitmap is one bit per page per data block, each block's bits rounded
+    /// up to a whole byte — so eight pages fit one byte and nine need two.
+    #[test]
+    fn the_page_init_bitmap_is_a_byte_per_eight_pages_per_block() {
+        let sb = |ndblks, dblk_nelmts| SuperBlockGeom {
+            ndblks,
+            blocks: DataBlockGeom {
+                dblk_nelmts,
+                page_nelmts: 16,
+            },
+        };
+        // Not paged: no bitmap at all, which is what makes the boundary above
+        // decide a byte offset rather than merely a size.
+        assert_eq!(sb(4, 16).bitmap_size(), 0);
+        // 2 blocks x 8 pages each -> one byte per block.
+        assert_eq!(sb(2, 8 * 16).bitmap_size(), 2);
+        // 2 blocks x 9 pages each -> the round-up costs a second byte per block.
+        assert_eq!(sb(2, 9 * 16).bitmap_size(), 4);
+        // One block, two pages: a single byte, not two bits.
+        assert_eq!(sb(1, 2 * 16).bitmap_size(), 1);
+    }
 
     /// The grid of a dataset with no maximum shape: dense row-major, which is
     /// what these tests read. The numbering rule itself is tested in
@@ -1924,9 +2016,11 @@ mod tests {
                             eadb_extent(nelmts as usize, &header, offset_size, blk_off).unwrap()
                                 as u64,
                             crate::chunked_write::eadb_size(
-                                nelmts,
+                                DataBlockGeom {
+                                    dblk_nelmts: nelmts,
+                                    page_nelmts,
+                                },
                                 stride,
-                                page_nelmts,
                                 offset_size,
                                 blk_off,
                             ),

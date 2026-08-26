@@ -36,7 +36,7 @@ use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
 use crate::error::{Error, FormatError};
-use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
+use crate::extensible_array::{DataBlockGeom, EaGeometry, ExtensibleArrayHeader, SuperBlockGeom};
 use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterPipeline;
 use crate::filters::{ChunkContext, FilterScratch, compress_chunk_with, decompress_chunk};
@@ -575,7 +575,7 @@ impl Located {
                 "chunk index geometry does not cover the appended element",
             ));
         }
-        let is_paged = region.dblk_nelmts > page_nelmts;
+        let is_paged = region.blocks(page_nelmts).is_paged();
         let slot = e - region.db_start;
 
         // Resolve the owning super block (if any) and the data-block pointer,
@@ -629,15 +629,13 @@ impl Located {
             }
             Parent::Super { dblk_local, .. } => {
                 let sblk_addr = sblk_addr.expect("super-block address resolved for a Super parent");
-                sb_dblk_slot_off(
+                Ok(sb_dblk_slot_off(
                     os,
                     sblk_addr,
                     dblk_local,
-                    region.ndblks,
-                    region.dblk_nelmts,
-                    self.page_nelmts,
+                    region.super_block(self.page_nelmts),
                     blk_off,
-                )
+                ))
             }
         }
     }
@@ -694,20 +692,16 @@ impl Located {
             ));
         }
         let dblk_nelmts = region.dblk_nelmts;
-        let is_paged = dblk_nelmts > self.page_nelmts;
+        let sb_geom = region.super_block(self.page_nelmts);
+        let is_paged = sb_geom.blocks.is_paged();
         let slot = e - region.db_start;
         let block_offset_rel = region.db_start - idx;
-        let ndblks = region.ndblks;
 
         // Ensure the owning super block exists (idempotent) for a Super parent.
         let sblk_addr = match region.parent {
-            Parent::Super { sblk_j, .. } => Some(self.ensure_super_block(
-                file,
-                sblk_j,
-                region.sb_block_offset,
-                ndblks,
-                dblk_nelmts,
-            )?),
+            Parent::Super { sblk_j, .. } => {
+                Some(self.ensure_super_block(file, sblk_j, region.sb_block_offset, sb_geom)?)
+            }
             Parent::IndexDirect { .. } => None,
         };
 
@@ -736,9 +730,7 @@ impl Located {
                 Parent::Super { .. } => self.publish_super_block(
                     file,
                     sblk_addr.unwrap(),
-                    ndblks,
-                    dblk_nelmts,
-                    self.page_nelmts,
+                    sb_geom,
                     blk_off,
                     dblk_ptr_off,
                     &new_addr.to_le_bytes()[..os],
@@ -775,16 +767,7 @@ impl Located {
                 if let Parent::Super { dblk_local, .. } = region.parent {
                     let global_page = dblk_local as u64 * npages + page;
                     let (byte, set) = sb_page_bit(file, sblk_addr, blk_off, global_page)?;
-                    self.publish_super_block(
-                        file,
-                        sblk_addr,
-                        ndblks,
-                        dblk_nelmts,
-                        self.page_nelmts,
-                        blk_off,
-                        byte,
-                        &[set],
-                    )?;
+                    self.publish_super_block(file, sblk_addr, sb_geom, blk_off, byte, &[set])?;
                 }
             }
         }
@@ -812,8 +795,7 @@ impl Located {
         file: &mut F,
         sblk_j: usize,
         sb_block_offset: u64,
-        ndblks: u64,
-        dblk_nelmts: u64,
+        sb: SuperBlockGeom,
     ) -> Result<u64, Error> {
         let existing = self.super_block_addr(file, sblk_j)?;
         if !is_undef(existing, file.offset_size()) {
@@ -823,8 +805,8 @@ impl Located {
         let ib_prefix = (4 + 1 + 1 + os) as u64;
         let ndblk_addrs = self.geom.direct_dblk_nelmts.len();
 
-        let bitmap = vec![0u8; sb_bitmap_size(ndblks, dblk_nelmts, self.page_nelmts)?];
-        let undef = vec![undef_addr(file.offset_size()); ndblks.to_usize()?];
+        let bitmap = vec![0u8; sb.bitmap_size().to_usize()?];
+        let undef = vec![undef_addr(file.offset_size()); sb.ndblks.to_usize()?];
         let aesb = crate::chunked_write::build_aesb(
             self.ea_addr,
             sb_block_offset,
@@ -976,17 +958,14 @@ impl Located {
         &self,
         file: &mut F,
         sblk_addr: u64,
-        ndblks: u64,
-        dblk_nelmts: u64,
-        page_nelmts: u64,
+        sb: SuperBlockGeom,
         blk_off: usize,
         at: u64,
         value: &[u8],
     ) -> Result<(), Error> {
         let os = file.offset_size() as usize;
         let prefix = (4 + 1 + 1 + os + blk_off) as u64;
-        let bitmap = sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts)? as u64;
-        let cks_off = sblk_addr + prefix + bitmap + ndblks * os as u64;
+        let cks_off = sblk_addr + prefix + sb.bitmap_size() + sb.ndblks * os as u64;
         file.publish_checksummed(sblk_addr, cks_off, at, value)
     }
 
@@ -1299,32 +1278,17 @@ fn sb_page_bit<F: Store>(
     Ok((byte, v[0] | (0x80u8 >> (global_page % 8))))
 }
 
-/// Byte size of a super block's page-init bitmap (0 when its data blocks are not
-/// paged): `ndblks * ceil(npages / 8)`.
-fn sb_bitmap_size(ndblks: u64, dblk_nelmts: u64, page_nelmts: u64) -> Result<usize, Error> {
-    if dblk_nelmts > page_nelmts {
-        let npages = (dblk_nelmts / page_nelmts).to_usize()?;
-        Ok(ndblks.to_usize()? * npages.div_ceil(8))
-    } else {
-        Ok(0)
-    }
-}
-
 /// File offset of the `dblk_local`-th data-block-address slot inside a super
 /// block, accounting for the page-init bitmap when the block is paged.
-#[allow(clippy::too_many_arguments)]
 fn sb_dblk_slot_off(
     os: usize,
     sblk_addr: u64,
     dblk_local: usize,
-    ndblks: u64,
-    dblk_nelmts: u64,
-    page_nelmts: u64,
+    sb: SuperBlockGeom,
     blk_off: usize,
-) -> Result<u64, Error> {
+) -> u64 {
     let prefix = (4 + 1 + 1 + os + blk_off) as u64;
-    let bitmap = sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts)? as u64;
-    Ok(sblk_addr + prefix + bitmap + (dblk_local * os) as u64)
+    sblk_addr + prefix + sb.bitmap_size() + (dblk_local * os) as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,6 +1309,30 @@ struct DataBlockLoc {
     ndblks: u64,
     sb_block_offset: u64,
     parent: Parent,
+}
+
+impl DataBlockLoc {
+    /// The shape of the super block this data block belongs to, in an array
+    /// whose pages hold `page_nelmts` elements.
+    ///
+    /// Meaningful for a [`Parent::Super`] block; for a [`Parent::IndexDirect`]
+    /// one the counts describe the single block itself and no `EASB` exists to
+    /// apply them to.
+    fn super_block(&self, page_nelmts: u64) -> SuperBlockGeom {
+        SuperBlockGeom {
+            ndblks: self.ndblks,
+            blocks: self.blocks(page_nelmts),
+        }
+    }
+
+    /// How this data block is paged, which holds whether or not it has a super
+    /// block above it.
+    fn blocks(&self, page_nelmts: u64) -> DataBlockGeom {
+        DataBlockGeom {
+            dblk_nelmts: self.dblk_nelmts,
+            page_nelmts,
+        }
+    }
 }
 
 /// Locate the data block containing element `e` (which is `>= idx_blk_elmts`).
