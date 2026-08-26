@@ -531,8 +531,7 @@ fn a_producers_error_keeps_its_own_type() {
 
     let err = mb
         .finish_to(Discard::default())
-        .err()
-        .expect("the producer failed");
+        .expect_err("the producer failed");
 
     assert_eq!(err.to_string(), "channel 3 stopped");
     assert_eq!(
