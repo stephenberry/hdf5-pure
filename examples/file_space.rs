@@ -9,8 +9,9 @@
 //!
 //! This example proves that reuse actually happens rather than just that free
 //! space is tracked: it deletes a dataset, then adds a same-sized one in a fresh
-//! session and shows the file barely grows. A non-persisting file is run through
-//! the identical churn as a control, where the freed space is forgotten on close
+//! session and shows the file barely grows. The same churn runs on a *paged* file
+//! (`FileSpaceStrategy::Page`), which reuses its freed pages the same way, and on
+//! a non-persisting file as a control, where the freed space is forgotten on close
 //! and the file grows by the full size of the new data.
 //!
 //! Run with:
@@ -34,10 +35,8 @@ fn main() {
     let persisting = dir.path().join("managed.h5");
     let mut builder = FileBuilder::new();
     builder.create_dataset("keep").with_i32_data(&[1, 2, 3]);
-    // A free-space-manager strategy that persists across sessions. (The paged
-    // strategy also persists, but a paged file is grown only through the
-    // append-only bounded engine, which cannot reuse a freed hole the
-    // way this delete-then-re-add demo does.)
+    // A free-space-manager strategy that persists across sessions. Its numbers are
+    // the data's own; the paged run below reports the same reuse in whole pages.
     builder.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1); // strategy, persist, threshold
     builder.write(&persisting).expect("write file");
 
@@ -60,6 +59,26 @@ fn main() {
          {reuse_growth}, a small fraction of the data — the freed hole was reused"
     );
 
+    // ---- Paged file: the same reuse, tracked per page type --------------
+    // A paged file segregates metadata and raw data by page, so it tracks free
+    // space per page type and an allocation draws from the list matching what it
+    // is placing (or from a page that is wholly free). The reuse itself is no
+    // different from the flat file above.
+    let paged = dir.path().join("paged.h5");
+    let mut builder = FileBuilder::new();
+    builder.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    builder.with_file_space_strategy(FileSpaceStrategy::Page, true, 1);
+    builder.write(&paged).expect("write file");
+
+    println!("\npaged file (strategy = Page, persist = true):");
+    let paged_growth = churn(&paged);
+
+    assert!(
+        paged_growth * 4 < SCRATCH_BYTES,
+        "expected reuse: re-adding {SCRATCH_BYTES} bytes into a paged file grew it \
+         by {paged_growth}, so the freed pages were not reused"
+    );
+
     // ---- Control: a non-persisting file forgets its free list -----------
     // Identical churn on a default-strategy file. Here the free list lives only
     // for the open session and is discarded on close, so the fresh session that
@@ -78,8 +97,8 @@ fn main() {
          grow the file by at least that, got {control_growth}"
     );
 
-    // ---- Both files still hold the original and the re-added data -------
-    for path in [&persisting, &default] {
+    // ---- Every file still holds the original and the re-added data ------
+    for path in [&persisting, &paged, &default] {
         let file = File::open(path).unwrap();
         assert_eq!(
             file.dataset("keep").unwrap().read_i32().unwrap(),
@@ -92,8 +111,9 @@ fn main() {
     }
 
     println!(
-        "\nverified: persisting reuse grew the file by {reuse_growth} bytes vs \
-         {control_growth} for the non-persisting control ({SCRATCH_BYTES} bytes of new data)"
+        "\nverified: reuse grew the file by {reuse_growth} bytes (FsmAggr) and \
+         {paged_growth} (Page) vs {control_growth} for the non-persisting control \
+         ({SCRATCH_BYTES} bytes of new data)"
     );
 }
 

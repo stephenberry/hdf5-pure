@@ -296,8 +296,8 @@ fn refusal_leaves_session_usable() {
 
 /// A file that persists its free space accepts an immediate in-place append as
 /// well as a staged one (issue #198). The in-place path leaves the on-disk
-/// free-space managers mid-file until the session closes, which is what
-/// `File::close` re-homes; both paths must leave every row readable.
+/// free-space managers describing a file shorter than it has become, which is what
+/// `File::close` rewrites; both paths must leave every row readable.
 #[test]
 fn persisting_file_takes_both_inplace_and_staged_appends() {
     let dir = tempdir().unwrap();

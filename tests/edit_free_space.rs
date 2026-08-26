@@ -1457,6 +1457,267 @@ fn a_paged_tail_conserves_free_space_across_layouts() {
     }
 }
 
+/// A **non-paged** persisting file's commit tail — the rewritten extension and
+/// its one `FSHD`/`FSSE` pair — is placed in space an earlier commit freed, the
+/// same way the paged tail above is (issue #358).
+///
+/// The paged tail learned this first (issue #286); the flat one kept appending,
+/// so every commit grew the file by a tail and freed its predecessor's, and a
+/// `FileSpaceStrategy::FsmAggr` file under churn climbed forever while reporting
+/// all of it as reusable. As above, the address is not fixed — best fit picks
+/// whatever hole suits — so what is asserted is that the manager landed where the
+/// file was already free, which is what it never was while the tail could only
+/// append.
+#[test]
+fn a_persisting_commit_tail_is_placed_in_free_space() {
+    let path = temp_path("hdf5_pure_fs_flat_tail_reuse.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("seed").with_i32_data(&[0i32; 4]);
+    b.create_dataset("scratch").with_i32_data(&[7i32; 256]);
+    // A live object above the hole, so the deletion below leaves an interior hole
+    // rather than a run reaching end-of-file.
+    b.create_dataset("ceiling").with_i32_data(&[9i32; 4]);
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.write(&path).unwrap();
+
+    // The hole the tail will move into: a fresh file has none, so the first tail
+    // has nowhere to go but end-of-file.
+    {
+        let f = File::open_rw(&path).unwrap();
+        f.root().delete("scratch").unwrap();
+        f.commit().unwrap();
+    }
+    let start_len = std::fs::metadata(&path).unwrap().len();
+
+    // Three commits that change nothing but one attribute and the tail the commit
+    // has to rewrite regardless.
+    for i in 0..3 {
+        let before: Vec<(u64, u64)> = File::open(&path).unwrap().persisted_free_space();
+        let f = File::open_rw(&path).unwrap();
+        f.root().set_attr("n", AttrValue::I64(i)).unwrap();
+        f.commit().unwrap();
+        drop(f);
+
+        let f = File::open(&path).unwrap();
+        let managers: Vec<u64> = f
+            .file_space_info()
+            .expect("a persisting file records its managers")
+            .manager_addrs
+            .iter()
+            .copied()
+            .filter(|&a| a != u64::MAX)
+            .collect();
+        assert!(
+            !managers.is_empty(),
+            "commit {i}: the file has free space, so it has a manager to place"
+        );
+        for addr in managers {
+            assert!(
+                before.iter().any(|&(a, len)| addr >= a && addr < a + len),
+                "commit {i}: a manager block landed at {addr}, which was not free \
+                 before the commit ({before:?}) — the tail appended instead of \
+                 reusing"
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            start_len,
+            "commit {i}: rewriting the tail must not grow the file"
+        );
+    }
+
+    assert_eof_matches_file(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.dataset("seed").unwrap().read_i32().unwrap(), [0; 4]);
+    assert_eq!(f.dataset("ceiling").unwrap().read_i32().unwrap(), [9; 4]);
+}
+
+/// The consequence of the test above, on the workload the issue describes: a
+/// non-paged persisting file under delete-and-recreate churn stops growing
+/// (issue #358).
+///
+/// Shaped like [`paged_churn_reaches_a_steady_size`]: the file may reach whatever
+/// size its live data and layout need over the first rounds, but once the
+/// workload is in its steady state it may not keep climbing. A tail appended per
+/// commit is what climbing looks like from the outside — about 590 bytes a round
+/// here, forever, with every one of them recorded as free.
+#[test]
+fn persisting_churn_reaches_a_steady_size() {
+    const ROUNDS: usize = 16;
+    const LIVE: usize = 2;
+
+    let path = temp_path("hdf5_pure_fs_flat_churn.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("seed").with_i32_data(&[0i32; 4]);
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.write(&path).unwrap();
+
+    let rows: Vec<i32> = (0..500).map(|i| i % 97).collect();
+    let mut sizes = Vec::new();
+    for round in 0..ROUNDS {
+        // A fresh session per round, so each round's tail is placed from the free
+        // list a reopen seeds out of the on-disk managers rather than from one the
+        // session has been carrying.
+        {
+            let f = File::open_rw(&path).unwrap();
+            f.root().create_group(&format!("g{round}")).unwrap();
+            f.commit().unwrap();
+            let g = f.group(&format!("g{round}")).unwrap();
+            for name in ["a", "b"] {
+                g.create_dataset(name, |b| {
+                    b.with_i32_data(&rows);
+                })
+                .unwrap();
+            }
+            f.commit().unwrap();
+        }
+        if round >= LIVE {
+            let f = File::open_rw(&path).unwrap();
+            f.root().delete(&format!("g{}", round - LIVE)).unwrap();
+            f.commit().unwrap();
+            drop(f);
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+    }
+
+    let settled = sizes[sizes.len() * 2 / 3];
+    let last = *sizes.last().unwrap();
+    assert_eq!(
+        last, settled,
+        "a persisting file under steady churn must stop growing (sizes by round: {sizes:?})"
+    );
+
+    let f = File::open(&path).unwrap();
+    for round in ROUNDS - LIVE..ROUNDS {
+        let g = f.group(&format!("g{round}")).unwrap();
+        for name in ["a", "b"] {
+            assert_eq!(g.dataset(name).unwrap().read_i32().unwrap(), rows);
+        }
+    }
+    drop(f);
+    assert_eof_matches_file(&path);
+}
+
+/// Across a sweep of layouts, a non-paged persisting file whose commits rewrite
+/// only the tail holds its size (issue #358).
+///
+/// The flat counterpart of [`a_paged_tail_conserves_free_space_across_layouts`],
+/// asserting size rather than the free-space total, because the two say different
+/// things here: the flat tail may take a few more bytes than its blocks fill, so
+/// consecutive commits legitimately record totals a section record apart, while
+/// the file's *size* may not move at all once a tail is landing in free space.
+///
+/// A single fixture reaches one settlement of an arithmetic that depends on the
+/// whole free list — the tail's length and the hole it lands in determine each
+/// other — so this sweeps the filler size and the file carries three holes rather
+/// than one, which is what makes the settlement turn over as the tail moves. The
+/// difference that buys is measured: requiring the tail to fill its reservation
+/// exactly leaves `a_persisting_commit_tail_is_placed_in_free_space` passing, and
+/// fails here from filler 18 on, where the file gains a tail per commit again.
+#[test]
+fn a_persisting_tail_holds_its_size_across_layouts() {
+    for filler in 0..64usize {
+        let path = temp_path(&format!("hdf5_pure_fs_flat_sweep_{filler}.h5"));
+        let mut b = FileBuilder::new();
+        b.create_dataset("seed")
+            .with_i32_data(&(0..100 + filler as i32).collect::<Vec<i32>>());
+        // Three holes of unrelated sizes rather than one, so the free list the
+        // tail is sized against has several sections and its length turns over as
+        // the tail moves between them.
+        for (i, len) in [256usize, 37, 91].into_iter().enumerate() {
+            b.create_dataset(&format!("scratch{i}"))
+                .with_i32_data(&vec![7i32; len + filler]);
+            b.create_dataset(&format!("keep{i}"))
+                .with_i32_data(&[9i32; 4]);
+        }
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+        b.write(&path).unwrap();
+        for i in 0..3 {
+            let f = File::open_rw(&path).unwrap();
+            f.root().delete(&format!("scratch{i}")).unwrap();
+            f.commit().unwrap();
+        }
+
+        // The first of these settles the tail into a hole; from the second on,
+        // each commit replaces an earlier tail and nothing else moves.
+        let mut sizes = Vec::new();
+        for i in 0..6 {
+            let f = File::open_rw(&path).unwrap();
+            f.root().set_attr("n", AttrValue::I64(i)).unwrap();
+            f.commit().unwrap();
+            drop(f);
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+        assert_eq!(
+            sizes[1],
+            *sizes.last().unwrap(),
+            "filler {filler}: rewriting the tail must not grow the file (sizes {sizes:?})"
+        );
+        assert_eof_matches_file(&path);
+    }
+}
+
+/// A paged file reuses a freed hole across a close, not only within one session
+/// (issue #358, which reported the opposite).
+///
+/// `paged_commit_reuses_freed_space_within_its_page_type` deletes and re-adds in
+/// one session, where the hole is in the list that session has been carrying. Here
+/// the delete and the re-add are separate sessions, so the second one knows the
+/// hole only from the per-page-type managers it seeds its free list from on open —
+/// the paged counterpart of `persisted_chunked_free_space_is_reused_after_a_reopen`.
+#[test]
+fn paged_free_space_is_reused_after_a_reopen() {
+    const ELEMS: usize = 32768;
+    let path = temp_path("hdf5_pure_fs_paged_persist_reuse.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1);
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.create_dataset("big")
+        .with_f64_data(&vec![1.0; ELEMS])
+        .with_chunks(&[4096]);
+    b.create_dataset("tail").with_i32_data(&[9; 16]);
+    b.write(&path).unwrap();
+    let start = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("big").unwrap();
+        s.commit().unwrap();
+    }
+    {
+        let s = File::open_rw(&path).unwrap();
+        assert!(
+            s.space_accounting().unwrap().reusable_free_bytes >= f64_data_bytes(ELEMS),
+            "the reopened session must recover the freed dataset's pages"
+        );
+        s.root()
+            .create_dataset("big2", |b| {
+                b.with_f64_data(&vec![2.0; ELEMS]).with_chunks(&[4096]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+
+    let end = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        end < start + f64_data_bytes(ELEMS) / 4,
+        "a reopened paged session should write into the pages the delete freed \
+         (start={start}, end={end})"
+    );
+
+    assert_eof_matches_file(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("big2").unwrap().read_f64().unwrap(),
+        vec![2.0; ELEMS]
+    );
+    assert_eq!(
+        f.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(f.dataset("tail").unwrap().read_i32().unwrap(), vec![9; 16]);
+}
+
 /// Build `name` as a rank-1, unlimited, chunked i32 dataset of length zero.
 fn create_log(session: &File, name: &str) {
     session
@@ -1548,8 +1809,10 @@ fn a_persisting_file_appends_at_end_of_file() {
     let path = temp_path("hdf5_pure_fs_immediate_append_persisting.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    // Comfortably larger than the payload, so the hole still holds the whole
+    // append after the commits below have placed their own tails inside it.
     b.create_dataset("scratch")
-        .with_i32_data(&vec![7; payload.len()]);
+        .with_i32_data(&vec![7; payload.len() + 1024]);
     b.create_dataset("ceiling").with_i32_data(&[9, 9, 9]);
     b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
     b.write(&path).unwrap();
