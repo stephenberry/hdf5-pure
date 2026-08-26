@@ -697,6 +697,12 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
 /// alternation — the read stays correct and the read *volume* multiplies. The
 /// sort is free to do here because every chunk of a read scatters into a
 /// disjoint part of the output, so their order was never load-bearing.
+///
+/// Coalescing is not the only thing resting on it. A read fills the chunk cache
+/// and then stops offering (see [`CachePass`]), so the visit order also decides
+/// *which* chunks a read leaves behind — and "no order at all" above is what
+/// makes that an arbitrary subset the next read has no reason to reach first.
+/// A loop with no spans to coalesce still owes its chunks this order.
 fn sort_chunks_by_address(chunks: &mut [ChunkInfo]) {
     chunks.sort_unstable_by_key(|c| c.address);
 }
@@ -975,7 +981,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         };
 
         let coord = spatial_coord(chunk, rank);
-        let hit = cache.with_decompressed(coord, |bytes| copy(&mut output, bytes));
+        let hit = cache.with_decompressed(pass, coord, |bytes| copy(&mut output, bytes));
         if hit.is_some() {
             continue;
         }
@@ -1161,7 +1167,7 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
         }
 
         // Scatter straight from the cached chunk under the lock (no copy out).
-        let hit = cache.with_decompressed(coord, |bytes| {
+        let hit = cache.with_decompressed(pass, coord, |bytes| {
             place_chunk(
                 bytes,
                 &mut output,
@@ -1783,7 +1789,7 @@ pub fn read_chunked_data_cached(
         reason = "chunk byte sizes are encoded into 32-bit chunk-info fields; they stay \
                   well below u32::MAX (HDF5 caps a chunk at 4 GiB)"
     )]
-    let chunks = if let Some(chunks) = cache.all_indexed_chunks() {
+    let mut chunks = if let Some(chunks) = cache.all_indexed_chunks() {
         chunks
     } else {
         let chunks = match (version, chunk_index_type) {
@@ -1852,6 +1858,9 @@ pub fn read_chunked_data_cached(
         cache.populate_index(&chunks, rank);
         chunks
     };
+    // This loop reads from a byte slice and has no spans to coalesce, but it owes
+    // its chunks an order all the same; see `sort_chunks_by_address`.
+    sort_chunks_by_address(&mut chunks);
 
     // Assemble output
     let total_elements = dataspace.num_elements().to_usize()?;
@@ -1890,7 +1899,7 @@ pub fn read_chunked_data_cached(
         chunk_offsets.extend(coord.iter().map(|&o| o as usize));
 
         // Scatter straight from the cached chunk under the lock (no copy out).
-        let hit = cache.with_decompressed(coord, |bytes| {
+        let hit = cache.with_decompressed(pass, coord, |bytes| {
             place_chunk(
                 bytes,
                 &mut output,

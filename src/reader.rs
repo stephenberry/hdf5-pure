@@ -507,9 +507,8 @@ impl FileAccessProperties {
 /// [property-support reference] for the rest.
 ///
 /// [`ChunkCacheConfig`] maps `H5Pset_chunk_cache`'s `rdcc_nslots` and
-/// `rdcc_nbytes`; its `rdcc_w0` preemption policy is not modeled, because this
-/// read cache uses strict LRU eviction (as noted on
-/// [`ChunkCacheConfig::from_h5p_cache`]).
+/// `rdcc_nbytes`; its `rdcc_w0` preemption policy is not modeled, for the reason
+/// on [`ChunkCacheConfig::from_h5p_cache`].
 ///
 /// Pass it to [`File::dataset_with_options`] or [`Group::dataset_with_options`].
 ///
@@ -4288,6 +4287,22 @@ the same commit to replace it",
         self.chunk_cache.stats()
     }
 
+    /// Zero this handle's cumulative chunk-cache counters, leaving the retained
+    /// index and chunks in place.
+    ///
+    /// [`ChunkCacheStats`]'s occupancy figures are unaffected — this resets what
+    /// the cache has *done*, not what it is *holding* — so a caller can measure
+    /// one read on a cache an earlier read already warmed. The cache is
+    /// per-handle, though clones of one handle share it, so this resets the
+    /// counters those clones report too.
+    pub fn reset_chunk_cache_stats(&self) {
+        // Resolve first for the same reason [`Self::chunk_cache_stats`] does: an
+        // edit drops the chunks it invalidated, and those belong in the
+        // invalidation count of the window being reset, not the next one.
+        let _ = self.resolved();
+        self.chunk_cache.reset_stats();
+    }
+
     /// Returns the shape (dimensions) of the dataset.
     pub fn shape(&self) -> Result<Vec<u64>, Error> {
         let ds = self.dataspace()?;
@@ -5922,6 +5937,9 @@ mod tests {
             }),
             ("Dataset::chunk_cache_stats", Change::Nothing, |f| {
                 let _ = f.dataset("log").unwrap().chunk_cache_stats();
+            }),
+            ("Dataset::reset_chunk_cache_stats", Change::Nothing, |f| {
+                f.dataset("log").unwrap().reset_chunk_cache_stats();
             }),
             ("BufferedAppender::new", Change::Nothing, |f| {
                 let mut ds = f.dataset("log").unwrap();

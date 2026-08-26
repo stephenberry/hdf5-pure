@@ -113,7 +113,7 @@ let values = ds.read_f64().unwrap();
 
 ### The chunk cache
 
-To confirm a cache is behaving as configured, `Dataset::chunk_cache_stats()` returns a read-only `ChunkCacheStats` snapshot taken after a read. It reports whether the parsed index is loaded (`index_loaded()`), how many decompressed chunks are retained (`cached_chunks()`), and how many bytes of chunk data are retained (`cached_bytes()`).
+To confirm a cache is behaving as configured, `Dataset::chunk_cache_stats()` returns a read-only `ChunkCacheStats` snapshot. Occupancy is a point-in-time view: whether the parsed index is loaded (`index_loaded()`), how many decompressed chunks are retained (`cached_chunks()`), and how many bytes they occupy (`cached_bytes()`). The counters beside it are cumulative since the handle was opened, or since the last `reset_chunk_cache_stats()`.
 
 ```rust
 use hdf5_pure::File;
@@ -127,7 +127,38 @@ let stats = ds.chunk_cache_stats();
 assert!(stats.cached_chunks() > 0);
 ```
 
-The counts are a point-in-time view and change as further reads populate or evict chunks. A disabled cache, or one over its byte or slot budget, reports fewer or no retained chunks.
+**Read `rejections()` and `evictions()` together, not one or the other.** Which of the two moves depends on how the dataset is read, and each is structurally zero on the other's path:
+
+| read | budget signal | stays zero |
+|---|---|---|
+| whole (`read_f64` and friends) | `rejections()` | `evictions()` |
+| row window (`read_*_rows`) | `evictions()` | `rejections()` |
+
+A whole read visits each of its chunks exactly once, so once it has filled the cache it stops offering rather than giving back chunks it has already placed or been served for chunks it will not ask for again: a dataset eight times the budget reports seven eighths of its chunks rejected and no evictions at all. Reading it again hits the retained chunks and rejects the rest, so a settled cache costs nothing to keep. A row window keeps the plain LRU rule, because the chunk its successor needs is the one it finished on. Either counter climbing while `hit_rate()` stays low is the same finding.
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open("data.h5").unwrap();
+let ds = file.dataset("signal").unwrap();
+
+// The reads that fill a cache miss by definition, so a rate measured over the
+// whole run charges the steady state for the warm-up.
+let _ = ds.read_f64().unwrap();
+ds.reset_chunk_cache_stats();
+let _ = ds.read_f64().unwrap();
+
+let stats = ds.chunk_cache_stats();
+if stats.rejections() > 0 || stats.evictions() > 0 {
+    // The working set did not fit: raise max_slots, max_bytes, or both.
+}
+if stats.oversize_chunks() > 0 {
+    // One chunk is larger than the whole byte budget; more slots will not help.
+}
+println!("{:?} over {} lookups", stats.hit_rate(), stats.lookups());
+```
+
+Two figures need a word of care. `hit_rate()` returns `None` before any lookup rather than `0.0`, which is what a cache that missed everything — and a cache that was disabled — both report; read it beside `chunk_cache_config()`. And `invalidations()` is session-wide rather than per handle: a commit through *any* handle advances the file's content revision, so every dataset handle drops its chunks. A figure approaching `misses()` means the session is rewriting what it caches, and a larger budget will not change that.
 
 ### The metadata cache
 

@@ -64,9 +64,27 @@ impl ChunkCacheConfig {
     /// `rdcc_nslots` maps to the maximum retained chunk slots and
     /// `rdcc_nbytes` maps to the maximum retained decompressed chunk bytes.
     /// Modern HDF5 ignores `H5Pset_cache`'s `mdc_nelmts`; use
-    /// [`crate::MetadataCacheConfig`] for the metadata-cache budget. The
-    /// `rdcc_w0` preemption policy has no direct equivalent because this
-    /// read-only cache uses strict LRU eviction.
+    /// [`crate::MetadataCacheConfig`] for the metadata-cache budget.
+    ///
+    /// # `rdcc_w0` has nothing to decide here
+    ///
+    /// C's third field is a head start, in entries, for a rule that preempts only
+    /// chunks the caller consumed *in full* before the unqualified rule joins the
+    /// walk (`H5D__chunk_cache_prune`, discriminating on
+    /// `H5D_rdcc_ent_t::rd_count` / `wr_count`). Nothing here answers to it. This
+    /// cache holds decompressed data read from the file, so there is no dirty
+    /// chunk for `wr_count` to describe; and it records only whether a chunk is
+    /// held, never how much of it a caller took, so the `rd_count` class it would
+    /// sort by does not exist to be sorted.
+    ///
+    /// What `w0` exists to prevent — a scan evicting chunks for chunks it will not
+    /// ask for again — is handled here without a knob: a whole read fills the
+    /// cache and stops offering, so it has no prune for a preemption policy to
+    /// order. The field-by-field argument, including why a row window is the one
+    /// path that does evict and why recency already keeps what it needs, is in
+    /// the [property-support reference].
+    ///
+    /// [property-support reference]: https://github.com/stephenberry/hdf5-pure/blob/main/docs/reference/property-support.md
     pub const fn from_h5p_cache(rdcc_nslots: usize, rdcc_nbytes: usize) -> Self {
         Self {
             max_bytes: rdcc_nbytes,
@@ -124,18 +142,38 @@ impl Default for ChunkCacheConfig {
     }
 }
 
-/// A read-only snapshot of a dataset's chunk-cache occupancy.
+/// What a dataset's chunk cache has done, and what it is holding.
 ///
-/// Returned by [`crate::Dataset::chunk_cache_stats`]. Use it to confirm a
-/// chunk-cache configuration is taking effect: after reading a chunked dataset,
-/// an enabled cache reports a loaded index and retained chunks, a disabled one
-/// (or one over its byte/slot budget) reports fewer or none. The counts are a
-/// point-in-time view and change as further reads populate or evict chunks.
+/// Returned by [`crate::Dataset::chunk_cache_stats`].
+/// [`index_loaded`](Self::index_loaded), [`cached_chunks`](Self::cached_chunks)
+/// and [`cached_bytes`](Self::cached_bytes) are a point-in-time view of
+/// occupancy; the counters are cumulative since the handle was opened or since
+/// the last [`reset_chunk_cache_stats`](crate::Dataset::reset_chunk_cache_stats).
+///
+/// The reason to look is that [`ChunkCacheConfig`] is a budget chosen before a
+/// single chunk has been read, and nothing else reports whether it was the right
+/// one:
+///
+/// - [`hit_rate`](Self::hit_rate) says whether the cache is earning its memory.
+/// - [`rejections`](Self::rejections) and [`evictions`](Self::evictions)
+///   together say whether the working set outgrew the budget. **Read both**:
+///   which of the two moves depends on how the dataset is being read, and each
+///   is structurally zero on the path the other reports. A whole read fills the
+///   cache and then stops offering, so it rejects and never evicts; a row window
+///   ([`Dataset::read_raw_rows`](crate::Dataset::read_raw_rows) and the typed
+///   `read_*_rows`) evicts by plain LRU, so it evicts and never rejects. Either
+///   one climbing while [`hit_rate`](Self::hit_rate) stays low is the same
+///   finding.
+/// - [`oversize_chunks`](Self::oversize_chunks) says whether a single chunk is
+///   larger than the whole byte budget, in which case no slot count helps.
+/// - [`invalidations`](Self::invalidations) says how many retained chunks a
+///   commit in this session threw away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChunkCacheStats {
     index_loaded: bool,
     cached_chunks: usize,
     cached_bytes: usize,
+    counters: Counters,
 }
 
 impl ChunkCacheStats {
@@ -152,6 +190,98 @@ impl ChunkCacheStats {
     /// Total bytes of decompressed chunk data currently retained.
     pub const fn cached_bytes(&self) -> usize {
         self.cached_bytes
+    }
+
+    /// Chunk lookups served from retained decompressed data.
+    pub const fn hits(&self) -> u64 {
+        self.counters.hits
+    }
+
+    /// Chunk lookups that had to be fetched and decoded.
+    pub const fn misses(&self) -> u64 {
+        self.counters.misses
+    }
+
+    /// Retained chunks dropped to make room for another chunk.
+    ///
+    /// A *whole* read never evicts a chunk it placed or was served, so on that
+    /// path this counts only what one read took from an earlier read's chunks
+    /// that it did not itself use — zero for a dataset read the same way twice,
+    /// and no evidence either way about the budget. See
+    /// [`rejections`](Self::rejections) for that. A *row window* asks for the
+    /// plain LRU rule instead, since the chunk its successor needs is the one it
+    /// finished on; there this is the budget signal and `rejections` is the
+    /// figure that stays at zero.
+    pub const fn evictions(&self) -> u64 {
+        self.counters.evictions
+    }
+
+    /// Chunks offered to the cache and not retained, because it was already full
+    /// of chunks the same read had placed or been served.
+    ///
+    /// A whole read visits each of its chunks exactly once, so once it has filled
+    /// the cache there is nothing to gain by evicting one of its own chunks for
+    /// another; it stops offering instead. That makes this the budget signal on
+    /// that path and [`evictions`](Self::evictions) useless there: a whole read of
+    /// a dataset eight times the budget reports seven eighths of its chunks here
+    /// and no evictions at all. A row window reverses the two — it evicts by plain
+    /// LRU and never reaches this.
+    ///
+    /// Counted apart from [`oversize_chunks`](Self::oversize_chunks), which more
+    /// slots would not fix.
+    pub const fn rejections(&self) -> u64 {
+        self.counters.rejections
+    }
+
+    /// Chunks offered to the cache whose decompressed size exceeds the whole
+    /// byte budget, [`ChunkCacheConfig::max_bytes`].
+    ///
+    /// Raising [`max_slots`](ChunkCacheConfig::max_slots) does nothing for these;
+    /// only a byte budget above one chunk will admit them. Like
+    /// [`rejections`](Self::rejections) this counts offers, so a chunk too large
+    /// for the budget is counted again on every read that reaches it.
+    pub const fn oversize_chunks(&self) -> u64 {
+        self.counters.oversize_chunks
+    }
+
+    /// Retained chunks dropped because a commit in this session may have made
+    /// them stale.
+    ///
+    /// Session-wide, not handle-wide: a commit through *any* handle advances the
+    /// file's content revision, and every dataset handle drops its chunks the
+    /// next time it resolves. Only a read-write session invalidates; this stays
+    /// zero on a read-only open. Invalidations approaching
+    /// [`misses`](Self::misses) mean the session is rewriting the chunks it is
+    /// caching, and a larger budget will not change that.
+    pub const fn invalidations(&self) -> u64 {
+        self.counters.invalidations
+    }
+
+    /// Every chunk lookup: hits plus misses.
+    pub const fn lookups(&self) -> u64 {
+        self.counters.hits.saturating_add(self.counters.misses)
+    }
+
+    /// The fraction of chunk lookups served from the cache, or `None` before any
+    /// lookup has happened.
+    ///
+    /// `None` rather than `0.0`, which is also what a cache that missed every
+    /// lookup reports: the two mean opposite things to a caller deciding whether
+    /// to raise the budget, and only one of them is a reason to. A *disabled*
+    /// cache is the third case reporting `Some(0.0)` — every lookup is counted a
+    /// miss whether or not the cache was ever allowed to answer — so read it
+    /// beside [`ChunkCacheConfig`], which says whether there was a cache at all.
+    pub fn hit_rate(&self) -> Option<f64> {
+        let lookups = self.lookups();
+        if lookups == 0 {
+            return None;
+        }
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a hit rate is a ratio; f64 holds these counts exactly far past any \
+                      chunk count a process will reach"
+        )]
+        Some(self.counters.hits as f64 / lookups as f64)
     }
 }
 
@@ -203,9 +333,27 @@ struct CachedChunk {
 /// them, since it asks for each chunk exactly once and has no more use for the
 /// last window's chunks than for the first's.
 ///
-/// Across passes nothing changes either way: a later read still evicts what an
-/// earlier one left, so the cache goes on tracking the most recent access
-/// pattern.
+/// # Being served a chunk claims it, too
+///
+/// The same reasoning reaches one step further than placing a chunk does. A pass
+/// owns any slot it has been *served* from as well as any it filled, because a
+/// chunk this read has already used is worth at least as much as one it has not
+/// reached yet — and giving it back buys the same nothing.
+///
+/// Left out, that cost a repeat read everything the previous read had saved for
+/// it. A second read of a dataset larger than the cache hit all `max_slots`
+/// retained chunks, then handed every one of them back on its next `max_slots`
+/// misses, so the third read hit nothing and the count alternated `max_slots`,
+/// 0, `max_slots`, 0 forever — half the available hit rate, plus a placement and
+/// an eviction per chunk to arrive at a set the next read would destroy.
+///
+/// This is narrower than refusing to touch an earlier pass's chunks at all,
+/// which would strand the cache on whatever filled it first. A read claims only
+/// what it is actually served, so a read that wants chunks the cache does not
+/// hold claims nothing and takes the slots it needs; one that half overlaps
+/// keeps the half it used and replaces the half it did not. The cache still
+/// tracks the most recent access pattern, and now stops paying to re-track the
+/// same one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CachePass(u64);
 
@@ -268,6 +416,21 @@ struct CacheInner {
 
     /// Whether the parsed chunk index should be retained between reads.
     cache_index: bool,
+
+    /// Cumulative counters reported by [`ChunkCache::stats`].
+    counters: Counters,
+}
+
+/// The cumulative half of [`ChunkCacheStats`], kept beside the slots it
+/// describes so a snapshot is taken under one lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Counters {
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    rejections: u64,
+    oversize_chunks: u64,
+    invalidations: u64,
 }
 
 impl ChunkCache {
@@ -297,12 +460,12 @@ impl ChunkCache {
                 tick: 0,
                 pass: 0,
                 cache_index: config.cache_index,
+                counters: Counters::default(),
             }),
         }
     }
 
-    /// Snapshot the current chunk-cache occupancy (index loaded, retained
-    /// chunk count, retained bytes).
+    /// Snapshot what this cache is holding and what it has done.
     ///
     /// This is the public, read-only way to observe whether a chunk-cache
     /// configuration is taking effect. It locks the cache briefly to read a
@@ -313,7 +476,19 @@ impl ChunkCache {
             index_loaded: inner.index.is_some(),
             cached_chunks: inner.slots.len(),
             cached_bytes: inner.current_bytes,
+            counters: inner.counters,
         }
+    }
+
+    /// Zero the cumulative counters, leaving the retained index and chunks
+    /// alone.
+    ///
+    /// Occupancy is unaffected: this resets what the cache *has done*, not what
+    /// it is holding, so a caller can measure one read without the reads that
+    /// warmed the cache for it.
+    pub fn reset_stats(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.counters = Counters::default();
     }
 
     // ----- Index operations -----
@@ -377,16 +552,37 @@ impl ChunkCache {
     /// the chunk straight into its output buffer with no intermediate `Vec`
     /// allocation or clone. The closure must not touch this cache (it would
     /// deadlock); the chunk-assembly scatter it is used for does not.
-    pub fn with_decompressed<R>(&self, coord: &[u64], f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        let mut inner = self.inner.lock().unwrap();
+    pub fn with_decompressed<R>(
+        &self,
+        pass: CachePass,
+        coord: &[u64],
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        let mut guard = self.inner.lock().unwrap();
+        // Reborrowed once so the loop below borrows `slots` and `counters`
+        // separately; through the guard itself each is a borrow of the whole.
+        let inner = &mut *guard;
         inner.tick += 1;
         let tick = inner.tick;
         for slot in inner.slots.iter_mut() {
             if slot.coord.as_slice() == coord {
                 slot.last_access = tick;
+                // A pass that has been served a chunk owns it for the rest of
+                // that pass, exactly as if it had placed it. Without this a
+                // repeat read gives back every chunk it was just served, one per
+                // miss, and the read after it hits nothing; see [`CachePass`].
+                //
+                // Not for [`CachePass::LRU`], which is entitled to evict its own
+                // and would only be overwriting the provenance of a real pass
+                // running beside it on another thread.
+                if pass != CachePass::LRU {
+                    slot.stored_by = pass.0;
+                }
+                inner.counters.hits += 1;
                 return Some(f(&slot.data));
             }
         }
+        inner.counters.misses += 1;
         None
     }
 
@@ -409,8 +605,15 @@ impl ChunkCache {
     /// believing it holds bytes nothing occupies. On `false` nothing was changed
     /// beyond the LRU tick.
     fn reserve(inner: &mut CacheInner, pass: CachePass, coord: &[u64], data_len: usize) -> bool {
-        // Don't cache if disabled or if a single chunk exceeds the budget.
-        if inner.max_bytes == 0 || inner.max_slots == 0 || data_len > inner.max_bytes {
+        // A disabled cache counts nothing: it was never offered the chunk, and a
+        // caller who turned it off is not looking for a budget signal.
+        if inner.max_bytes == 0 || inner.max_slots == 0 {
+            return false;
+        }
+        // A chunk larger than the whole budget can never be retained, at any slot
+        // count, so it is counted apart from the chunks that merely did not fit.
+        if data_len > inner.max_bytes {
+            inner.counters.oversize_chunks += 1;
             return false;
         }
 
@@ -457,6 +660,7 @@ impl ChunkCache {
         if least_slots >= inner.max_slots
             || (least_bytes + data_len > inner.max_bytes && least_slots > 0)
         {
+            inner.counters.rejections += 1;
             return false;
         }
 
@@ -484,6 +688,7 @@ impl ChunkCache {
             };
             let removed = inner.slots.swap_remove(lru_idx);
             inner.current_bytes -= removed.data.len();
+            inner.counters.evictions += 1;
         }
 
         inner.current_bytes += data_len;
@@ -557,6 +762,10 @@ impl ChunkCache {
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.index = None;
+        // Counted before the drop, and as chunks rather than as one event: what a
+        // caller wants to compare against its miss count is how much retained
+        // data a write threw away, not how many times a write happened.
+        inner.counters.invalidations += inner.slots.len() as u64;
         inner.slots.clear();
         inner.current_bytes = 0;
         inner.tick = 0;
@@ -609,7 +818,7 @@ mod tests {
     /// Test helper: clone a cached chunk's bytes if present (the production
     /// path uses `with_decompressed` to avoid this copy).
     fn get_decompressed(cache: &ChunkCache, coord: &[u64]) -> Option<Vec<u8>> {
-        cache.with_decompressed(coord, <[u8]>::to_vec)
+        cache.with_decompressed(CachePass::LRU, coord, <[u8]>::to_vec)
     }
 
     #[test]
@@ -701,6 +910,62 @@ mod tests {
         assert_eq!(cache.stats().cached_chunks(), 2);
         assert!(get_decompressed(&cache, &[9]).is_some());
         assert!(get_decompressed(&cache, &[8]).is_some());
+    }
+
+    /// One eviction is counted per chunk dropped, not per admission that had to
+    /// drop something.
+    ///
+    /// Only the byte budget can force an admission to drop more than one chunk,
+    /// and only when chunks differ in size — which a real dataset's do not, since
+    /// every chunk decompresses to the same length. So this exercises the cache
+    /// directly: two small chunks, then one that needs the room of both.
+    #[test]
+    fn evictions_count_chunks_dropped_not_admissions_that_dropped_them() {
+        let cache = ChunkCache::with_capacity(250, 8);
+        let first = cache.begin_pass();
+        cache.put_decompressed(first, &[0], vec![0u8; 100]);
+        cache.put_decompressed(first, &[1], vec![0u8; 100]);
+        assert_eq!(cache.stats().cached_chunks(), 2);
+        assert_eq!(cache.stats().evictions(), 0);
+
+        // 200 held, 250 allowed: a 200-byte chunk needs both slots gone.
+        let second = cache.begin_pass();
+        cache.put_decompressed(second, &[2], vec![0u8; 200]);
+
+        let stats = cache.stats();
+        assert_eq!(stats.cached_chunks(), 1);
+        assert_eq!(stats.evictions(), 2);
+    }
+
+    /// A pass keeps what it was served even if a windowed read is served the same
+    /// chunk in between.
+    ///
+    /// [`CachePass::LRU`] is entitled to give up its own chunks, so it must not
+    /// stamp its identity onto a slot a real pass owns — that would hand the
+    /// chunk back to the very pass that is relying on keeping it. Two live passes
+    /// are what it takes to see this, which no single read produces; the cache
+    /// API hands them out directly, so this needs no threads.
+    #[test]
+    fn an_lru_hit_does_not_release_another_passs_chunk_to_it() {
+        let cache = ChunkCache::with_capacity(1024 * 1024, 2);
+        let reader = cache.begin_pass();
+        cache.put_decompressed(reader, &[0], vec![0u8; 100]);
+        cache.put_decompressed(reader, &[1], vec![0u8; 100]);
+
+        // A row window, elsewhere, is served the chunk `reader` placed.
+        assert!(
+            cache
+                .with_decompressed(CachePass::LRU, &[0], |_| ())
+                .is_some()
+        );
+
+        // `reader` offers a third chunk. Both slots are still its own, so there
+        // is nothing it may take, and the offer is refused.
+        cache.put_decompressed(reader, &[2], vec![0u8; 100]);
+
+        assert_eq!(cache.stats().cached_chunks(), 2);
+        assert!(get_decompressed(&cache, &[0]).is_some());
+        assert!(get_decompressed(&cache, &[1]).is_some());
     }
 
     /// [`CachePass::LRU`] is a sentinel: it works only because a real pass is
