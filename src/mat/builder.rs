@@ -2001,4 +2001,40 @@ mod tests {
         assert_eq!(read_class(&file, "#refs#/ref_0000000000000001"), "uint8");
         std::fs::remove_file(path).unwrap();
     }
+
+    #[derive(Debug, PartialEq)]
+    struct EmbedderError(u32);
+
+    impl std::fmt::Display for EmbedderError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "embedder failed with code {}", self.0)
+        }
+    }
+
+    impl std::error::Error for EmbedderError {}
+
+    /// A caller's own error type survives two nested closures, each of which
+    /// runs its own cleanup on the way out: `cell` resolves its parent target
+    /// before `fill`, and `push_with` records the reference it armed before it
+    /// propagates. The doctest on [`MatError::Source`] covers `struct_`, the
+    /// third shape.
+    #[test]
+    fn a_caller_error_crosses_the_closure_boundary_whole() {
+        use std::error::Error;
+
+        let mut mb = MatBuilder::new(Options::default());
+        let err = mb
+            .cell("c", &[1, 1], |cw| {
+                cw.push_with(|_| Err(MatError::from_source(EmbedderError(7))))?;
+                Ok(())
+            })
+            .err()
+            .expect("the closure failed");
+
+        assert_eq!(err.to_string(), "embedder failed with code 7");
+        assert_eq!(
+            err.source().unwrap().downcast_ref::<EmbedderError>(),
+            Some(&EmbedderError(7))
+        );
+    }
 }

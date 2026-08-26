@@ -335,6 +335,20 @@ A wrong block length is refused rather than written, because a short or long blo
 !!! tip
     The `mat_streaming` example is a complete working version of the above — an acquisition producer, a streamed write, a read-back, and a check that the bytes match the same content written the ordinary way. Run it with `cargo run --example mat_streaming` (no features needed: `MatBuilder` is not behind `serde`).
 
+## Carrying your own error type
+
+Every callback the builder takes returns `Result<(), MatError>`: `DataProducer::block_bytes`, and the nesting closures `MatBuilder::struct_`, `MatBuilder::cell`, `CellWriter::push_with` and their siblings. A crate that writes `.mat` as one of several output formats therefore has to put its own error type through that boundary, and `MatError::Custom(e.to_string())` gets it across as text alone.
+
+`MatError::from_source` carries the error itself instead, so the caller's caller can recover it:
+
+```rust,ignore
+let value = self.encode(x).map_err(MatError::from_source)?;
+```
+
+It takes a concrete error type or an already-boxed one, and the result answers `Error::source` with what it was given, so `err.source().and_then(|e| e.downcast_ref::<EncodeError>())` reaches the original. `Display` prints the inner error, so nothing about the message changes.
+
+This covers what a callback of yours returns. An error raised by a sink you supplied to `finish_to` or `write` is an `io::Error` the writer met on its own, and it arrives as `MatError::Hdf5(Error::Io(..))` rather than through this variant.
+
 ## Hand-built files (low-level conventions)
 
 If you are not using serde, you can apply the MATLAB conventions yourself on top of `FileBuilder`. Two pieces matter: the userblock header and the `MATLAB_class` / `MATLAB_fields` attributes.
