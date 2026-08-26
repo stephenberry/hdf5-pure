@@ -94,6 +94,7 @@ Two accessors describe an existing dataset's type:
 | `AttrValue::AsciiString` | Fixed-width ASCII string |
 | `AttrValue::AsciiStringArray` | Array of fixed-width ASCII strings (null-padded to the longest element) |
 | `AttrValue::VarLenAsciiArray` | Variable-length ASCII string array (stored in a global heap collection) |
+| `AttrValue::StringSized` / `AsciiStringSized` (and their `*ArraySized` forms) | Fixed-width string of a width you declare, built by `AttrValue::string_sized` / `ascii_string_sized` and their array siblings |
 
 ```rust
 use hdf5_pure::{FileBuilder, AttrValue};
@@ -101,7 +102,14 @@ use hdf5_pure::{FileBuilder, AttrValue};
 let mut builder = FileBuilder::new();
 builder.set_attr("version", AttrValue::I64(2));
 builder.set_attr("unit", AttrValue::AsciiString("m/s".into()));
+
+// A slot of a chosen width, holding a shorter value: `H5T_C_S1` plus
+// `H5Tset_size(64)`. Writing it again at the same width leaves the slot the
+// size it was, where `AsciiString` would resize it to the new content.
+builder.set_attr("label", AttrValue::ascii_string_sized("ok", 64).unwrap());
 ```
+
+The `*_sized` constructors return a `Result`: a value longer than the declared width is refused with `FormatError::FixedStringTooLong` rather than stored as a prefix, and a width of zero with `FormatError::ZeroFixedStringWidth`. `width` counts bytes, so a UTF-8 value with multi-byte characters takes more of it than its character count suggests.
 
 `AsciiStringArray` and `VarLenAsciiArray` exist for MATLAB interoperability (the `MATLAB_fields` pattern). See the [groups and attributes guide](../guide/groups-attributes.md).
 

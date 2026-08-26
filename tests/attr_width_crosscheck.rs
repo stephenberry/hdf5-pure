@@ -2,8 +2,8 @@
 // which is gated to 64-bit little-endian targets; skip them elsewhere so the pure-Rust
 // suite can run under `cross test --target i686-...`.
 #![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
-//! A numeric attribute keeps the width it is stored at, in both directions
-//! across the reference C library (issues #350 and #354).
+//! An attribute keeps the width it is stored at, in both directions across the
+//! reference C library (issues #350, #354 and #359).
 //!
 //! `AttrValue` used to carry integers only at 64 bits and floats only at 64,
 //! so an attribute written from a value was eight bytes wide whatever the
@@ -17,9 +17,16 @@
 //! and the rest — because a value that only fits at its own width is what
 //! catches a narrowing that wrapped or rounded, or a widening that lost a sign,
 //! which `-7` in every slot would not.
+//!
+//! The string half is the same claim about a different field: a fixed-width
+//! string attribute declares a `STRSIZE`, and a value's own length is only one
+//! of the widths it can be stored at. The C library's `H5T_C_S1` plus
+//! `H5Tset_size(N)` is the slot this crate had no way to write before issue
+//! #359, and the one it now has to read back without losing the N.
 
-use hdf5::types::{FloatSize, IntSize, TypeDescriptor};
+use hdf5::types::{FixedAscii, FixedUnicode, FloatSize, IntSize, TypeDescriptor};
 use hdf5_pure::{AttrValue, File, FileBuilder};
+use std::str::FromStr;
 use tempfile::tempdir;
 
 /// One attribute per width: the name, the value this crate writes, and the type
@@ -264,5 +271,139 @@ fn every_width_the_c_library_writes_reads_back_as_itself() {
         expected.len(),
         "every attribute the C library wrote must decode, got {:?}",
         attrs.keys().collect::<Vec<_>>()
+    );
+}
+
+/// The C library reports the `STRSIZE` this crate declared, and reads the value
+/// out of the slot.
+///
+/// The width is the claim: a padded slot and a slot sized to its content read
+/// back through this crate as the same string, so only a second library can say
+/// which one the file holds. The value is read at the declared width too, since
+/// a message declaring 64 over bytes laid out at 2 would report the right width
+/// and hand back the wrong text.
+#[test]
+fn c_reads_the_string_width_this_crate_declared() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("string_widths.h5");
+
+    let mut builder = FileBuilder::new();
+    builder.set_attr("units", AttrValue::ascii_string_sized("ok", 64).unwrap());
+    builder.set_attr("plain", AttrValue::AsciiString("ok".into()));
+    builder.set_attr("label", AttrValue::string_sized("mètre", 16).unwrap());
+    builder.set_attr(
+        "labels",
+        AttrValue::ascii_string_array_sized(vec!["north".into(), "s".into()], 16).unwrap(),
+    );
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    for (name, expected) in [
+        ("units", TypeDescriptor::FixedAscii(64)),
+        ("plain", TypeDescriptor::FixedAscii(2)),
+        ("label", TypeDescriptor::FixedUnicode(16)),
+        ("labels", TypeDescriptor::FixedAscii(16)),
+    ] {
+        assert_eq!(
+            file.attr(name)
+                .unwrap()
+                .dtype()
+                .unwrap()
+                .to_descriptor()
+                .unwrap(),
+            expected,
+            "attribute {name} reached the file at the wrong string width"
+        );
+    }
+
+    assert_eq!(
+        file.attr("units")
+            .unwrap()
+            .read_scalar::<FixedAscii<64>>()
+            .unwrap()
+            .as_str(),
+        "ok"
+    );
+    assert_eq!(
+        file.attr("label")
+            .unwrap()
+            .read_scalar::<FixedUnicode<16>>()
+            .unwrap()
+            .as_str(),
+        "mètre"
+    );
+    let labels: Vec<FixedAscii<16>> = file
+        .attr("labels")
+        .unwrap()
+        .read_1d::<FixedAscii<16>>()
+        .unwrap()
+        .to_vec();
+    assert_eq!(
+        labels.iter().map(FixedAscii::as_str).collect::<Vec<_>>(),
+        ["north", "s"]
+    );
+    file.close().unwrap();
+}
+
+/// The read direction: a padded slot the C library wrote arrives carrying its
+/// width, so writing the value back reproduces the slot instead of shrinking it.
+///
+/// This is the half a caller sees on somebody else's file, and the one the
+/// previous representation could not express at all — every fixed-width string
+/// attribute arrived as its trimmed text, and the `STRSIZE` was gone.
+#[test]
+fn a_padded_slot_the_c_library_wrote_reads_back_carrying_its_width() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_string_widths.h5");
+
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        file.new_attr::<FixedAscii<64>>()
+            .shape(())
+            .create("padded")
+            .unwrap()
+            .write_scalar(&FixedAscii::<64>::from_ascii("ok").unwrap())
+            .unwrap();
+        // Sized to its own content, which is what the plain variant writes.
+        file.new_attr::<FixedAscii<2>>()
+            .shape(())
+            .create("exact")
+            .unwrap()
+            .write_scalar(&FixedAscii::<2>::from_ascii("ok").unwrap())
+            .unwrap();
+        file.new_attr::<FixedUnicode<32>>()
+            .shape([2])
+            .create("padded_utf8")
+            .unwrap()
+            .write(&[
+                FixedUnicode::<32>::from_str("mètre").unwrap(),
+                FixedUnicode::<32>::from_str("K").unwrap(),
+            ])
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    let attrs = File::from_bytes(bytes).unwrap().root().attrs().unwrap();
+
+    assert!(
+        matches!(
+            &attrs["padded"],
+            AttrValue::AsciiStringSized { value, width, .. }
+                if value == "ok" && width.get() == 64
+        ),
+        "a 64-byte slot must keep its width, got {:?}",
+        attrs["padded"]
+    );
+    assert_eq!(attrs["exact"], AttrValue::AsciiString("ok".into()));
+    assert!(
+        matches!(
+            &attrs["padded_utf8"],
+            AttrValue::StringArraySized { values, width, .. }
+                if values == &["mètre".to_string(), "K".to_string()] && width.get() == 32
+        ),
+        "a padded UTF-8 array must keep its width, got {:?}",
+        attrs["padded_utf8"]
     );
 }

@@ -112,6 +112,8 @@ println!("attributes:   {:?}", sensors.attrs().unwrap());
 
 An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, the datatype's charset selects the `Ascii` variants, and a number's width selects among `I8` … `U64` and `F32` / `F64`. A `VarLenAsciiArray` of one element stays a `VarLenAsciiArray`, an `AsciiString` does not arrive as a `String`, and a 16-bit integer does not arrive as an `I64`.
 
+A fixed-width string carries its width the same way. `AttrValue::ascii_string_sized("ok", 64)` declares a 64-byte slot — `H5T_C_S1` plus `H5Tset_size(64)` — and a slot whose width is not the one its content implies reads back as `AsciiStringSized` (or `StringSized`, or the array forms) carrying that width, so writing the value back reproduces the slot rather than shrinking it to the content. A slot sized exactly to its content reads back as the plain `AsciiString`, which writes the same bytes.
+
 That fidelity means several variants can carry the same logical value, so match on the variant only when the encoding is what you care about. Otherwise use the accessors, each of which spans every variant that can hold the shape it names:
 
 ```rust
@@ -132,7 +134,7 @@ What a read cannot recover, because `AttrValue` has no way to express it. Each o
 - **Unrepresentable integer widths.** A number keeps its width at 1, 2, 4 and 8 bytes; an integer width with no Rust integer of its own — 3 bytes, say — widens to 64-bit.
 - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR` — what h5py writes, and what this crate's writer never emits — has no variant of its own and reads as the fixed-width variant of the same charset.
 - **Rank.** Every array variant is one-dimensional, so a rank-2 attribute reads as its elements flattened.
-- **Padding and declared width.** A fixed-width string reports its content, not its `STRSIZE` or which padding it used.
+- **String padding.** A fixed-width string reports its content and the `STRSIZE` it was stored at, but not which padding rule filled the bytes past the content: every variant writes back `NULLPAD`.
 - **Enumeration member names.** An enum attribute decodes through its integer base, so its codes arrive and its labels do not.
 
 The variant may become **more specific** in a future release as `AttrValue` grows further variants — the numeric widths landed that way — so match with a `_` arm, which the `#[non_exhaustive]` enum requires anyway, or read through the accessors, which are unaffected by such a change.
