@@ -129,6 +129,8 @@ For full control, the crate re-exports the low-level datatype types from `dataty
 
 `Datatype::type_size()` returns the on-disk size in bytes.
 
+A `FixedPoint` or `FloatingPoint` element **wider than 8 bytes** parses and reports its type like any other, but the typed *numeric* readers refuse to decode it rather than return part of a value (`read_raw`, `read_u8` and `read_i8` still hand back the bytes) — see [Limitations](limitations.md#numeric-element-width).
+
 ### Helper enums
 
 | Enum | Variants |

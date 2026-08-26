@@ -7192,6 +7192,101 @@ mod tests {
         }
     }
 
+    /// The refusal reaches a dataset too, not only the attribute the issue was
+    /// reported through: the same decoders back `Dataset::read_*`, by both the
+    /// whole-dataset and the windowed route.
+    #[test]
+    fn a_wide_dataset_is_refused_by_the_typed_readers() {
+        let dt = Datatype::FixedPoint {
+            size: 16,
+            byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 128,
+        };
+        let mut b = FileBuilder::new();
+        b.create_dataset("wide")
+            .with_raw_data(dt.clone(), vec![0xFF; 32], 2);
+        let file = File::from_bytes(b.finish().unwrap()).unwrap();
+        let ds = file.dataset("wide").unwrap();
+
+        assert_eq!(
+            ds.datatype().unwrap(),
+            dt,
+            "the datatype still reads: it is the values that have no answer"
+        );
+        assert!(matches!(
+            ds.read_u64(),
+            Err(Error::Format(FormatError::NumericElementTooWide {
+                size: 16
+            }))
+        ));
+        assert!(matches!(
+            ds.read_u64_rows(0, 1),
+            Err(Error::Format(FormatError::NumericElementTooWide {
+                size: 16
+            }))
+        ));
+        // What is refused is the decode, not the data: the bytes are still
+        // there for a caller willing to read the width itself.
+        assert_eq!(ds.read_raw().unwrap().len(), 32);
+    }
+
+    /// A fixed-point attribute wider than the 64-bit value the readers decode
+    /// into joins the attributes `attrs` omits, rather than appearing there
+    /// holding part of its value.
+    ///
+    /// This one used to be *present* in the values channel: nine bytes holding
+    /// 2^64 read back as `U64(0)`, a value indistinguishable from an attribute
+    /// that really holds zero. Omitting it puts it where the opaque attribute
+    /// above already sits — absent from the values, reported in full by the
+    /// datatypes — so a caller can see that something was dropped (#361).
+    #[test]
+    fn an_attribute_too_wide_to_decode_is_omitted_rather_than_truncated() {
+        let wide = Datatype::FixedPoint {
+            size: 9,
+            byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 72,
+        };
+        // 2^64 exactly, so every one of the low 64 bits is zero.
+        let mut raw_data = vec![0u8; 9];
+        raw_data[8] = 1;
+        let huge = crate::attribute::AttributeMessage {
+            name: "huge".into(),
+            datatype: wide.clone(),
+            dataspace: Dataspace {
+                space_type: crate::dataspace::DataspaceType::Scalar,
+                rank: 0,
+                dimensions: vec![],
+                max_dimensions: None,
+            },
+            raw_data,
+            datatype_location: crate::shared_message::DatatypeLocation::Inline,
+        };
+
+        for c in attr_channels(&[("count", AttrValue::I32(1))], std::slice::from_ref(&huge)).owners
+        {
+            assert!(
+                !c.values.contains_key("huge"),
+                "{}: decoding this attribute would report 0 for a value of 2^64",
+                c.owner
+            );
+            assert_eq!(
+                c.datatypes.get("huge"),
+                Some(&wide),
+                "{}: the datatype channel must still report the width on disk",
+                c.owner
+            );
+            assert!(
+                c.values.contains_key("count") && c.datatypes.contains_key("count"),
+                "{}: the attribute beside it must still decode",
+                c.owner
+            );
+        }
+    }
+
     /// The channel must cover dense (fractal-heap) attribute storage, not only
     /// the compact form that lives in the object header.
     ///
