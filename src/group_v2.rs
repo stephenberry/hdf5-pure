@@ -10,7 +10,7 @@ use crate::btree_v2::{
     BTreeV2Header, collect_btree_v2_records, collect_btree_v2_records_from_source,
 };
 use crate::convert::TryToUsize;
-use crate::error::FormatError;
+use crate::error::{FormatError, ResolveError};
 use crate::fractal_heap::FractalHeapHeader;
 use crate::group_v1::{self, GroupEntry};
 use crate::link_info::LinkInfoMessage;
@@ -75,8 +75,41 @@ fn resolve_compact_entries(
     Ok(entries)
 }
 
-/// The stored object-header address of the child named `name` in the group whose
-/// header is at `group_address`, found without reading every other child.
+/// What a by-name child lookup found in the object it was pointed at.
+///
+/// Three answers rather than an `Option`, because "this is not a group, so it
+/// has no children to search" is a different fact from "this group has no child
+/// of that name". Both used to leave the lookup as a `FormatError::PathNotFound`
+/// — absence naming the component, a non-group naming nothing at all — so a
+/// caller could not tell them apart, and a path *through* a dataset read as a
+/// path that does not exist (issue #365).
+///
+/// Which object the answer is about is left to the caller. Naming it takes the
+/// path walked to reach it, and only the caller has that; a lookup one component
+/// deep knows an address and nothing else. Which address convention `Found`
+/// carries is the producing function's to state, and each does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildLookup {
+    /// The group holds a child of that name, at this address.
+    Found(u64),
+    /// The group holds no child of that name.
+    Absent,
+    /// The object searched is not a group at all, in either form.
+    NotAGroup,
+}
+
+impl ChildLookup {
+    /// The answer reached by searching an object that *is* a group.
+    fn of(address: Option<u64>) -> Self {
+        match address {
+            Some(address) => ChildLookup::Found(address),
+            None => ChildLookup::Absent,
+        }
+    }
+}
+
+/// The child named `name` in the group whose header is at `group_address`, found
+/// without reading every other child.
 ///
 /// A group of *n* children is *n* Link messages in its object header, and
 /// [`resolve_group_entries`] turns each into a [`GroupEntry`] with an owned name.
@@ -91,8 +124,13 @@ fn resolve_compact_entries(
 /// symbol table — so the fallback below reads a header that is whole as far as
 /// it is concerned.
 ///
-/// The address returned is the stored one, relative to the superblock base
-/// address, exactly as [`GroupEntry::object_header_address`] carries it.
+/// The object searched is classified before it is searched, so that one that is
+/// no group at all answers [`ChildLookup::NotAGroup`] rather than an error the
+/// caller cannot tell from an absent child; see that type.
+///
+/// A [`ChildLookup::Found`] address is the stored one, relative to the
+/// superblock base address, exactly as [`GroupEntry::object_header_address`]
+/// carries it.
 pub(crate) fn find_child_address(
     file_data: &[u8],
     group_address: u64,
@@ -100,7 +138,7 @@ pub(crate) fn find_child_address(
     length_size: u8,
     base_address: u64,
     name: &str,
-) -> Result<Option<u64>, FormatError> {
+) -> Result<ChildLookup, FormatError> {
     let mut saw_link = false;
     let header = {
         let mut wanted = wanted_link_only(name, &mut saw_link);
@@ -113,15 +151,22 @@ pub(crate) fn find_child_address(
             MessageFilter::Only(&mut wanted),
         )?
     };
-    if holds_compact_links(&header, offset_size, saw_link)? {
-        return scan_compact_links(&header, offset_size, name);
+    if !filtered_is_group(&header, saw_link) {
+        return Ok(ChildLookup::NotAGroup);
     }
-    Ok(
+    if holds_compact_links(&header, offset_size)? {
+        return Ok(ChildLookup::of(scan_compact_links(
+            &header,
+            offset_size,
+            name,
+        )?));
+    }
+    Ok(ChildLookup::of(
         resolve_group_entries(file_data, &header, offset_size, length_size, base_address)?
             .into_iter()
             .find(|e| e.name == name)
             .map(|e| e.object_header_address),
-    )
+    ))
 }
 
 /// Streaming counterpart of [`find_child_address`].
@@ -132,7 +177,7 @@ pub(crate) fn find_child_address_from_source<S: Source + ?Sized>(
     length_size: u8,
     base_address: u64,
     name: &str,
-) -> Result<Option<u64>, FormatError> {
+) -> Result<ChildLookup, FormatError> {
     let mut saw_link = false;
     let header = {
         let mut wanted = wanted_link_only(name, &mut saw_link);
@@ -145,15 +190,22 @@ pub(crate) fn find_child_address_from_source<S: Source + ?Sized>(
             MessageFilter::Only(&mut wanted),
         )?
     };
-    if holds_compact_links(&header, offset_size, saw_link)? {
-        return scan_compact_links(&header, offset_size, name);
+    if !filtered_is_group(&header, saw_link) {
+        return Ok(ChildLookup::NotAGroup);
     }
-    Ok(
+    if holds_compact_links(&header, offset_size)? {
+        return Ok(ChildLookup::of(scan_compact_links(
+            &header,
+            offset_size,
+            name,
+        )?));
+    }
+    Ok(ChildLookup::of(
         resolve_group_entries_from_source(source, &header, offset_size, length_size, base_address)?
             .into_iter()
             .find(|e| e.name == name)
             .map(|e| e.object_header_address),
-    )
+    ))
 }
 
 /// A message filter that keeps everything except the links this lookup did not
@@ -162,7 +214,7 @@ pub(crate) fn find_child_address_from_source<S: Source + ?Sized>(
 /// That record is what keeps the filter honest: dropping the other links must
 /// not change what the header *is*, and a compact group is recognized partly by
 /// having Link messages ([`is_v2_group`]). So the ones dropped here are still
-/// counted, and [`holds_compact_links`] classifies the header the way an
+/// counted, and [`filtered_is_group`] classifies the header the way an
 /// unfiltered parse would have.
 fn wanted_link_only<'a>(
     name: &'a str,
@@ -181,27 +233,39 @@ fn wanted_link_only<'a>(
 /// — the case [`scan_compact_links`] can answer from the header alone, now that
 /// [`wanted_link_only`] has narrowed it to the link asked for.
 ///
-/// A v1 (symbol-table) group, a dense v2 group, and a header that is no group at
-/// all all answer `false`, and their callers fall back to the full walk, which
-/// reads what it needs and reports the last case as the error it is. None of the
-/// three stores links as Link messages, so that walk reads a header the filter
+/// **Only ask this of a header [`filtered_is_group`] has accepted.** A header that
+/// is no group at all has no fractal heap either, so it would answer `true` here
+/// and be scanned for links it cannot have; both callers classify first, which is
+/// what lets this ask the two questions that remain. A v1 (symbol-table) group
+/// and a dense v2 group both answer `false` and fall back to the full walk —
+/// neither stores links as Link messages, so that walk reads a header the filter
 /// took nothing from.
 ///
-/// The symbol table is checked first because [`resolve_group_entries`] checks it
-/// first: a header carrying both a Symbol Table message and a Link Info message
-/// is not something any writer here produces, but the two paths must agree on
-/// what it is, or a child that the fallback finds through the symbol table would
-/// be reported as absent by the scan.
-fn holds_compact_links(
-    header: &ObjectHeader,
-    offset_size: u8,
-    saw_link: bool,
-) -> Result<bool, FormatError> {
+/// The `!is_v1_group` term is what gives the symbol table precedence, matching
+/// [`resolve_group_entries`], which checks it first: a header carrying both a
+/// Symbol Table message and a Link Info message is not something any writer here
+/// produces, but the two paths must agree on what it is, or a child that the
+/// fallback finds through the symbol table would be reported as absent by the
+/// scan.
+fn holds_compact_links(header: &ObjectHeader, offset_size: u8) -> Result<bool, FormatError> {
     Ok(!is_v1_group(header)
-        && (saw_link || is_v2_group(header))
         && find_link_info(header, offset_size)?
             .fractal_heap_address
             .is_none())
+}
+
+/// Whether the filtered header a child lookup parsed describes a group at all.
+///
+/// [`is_group`] alone is not the question here. [`wanted_link_only`] drops the
+/// Link messages the lookup did not ask for, so a compact group that keeps its
+/// links as Link messages and carries no Link Info message comes back with
+/// nothing left to recognize it by whenever the wanted link is not one of them.
+/// `saw_link` is the record that it had links, and consulting it is what makes
+/// this answer what an unfiltered parse would have: filtering drops only Link
+/// messages, so `saw_link || is_group(filtered)` is exactly `is_group` of the
+/// header before the filter ran.
+fn filtered_is_group(header: &ObjectHeader, saw_link: bool) -> bool {
+    saw_link || is_group(header)
 }
 
 /// The stored address of the hard link named `name` among this header's compact
@@ -335,10 +399,26 @@ fn is_v1_group(object_header: &ObjectHeader) -> bool {
 /// The union of the two predicates above, which is to say: exactly the headers
 /// [`resolve_group_entries`] will enumerate rather than refuse. A by-name group
 /// lookup ([`crate::File::group`], [`crate::Group::group`]) asks the same
-/// question to decide whether to open at all, and asks it here so that a header
-/// this module would enumerate cannot be one that lookup turns away.
+/// question to decide whether to open at all, and a path walk asks it through
+/// [`filtered_is_group`] to decide whether it can descend at all. Each asks it
+/// here, so a header this module would enumerate cannot be one they turn away.
 pub(crate) fn is_group(object_header: &ObjectHeader) -> bool {
     is_v1_group(object_header) || is_v2_group(object_header)
+}
+
+/// The root-relative path of the object a path walk had descended into when it
+/// tried to look `components[i]` up inside it: every component before `i`.
+///
+/// The whole prefix rather than the one component, because that is the path the
+/// refusal is *about* — `a/b/c` stopped by a dataset at `a/b` names `a/b`, which
+/// a caller can go and open, where a bare `b` would not say where to find it.
+/// Empty at `i == 0`, the root group, which is how this crate names the root
+/// throughout (a root [`crate::Group`] handle carries the empty path too).
+///
+/// Both walks resolve the same path the same way, so they name the object the
+/// same way as well.
+fn walked_prefix(components: &[&str], i: usize) -> String {
+    components[..i].join("/")
 }
 
 /// Unified path resolution that works for both v1 and v2 groups.
@@ -348,7 +428,7 @@ pub fn resolve_path_any(
     file_data: &[u8],
     superblock: &Superblock,
     path: &str,
-) -> Result<u64, FormatError> {
+) -> Result<u64, ResolveError> {
     let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if components.is_empty() {
         return Ok(superblock.root_group_address);
@@ -362,7 +442,7 @@ pub fn resolve_path_any(
 
     for (i, component) in components.iter().enumerate() {
         match find_child_address(file_data, current_addr, os, ls, base, component)? {
-            Some(stored_addr) => {
+            ChildLookup::Found(stored_addr) => {
                 // Link addresses are relative to base_address; convert to absolute.
                 let abs_addr = stored_addr + base;
                 if i == components.len() - 1 {
@@ -370,8 +450,11 @@ pub fn resolve_path_any(
                 }
                 current_addr = abs_addr;
             }
-            None => {
-                return Err(FormatError::PathNotFound(String::from(*component)));
+            ChildLookup::Absent => {
+                return Err(FormatError::PathNotFound(String::from(*component)).into());
+            }
+            ChildLookup::NotAGroup => {
+                return Err(ResolveError::NotAGroup(walked_prefix(&components, i)));
             }
         }
     }
@@ -408,6 +491,14 @@ pub fn resolve_group_entries(
             base_address,
         )
     } else {
+        // Names no object, and cannot: an enumeration is handed a header and
+        // nothing else. Where there is a path to give, the walks give it: they
+        // classify through `find_child_address` before they descend and refuse a
+        // non-group by name (issue #365). What is left reaches this holding no
+        // path either — `reference_patch` and the incoming-hard-link tally read
+        // it as "not a group, skip", and `FileInner::group_children` and
+        // `reconstruct_v1_group` surface it — so there is nothing better for it
+        // to say.
         Err(FormatError::PathNotFound(String::from(
             "object header is not a group",
         )))
@@ -429,7 +520,7 @@ pub fn resolve_path_any_from_source<S: Source + ?Sized>(
     source: &S,
     superblock: &Superblock,
     path: &str,
-) -> Result<u64, FormatError> {
+) -> Result<u64, ResolveError> {
     let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if components.is_empty() {
         return Ok(superblock.root_group_address);
@@ -443,14 +534,19 @@ pub fn resolve_path_any_from_source<S: Source + ?Sized>(
 
     for (i, component) in components.iter().enumerate() {
         match find_child_address_from_source(source, current_addr, os, ls, base, component)? {
-            Some(stored_addr) => {
+            ChildLookup::Found(stored_addr) => {
                 let abs_addr = stored_addr + base;
                 if i == components.len() - 1 {
                     return Ok(abs_addr);
                 }
                 current_addr = abs_addr;
             }
-            None => return Err(FormatError::PathNotFound(String::from(*component))),
+            ChildLookup::Absent => {
+                return Err(FormatError::PathNotFound(String::from(*component)).into());
+            }
+            ChildLookup::NotAGroup => {
+                return Err(ResolveError::NotAGroup(walked_prefix(&components, i)));
+            }
         }
     }
 
@@ -699,16 +795,22 @@ mod tests {
     /// parse's word for having seen them — otherwise a group that stores links as
     /// messages *without* a Link Info message (which [`find_link_info`] accepts on
     /// purpose) would stop looking like a group the moment its links were filtered
-    /// out, and a missing child would be reported as "not a group" instead.
+    /// out, and a missing child would be reported as "not a group" instead. Since
+    /// issue #365 that report is the refusal a lookup gives, so this is what keeps
+    /// such a group from being refused outright rather than merely searched twice.
     #[test]
     fn a_filtered_out_link_still_makes_the_header_a_compact_group() {
         let no_link_info = header_of(vec![]);
         assert!(
-            holds_compact_links(&no_link_info, 8, true).unwrap(),
-            "a header whose links the filter dropped is still a compact group"
+            filtered_is_group(&no_link_info, true),
+            "a header whose links the filter dropped is still a group"
         );
         assert!(
-            !holds_compact_links(&no_link_info, 8, false).unwrap(),
+            holds_compact_links(&no_link_info, 8).unwrap(),
+            "and one holding its links compactly, so the scan answers it"
+        );
+        assert!(
+            !filtered_is_group(&no_link_info, false),
             "a header that held no link and no link info is no group of ours"
         );
     }
@@ -718,9 +820,12 @@ mod tests {
     #[test]
     fn a_dense_group_is_never_scanned_for_compact_links() {
         let dense = header_of(vec![dense_link_info_message()]);
-        assert!(!holds_compact_links(&dense, 8, false).unwrap());
         assert!(
-            !holds_compact_links(&dense, 8, true).unwrap(),
+            filtered_is_group(&dense, true),
+            "a dense group is a group, so a lookup goes on to ask the question below"
+        );
+        assert!(
+            !holds_compact_links(&dense, 8).unwrap(),
             "a fractal heap decides, not the presence of a link message"
         );
     }
@@ -840,7 +945,10 @@ mod tests {
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
 
         let err = resolve_path_any(file_data, &sb, "nonexistent").unwrap_err();
-        assert!(matches!(err, FormatError::PathNotFound(_)));
+        assert!(matches!(
+            err,
+            ResolveError::Format(FormatError::PathNotFound(_))
+        ));
     }
 }
 

@@ -106,7 +106,7 @@ println!("datasets:     {:?}", sensors.datasets().unwrap()); // ["humidity", "pr
 println!("attributes:   {:?}", sensors.attrs().unwrap());
 ```
 
-`File::group(path)` resolves a group by path, and `Group::group(name)` resolves a child relative to that group. Both fail with `Error::NotAGroup` when the name reaches something that is not a group — a dataset, or a committed datatype — the way `Error::NotADataset` reports the mirror case for `dataset()`; a name that reaches nothing at all is a `FormatError::PathNotFound` instead. The names returned by `groups()` and `datasets()` are not sorted in any guaranteed order, so sort them yourself if you need a stable listing.
+`File::group(path)` resolves a group by path, and `Group::group(name)` resolves a child relative to that group. Both fail with `Error::NotAGroup` when the name reaches something that is not a group — a dataset, or a committed datatype — the way `Error::NotADataset` reports the mirror case for `dataset()`; a name that reaches nothing at all is a `FormatError::PathNotFound` instead. The same error reports a component *along* a path, since resolving `a/b/c` opens `a` and then `a/b` to look inside them, and it names that component's own path rather than the one asked for: a dataset at `a/b` gives `Error::NotAGroup("a/b")` from `File::group("a/b/c")` and from `File::dataset("a/b/c")` alike. The names returned by `groups()` and `datasets()` are not sorted in any guaranteed order, so sort them yourself if you need a stable listing.
 
 ### Reading an attribute value
 

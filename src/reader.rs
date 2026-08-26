@@ -31,7 +31,7 @@ use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterPipeline;
 use crate::free_space_manager;
 use crate::group_v1::GroupEntry;
-use crate::group_v2::{self, is_group};
+use crate::group_v2::{self, ChildLookup, is_group};
 use crate::layout_info::{Chunk, ChunkIndex, Filter, Layout};
 use crate::libver::LibVer;
 use crate::message_type::MessageType;
@@ -1525,17 +1525,17 @@ impl FileInner {
         Ok(entries)
     }
 
-    /// The base-adjusted object-header address of the child named `name`, or
-    /// `None` if the group has no such child.
+    /// The child named `name`, with a [`ChildLookup::Found`] address adjusted to
+    /// an absolute file offset.
     ///
     /// The by-name counterpart of [`group_children`](Self::group_children), and
     /// the one to reach for when a single child is wanted: it stops at the match
     /// rather than building an entry, and an owned name, for every other child
     /// of the group (issue #228).
-    fn group_child(&self, group_address: u64, name: &str) -> Result<Option<u64>, Error> {
+    fn group_child(&self, group_address: u64, name: &str) -> Result<ChildLookup, Error> {
         let (os, ls, base) = (self.offset_size(), self.length_size(), self.addr_offset);
         let addr = group_address;
-        let stored = match &self.backend {
+        let found = match &self.backend {
             Backend::InMemory(v) => group_v2::find_child_address(v, addr, os, ls, base, name),
             Backend::Streaming(s) => {
                 group_v2::find_child_address_from_source(s.as_ref(), addr, os, ls, base, name)
@@ -1547,19 +1547,19 @@ impl FileInner {
             ),
         }
         .map_err(Error::Format)?;
+        let ChildLookup::Found(stored) = found else {
+            return Ok(found);
+        };
         // The stored address is relative to the base address; normalize to an
         // absolute file offset, refusing the wrap a crafted entry (e.g. the
         // HADDR_UNDEF sentinel) would otherwise cause — as `group_children` does.
-        stored
-            .map(|addr| {
-                addr.checked_add(base)
-                    .ok_or(FormatError::OffsetOverflow {
-                        offset: addr,
-                        length: base,
-                    })
-                    .map_err(Error::Format)
-            })
-            .transpose()
+        let absolute = stored
+            .checked_add(base)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: stored,
+                length: base,
+            })?;
+        Ok(ChildLookup::Found(absolute))
     }
 
     /// Read all attributes attached to an object header, dispatching on the
@@ -2557,6 +2557,11 @@ impl File {
     /// The dataset uses the file-wide chunk-cache default (configured with
     /// [`FileAccessProperties::with_chunk_cache`]). To override the cache for this
     /// one dataset, use [`dataset_with_options`](Self::dataset_with_options).
+    ///
+    /// Returns [`Error::NotADataset`] if the path names something that is not a
+    /// dataset, and [`Error::NotAGroup`] if a component *along* the path is not
+    /// a group: resolving `a/b/c` opens `a` and then `a/b` to look inside them,
+    /// so a dataset at `a/b` reports `NotAGroup("a/b")` (issue #365).
     pub fn dataset(&self, path: &str) -> Result<Dataset, Error> {
         self.dataset_with_options(path, DatasetAccessProperties::new())
     }
@@ -2595,6 +2600,10 @@ impl File {
     /// group, the way [`dataset`](Self::dataset) returns
     /// [`Error::NotADataset`] for the mirror case, and
     /// [`FormatError::PathNotFound`] if it names nothing.
+    ///
+    /// The same error reports a component *along* the path that is not a group,
+    /// naming that component's own path rather than the one asked for: `a/b/c`
+    /// stopped by a dataset at `a/b` reports `NotAGroup("a/b")` (issue #365).
     pub fn group(&self, path: &str) -> Result<Group, Error> {
         let revisions = self.inner.revisions();
         let addr = self.inner.resolve_path(path)?;
@@ -3374,7 +3383,18 @@ impl Group {
     /// each member of a large group in turn cost the group once rather than once
     /// per member (issue #228).
     fn child_address(&self, name: &str) -> Result<Option<u64>, Error> {
-        self.file.group_child(self.header_address()?, name)
+        match self.file.group_child(self.header_address()?, name)? {
+            ChildLookup::Found(address) => Ok(Some(address)),
+            ChildLookup::Absent => Ok(None),
+            // Reached by the one handle whose object is never classified: the
+            // root. Every other `Group` comes from a lookup that classified it
+            // (`File::group`, `Group::group`, `iter_groups`, `object_at_relative`)
+            // or re-resolves through `header_address`, which classifies again;
+            // `File::root` takes the superblock's word for it, and nothing checks
+            // that the root address names a group. The empty path is the root's
+            // own name here, so the refusal names it correctly.
+            ChildLookup::NotAGroup => Err(Error::NotAGroup(self.path.clone().unwrap_or_default())),
+        }
     }
 
     /// The root-relative path of a child named `name`, or `None` if this group
@@ -5526,7 +5546,7 @@ the same commit to replace it",
             .into());
         }
         raw.chunks_exact(element_size.get())
-            .map(|bytes| T::decode(&datatype, bytes).map_err(Error::from))
+            .map(|bytes| T::decode(&datatype, bytes).map_err(Error::Format))
             .collect()
     }
 
@@ -6194,6 +6214,20 @@ mod tests {
     // Opening an object as the wrong kind (issue #352)
     // -----------------------------------------------------------------------
 
+    /// A dataset at the root and a dataset one level down inside a group.
+    ///
+    /// Shared by the two sections below: opening one of those datasets *as* a
+    /// group is issue #352, and resolving a path *through* one is issue #365, so
+    /// the sibling refusals are provably about the same file.
+    fn nested_dataset_bytes() -> Vec<u8> {
+        let mut b = FileBuilder::new();
+        b.create_dataset("plain").with_i32_data(&[1]);
+        let mut g = b.create_group("g");
+        g.create_dataset("inner").with_i32_data(&[2]);
+        b.add_group(g.finish());
+        b.finish().unwrap()
+    }
+
     /// The issue: a by-name group lookup took whatever the name resolved to.
     /// `H5Gopen` fails on a non-group, and so must this — at the lookup, where
     /// the caller can act on it, rather than at some later call on a handle that
@@ -6204,12 +6238,7 @@ mod tests {
     /// wrong answer rather than an error.
     #[test]
     fn opening_a_dataset_as_a_group_is_refused() {
-        let mut b = FileBuilder::new();
-        b.create_dataset("plain").with_i32_data(&[1]);
-        let mut g = b.create_group("g");
-        g.create_dataset("inner").with_i32_data(&[2]);
-        b.add_group(g.finish());
-        let file = File::from_bytes(b.finish().unwrap()).unwrap();
+        let file = File::from_bytes(nested_dataset_bytes()).unwrap();
         let nested = file.group("g").unwrap();
 
         // Both by-name forms — from the file by path, and from a group by child
@@ -6465,6 +6494,132 @@ mod tests {
         file.close().unwrap();
     }
 
+    // -----------------------------------------------------------------------
+    // Resolving a path *through* something that is not a group (issue #365)
+    // -----------------------------------------------------------------------
+
+    /// The issue: resolution opens each component in turn to look the next one
+    /// up inside it, and reported a component that is not a group as
+    /// `PathNotFound("object header is not a group")` — one string for every
+    /// such path, naming no component at all. It read as "this path does not
+    /// exist" where the truth was "`plain` is a dataset".
+    ///
+    /// It is now the same [`Error::NotAGroup`] a *final* component that is not a
+    /// group returns (issue #352), so one match covers a path that goes wrong
+    /// anywhere along it, and it names the object that stopped the walk rather
+    /// than the path that was asked for.
+    #[test]
+    fn a_path_through_a_non_group_names_the_object_that_stopped_it() {
+        let file = File::from_bytes(nested_dataset_bytes()).unwrap();
+
+        // Two entry points, because each resolves the path for itself, and two
+        // depths, because the name is the whole prefix walked rather than the
+        // one component: `g/inner` is a path the caller can go and open, where a
+        // bare `inner` would not say where to find it.
+        for (asked, stopper) in [("plain/sub", "plain"), ("g/inner/deeper", "g/inner")] {
+            for (entry, got) in [
+                ("File::group", file.group(asked).map(|_| ())),
+                ("File::dataset", file.dataset(asked).map(|_| ())),
+            ] {
+                assert!(
+                    matches!(&got, Err(Error::NotAGroup(p)) if p == stopper),
+                    "{entry}({asked:?}) answered {got:?}, expected the stop at {stopper:?}"
+                );
+            }
+        }
+
+        // A component that names nothing at all stays a `PathNotFound` naming
+        // it. The two are different facts, and reading differently is the whole
+        // point of the change.
+        assert!(matches!(
+            file.group("absent/sub"),
+            Err(Error::Format(FormatError::PathNotFound(ref p))) if p == "absent"
+        ));
+
+        // Empty components are dropped before the walk, so the object is named
+        // the same way however the path was spelled.
+        assert!(matches!(
+            file.group("/plain//sub/"),
+            Err(Error::NotAGroup(ref p)) if p == "plain"
+        ));
+
+        // The name reaches a caller that only prints the error, too.
+        let printed = file
+            .group("g/inner/deeper")
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(printed.contains("g/inner"), "the message read {printed:?}");
+
+        // And a path that really does run through groups still resolves, so the
+        // classification has not turned the walk itself into a refusal.
+        assert_eq!(file.dataset("g/inner").unwrap().read_i32().unwrap(), [2]);
+
+        // A committed datatype is neither a dataset nor a group, so it separates
+        // "is not a group" from "is a dataset" for an intermediate component the
+        // way it does for a final one.
+        let mut b = FileBuilder::new();
+        b.commit_datatype("mytype", crate::make_i32_type());
+        let typed = File::from_bytes(b.finish().unwrap()).unwrap();
+        assert!(matches!(
+            typed.group("mytype/sub"),
+            Err(Error::NotAGroup(ref p)) if p == "mytype"
+        ));
+    }
+
+    /// The streaming walk is a second copy of the same loop, reading each header
+    /// from a `Source`. A fix applied to one and not the other would leave the
+    /// backend that exists for files too large to buffer reporting the old
+    /// string.
+    #[test]
+    fn the_streaming_walk_names_the_object_that_stopped_it_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.h5");
+        std::fs::write(&path, nested_dataset_bytes()).unwrap();
+
+        let file = File::open_streaming(&path).unwrap();
+        for (asked, stopper) in [("plain/sub", "plain"), ("g/inner/deeper", "g/inner")] {
+            let got = file.group(asked).map(|_| ());
+            assert!(
+                matches!(&got, Err(Error::NotAGroup(p)) if p == stopper),
+                "group({asked:?}) answered {got:?}"
+            );
+        }
+        assert!(matches!(
+            file.group("absent/sub"),
+            Err(Error::Format(FormatError::PathNotFound(ref p))) if p == "absent"
+        ));
+        assert_eq!(file.dataset("g/inner").unwrap().read_i32().unwrap(), [2]);
+        // Before the directory goes: an open file blocks its removal on Windows.
+        drop(file);
+    }
+
+    /// The root is the one group handle nothing classifies: `File::root` takes
+    /// the address from the superblock, and no open validates that it names a
+    /// group. So a file whose superblock points the root at a dataset reaches
+    /// the refusal in `Group::child_address` that every other handle is kept
+    /// away from — and names the root by the empty path it carries.
+    #[test]
+    fn a_root_that_is_not_a_group_refuses_rather_than_being_searched() {
+        let mut bytes = nested_dataset_bytes();
+        let sig = crate::signature::find_signature(&bytes).unwrap();
+        let mut sb = crate::superblock::Superblock::parse(&bytes, sig).unwrap();
+        // The fixture has no userblock, so its base address is zero and the
+        // absolute address a walk returns is also the stored one the superblock
+        // field wants.
+        assert_eq!(sb.base_address, 0);
+        sb.root_group_address = group_v2::resolve_path_any(&bytes, &sb, "plain").unwrap();
+        let rewritten = sb.serialize();
+        bytes[sig..sig + rewritten.len()].copy_from_slice(&rewritten);
+
+        let file = File::from_bytes(bytes).unwrap();
+        let got = file.root().dataset("anything").map(|_| ());
+        assert!(
+            matches!(&got, Err(Error::NotAGroup(p)) if p.is_empty()),
+            "a root that is not a group must refuse, got {got:?}"
+        );
+    }
+
     /// Read everything a read-write file can serve through the paired read
     /// paths, as comparable text.
     ///
@@ -6479,7 +6634,17 @@ mod tests {
         out.push(format!("root datasets: {:?}", file.root().datasets()));
         out.push(format!("root attrs: {:?}", sorted(file.root().attrs())));
 
-        for path in ["plain", "g/nested", "many_attrs", "missing", "g/missing"] {
+        // `plain/nope` runs the walk through a dataset (issue #365): the two
+        // backends must refuse it with the same error as well as agree on the
+        // reads that succeed.
+        for path in [
+            "plain",
+            "g/nested",
+            "many_attrs",
+            "missing",
+            "g/missing",
+            "plain/nope",
+        ] {
             match file.dataset(path) {
                 Ok(ds) => {
                     out.push(format!("{path}: shape {:?}", ds.shape()));

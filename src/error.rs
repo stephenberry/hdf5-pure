@@ -1029,6 +1029,36 @@ impl fmt::Display for FormatError {
 #[cfg(feature = "std")]
 impl std::error::Error for FormatError {}
 
+/// How resolving a path can fail: at a component that is not a group, named, or
+/// at anything else the parse refuses.
+///
+/// Crate-internal, and a separate type rather than another [`FormatError`]
+/// variant, because the answer a caller wants for the first case is
+/// [`Error::NotAGroup`] — the same error a *final* component that is not a group
+/// returns (issue #352), so that one match covers a path that goes wrong
+/// anywhere along it. A public `FormatError::NotAGroup` would be a variant no
+/// caller could observe (`group_v2` is private, and the conversion below turns
+/// every one of them into `Error::NotAGroup`) while making
+/// `Error::Format(<a non-group>)` a shape a hand-written `Error::Format(..)`
+/// could still produce. Here it is unrepresentable instead of merely unwritten.
+#[derive(Debug)]
+pub(crate) enum ResolveError {
+    /// A component the walk had to descend through does not name a group. The
+    /// string is that object's own root-relative path — empty for the root
+    /// group, which is how this crate names the root throughout — and not the
+    /// path that was asked for (issue #365).
+    NotAGroup(String),
+    /// Anything else, including a component that names nothing at all, which
+    /// stays a [`FormatError::PathNotFound`] naming it.
+    Format(FormatError),
+}
+
+impl From<FormatError> for ResolveError {
+    fn from(e: FormatError) -> Self {
+        ResolveError::Format(e)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // High-level Error type
 // ---------------------------------------------------------------------------
@@ -1047,6 +1077,12 @@ pub enum Error {
     /// The object at the given path is not a group. A name that resolves to
     /// nothing at all is
     /// [`FormatError::PathNotFound`](crate::FormatError::PathNotFound) instead.
+    ///
+    /// The path may be an *intermediate* component of the one that was asked
+    /// for: resolving `a/b/c` opens `a` and then `a/b` to look inside them, so
+    /// a dataset at `a/b` reports `NotAGroup("a/b")` rather than anything about
+    /// `a/b/c` (issue #365). `Group::group`, which takes a child name rather
+    /// than a path, reports that name.
     NotAGroup(String),
     /// The child of the given name is not a committed (`H5Tcommit`) datatype. A
     /// name that resolves to nothing at all is
@@ -1261,6 +1297,16 @@ impl std::error::Error for Error {
 impl From<FormatError> for Error {
     fn from(e: FormatError) -> Self {
         Error::Format(e)
+    }
+}
+
+#[cfg(feature = "std")]
+impl From<ResolveError> for Error {
+    fn from(e: ResolveError) -> Self {
+        match e {
+            ResolveError::NotAGroup(path) => Error::NotAGroup(path),
+            ResolveError::Format(e) => Error::Format(e),
+        }
     }
 }
 
