@@ -2001,4 +2001,40 @@ mod tests {
         assert_eq!(read_class(&file, "#refs#/ref_0000000000000001"), "uint8");
         std::fs::remove_file(path).unwrap();
     }
+
+    #[derive(Debug, PartialEq)]
+    struct EmbedderError(u32);
+
+    impl std::fmt::Display for EmbedderError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "embedder failed with code {}", self.0)
+        }
+    }
+
+    impl std::error::Error for EmbedderError {}
+
+    /// A caller's own error type survives the nesting closures, which return
+    /// `Result<(), MatError>` and so are the only place it can be flattened.
+    /// `push_with` is the deepest of them and the one that finishes recording
+    /// the reference before it propagates, so it is where a rewrapped error
+    /// would go unnoticed.
+    #[test]
+    fn a_caller_error_crosses_the_closure_boundary_whole() {
+        use std::error::Error;
+
+        let mut mb = MatBuilder::new(Options::default());
+        let err = mb
+            .cell("c", &[1, 1], |cw| {
+                cw.push_with(|_| Err(MatError::from_source(EmbedderError(7))))?;
+                Ok(())
+            })
+            .err()
+            .expect("the closure failed");
+
+        assert_eq!(err.to_string(), "embedder failed with code 7");
+        assert_eq!(
+            err.source().unwrap().downcast_ref::<EmbedderError>(),
+            Some(&EmbedderError(7))
+        );
+    }
 }

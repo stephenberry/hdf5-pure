@@ -78,6 +78,68 @@ pub enum MatError {
     CompressionNeedsNewerFormat,
     /// A generic serde-originated error (from `Error::custom`).
     Custom(String),
+    /// An error from the calling crate, carried whole.
+    ///
+    /// The builder's nesting APIs
+    /// ([`MatBuilder::struct_`](crate::mat::MatBuilder::struct_),
+    /// [`MatBuilder::cell`](crate::mat::MatBuilder::cell),
+    /// [`CellWriter::push_with`](crate::mat::CellWriter::push_with), …) take
+    /// closures returning `Result<(), MatError>`, so a crate that emits `.mat`
+    /// files as one of several formats has to put its own error type through
+    /// that boundary. [`Custom`](MatError::Custom) keeps only the `Display`
+    /// text; this keeps the error, so the caller's caller can still
+    /// `downcast_ref` it back out of [`source`](std::error::Error::source):
+    ///
+    /// ```
+    /// # use hdf5_pure::mat::{MatBuilder, MatError, Options};
+    /// # use std::error::Error;
+    /// # #[derive(Debug)]
+    /// # struct EncodeError(&'static str);
+    /// # impl std::fmt::Display for EncodeError {
+    /// #     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    /// #         write!(f, "{}", self.0)
+    /// #     }
+    /// # }
+    /// # impl Error for EncodeError {}
+    /// # fn encode() -> Result<u32, EncodeError> { Err(EncodeError("no MAT encoding")) }
+    /// let mut mb = MatBuilder::new(Options::default());
+    /// let err = mb
+    ///     .struct_("payload", |s| {
+    ///         let value = encode().map_err(MatError::from_source)?;
+    ///         s.write_scalar_u32("value", value)?;
+    ///         Ok(())
+    ///     })
+    ///     .err()
+    ///     .expect("the closure failed");
+    ///
+    /// let original = err.source().unwrap().downcast_ref::<EncodeError>().unwrap();
+    /// assert_eq!(original.0, "no MAT encoding");
+    /// ```
+    ///
+    /// The bounds are `Send + Sync + 'static` because `MatError` is `Send + Sync`
+    /// itself and callers move it across threads (a
+    /// [`DataProducer`](crate::mat::DataProducer) is `Send + Sync` by
+    /// definition); a bare `Box<dyn Error>` here would revoke both.
+    ///
+    /// `Display` prints the inner error, which a formatter that walks the whole
+    /// source chain will therefore print twice. That matches
+    /// [`std::io::Error`]'s behaviour for the same case.
+    Source(Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
+impl MatError {
+    /// Carry an error from the calling crate whole, as [`MatError::Source`].
+    ///
+    /// Shaped after `std::io::Error::other`: it takes a concrete error type,
+    /// an already-boxed one, or a `String`. Reach for it at a builder closure's
+    /// edge, where `.map_err(MatError::from_source)` reads as a one-word
+    /// conversion.
+    pub fn from_source<E>(source: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
+        MatError::Source(source.into())
+    }
 }
 
 impl fmt::Display for MatError {
@@ -127,6 +189,7 @@ impl fmt::Display for MatError {
                  set libver to LibVer::V110 to compress"
             ),
             MatError::Custom(msg) => write!(f, "{msg}"),
+            MatError::Source(e) => write!(f, "{e}"),
         }
     }
 }
@@ -137,6 +200,7 @@ impl std::error::Error for MatError {
             MatError::Hdf5(e) => Some(e),
             MatError::Format(e) => Some(e),
             MatError::Io(e) => Some(e),
+            MatError::Source(e) => Some(&**e),
             _ => None,
         }
     }
@@ -171,5 +235,75 @@ impl serde::ser::Error for MatError {
 impl serde::de::Error for MatError {
     fn custom<T: fmt::Display>(msg: T) -> Self {
         MatError::Custom(msg.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+
+    #[derive(Debug, PartialEq)]
+    struct EmbedderError {
+        code: u32,
+    }
+
+    impl fmt::Display for EmbedderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "embedder failed with code {}", self.code)
+        }
+    }
+
+    impl Error for EmbedderError {}
+
+    #[test]
+    fn a_carried_error_downcasts_back_to_its_own_type() {
+        let err = MatError::from_source(EmbedderError { code: 7 });
+
+        let source = err.source().expect("Source carries its error");
+        assert_eq!(
+            source.downcast_ref::<EmbedderError>(),
+            Some(&EmbedderError { code: 7 }),
+            "the whole point of the variant: the type survives the boundary"
+        );
+    }
+
+    #[test]
+    fn a_carried_error_displays_as_itself() {
+        let err = MatError::from_source(EmbedderError { code: 7 });
+        assert_eq!(err.to_string(), "embedder failed with code 7");
+    }
+
+    #[test]
+    fn a_message_carried_as_custom_keeps_no_source() {
+        // The contrast the variant exists for. `Custom` is what an embedder had
+        // to reach for before, and it is a dead end for anything but printing.
+        let err = MatError::Custom(EmbedderError { code: 7 }.to_string());
+        assert_eq!(err.to_string(), "embedder failed with code 7");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn an_already_boxed_error_is_accepted_whole() {
+        // `Box<dyn Error + Send + Sync>` does not itself implement `Error`, so a
+        // bound of `E: Error` would refuse exactly the embedder that had already
+        // erased its own type. `Into<Box<...>>` takes both.
+        let boxed: Box<dyn Error + Send + Sync + 'static> = Box::new(EmbedderError { code: 7 });
+        let err = MatError::from_source(boxed);
+
+        assert!(
+            err.source()
+                .and_then(|s| s.downcast_ref::<EmbedderError>())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_error_type_is_still_send_and_sync() {
+        // A `Box<dyn Error>` without these bounds would revoke both, silently,
+        // for every caller that moves a `MatError` off the thread that made it
+        // — a `DataProducer` is `Send + Sync` by definition.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MatError>();
     }
 }
