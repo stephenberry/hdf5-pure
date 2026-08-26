@@ -292,19 +292,22 @@ fn pure_reads_every_attribute_encoding_the_c_library_writes() {
     let file = File::open(&path).unwrap();
     let attrs = file.root().attrs().unwrap();
 
-    // Charset and arity both survive a foreign writer.
+    // Charset, arity, and the declared width all survive a foreign writer. Every
+    // fixed-width fixture above is an 8-byte slot holding something shorter,
+    // which is the case that used to arrive as its trimmed text with the
+    // `STRSIZE` gone — so writing one of these back shrank the slot (#359).
     assert_eq!(
         attrs.get("fixed_ascii_scalar"),
-        Some(&AttrValue::AsciiString("double".into()))
+        Some(&AttrValue::ascii_string_sized("double", 8).unwrap())
     );
     assert_eq!(
         attrs.get("fixed_ascii_one"),
-        Some(&AttrValue::AsciiStringArray(vec!["double".into()])),
+        Some(&AttrValue::ascii_string_array_sized(vec!["double".into()], 8).unwrap()),
         "a one-element array must not collapse to a scalar"
     );
     assert_eq!(
         attrs.get("fixed_ascii_two"),
-        Some(&AttrValue::AsciiStringArray(vec!["ab".into(), "cd".into()]))
+        Some(&AttrValue::ascii_string_array_sized(vec!["ab".into(), "cd".into()], 8).unwrap())
     );
 
     // A true variable-length string has no variant of its own, so it reads as
@@ -322,7 +325,7 @@ fn pure_reads_every_attribute_encoding_the_c_library_writes() {
 
     assert_eq!(
         attrs.get("fixed_utf8_scalar"),
-        Some(&AttrValue::String("m/s".into()))
+        Some(&AttrValue::string_sized("m/s", 8).unwrap())
     );
     assert_eq!(
         attrs.get("vlen_utf8_scalar"),

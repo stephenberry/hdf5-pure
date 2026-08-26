@@ -223,9 +223,11 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
 ///   as the fixed-width variant of the same charset and arity.
 /// - **Rank.** Every array variant is one-dimensional, so a rank-2 attribute
 ///   reads as its elements flattened.
-/// - **Padding and declared width.** A fixed-width string reports its content,
-///   not its `STRSIZE` or whether it was null-terminated, null-padded or
-///   space-padded.
+/// - **String padding.** A fixed-width string reports its content and the
+///   `STRSIZE` it was stored at, but not whether the bytes past the content were
+///   null-terminated, null-padded or space-padded: every variant writes back
+///   `NULLPAD`. A slot *narrower* than its decoded text loses its width too,
+///   since the decoder is lossy and the text can outgrow the slot it came from.
 /// - **Null dataspaces.** These read as an empty array variant.
 ///
 /// A numeric attribute whose message holds fewer bytes than its dataspace
@@ -243,7 +245,7 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
     base_address: u64,
 ) -> Option<AttrValue> {
     use crate::dataspace::DataspaceType;
-    use crate::datatype::{CharacterSet, Datatype};
+    use crate::datatype::Datatype;
 
     // A scalar dataspace and a 1-element simple dataspace are different on
     // disk (v1 carries rank 0, v2 a type byte), and the write side picks
@@ -280,19 +282,25 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
             size,
             ..
         } => unsigned_attr_value(attr.read_as_u64().ok()?, scalar, *size),
-        Datatype::String { charset, .. } => {
+        Datatype::String { charset, size, .. } => {
             let strings = attr.read_as_strings().ok()?;
-            let ascii = *charset == CharacterSet::Ascii;
             // A zero-size string datatype decodes to no elements at all, so a
             // scalar takes the empty string rather than reporting the whole
             // attribute undecodable — `attrs_to_map` drops what this returns
             // `None` for, and an empty string attribute must not disappear.
-            match (ascii, scalar) {
-                (true, true) => Some(AttrValue::AsciiString(one_or_empty(strings))),
-                (true, false) => Some(AttrValue::AsciiStringArray(strings)),
-                (false, true) => Some(AttrValue::String(one_or_empty(strings))),
-                (false, false) => Some(AttrValue::StringArray(strings)),
-            }
+            //
+            // `size` is the stored `STRSIZE`, which the value alone does not
+            // recover: a 64-byte slot holding "ok" and a 2-byte one holding it
+            // read back the same string. The variant carries the width when the
+            // slot is wider than its content (issue #359), so that writing the
+            // value back reproduces the slot's *width* rather than shrinking it.
+            // Not its padding rule: a `SPACEPAD` or `NULLTERM` source comes back
+            // `NULLPAD`, which is the one encoding these variants write.
+            Some(if scalar {
+                crate::type_builders::decoded_fixed_string(one_or_empty(strings), *size, charset)
+            } else {
+                crate::type_builders::decoded_fixed_string_array(strings, *size, charset)
+            })
         }
         Datatype::VariableLength {
             is_string,
@@ -610,11 +618,59 @@ mod tests {
                 "vlen_three",
                 AttrValue::VarLenAsciiArray(vec!["x".into(), "y".into(), "velocity".into()]),
             ),
+            // A declared width is stored and recovered too, or a slot would
+            // shrink to its content the next time it was written (#359).
+            (
+                "ascii_sized",
+                AttrValue::ascii_string_sized("ok", 64).unwrap(),
+            ),
+            (
+                "ascii_array_sized",
+                AttrValue::ascii_string_array_sized(vec!["north".into(), "s".into()], 16).unwrap(),
+            ),
+            ("utf8_sized", AttrValue::string_sized("mètre", 32).unwrap()),
+            (
+                "utf8_array_sized",
+                AttrValue::string_array_sized(vec!["m/s".into()], 12).unwrap(),
+            ),
         ];
         let read = round_trip(&cases);
         for (name, written) in &cases {
             assert_eq!(read.get(*name), Some(written), "attribute {name}");
         }
+    }
+
+    /// A width that is the one the content implies reads back as the *plain*
+    /// variant, not the sized one.
+    ///
+    /// The two write identical bytes at that width, so reporting the sized
+    /// variant for them would be a distinction with nothing behind it — and
+    /// would move every string attribute this crate has ever written onto a
+    /// variant its readers do not match. The sized variant is reserved for the
+    /// widths the content cannot recover (#359).
+    #[test]
+    fn a_width_the_content_implies_reads_back_as_the_plain_variant() {
+        let cases = vec![
+            ("exact", AttrValue::ascii_string_sized("double", 6).unwrap()),
+            ("empty", AttrValue::ascii_string_sized("", 1).unwrap()),
+            (
+                "longest",
+                AttrValue::string_array_sized(vec!["m/s".into(), "kg".into()], 3).unwrap(),
+            ),
+        ];
+        let read = round_trip(&cases);
+        assert_eq!(
+            read.get("exact"),
+            Some(&AttrValue::AsciiString("double".into()))
+        );
+        assert_eq!(
+            read.get("empty"),
+            Some(&AttrValue::AsciiString(String::new()))
+        );
+        assert_eq!(
+            read.get("longest"),
+            Some(&AttrValue::StringArray(vec!["m/s".into(), "kg".into()]))
+        );
     }
 
     /// Decode one attribute of an arbitrary datatype, which the writer cannot
@@ -645,6 +701,42 @@ mod tests {
             datatype_location: crate::shared_message::DatatypeLocation::Inline,
         };
         decode_attr_value(&attr, &crate::source::BytesSource::new(Vec::new()), 8, 8, 0)
+    }
+
+    /// A slot narrower than the text it decodes to keeps the plain variant.
+    ///
+    /// The string decoder is lossy: a byte that is not valid UTF-8 becomes
+    /// `U+FFFD`, which is *three* bytes, so a two-byte Latin-1 slot — `0xB0`
+    /// `0x43`, "°C" in a fixed ASCII attribute, which is ordinary in real files
+    /// — decodes to four bytes of text. Declaring the stored width over that
+    /// text would build a sized variant holding a value it cannot fit, the exact
+    /// pair `AttrValue::ascii_string_sized` refuses; the `width` field would be a
+    /// false claim about the bytes beside it, and writing the value back would
+    /// declare 4 while the variant said 2.
+    ///
+    /// This is why `declared_width` compares with `>` and not `!=` (#359).
+    #[test]
+    fn a_slot_narrower_than_its_decoded_text_is_not_reported_as_padded() {
+        let value = decode_raw(
+            Datatype::String {
+                size: 2,
+                padding: crate::datatype::StringPadding::NullPad,
+                charset: crate::datatype::CharacterSet::Ascii,
+            },
+            vec![0xB0, b'C'],
+            vec![],
+        )
+        .expect("a fixed ASCII attribute decodes");
+
+        assert_eq!(
+            value,
+            AttrValue::AsciiString("\u{FFFD}C".into()),
+            "a slot its own text does not fit must not claim a width"
+        );
+        assert!(
+            value.as_str().is_some_and(|s| s.len() > 2),
+            "the case only bites because the decoded text outgrew the slot"
+        );
     }
 
     /// An enum attribute decodes through its integer base type rather than being

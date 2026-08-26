@@ -14,10 +14,10 @@
 //! this file fails to compile. Adding a variant later needs no change here — the
 //! `_` simply keeps covering it — so the guard costs nothing to carry.
 //!
-//! **Structs** have no equivalent positive signal (a sealed struct cannot be
-//! constructed or destructured from here at all, and a redundant `..` is not
-//! linted), so their seals are asserted against the source text instead. Crude,
-//! but it fails loudly on deletion, which is the whole job.
+//! **Structs and sealed enum *variants*** have no equivalent positive signal (a
+//! sealed struct cannot be constructed or destructured from here at all, and a
+//! redundant `..` is not linted), so their seals are asserted against the source
+//! text instead. Crude, but it fails loudly on deletion, which is the whole job.
 //!
 //! `compile_fail` doctests were the obvious alternative and are a trap: rustdoc
 //! ignores the `E0004`-style error-code pin, so such a test passes when the
@@ -189,6 +189,28 @@ fn sealed_verify_result_still_requires_a_wildcard_arm() {
     verify(&VerifyResult::Ok);
 }
 
+/// Whether the declaration `decl` in `file` carries `#[non_exhaustive]` among
+/// the attributes and doc comments directly above it.
+///
+/// Panics if `decl` is not in the file at all: a guard that quietly finds
+/// nothing is a guard that stopped checking.
+fn sealed_in_source(file: &str, decl: &str) -> bool {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(root.join(file))
+        .unwrap_or_else(|e| panic!("cannot read {file}: {e}"));
+    let at = src
+        .find(decl)
+        .unwrap_or_else(|| panic!("{file} no longer declares `{decl}` — update this guard"));
+    src[..at]
+        .lines()
+        .rev()
+        .take_while(|l| {
+            let t = l.trim();
+            t.starts_with('#') || t.starts_with("///") || t.starts_with("//")
+        })
+        .any(|l| l.trim() == "#[non_exhaustive]")
+}
+
 /// The sealed structs, asserted against the source text. A sealed struct cannot
 /// be constructed or destructured from an external crate at all, so there is no
 /// expression that compiles only while the seal is present — unlike the enums
@@ -201,7 +223,6 @@ fn sealed_structs_keep_their_attribute() {
         info.manager_addrs.len() + member.name.len()
     }
 
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let expected = [
         ("src/file_space_info.rs", "pub struct FileSpaceInfo {"),
         ("src/datatype.rs", "pub struct CompoundMember {"),
@@ -213,26 +234,49 @@ fn sealed_structs_keep_their_attribute() {
     ];
 
     for (file, decl) in expected {
-        let src = std::fs::read_to_string(root.join(file))
-            .unwrap_or_else(|e| panic!("cannot read {file}: {e}"));
-        let at = src
-            .find(decl)
-            .unwrap_or_else(|| panic!("{file} no longer declares `{decl}` — update this guard"));
-        // Walk back over the attributes and doc comments directly above the
-        // declaration; `#[non_exhaustive]` must be among them.
-        let sealed = src[..at]
-            .lines()
-            .rev()
-            .take_while(|l| {
-                let t = l.trim();
-                t.starts_with('#') || t.starts_with("///") || t.starts_with("//")
-            })
-            .any(|l| l.trim() == "#[non_exhaustive]");
         assert!(
-            sealed,
+            sealed_in_source(file, decl),
             "`{decl}` in {file} lost its #[non_exhaustive]: adding a field to it is now a \
              breaking change for every caller. Restore the attribute, or drop this entry and \
              record the break in CHANGELOG.md."
+        );
+    }
+}
+
+/// The sealed *variants*, which are a stronger claim than a sealed struct: their
+/// seal is what stops an [`AttrValue`] being written by hand past the checked
+/// constructor that is supposed to be the only way to build one (issue #359).
+/// Lose it and a caller can declare a width too small for the value beside it,
+/// which the infallible write path has no way to refuse.
+///
+/// Asserted against the source text for the same reason as the structs: a
+/// pattern needs `..` while the seal is present, and keeps compiling with a
+/// redundant `..` once it is gone, so nothing here can test it positively.
+#[test]
+fn sealed_variants_keep_their_attribute() {
+    // Named so a rename breaks the build here rather than silently skipping the
+    // assertion below.
+    fn _live(v: &AttrValue) -> Option<u32> {
+        match v {
+            AttrValue::AsciiStringSized { width, .. }
+            | AttrValue::AsciiStringArraySized { width, .. }
+            | AttrValue::StringSized { width, .. }
+            | AttrValue::StringArraySized { width, .. } => Some(width.get()),
+            _ => None,
+        }
+    }
+
+    for decl in [
+        "    StringSized {",
+        "    StringArraySized {",
+        "    AsciiStringSized {",
+        "    AsciiStringArraySized {",
+    ] {
+        assert!(
+            sealed_in_source("src/type_builders.rs", decl),
+            "`{decl}` in src/type_builders.rs lost its #[non_exhaustive]: a caller can now build \
+             one past `AttrValue::ascii_string_sized` and its siblings, which is where a value \
+             too long for its declared width is refused. Restore the attribute."
         );
     }
 }

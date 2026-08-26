@@ -495,22 +495,26 @@ pub enum FormatError {
         /// The heap address space, in bytes.
         limit: u64,
     },
-    /// A fixed-width string dataset was asked for a declared width of zero. No
-    /// HDF5 string datatype may be zero bytes wide: libhdf5 refuses one with
+    /// A fixed-width string was asked for a declared width of zero. No HDF5
+    /// string datatype may be zero bytes wide: libhdf5 refuses one with
     /// "invalid datatype size", and it does so while *iterating* the object's
     /// members, so one such type takes its neighbours down with it.
     ///
-    /// Only an explicitly requested width raises this. A width *derived* from
-    /// the values — every one of them empty — is one byte rather than zero,
-    /// since the empty string is representable and it was only the datatype
-    /// that was not.
+    /// Only an explicitly requested width raises this — a dataset's through
+    /// [`DatasetBuilder::with_ascii_strings_sized`](crate::DatasetBuilder::with_ascii_strings_sized)
+    /// or its siblings, an attribute's through
+    /// [`AttrValue::ascii_string_sized`](crate::AttrValue::ascii_string_sized)
+    /// or its siblings. A width *derived* from the values — every one of them
+    /// empty — is one byte rather than zero, since the empty string is
+    /// representable and it was only the datatype that was not.
     ZeroFixedStringWidth,
-    /// An element handed to a fixed-width string dataset is longer than the
-    /// width declared for it. Storing a prefix would read back later as a value
-    /// the caller never wrote, and with no error to say so, which is why this
-    /// refuses rather than truncates.
+    /// An element handed to a fixed-width string dataset or attribute is longer
+    /// than the width declared for it. Storing a prefix would read back later as
+    /// a value the caller never wrote, and with no error to say so, which is why
+    /// this refuses rather than truncates.
     FixedStringTooLong {
-        /// Position of the offending element among the values passed.
+        /// Position of the offending element among the values passed. Zero for
+        /// a scalar attribute, which holds one value.
         index: usize,
         /// That element's length in bytes.
         len: usize,
@@ -1011,8 +1015,7 @@ impl fmt::Display for FormatError {
             FormatError::FixedStringTooLong { index, len, width } => {
                 write!(
                     f,
-                    "string element {index} is {len} bytes, past the {width}-byte width declared \
-                     for the dataset"
+                    "string element {index} is {len} bytes, past the declared {width}-byte width"
                 )
             }
             FormatError::NumericElementTooWide { size } => {
