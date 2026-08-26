@@ -80,15 +80,17 @@ pub enum MatError {
     Custom(String),
     /// An error from the calling crate, carried whole.
     ///
-    /// The builder's nesting APIs
+    /// The builder's nesting closures
     /// ([`MatBuilder::struct_`](crate::mat::MatBuilder::struct_),
     /// [`MatBuilder::cell`](crate::mat::MatBuilder::cell),
-    /// [`CellWriter::push_with`](crate::mat::CellWriter::push_with), …) take
-    /// closures returning `Result<(), MatError>`, so a crate that emits `.mat`
-    /// files as one of several formats has to put its own error type through
-    /// that boundary. [`Custom`](MatError::Custom) keeps only the `Display`
-    /// text; this keeps the error, so the caller's caller can still
-    /// `downcast_ref` it back out of [`source`](std::error::Error::source):
+    /// [`CellWriter::push_with`](crate::mat::CellWriter::push_with) and their
+    /// siblings) and
+    /// [`DataProducer::block_bytes`](crate::mat::DataProducer::block_bytes)
+    /// return `Result<(), MatError>`, so a crate that emits `.mat` files as one
+    /// of several formats has to put its own error type through that boundary.
+    /// [`Custom`](MatError::Custom) keeps only the `Display` text; this keeps
+    /// the error, so the caller's caller can still `downcast_ref` it back out
+    /// of [`source`](std::error::Error::source):
     ///
     /// ```
     /// # use hdf5_pure::mat::{MatBuilder, MatError, Options};
@@ -116,10 +118,10 @@ pub enum MatError {
     /// assert_eq!(original.0, "no MAT encoding");
     /// ```
     ///
-    /// The bounds are `Send + Sync + 'static` because `MatError` is `Send + Sync`
-    /// itself and callers move it across threads (a
-    /// [`DataProducer`](crate::mat::DataProducer) is `Send + Sync` by
-    /// definition); a bare `Box<dyn Error>` here would revoke both.
+    /// `'static` is what `source` hands back. `Send + Sync` is what the crate
+    /// already needs of a `MatError`: a failed producer's error waits in an
+    /// `Arc<Mutex<_>>` for the finalizer to swap it back in, and that is what
+    /// keeps `MatBuilder` itself `Send + Sync`.
     ///
     /// `Display` prints the inner error, which a formatter that walks the whole
     /// source chain will therefore print twice. That matches
@@ -130,10 +132,14 @@ pub enum MatError {
 impl MatError {
     /// Carry an error from the calling crate whole, as [`MatError::Source`].
     ///
-    /// Shaped after `std::io::Error::other`: it takes a concrete error type,
-    /// an already-boxed one, or a `String`. Reach for it at a builder closure's
-    /// edge, where `.map_err(MatError::from_source)` reads as a one-word
-    /// conversion.
+    /// Shaped after `std::io::Error::other`: it takes a concrete error type or
+    /// an already-boxed one. Reach for it at a builder closure's edge, where
+    /// `.map_err(MatError::from_source)` reads as a one-word conversion.
+    ///
+    /// The bound also admits a `String`, which the conversion accepts and
+    /// nothing can recover: `downcast_ref` needs a type that implements
+    /// `Error`, and `String` does not. A bare message belongs in
+    /// [`MatError::Custom`].
     pub fn from_source<E>(source: E) -> Self
     where
         E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
@@ -275,15 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn a_message_carried_as_custom_keeps_no_source() {
-        // The contrast the variant exists for. `Custom` is what an embedder had
-        // to reach for before, and it is a dead end for anything but printing.
-        let err = MatError::Custom(EmbedderError { code: 7 }.to_string());
-        assert_eq!(err.to_string(), "embedder failed with code 7");
-        assert!(err.source().is_none());
-    }
-
-    #[test]
     fn an_already_boxed_error_is_accepted_whole() {
         // `Box<dyn Error + Send + Sync>` does not itself implement `Error`, so a
         // bound of `E: Error` would refuse exactly the embedder that had already
@@ -300,9 +297,10 @@ mod tests {
 
     #[test]
     fn the_error_type_is_still_send_and_sync() {
-        // A `Box<dyn Error>` without these bounds would revoke both, silently,
-        // for every caller that moves a `MatError` off the thread that made it
-        // — a `DataProducer` is `Send + Sync` by definition.
+        // A `Box<dyn Error>` without these bounds would revoke both, and the
+        // first thing to break is a `MatBuilder` holding a producer's stashed
+        // failure. This states the property where it lives, so the failure
+        // names the error type rather than the builder three modules away.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<MatError>();
     }

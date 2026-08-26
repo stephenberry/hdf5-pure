@@ -2013,11 +2013,11 @@ mod tests {
 
     impl std::error::Error for EmbedderError {}
 
-    /// A caller's own error type survives the nesting closures, which return
-    /// `Result<(), MatError>` and so are the only place it can be flattened.
-    /// `push_with` is the deepest of them and the one that finishes recording
-    /// the reference before it propagates, so it is where a rewrapped error
-    /// would go unnoticed.
+    /// A caller's own error type survives two nested closures, each of which
+    /// runs its own cleanup on the way out: `cell` resolves its parent target
+    /// before `fill`, and `push_with` records the reference it armed before it
+    /// propagates. The doctest on [`MatError::Source`] covers `struct_`, the
+    /// third shape.
     #[test]
     fn a_caller_error_crosses_the_closure_boundary_whole() {
         use std::error::Error;

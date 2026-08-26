@@ -494,6 +494,55 @@ fn a_producers_own_error_is_surfaced_verbatim() {
     }
 }
 
+/// The same trip, for a producer that failed in its *own* error type rather
+/// than a message. This is the one path that puts a caller's error down and
+/// picks it up again — the provider seam stashes it and hands the writer a
+/// placeholder to carry, which the finalizer swaps back — so it is the one that
+/// could substitute a different error and still look right from the outside.
+#[test]
+fn a_producers_error_keeps_its_own_type() {
+    use std::error::Error;
+
+    #[derive(Debug, PartialEq)]
+    struct AcquisitionStopped {
+        channel: u32,
+    }
+
+    impl std::fmt::Display for AcquisitionStopped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "channel {} stopped", self.channel)
+        }
+    }
+
+    impl Error for AcquisitionStopped {}
+
+    struct Stopping;
+
+    impl DataProducer for Stopping {
+        fn block_bytes(&self, _block: Block, _out: &mut Vec<u8>) -> Result<(), MatError> {
+            Err(MatError::from_source(AcquisitionStopped { channel: 3 }))
+        }
+    }
+
+    const DIMS: [usize; 2] = [4, 100_000];
+    let mut mb = MatBuilder::new(Options::default());
+    mb.write_blocks::<f64>("samples", &DIMS, Box::new(Stopping))
+        .unwrap();
+
+    let err = mb
+        .finish_to(Discard::default())
+        .err()
+        .expect("the producer failed");
+
+    assert_eq!(err.to_string(), "channel 3 stopped");
+    assert_eq!(
+        err.source()
+            .and_then(|e| e.downcast_ref::<AcquisitionStopped>()),
+        Some(&AcquisitionStopped { channel: 3 }),
+        "the producer's own type has to survive the stash and the swap"
+    );
+}
+
 /// Compression is refused up front rather than silently dropped: a caller who
 /// asked for deflate and got an unfiltered dataset would have no way to notice.
 #[test]

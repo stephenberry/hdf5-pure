@@ -332,9 +332,12 @@ A producer that fails partway leaves a partial file on the sink. With a non-seek
 
 A wrong block length is refused rather than written, because a short or long block shifts every address after it and the result would be a file that fails to open for reasons that no longer point back at the producer.
 
-### Carrying your own error type
+!!! tip
+    The `mat_streaming` example is a complete working version of the above — an acquisition producer, a streamed write, a read-back, and a check that the bytes match the same content written the ordinary way. Run it with `cargo run --example mat_streaming` (no features needed: `MatBuilder` is not behind `serde`).
 
-Everything the builder hands a callback back through returns `Result<(), MatError>`: `DataProducer::block_bytes`, and the nesting closures `MatBuilder::struct_`, `MatBuilder::cell`, `CellWriter::push_with` and their siblings. A crate that writes `.mat` as one of several output formats therefore has to put its own error type through that boundary, and `MatError::Custom(e.to_string())` gets it across as text alone.
+## Carrying your own error type
+
+Every callback the builder takes returns `Result<(), MatError>`: `DataProducer::block_bytes`, and the nesting closures `MatBuilder::struct_`, `MatBuilder::cell`, `CellWriter::push_with` and their siblings. A crate that writes `.mat` as one of several output formats therefore has to put its own error type through that boundary, and `MatError::Custom(e.to_string())` gets it across as text alone.
 
 `MatError::from_source` carries the error itself instead, so the caller's caller can recover it:
 
@@ -342,10 +345,9 @@ Everything the builder hands a callback back through returns `Result<(), MatErro
 let value = self.encode(x).map_err(MatError::from_source)?;
 ```
 
-It takes a concrete error type, an already-boxed one, or a `String`, and the result answers `Error::source` with what it was given, so `err.source().and_then(|e| e.downcast_ref::<EncodeError>())` reaches the original. `Display` prints the inner error, so nothing about the message changes.
+It takes a concrete error type or an already-boxed one, and the result answers `Error::source` with what it was given, so `err.source().and_then(|e| e.downcast_ref::<EncodeError>())` reaches the original. `Display` prints the inner error, so nothing about the message changes.
 
-!!! tip
-    The `mat_streaming` example is a complete working version of the above — an acquisition producer, a streamed write, a read-back, and a check that the bytes match the same content written the ordinary way. Run it with `cargo run --example mat_streaming` (no features needed: `MatBuilder` is not behind `serde`).
+This covers what a callback of yours returns. An error raised by a sink you supplied to `finish_to` or `write` is an `io::Error` the writer met on its own, and it arrives as `MatError::Hdf5(Error::Io(..))` rather than through this variant.
 
 ## Hand-built files (low-level conventions)
 
