@@ -1206,10 +1206,6 @@ pub(crate) fn create_would_refuse_reopen(
     // the creation pair that would walk into them. They are phrased as something
     // to *add* to the properties in hand rather than as something to recreate the
     // file with, since the file does not exist yet (issues #288 and #308).
-    //
-    // The version-3 refusal needs no counterpart: `FileSpaceStrategy::Page` below
-    // the 1.10 format is refused by the builder itself, before anything is
-    // written, so that pair never reaches an open.
     if access.page_buffer_size() != 0 {
         if access.sync_policy() == SyncPolicy::Always {
             return Some(
@@ -1220,18 +1216,42 @@ pub(crate) fn create_would_refuse_reopen(
                  page buffer",
             );
         }
+        // The version-3 counterpart. It used to need none: a page buffer required
+        // a paged file, and `FileSpaceStrategy::Page` below the 1.10 format is
+        // refused by the builder itself before anything is written, so that pair
+        // never reached an open. Issue #357 lifted the paged requirement, and an
+        // *unpaged* file at `LibVer::V18` is an ordinary, buildable file with a
+        // version-2 superblock — one whose status-flags byte no library reads
+        // back, so the mark could not be raised on it. Without this the pair
+        // would write the file and fail the open it promised.
+        //
+        // Unsatisfiable bounds are left to the builder, which reports which
+        // format it can write; this is not the place to restate that.
+        if matches!(
+            crate::libver::LibVer::resolve_writable(create.libver_bounds()),
+            Ok(v) if v < crate::libver::LibVer::V110
+        ) {
+            return Some(
+                "a page buffer marks the file in a version-3 superblock, and these bounds \
+                 write the 1.8 format, so creating one this way would write the file and then \
+                 fail to open it; raise with_libver_bounds to admit LibVer::V110, or drop the \
+                 page buffer",
+            );
+        }
+        // An unpaged file has no page size of its own and merges within
+        // `DEFAULT_GATHER_PAGE`, which is the same figure the format defaults
+        // `H5Pset_file_space_page_size` to. It cannot decide anything today —
+        // 4 KiB is below the floor checked alongside it, so a budget that clears
+        // the floor clears this too, and mutating this arm fails no test. It is
+        // written out rather than folded into the paged arm's `unwrap_or` because
+        // the two constants are free to move apart, and because a reader
+        // comparing this function against `set_page_buffer_size` should find the
+        // same rule in both.
         let page_size = match create.file_space_strategy() {
             Some((FileSpaceStrategy::Page, _, _)) => create
                 .file_space_page_size()
                 .unwrap_or(crate::file_space_info::DEFAULT_PAGE_SIZE),
-            _ => {
-                return Some(
-                    "a page buffer (with_page_buffer_size) needs a paged file, so creating one \
-                     this way would write the file and then fail to open it; add \
-                     with_file_space_strategy(FileSpaceStrategy::Page, true, ..) to the \
-                     creation properties, or drop the page buffer",
-                );
-            }
+            _ => DEFAULT_GATHER_PAGE,
         };
         if (access.page_buffer_size() as u64) < page_size
             || access.page_buffer_size() < WRITE_GATHER_BYTES
@@ -1543,10 +1563,11 @@ fn barrier_data(image: &mut dyn FileImage, sync_policy: SyncPolicy) -> Result<()
 /// It is also the floor under an explicit
 /// [page buffer](crate::FileAccessProperties::with_page_buffer_size), because a
 /// page buffer *replaces* this budget rather than adding to it, so a smaller one
-/// can issue more writes than leaving the property unset. Whether it does depends
-/// on the workload, which is why the floor is set to the worst case rather than
-/// to a crossover — [`set_page_buffer_size`](WriteEngine::set_page_buffer_size)
-/// has the measurements on both sides.
+/// is also where a long contiguous run is flushed and restarted — a 4 MiB append
+/// costs 10 writes at this budget and 1,094 at 4 KiB. No smaller budget has
+/// measured better on either direction of workload;
+/// [`set_page_buffer_size`](WriteEngine::set_page_buffer_size) carries the table
+/// and `no_budget_below_the_floor_beats_the_floor` asserts the ordering.
 const WRITE_GATHER_BYTES: usize = 1 << 20;
 
 /// Page the write gatherer merges within on a file that is not paged.
@@ -1898,12 +1919,13 @@ impl WriteEngine {
     /// the absolute address here repoints the root past the end of the file while
     /// claiming only to have touched a flag, and the file stops reading.
     ///
-    /// Both callers happen to hold a base of zero, by two different refusals —
-    /// `open_swmr_writer` turns a userblock away outright, and
-    /// [`set_page_buffer_size`](Self::set_page_buffer_size) requires persisted
-    /// free space, which is declined for a non-zero base. Those are refusals
-    /// about other things that settle this one as a side effect, which is not a
-    /// property to build on: `a_status_flag_write_leaves_a_userblock_files_root_alone`
+    /// `open_swmr_writer` happens to hold a base of zero, since it turns a
+    /// userblock away outright. Its sibling no longer does:
+    /// [`set_page_buffer_size`](Self::set_page_buffer_size) once required
+    /// persisted free space, which is declined for a non-zero base, and issue
+    /// #357 scoped that refusal to paged files — so an unpaged userblock file
+    /// now reaches here with a base to convert. It was never a property to build
+    /// on, which is why `a_status_flag_write_leaves_a_userblock_files_root_alone`
     /// pins the conversion directly rather than through a caller.
     fn set_consistency_flags(&mut self, flags: u32) -> Result<(), Error> {
         self.superblock.consistency_flags = flags;
@@ -2160,14 +2182,28 @@ impl WriteEngine {
     /// `H5Pset_page_buffer_size` analogue, requested through
     /// [`FileAccessProperties::with_page_buffer_size`](crate::FileAccessProperties::with_page_buffer_size).
     ///
-    /// Refused on a file that is not paged, and for a budget below the file's
-    /// page size: a page buffer that cannot hold one page flushes on every page
-    /// it touches, and page buffering on an unpaged file has no page boundary to
-    /// align to. The C library reaches the same two conclusions at `H5Fopen` and
-    /// acts on them *silently* — zeroing the budget in the first case, rounding
-    /// up in the second — which is the one part of its behavior not worth
-    /// copying. A zero budget leaves the session's default gathering alone,
-    /// matching the property's own "unset" value.
+    /// Refused for a budget below the page this session merges within — the
+    /// file's own file-space page size when it is paged and
+    /// [`DEFAULT_GATHER_PAGE`] when it is not, which is what
+    /// [`gather_page_size`](Self::gather_page_size) answers. A buffer that
+    /// cannot hold one page flushes on every page it touches. The C library
+    /// reaches the same conclusion and acts on it *silently*, rounding the budget
+    /// up at `H5Fopen`, which is the one part of its behavior not worth copying.
+    ///
+    /// It does **not** require a paged file, where `H5Pset_page_buffer_size`
+    /// does. The C page buffer is a page *cache*, and `H5PB_create` rejects an
+    /// unpaged file because its `min_meta_perc`/`min_raw_perc` reservations are
+    /// counted in pages that the paged allocator keeps segregated by kind. This
+    /// is a write gatherer instead: it merges runs within a page-sized window and
+    /// flushes whole, so the window is all it needs, and `gather_page_size`
+    /// supplies one on an unpaged file already — it is what every read-write
+    /// session's default [`Operation`](WriteBuffering::Operation) gathering runs
+    /// under. Lifting the requirement leaves the file byte-identical, which is
+    /// what the unpaged arm of `a_page_buffer_holds_dirty_pages_across_operations`
+    /// asserts (issue #357).
+    ///
+    /// A zero budget leaves the session's default gathering alone, matching the
+    /// property's own "unset" value.
     pub(crate) fn set_page_buffer_size(&mut self, max_bytes: usize) -> Result<(), Error> {
         if max_bytes == 0 {
             return Ok(());
@@ -2176,17 +2212,12 @@ impl WriteEngine {
         // visible in. `File::open_swmr_writer` refuses this property before it
         // raises the on-disk flag, which is the refusal a caller sees; this one is
         // here because the guarantee belongs to the engine that would break it,
-        // and a SWMR session on a paged file satisfies both checks below.
+        // and a SWMR session can otherwise clear every check below — an unpaged
+        // version-3 file with an ample budget is exactly what SWMR writing wants.
         if self.swmr_mode {
             return Err(Error::EditUnsupported(
                 "a SWMR writer cannot buffer its writes: its readers observe the order they \
                  become visible in",
-            ));
-        }
-        if self.paged.is_none() {
-            return Err(Error::EditUnsupported(
-                "a page buffer (H5Pset_page_buffer_size) requires a file created with \
-                 with_file_space_strategy(FileSpaceStrategy::Page, ..)",
             ));
         }
         let page_size = self.gather_page_size();
@@ -2196,20 +2227,22 @@ impl WriteEngine {
             ));
         }
         // A page buffer *replaces* the byte budget the session was already
-        // gathering under rather than adding to it, so a smaller one can be a
-        // downgrade on the default — steeply. Measured on a 4 KiB-paged file, one
-        // four-megabyte append cost 37 writes with no page buffer, 60 with a
-        // 64 KiB one, and 517 with a 4 KiB one.
+        // gathering under rather than adding to it, so a smaller one is also the
+        // point at which one long run is flushed and restarted. The C library
+        // needs no floor because `H5PB_write` bypasses its buffer for any I/O of
+        // a page or more; nothing bypasses this gatherer, so the floor is what
+        // stands in for that (issues #288, #308, #357).
         //
-        // This is a floor set to the worst case, **not** a crossover. On the
-        // workload this property is sold for it goes the other way: 32 chunk
-        // appends into eight datasets cost 184 writes unset, 23 at 4 KiB and 3 at
-        // 64 KiB, so a budget this refuses would have been 60x better than
-        // leaving the property unset. What decides the direction is whether the
-        // session's writes are one long run (where a small budget flushes it
-        // repeatedly) or many small scattered ones (where any budget merges them).
-        // A caller cannot be asked to know which they have before choosing a
-        // number, so the floor is set where no workload loses (issues #288, #308).
+        // Measured on a 4 KiB-paged file, both directions, writes issued:
+        //
+        //     workload                          unset   4 KiB   64 KiB   1 MiB
+        //     32 chunk appends into 8 + commit    188      25        4       4
+        //     one 4 MiB append                    131    1094       74      10
+        //
+        // The floor is not a worst-case trade: on the scattered workload this
+        // property is sold for, 64 KiB buys nothing the floor does not, and on
+        // the long run it is 7x worse. `no_budget_below_the_floor_beats_the_floor`
+        // asserts that ordering rather than these counts.
         if max_bytes < WRITE_GATHER_BYTES {
             return Err(Error::EditUnsupported(
                 "a page buffer must be at least the byte budget a session already gathers \
@@ -2235,12 +2268,14 @@ impl WriteEngine {
         // append — both are refused — so a page buffer would have nothing to
         // hold, while its mark blocked every reader for the session's life.
         //
-        // This also settles the base address for the mark's superblock rewrite:
-        // persistence is declined for a non-zero base, so a session that clears
-        // this check has `base_address == 0`.
-        if self.persist.is_none() {
+        // Scoped to a paged file: an *unpaged* one commits and appends whether it
+        // persists its free space or not, so there is nothing here to refuse. The
+        // base address the mark's superblock rewrite needs is not this check's to
+        // settle — `set_consistency_flags` converts the root address itself, and
+        // is tested for a userblock file directly rather than through a caller.
+        if self.paged.is_some() && self.persist.is_none() {
             return Err(Error::EditUnsupported(
-                "a page buffer needs a paged file whose free space is persisted: without it \
+                "a page buffer on a paged file needs its free space persisted: without it \
                  this session can neither commit nor append, so the buffer would hold nothing \
                  while marking the file against every reader; recreate the file with \
                  with_file_space_strategy(FileSpaceStrategy::Page, true, ..), or drop the \
@@ -14429,11 +14464,15 @@ mod tests {
     /// past the end of the file, so a call that promised to touch a flag silently
     /// makes the file unreadable.
     ///
-    /// Driven directly rather than through a caller. Both callers require a base
-    /// of zero today — but each does so as a side effect of refusing something
-    /// else (a userblock for SWMR, unpersisted free space for a page buffer), so
-    /// a test routed through either would be pinning those refusals rather than
-    /// this conversion, and would go quiet the day one of them moved.
+    /// Driven directly rather than through a caller, because for a long time
+    /// neither caller could reach a non-zero base: SWMR refuses a userblock
+    /// outright, and a page buffer required persisted free space, which is
+    /// declined for a non-zero base. Both were refusals about something else that
+    /// settled this as a side effect — and the day one of them moved is the day a
+    /// test routed through it would have gone quiet. Issue #357 moved the second,
+    /// so `a_page_buffer_marks_a_userblock_file_without_repointing_its_root`
+    /// exercises the same conversion through a real session; this one stays as
+    /// the direct statement of the rule.
     #[test]
     fn a_status_flag_write_leaves_a_userblock_files_root_alone() {
         use crate::writer::FileBuilder;
@@ -14478,6 +14517,253 @@ mod tests {
         );
     }
 
+    /// The budget a caller asks for is the budget the gatherer is given, so a
+    /// session that outruns it flushes rather than growing without bound.
+    ///
+    /// `set_page_buffer_size` spends most of its length on refusals, and the one
+    /// line that does the work hands `max_bytes` on. Passing `usize::MAX` instead
+    /// fails nothing else in the suite: every other page-buffer test runs a
+    /// workload smaller than the budget, so it holds everything to the end either
+    /// way and the file it leaves is identical. What that would cost is a
+    /// long-running session holding the whole of what it wrote in memory, which
+    /// is the one thing the budget is for.
+    ///
+    /// Asserted as "some writes went out before the session ended" rather than as
+    /// a count, since how many a 4 MiB append needs is free to change.
+    #[test]
+    fn a_page_buffered_session_flushes_when_it_outruns_its_budget() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("outrun.h5");
+        gather_fixture(&path, 1, true);
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        s.set_sync_policy(SyncPolicy::OnClose);
+        s.set_page_buffer_size(WRITE_GATHER_BYTES).unwrap();
+        let before = s.image.issued_writes();
+        // Four times the budget, in one append, so nothing but the budget can
+        // account for a write going out before the teardown below.
+        s.append_inplace_i32_phased("t0", &vec![7i32; 1 << 20], 4)
+            .unwrap();
+        let during = s.image.issued_writes() - before;
+        s.force_sync().unwrap();
+        s.release_status_flags().unwrap();
+        drop(s);
+
+        assert!(
+            during > 0,
+            "a session that wrote four times its budget issued nothing until it \
+             closed, so the budget it was given is not the one it asked for"
+        );
+        assert_eq!(
+            crate::reader::File::open(&path)
+                .unwrap()
+                .dataset("t0")
+                .unwrap()
+                .read_i32()
+                .unwrap()
+                .len(),
+            256 + (1 << 20),
+            "and the flushed append must still read back whole"
+        );
+    }
+
+    /// No budget below the 1 MiB floor issues fewer writes than the floor does —
+    /// on the workload a page buffer is *sold* for, or on the one it is worst at.
+    ///
+    /// This is the measurement the floor rests on, so it belongs in the suite
+    /// rather than in a comment: someone relaxing
+    /// [`WRITE_GATHER_BYTES`](super::WRITE_GATHER_BYTES) to honor a caller's
+    /// smaller number is exactly who needs to see it fail. The refusal is
+    /// deliberately bypassed here — `set_write_buffering` is driven directly —
+    /// because the point is what the smaller budgets *would* cost, which the
+    /// public path cannot ask for.
+    ///
+    /// The C library needs no such floor: `H5PB_write` sends any I/O of a page or
+    /// more straight to the driver, so a small `page_buf_size` there caps memory
+    /// without throttling a long write. Nothing bypasses this gatherer, so the
+    /// budget is also the point at which a long run is flushed and restarted.
+    ///
+    /// Asserted as an **ordering** rather than as counts. The counts are
+    /// deterministic on one target and are quoted on the public property, but how
+    /// many writes a commit needs is free to fall; what must not change is which
+    /// budget wins (issue #357).
+    #[test]
+    fn no_budget_below_the_floor_beats_the_floor() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let fixture = |path: &std::path::Path, tables: usize| {
+            use crate::writer::FileBuilder;
+            let mut b = FileBuilder::new();
+            b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
+                .with_file_space_page_size(4096);
+            for t in 0..tables {
+                b.create_dataset(&std::format!("t{t}"))
+                    .with_i32_data(&(0..256).collect::<Vec<_>>())
+                    .with_shape(&[256])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[64]);
+            }
+            b.write(path).unwrap();
+        };
+
+        // `set_page_buffer_size` without its floor: everything else that property
+        // does, so the arms differ in the budget and nothing else.
+        let run = |path: &std::path::Path, budget: usize, workload: &dyn Fn(&mut WriteEngine)| {
+            let mut s = WriteEngine::open_with_locking(path, FileLocking::Enabled).unwrap();
+            s.set_sync_policy(SyncPolicy::OnClose);
+            let page_size = s.gather_page_size();
+            s.raise_crash_mark().unwrap();
+            s.image
+                .set_write_buffering(WriteBuffering::Session {
+                    page_size,
+                    max_bytes: budget,
+                })
+                .unwrap();
+            let before = s.image.issued_writes();
+            workload(&mut s);
+            s.force_sync().unwrap();
+            s.release_status_flags().unwrap();
+            let issued = s.image.issued_writes() - before;
+            drop(s);
+            issued
+        };
+
+        // Many small scattered writes — what the property is for — and one long
+        // contiguous run, which is where a small budget collapses.
+        let workload = |scattered: bool| {
+            move |s: &mut WriteEngine| {
+                if scattered {
+                    for round in 0..4 {
+                        for t in 0..8 {
+                            s.append_inplace_i32_phased(&std::format!("t{t}"), &[round; 64], 4)
+                                .unwrap();
+                        }
+                    }
+                } else {
+                    s.append_inplace_i32_phased("t0", &vec![7i32; 1 << 20], 4)
+                        .unwrap();
+                }
+            }
+        };
+
+        for (label, tables, scattered) in [("scattered", 8, true), ("one long run", 1, false)] {
+            let workload = workload(scattered);
+            let at = |budget: usize| {
+                let path = dir
+                    .path()
+                    .join(std::format!("{}_{budget}.h5", label.replace(' ', "_")));
+                fixture(&path, tables);
+                run(&path, budget, &workload)
+            };
+            let floor = at(WRITE_GATHER_BYTES);
+            let smallest = at(4096);
+            for smaller in [4096, 64 * 1024] {
+                let below = at(smaller);
+                assert!(
+                    floor <= below,
+                    "{label}: a {smaller}-byte budget issued {below} writes against \
+                     {floor} at the {WRITE_GATHER_BYTES}-byte floor, so the floor is \
+                     refusing a budget that would have been better"
+                );
+            }
+            // Not vacuous: a gatherer that ignored `max_bytes` outright would
+            // report the same count at every budget and satisfy the ordering
+            // above without honoring any of them. One page is a quarter of the
+            // floor's smallest step, so a workload that does not separate there
+            // is one this assertion cannot speak for.
+            assert!(
+                smallest > floor,
+                "{label}: the budget changed nothing — {smallest} writes at 4 KiB \
+                 against {floor} at the floor — so this workload cannot say which \
+                 budget is better"
+            );
+        }
+    }
+
+    /// A page-buffered session on a file with a userblock raises and clears its
+    /// crash mark without disturbing the root address that mark's superblock
+    /// rewrite carries — and the userblock's own bytes stay put.
+    ///
+    /// The caller-side half of
+    /// `a_status_flag_write_leaves_a_userblock_files_root_alone`, reachable only
+    /// since issue #357 scoped the persisted-free-space refusal to paged files.
+    /// A userblock file persists no free space whatever its creation properties
+    /// asked for, so before that the mark could not be raised on one at all, and
+    /// `set_consistency_flags`'s base conversion had no caller that needed it.
+    #[test]
+    fn a_page_buffer_marks_a_userblock_file_without_repointing_its_root() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ub_buffered.h5");
+        let mut b = FileBuilder::new();
+        b.with_userblock(4096);
+        b.create_dataset("t0")
+            .with_i32_data(&(0..256).collect::<Vec<_>>())
+            .with_shape(&[256]);
+        b.write(&path).unwrap();
+        let userblock_before = std::fs::read(&path).unwrap()[..4096].to_vec();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        assert_eq!(
+            s.superblock.base_address, 4096,
+            "the fixture must have a userblock, or this test says nothing about \
+             the conversion it exists for"
+        );
+        s.set_sync_policy(SyncPolicy::OnClose);
+        s.set_page_buffer_size(1 << 20)
+            .expect("an unpaged userblock file must accept a page buffer");
+        // The mark is the point: a session that accepted the property and raised
+        // nothing would pass every assertion below, since the conversion under
+        // test runs only when the flags byte is written, and `raise_crash_mark`
+        // is the only thing that writes it here. Asserted in memory rather than
+        // off the disk because the session holds an exclusive OS lock on the
+        // file, which is mandatory on Windows.
+        assert_eq!(
+            s.held_status_flags,
+            file_lock::WRITE_ACCESS,
+            "a page-buffered session must hold the crash mark"
+        );
+        // A staged commit rather than an in-place append: in-place appending is
+        // refused on a userblock file for reasons of its own, which is a
+        // different subject and would only mask this one.
+        for t in 0..3 {
+            let mut db = crate::type_builders::DatasetBuilder::new(&std::format!("n{t}"));
+            db.with_f64_data(&[2.5f64; 32]).with_shape(&[32]);
+            s.stage_created_dataset(&std::format!("/n{t}"), db).unwrap();
+        }
+        s.commit().unwrap();
+        s.force_sync().unwrap();
+        s.release_status_flags().unwrap();
+        drop(s);
+
+        assert_eq!(
+            &std::fs::read(&path).unwrap()[..4096],
+            &userblock_before[..],
+            "the page-buffered session rewrote the userblock"
+        );
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("t0").unwrap().read_i32().unwrap(),
+            (0..256).collect::<Vec<_>>(),
+            "the commit must have left the original dataset alone"
+        );
+        for t in 0..3 {
+            assert_eq!(
+                f.dataset(&std::format!("n{t}"))
+                    .unwrap()
+                    .read_f64()
+                    .unwrap(),
+                vec![2.5f64; 32],
+                "n{t}: the committed dataset must read back"
+            );
+        }
+    }
+
     /// A page buffer keeps dirty pages across operations, so a workload that
     /// touches the same pages again and again pays for them once rather than
     /// once per operation (issue #288) — and still produces the same file.
@@ -14485,16 +14771,21 @@ mod tests {
     /// This is what the default gathering deliberately does *not* do, so the
     /// comparison is against that default rather than against no gathering at
     /// all: what is being measured is the second reduction, not the first.
+    ///
+    /// Run on a paged file **and an unpaged one**. `H5Pset_page_buffer_size`
+    /// requires the paged allocator because the C page buffer is a page cache
+    /// whose `min_meta_perc`/`min_raw_perc` reservations count pages that
+    /// allocator keeps segregated by kind; this is a write gatherer, which needs
+    /// only a window to merge within, and
+    /// [`gather_page_size`](WriteEngine::gather_page_size) supplies one either
+    /// way. The unpaged arm is what says so (issue #357), and it is the arm that
+    /// matters most in practice: unpaged is the default strategy, so before this
+    /// the property was reachable only from a file deliberately created paged.
     #[test]
     fn a_page_buffer_holds_dirty_pages_across_operations() {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
-        let per_op = dir.path().join("per_op.h5");
-        let buffered = dir.path().join("buffered.h5");
-        gather_fixture(&per_op, 4, true);
-        gather_fixture(&buffered, 4, true);
-
         let run = |path: &std::path::Path, page_buffer: usize| {
             let mut s = WriteEngine::open_with_locking(path, FileLocking::Enabled).unwrap();
             s.set_sync_policy(SyncPolicy::OnClose);
@@ -14514,19 +14805,28 @@ mod tests {
             drop(s);
             appends + commit
         };
-        let per_op_writes = run(&per_op, 0);
-        let buffered_writes = run(&buffered, 1 << 20);
 
-        assert!(
-            buffered_writes * 4 < per_op_writes,
-            "a page buffer must cost meaningfully fewer writes than the \
-             per-operation default, but cost {buffered_writes} against {per_op_writes}"
-        );
-        assert_eq!(
-            std::fs::read(&per_op).unwrap(),
-            std::fs::read(&buffered).unwrap(),
-            "a page buffer changed the file it produced"
-        );
+        for paged in [true, false] {
+            let label = if paged { "paged" } else { "unpaged" };
+            let per_op = dir.path().join(std::format!("{label}_per_op.h5"));
+            let buffered = dir.path().join(std::format!("{label}_buffered.h5"));
+            gather_fixture(&per_op, 4, paged);
+            gather_fixture(&buffered, 4, paged);
+
+            let per_op_writes = run(&per_op, 0);
+            let buffered_writes = run(&buffered, 1 << 20);
+
+            assert!(
+                buffered_writes * 4 < per_op_writes,
+                "{label}: a page buffer must cost meaningfully fewer writes than the \
+                 per-operation default, but cost {buffered_writes} against {per_op_writes}"
+            );
+            assert_eq!(
+                std::fs::read(&per_op).unwrap(),
+                std::fs::read(&buffered).unwrap(),
+                "{label}: a page buffer changed the file it produced"
+            );
+        }
     }
 
     /// A barrier issues what has been gathered under **every** policy, so the
