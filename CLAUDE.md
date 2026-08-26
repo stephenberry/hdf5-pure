@@ -18,6 +18,14 @@ cargo nextest run --all-features && cargo test --all-features --doc
 
 Both halves are needed. **nextest does not run doctests** and never will: `rustdoc` compiles those, not the test harness. Running only the first command leaves 46 doctests silently unexecuted.
 
+**Neither half runs rustdoc's link lints.** Doctests compile the code inside ```` ```rust ```` blocks; they say nothing about the links around them. Add a third command whenever a public doc comment changed:
+
+```
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --features "provenance zfp ndarray serde"
+```
+
+It takes about two seconds and it is the exact command the `Lint (fmt, clippy)` job runs. The lint that bites is `rustdoc::private_intra_doc_links`, and the curated API makes this crate unusually easy to trip: a module is `pub(crate)` while individual items inside it are `pub` and re-exported from `lib.rs`, so a link from one re-exported item to a neighbour that was *not* re-exported resolves fine for you and not at all for a reader of the published docs. `ChunkCacheConfig::from_h5p_cache` linking `[`CachePass`]` reddened that job on PR #375 while the other 22 passed. The same link written in the docs of a *private* item is accepted, since only public documentation is checked — which is what makes the bad one easy to write by analogy with its neighbours.
+
 nextest rather than `cargo test` because `cargo test` runs the ~110 integration binaries one after another, so the suite spends most of its wall clock on a single core no matter how many the machine has. Measured on a 10-core host at `--all-features`: **46.1s under `cargo test` (115% CPU) against 17.9s under nextest (421% CPU)**, running the identical 2,034 tests. Install it with `cargo install cargo-nextest --locked`; CI runs the same two commands per matrix config.
 
 `.config/nextest.toml` fails the run on any test slower than 90s and prints a warning at 30s. That gate exists because a single test once spent 117s issuing one `fsync` per appended element — five times the rest of the suite combined — and nothing surfaced it, since `cargo test` reports no per-test timings at all. **A long-running test in this suite is a defect signal, not a cost of doing business**: the usual cause is a session left on the default `SyncPolicy::Always` while looping over appends, and the fix is `SyncPolicy::OnClose`, which writes byte-identical files (`tests/sync_policy.rs` asserts exactly that) and still barriers at `close`. Reach for a per-test override in that config only after ruling this out.
