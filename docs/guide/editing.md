@@ -378,18 +378,34 @@ let file = File::open_rw_with_options(
 ).unwrap();
 ```
 
-Dirty pages then survive across barriers, commits and appends until the budget is spent, an `fsync` is issued, or the session closes. Measured on a paged file, 32 chunk appends into eight datasets followed by a commit: **188 writes with the default gathering, 5 with a page buffer** — two of which are the mark below going up and coming down. The appends issue nothing at all until the session ends.
+Dirty pages then survive across barriers, commits and appends until the budget is spent, an `fsync` is issued, or the session closes. Measured on a paged file, 32 chunk appends into eight datasets followed by a commit: **188 writes with the default gathering, 5 with a page buffer** — two of which are the mark below going up and coming down. The appends issue nothing at all until the session ends. The file it produces is byte-identical either way.
 
-Six things are required, each refused rather than quietly ignored:
+Five things are required, each refused rather than quietly ignored:
 
-- **A paged file** created with `FileSpaceStrategy::Page`, and a budget of at least that file's page size.
-- **A budget of at least 1 MiB**, which is what a session already gathers between barriers. A smaller page buffer *replaces* that budget rather than extending it, and on a workload whose writes form one long run that is far worse than leaving the property unset: measured on a 4 KiB-paged file, one 4 MiB append cost 37 writes unset, 60 with a 64 KiB buffer, and 517 with a 4 KiB one. The floor is set to that worst case rather than to a crossover — a many-small-appends workload prefers the *smaller* budget (32 appends cost 184 writes unset, 23 at 4 KiB, 3 at 64 KiB) — because the number has to be chosen before the workload is known.
-- **Persisted free space**, since a paged file without it can neither be committed to nor appended to — the buffer would hold nothing while its mark blocked every reader.
+- **A budget of at least the page the session merges within**: the file's own page size when it was created with `FileSpaceStrategy::Page`, and the format's 4 KiB default otherwise. A buffer that cannot hold one page drains on every page it touches.
+- **A budget of at least 1 MiB**, which is what a session already gathers between barriers. A smaller page buffer *replaces* that budget rather than extending it, so it is also the point at which one long contiguous run is flushed and restarted. Writes issued, measured on a 4 KiB-paged file:
+
+  | workload | unset | 4 KiB | 64 KiB | 1 MiB |
+  | --- | --- | --- | --- | --- |
+  | 32 chunk appends into 8 datasets, then a commit | 188 | 25 | 4 | 4 |
+  | one 4 MiB append | 131 | 1,094 | 74 | 10 |
+
+  On the scattered workload a page buffer exists for, 64 KiB buys nothing 1 MiB does not; on the long run it is 7x worse. The floor is also not memory a session was not already spending, since the gather budget it replaces is the same figure.
+- **Persisted free space, on a paged file**, which without it can neither be committed to nor appended to — the buffer would hold nothing while its mark blocked every reader. An unpaged file has no such constraint.
 - **A version-3 superblock**, because the session marks the file while it holds it and nothing reads that byte back on an older one. See below.
 - **`SyncPolicy::OnClose`.** Under the default `Always` every barrier is an `fsync` that flushes the buffer, so it would hold nothing while still costing the mark.
-- **A session long enough to pay for the mark.** See below.
 
-`File::create_with_options` refuses a creation/access pair it could not reopen with, rather than writing the file first, and the SWMR writer refuses a page buffer outright: its readers observe the order its writes become visible in, which is exactly what a buffer coalesces away. The first two refusals are deliberately *stricter* than the C library on the path that matters — `H5Pset_page_buffer_size` refuses them at `H5Fcreate`, but at `H5Fopen` it silently zeroes the budget on an unpaged file and rounds a sub-page budget up.
+There is also **a session long enough to pay for the mark**, which is a trade rather than a refusal. See below.
+
+`File::create_with_options` refuses a creation/access pair it could not reopen with, rather than writing the file first, and the SWMR writer refuses a page buffer outright: its readers observe the order its writes become visible in, which is exactly what a buffer coalesces away.
+
+### Where this differs from `H5Pset_page_buffer_size`
+
+**A paged file is not required.** `H5PB_create` refuses one, because the C page buffer is a page *cache* whose `min_meta_perc` / `min_raw_perc` reservations count pages the paged allocator keeps segregated by kind. This is a write gatherer instead: it merges runs within a page-sized window and flushes whole, so a window is all it needs, and an unpaged file gets the same 4 KiB one every read-write session already gathers under. Since unpaged is the default strategy, requiring `Page` put the property out of reach of most files for no reason this implementation had.
+
+**The 1 MiB floor has no C counterpart**, because `H5PB_write` bypasses the C buffer for any I/O of a page or more — capping memory there does not throttle a long write. Nothing bypasses this gatherer, so the floor stands in for that.
+
+**A sub-page budget is refused rather than rounded.** `H5Fcreate` refuses it too; `H5Fopen` rounds it up to one page silently, and on an unpaged file silently zeroes the budget outright. A property quietly ignored is worse than one refused.
 
 ### What a page buffer trades, and what pays for it
 

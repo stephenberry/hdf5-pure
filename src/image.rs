@@ -501,6 +501,25 @@ impl BufferedWrites {
         // Measured on a 16 MiB staged commit, that copy was the whole dataset a
         // second time. Flush before issuing so this cannot overtake a pending
         // byte at a lower address.
+        //
+        // The threshold is the **budget**, not the page. `H5PB_write` bypasses at
+        // `size >= page_size`, and the difference is what the two are for: the C
+        // page buffer is a cache, and its rule keeps data that will not be re-read
+        // from evicting data that will. This is a coalescer, and a write between
+        // one page and the budget is precisely the kind that still merges with its
+        // neighbours — bypassing it would forfeit the merge that earns the
+        // reduction. A chunked dataset with 8 KiB chunks would go from adjacent
+        // chunks joined into one issue to one issue per chunk.
+        //
+        // The rule would also buy nothing to offset that, because this engine's
+        // writes are far smaller than a page. Measured on a page-buffered session,
+        // incoming sizes: 32 chunk appends into eight datasets are 184 writes with
+        // a median of 60 bytes and a maximum of 256, none of them a page; one
+        // 4 MiB append is 32,912 writes with a median of 256 bytes, of which 34 —
+        // 0.1% of the writes and 0.5% of the bytes — reach 4 KiB. What looks like
+        // one long run at the dataset level arrives here as tens of thousands of
+        // small writes, and merging them into that run is this type's whole job
+        // (issue #357).
         if bytes.len() >= max_bytes {
             self.flush()?;
             return self.issue(offset, bytes);

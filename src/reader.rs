@@ -397,21 +397,21 @@ impl FileAccessProperties {
     ///
     /// # Refusals
     ///
-    /// Six, each refused with
+    /// Five, each refused with
     /// [`Error::EditUnsupported`](crate::Error::EditUnsupported) rather than
     /// quietly ignored:
     ///
-    /// - a file not created with
-    ///   [`FileSpaceStrategy::Page`](crate::FileSpaceStrategy::Page), which has no
-    ///   page boundary to align to;
-    /// - a budget below that file's file-space page size;
+    /// - a budget below the page the session merges within: the file's own
+    ///   file-space page size when it was created with
+    ///   [`FileSpaceStrategy::Page`](crate::FileSpaceStrategy::Page), and the
+    ///   format's 4 KiB default otherwise. A buffer that cannot hold one page
+    ///   drains on every page it touches;
     /// - a budget below the 1 MiB a session already gathers under, since a page
-    ///   buffer *replaces* that budget rather than adding to it, and on a
-    ///   single-long-run workload a smaller one issues far more writes than
-    ///   leaving this unset (one 4 MiB append: 37 writes unset, 517 at 4 KiB).
-    ///   A floor set to the worst case — a small-append workload prefers the
-    ///   smaller budget — because the choice is made before the workload is known;
-    /// - a paged file whose free space is not persisted, which can be neither
+    ///   buffer *replaces* that budget rather than adding to it, so a smaller one
+    ///   is also where a long contiguous run is flushed and restarted (one 4 MiB
+    ///   append: 10 writes at 1 MiB, 1,094 at 4 KiB). See below for why this
+    ///   floor has no counterpart in the C library;
+    /// - a **paged** file whose free space is not persisted, which can be neither
     ///   committed to nor appended to, so the buffer would hold nothing while its
     ///   mark blocked every reader;
     /// - a superblock older than version 3, whose status-flags byte no library
@@ -427,11 +427,41 @@ impl FileAccessProperties {
     /// observe the order its writes become visible in, which is exactly what a
     /// buffer coalesces away.
     ///
-    /// The first two are stricter than the C library *on this path*.
-    /// `H5Pset_page_buffer_size` refuses them at `H5Fcreate`, but `H5Fopen`
-    /// silently sets the budget to zero for an unpaged file and silently rounds a
-    /// sub-page budget up to one page. A property quietly ignored is worse than
-    /// one refused. The read-only opens ignore this setting; they write nothing.
+    /// # How this differs from `H5Pset_page_buffer_size`
+    ///
+    /// **A paged file is not required, where the C library requires one.**
+    /// `H5PB_create` refuses an unpaged file because the C page buffer is a page
+    /// *cache*, and its `min_meta_perc` / `min_raw_perc` reservations are counted
+    /// in pages that the paged allocator keeps segregated by kind. This is a
+    /// write gatherer: it merges runs within a page-sized window and flushes
+    /// whole, so a window is all it needs, and an unpaged file gets the same
+    /// 4 KiB one that every read-write session already gathers under. Since
+    /// unpaged is the default strategy, requiring `Page` put this property out of
+    /// reach of most files for no reason this implementation had.
+    ///
+    /// **The 1 MiB floor has no C counterpart, because the C buffer bypasses
+    /// itself.** `H5PB_write` sends any I/O of a page or more straight to the
+    /// driver, so a small `page_buf_size` there caps memory without throttling a
+    /// long write. Nothing bypasses here — the budget is the point at which
+    /// everything held is flushed — so a small one turns a single long run into
+    /// repeated flushes. The floor is what stands in for that bypass, and it
+    /// costs nothing measurable to give up. Writes issued on a 4 KiB-paged file:
+    ///
+    /// | workload | unset | 4 KiB | 64 KiB | 1 MiB |
+    /// | --- | --- | --- | --- | --- |
+    /// | 32 chunk appends into 8 datasets, then a commit | 188 | 25 | 4 | 4 |
+    /// | one 4 MiB append | 131 | 1,094 | 74 | 10 |
+    ///
+    /// On the scattered workload this property exists for, 64 KiB buys nothing
+    /// 1 MiB does not; on the long run it is 7x worse. Nor is the floor memory a
+    /// session was not already spending — the gather budget it replaces is the
+    /// same figure.
+    ///
+    /// **A sub-page budget is refused rather than rounded.** `H5Fopen` rounds it
+    /// up to one page silently, and `H5Fcreate` refuses it. A property quietly
+    /// ignored is worse than one refused.
+    ///
+    /// The read-only opens ignore this setting; they write nothing.
     ///
     /// Only the budget of `H5Pset_page_buffer_size` is modeled; its
     /// `min_meta_perc` / `min_raw_perc` reservations are not, since this buffer
@@ -8156,16 +8186,20 @@ mod tests {
     /// The page-buffer property is refused where it cannot be honored, rather
     /// than accepted and ignored (issues #288 and #308).
     ///
-    /// Each refusal has a different reason and none stands in for the others: an
-    /// unpaged file has no page boundary to align a page buffer to, a budget
-    /// under one page is a buffer that drains on every page it touches, a budget
-    /// under the session's own gather budget replaces it with something that can
-    /// be far worse, a session that persists no free space can neither commit nor
-    /// append, a pre-version-3 superblock carries a status-flags byte
-    /// no library reads back so the crash mark would announce nothing, and the
-    /// SWMR writer's readers observe the order its writes become visible in.
-    /// The first two are where the C library refuses `H5Pset_page_buffer_size`
-    /// too; the rest are this crate's.
+    /// Each refusal has a different reason and none stands in for the others: a
+    /// budget under one page is a buffer that drains on every page it touches, a
+    /// budget under the session's own gather budget replaces it with something
+    /// that can be far worse, a *paged* file that persists no free space can
+    /// neither commit nor append, a pre-version-3 superblock carries a
+    /// status-flags byte no library reads back so the crash mark would announce
+    /// nothing, and the SWMR writer's readers observe the order its writes become
+    /// visible in. The first is where the C library refuses
+    /// `H5Pset_page_buffer_size` too; the rest are this crate's.
+    ///
+    /// An unpaged file is **not** among them, which is what the first case here
+    /// pins: `H5PB_create` requires the paged allocator because the C page buffer
+    /// is a page cache with per-kind reservations, and this gatherer has neither
+    /// (issue #357).
     ///
     /// Every case also asserts the file is left byte-identical. Each refusal
     /// fires with a read-write session already open, and the version-3 one fires
@@ -8210,14 +8244,16 @@ mod tests {
             );
         };
 
+        // The one that is *accepted*, kept here beside its former siblings so
+        // reinstating the refusal fails this test rather than only the behavior
+        // test one module over.
         let unpaged = fixture("unpaged.h5", false);
-        let before = std::fs::read(&unpaged).unwrap();
-        let refused = File::open_rw_with_options(&unpaged, buffered(1 << 20));
+        let accepted = File::open_rw_with_options(&unpaged, buffered(1 << 20));
         assert!(
-            matches!(&refused, Err(Error::EditUnsupported(m)) if m.contains("FileSpaceStrategy::Page")),
-            "a page buffer on an unpaged file must be refused, got {refused:?}"
+            accepted.is_ok(),
+            "a page buffer on an unpaged file must be accepted, got {accepted:?}"
         );
-        untouched("unpaged", &unpaged, &before);
+        accepted.unwrap().close().unwrap();
 
         let paged = fixture("paged.h5", true);
         let before = std::fs::read(&paged).unwrap();
@@ -8341,11 +8377,17 @@ mod tests {
     /// could write but not then open, rather than writing it and failing the open
     /// it promised (issue #288).
     ///
-    /// A page buffer needs a paged file and a budget of at least its page size,
-    /// and both of those are properties of the file being *created* — so the
-    /// refusal belongs before the bytes are written, not in the reopen. The
-    /// assertion that matters here is `file_left`: an error alone would pass with
-    /// the file already on disk, which is the defect.
+    /// A page buffer needs a budget of at least the file's page size and a
+    /// version-3 superblock, and both of those are properties of the file being
+    /// *created* — so the refusal belongs before the bytes are written, not in
+    /// the reopen. The assertion that matters here is the `!path.exists()`: an
+    /// error alone would pass with the file already on disk, which is the defect.
+    ///
+    /// The version-3 case is the one issue #357 made reachable. While a page
+    /// buffer required a paged file it could not be: this crate's builder refuses
+    /// `FileSpaceStrategy::Page` below the 1.10 format outright, so no pair got
+    /// this far. An unpaged file at `LibVer::V18` is an ordinary buildable file,
+    /// and without a check here it would be written and only then refused.
     #[test]
     fn create_with_options_refuses_a_page_buffer_it_could_not_reopen_with() {
         use tempfile::tempdir;
@@ -8365,10 +8407,20 @@ mod tests {
         // It is here because it was missing — the refusal used to sit at the fapl
         // rather than with its siblings, so this function did not restate it and
         // the file was written before the open failed.
-        let cases: [(&str, crate::FileCreateProperties, usize, SyncPolicy); 4] = [
+        let cases: [(&str, crate::FileCreateProperties, usize, SyncPolicy); 5] = [
+            // A page larger than the 1 MiB floor, which is the only shape in
+            // which the page-size half of the check below decides anything: for
+            // every smaller page the floor already refuses whatever it would.
             (
-                "unpaged file",
-                crate::FileCreateProperties::new(),
+                "page larger than the floor",
+                paged(2 << 20),
+                1 << 20,
+                SyncPolicy::OnClose,
+            ),
+            (
+                "the 1.8 format",
+                crate::FileCreateProperties::new()
+                    .with_libver_bounds(crate::LibVer::Earliest, crate::LibVer::V18),
                 1 << 20,
                 SyncPolicy::OnClose,
             ),
@@ -8413,18 +8465,26 @@ mod tests {
             );
         }
 
-        // The honorable pair still creates.
-        let ok = File::create_with_options(
-            dir.path().join("ok.h5"),
-            paged(16 * 1024),
-            FileAccessProperties::new()
-                .with_sync_policy(SyncPolicy::OnClose)
-                .with_page_buffer_size(1 << 20),
-        );
-        assert!(
-            ok.is_ok(),
-            "a paged file with an ample budget must create: {ok:?}"
-        );
+        // The honorable pairs still create — including the unpaged one, which is
+        // the default creation properties and so the pair a caller reaches by
+        // asking for nothing but the buffer.
+        for (label, create) in [
+            ("paged", paged(16 * 1024)),
+            ("unpaged", crate::FileCreateProperties::new()),
+        ] {
+            let ok = File::create_with_options(
+                dir.path().join(std::format!("ok_{label}.h5")),
+                create,
+                FileAccessProperties::new()
+                    .with_sync_policy(SyncPolicy::OnClose)
+                    .with_page_buffer_size(1 << 20),
+            );
+            assert!(
+                ok.is_ok(),
+                "{label}: a file with an ample budget must create: {ok:?}"
+            );
+            ok.unwrap().close().unwrap();
+        }
     }
 
     /// `close` and `drop` issue their barrier under *every* policy, on both the
