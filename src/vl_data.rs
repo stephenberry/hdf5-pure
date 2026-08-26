@@ -7,6 +7,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, string::String, vec::Vec};
 
+use crate::address::BaseAddress;
 use crate::bytes::read_offset;
 use crate::convert::{TryToUsize, is_undefined_addr};
 use crate::datatype::{CharacterSet, Datatype};
@@ -371,7 +372,7 @@ pub fn visit_vl_strings_from_source<S, F>(
     num_elements: u64,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
     options: VlenStringReadOptions,
     mut visitor: F,
 ) -> Result<(), FormatError>
@@ -397,7 +398,7 @@ where
         {
             continue;
         }
-        let Some(address) = element.collection_address.checked_add(base_address) else {
+        let Ok(address) = base_address.absolute(element.collection_address) else {
             continue;
         };
         let Ok(index) = u16::try_from(element.object_index) else {
@@ -427,12 +428,7 @@ where
             ));
         }
 
-        let collection_address = element.collection_address.checked_add(base_address).ok_or(
-            FormatError::OffsetOverflow {
-                offset: element.collection_address,
-                length: base_address,
-            },
-        )?;
+        let collection_address = base_address.absolute(element.collection_address)?;
         let collection_pos = match collections
             .iter()
             .position(|(address, _)| *address == collection_address)
@@ -488,7 +484,7 @@ pub fn read_vl_strings_from_source<S: Source + ?Sized>(
     num_elements: u64,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
     options: VlenStringReadOptions,
 ) -> Result<Vec<String>, FormatError> {
     let mut strings = Vec::new();
@@ -540,7 +536,7 @@ pub(crate) fn read_vl_byte_objects_from_source<S: Source + ?Sized>(
     num_elements: u64,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
     element_size: usize,
     options: VlenStringReadOptions,
 ) -> Result<Vec<VlByteObject>, FormatError> {
@@ -564,12 +560,7 @@ pub(crate) fn read_vl_byte_objects_from_source<S: Source + ?Sized>(
             ));
         }
 
-        let collection_address = element.collection_address.checked_add(base_address).ok_or(
-            FormatError::OffsetOverflow {
-                offset: element.collection_address,
-                length: base_address,
-            },
-        )?;
+        let collection_address = base_address.absolute(element.collection_address)?;
         let collection_pos = match collections
             .iter()
             .position(|(address, _)| *address == collection_address)
@@ -635,7 +626,7 @@ pub fn read_vl_strings(
         num_elements,
         offset_size,
         length_size,
-        0,
+        BaseAddress::ZERO,
         VlenStringReadOptions::default(),
     )
 }
@@ -752,7 +743,7 @@ mod tests {
             2,
             8,
             8,
-            0,
+            BaseAddress::ZERO,
             VlenStringReadOptions::default(),
         )
         .unwrap();

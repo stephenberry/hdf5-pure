@@ -136,6 +136,7 @@ extern crate alloc;
 // re-exported at the bottom of this file).
 // ---------------------------------------------------------------------------
 
+pub(crate) mod address;
 pub(crate) mod attribute;
 pub(crate) mod attribute_info;
 pub(crate) mod btree_v1;

@@ -430,10 +430,10 @@ fn collect_chunk_info_from_source_inner<S: Source + ?Sized>(
 
 /// Generate ChunkInfo entries for an implicit index (v4 index type 2).
 ///
-/// Chunks are stored contiguously starting at `base_address`. No stored index;
+/// Chunks are stored contiguously starting at `data_address`. No stored index;
 /// addresses are computed from the chunk position.
 pub fn generate_implicit_chunks(
-    base_address: u64,
+    data_address: u64,
     dataset_dims: &[u64],
     chunk_dimensions: &[u32],
     element_size: u32,
@@ -475,7 +475,7 @@ pub fn generate_implicit_chunks(
             chunk_size: chunk_byte_size as u32,
             filter_mask: 0,
             offsets,
-            address: base_address + linear_idx * chunk_byte_size,
+            address: data_address + linear_idx * chunk_byte_size,
         });
     }
 

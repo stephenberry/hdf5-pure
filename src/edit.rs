@@ -210,6 +210,7 @@ use std::path::Path;
 
 use core::num::NonZeroUsize;
 
+use crate::address::BaseAddress;
 use crate::checksum::jenkins_lookup3;
 use crate::chunk_index_inplace::{Located, Store, apply_ea_append, plan_ea_append};
 use crate::chunked_read::{
@@ -1142,7 +1143,7 @@ fn bounded_only_limitation(session: &WriteEngine) -> Option<&'static str> {
              the whole-file mirror here",
         );
     }
-    if session.superblock.base_address != 0 {
+    if !session.superblock.base_address.is_zero() {
         return Some(
             "bounded read-write access does not support a file with a userblock \
              (non-zero base address); leave MemoryStrategy unset, or pass \
@@ -1892,7 +1893,7 @@ impl WriteEngine {
         // reaches every other process, which reads it from the operating system.
         session.set_sync_policy(sync_policy);
         if session.superblock.version < 3
-            || session.superblock.base_address != 0
+            || !session.superblock.base_address.is_zero()
             || session.persist.is_some()
         {
             return Err(Error::SwmrAppendUnsupported(
@@ -1933,13 +1934,10 @@ impl WriteEngine {
         self.superblock.consistency_flags = flags;
         self.held_status_flags = flags;
         let mut on_disk = self.superblock.clone();
-        // Exact, not saturating: `open_imaged` built the in-memory address by
-        // adding the base to the stored one, so it is never below it.
-        debug_assert!(
-            on_disk.root_group_address >= on_disk.base_address,
-            "the root address is held absolute, so it cannot be below the base"
-        );
-        on_disk.root_group_address -= on_disk.base_address;
+        // `open_imaged` built the in-memory address by adding the base to the
+        // stored one, so this cannot be below the base — but it is a subtraction
+        // over two file-derived numbers, and `relative` reports rather than wraps.
+        on_disk.root_group_address = on_disk.base_address.relative(on_disk.root_group_address)?;
         let bytes = on_disk.serialize();
         self.write_at(self.sb_sig_off, &bytes)?;
         self.barrier_data()?;
@@ -2093,7 +2091,7 @@ impl WriteEngine {
         // exactly at the base address (e.g. a MATLAB v7.3 `.mat` file's 512-byte
         // userblock) — is accepted; a base address that disagrees with the
         // superblock's location is a relocated or malformed file we will not rewrite.
-        if superblock.base_address != sb_sig_off as u64 {
+        if superblock.base_address != BaseAddress::new(sb_sig_off as u64) {
             return Err(Error::EditUnsupported(
                 "a file whose superblock is not located at its base address is not editable in place",
             ));
@@ -2104,12 +2102,8 @@ impl WriteEngine {
         // stored (base-relative) address only when the superblock is serialized on
         // commit.
         superblock.root_group_address = superblock
-            .root_group_address
-            .checked_add(superblock.base_address)
-            .ok_or(FormatError::OffsetOverflow {
-                offset: superblock.root_group_address,
-                length: superblock.base_address,
-            })?;
+            .base_address
+            .absolute(superblock.root_group_address)?;
 
         // Everything that can refuse this file has run; only now is it worth
         // holding the bytes.
@@ -2332,9 +2326,11 @@ impl WriteEngine {
         // shifted to an absolute file offset before the header is read. This is a
         // no-op on the base-0 file every path below the userblock check sees, but
         // that check itself needs the strategy of a *userblock* file.
-        let Ok(ext_addr) = ext_rel
-            .checked_add(self.superblock.base_address)
-            .ok_or(())
+        let Ok(ext_addr) = self
+            .superblock
+            .base_address
+            .absolute(ext_rel)
+            .map_err(|_| ())
             .and_then(|a| usize::try_from(a).map_err(|_| ()))
         else {
             return;
@@ -2355,7 +2351,7 @@ impl WriteEngine {
         // paged strategy but no longer satisfies it. Install the paged marker
         // without persistence so the commit refusal below catches it, which is the
         // same rule a paged non-persisting file already takes.
-        if self.superblock.base_address != 0 {
+        if !self.superblock.base_address.is_zero() {
             if info.strategy == FileSpaceStrategy::Page && info.page_size > 0 {
                 self.paged = Some(PagedEdit::new(info.page_size));
             }
@@ -2399,10 +2395,13 @@ impl WriteEngine {
                 if m == UNDEF {
                     continue;
                 }
-                let Ok(sections) =
-                    free_space_manager::read_persisted_sections_source(&self.image(), &[m], 0, os)
-                        .map(|(sections, _)| sections)
-                else {
+                let Ok(sections) = free_space_manager::read_persisted_sections_source(
+                    &self.image(),
+                    &[m],
+                    BaseAddress::ZERO,
+                    os,
+                )
+                .map(|(sections, _)| sections) else {
                     continue;
                 };
                 for s in sections {
@@ -2434,7 +2433,7 @@ impl WriteEngine {
         } else if let Ok(mut sections) = free_space_manager::read_persisted_sections_source(
             &self.image(),
             &info.manager_addrs,
-            0,
+            BaseAddress::ZERO,
             os,
         )
         .map(|(sections, _)| sections)
@@ -3170,7 +3169,7 @@ impl WriteEngine {
         // place per call. A userblock or pre-v2 file falls back to the staged
         // `append_dataset`, which rebuilds the index and repoints the superblock
         // last.
-        if self.superblock.base_address != 0 {
+        if !self.superblock.base_address.is_zero() {
             return Err(Error::AppendInPlaceUnsupported(
                 "in-place append does not support a file with a userblock (non-zero base \
                  address); use Dataset::append_staged",
@@ -3748,7 +3747,7 @@ impl WriteEngine {
                 "cross-file copy requires the source file to use 8-byte offsets and lengths",
             ));
         }
-        if source.base_address() != 0 {
+        if !source.base_address().is_zero() {
             return Err(Error::EditUnsupported(
                 "cross-file copy requires the source file to have no userblock (base address 0)",
             ));
@@ -3768,7 +3767,13 @@ impl WriteEngine {
         // Read (and foreign-address-screen) the whole subtree now, while `source`
         // is borrowed; the owned tree carries every byte the commit will write. The
         // source is gated to base 0 above, so its stored addresses are absolute.
-        let tree = Self::read_copy_subtree(&BytesSource::new(src_data), src_addr, 0, true, 0)?;
+        let tree = Self::read_copy_subtree(
+            &BytesSource::new(src_data),
+            src_addr,
+            0,
+            true,
+            BaseAddress::ZERO,
+        )?;
         self.refuse_if_claimed(&dst)?;
         self.staged.cross_copies.push((dst, tree));
         Ok(())
@@ -4927,7 +4932,9 @@ impl WriteEngine {
                                 let data_end = kept_chunks
                                     .iter()
                                     .filter_map(|c| {
-                                        c.address.checked_add(base)?.checked_add(c.compressed_size)
+                                        base.absolute(c.address)
+                                            .ok()?
+                                            .checked_add(c.compressed_size)
                                     })
                                     .chain(old_tail_extent.and_then(|(a, l)| a.checked_add(l)))
                                     .max();
@@ -5011,7 +5018,7 @@ impl WriteEngine {
             // link stores it relative to the userblock base.
             for (leaf, tree) in copies {
                 let root = self.write_copy_subtree(&tree)?;
-                region.extend_from_slice(&encode_link_message(&leaf, root - base));
+                region.extend_from_slice(&encode_link_message(&leaf, base.relative(root)?));
             }
 
             // Datasets directly under this group. Appended addresses are absolute
@@ -5082,7 +5089,7 @@ impl WriteEngine {
                     let data_addr = if fd.raw.is_empty() {
                         u64::MAX
                     } else {
-                        self.alloc_or_append_typed(&fd.raw, PageType::Raw)? - base
+                        base.relative(self.alloc_or_append_typed(&fd.raw, PageType::Raw)?)?
                     };
                     build_dataset_oh(
                         &fd.dt,
@@ -5100,7 +5107,7 @@ impl WriteEngine {
                     )?
                 };
                 let oh_addr = self.alloc_or_append_typed(&oh, PageType::Meta)?;
-                region.extend_from_slice(&encode_link_message(&fd.name, oh_addr - base));
+                region.extend_from_slice(&encode_link_message(&fd.name, base.relative(oh_addr)?));
                 let mut full = key.clone();
                 full.push(fd.name.clone());
                 path_addr.insert(full, oh_addr);
@@ -5113,7 +5120,7 @@ impl WriteEngine {
             // compact resizes are refused in the write preflight).
             for (leaf, old_oh, mw) in &writes {
                 let new_oh = self.write_moving(mw)?;
-                patch_link_target(&mut region, leaf, new_oh - base)?;
+                patch_link_target(&mut region, leaf, base.relative(new_oh)?)?;
                 relocations.insert(*old_oh, new_oh);
             }
 
@@ -5122,7 +5129,7 @@ impl WriteEngine {
             // stored relative to the base address.
             for child in children.get(key).into_iter().flatten() {
                 let child_name = child.last().unwrap();
-                let child_addr = path_addr[child] - base;
+                let child_addr = base.relative(path_addr[child])?;
                 if nodes[child].is_new {
                     region.extend_from_slice(&encode_link_message(child_name, child_addr));
                 } else {
@@ -5242,7 +5249,7 @@ impl WriteEngine {
             // write succeeds, so a failed write does not desync the in-memory
             // state. The v2/v3 superblock carries its own checksum.
             let mut new_sb = self.superblock.clone();
-            new_sb.root_group_address = new_root - base;
+            new_sb.root_group_address = base.relative(new_root)?;
             new_sb.eof_address = new_eof;
             // Publish the flags this session *raised*, so a flag the source file
             // arrived carrying (left set by a crashed SWMR writer, say) is
@@ -5265,7 +5272,7 @@ impl WriteEngine {
             self.superblock = new_sb;
         } else {
             self.publish_attempted = true;
-            self.repoint_v0v1_root(new_root - base, new_eof)?;
+            self.repoint_v0v1_root(base.relative(new_root)?, new_eof)?;
             self.barrier()?;
             self.superblock.root_group_address = new_root;
             self.superblock.eof_address = new_eof;
@@ -6113,7 +6120,7 @@ impl WriteEngine {
     fn gather_oh_messages<S: Source + ?Sized>(
         src: &S,
         addr: u64,
-        base: u64,
+        base: BaseAddress,
     ) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         for chunk in read_oh_chunks(src, addr, base)? {
@@ -6340,7 +6347,7 @@ impl WriteEngine {
         src: &S,
         addr: u64,
         fd: &FlatDataset,
-        base: u64,
+        base: BaseAddress,
         path: &PathKey,
     ) -> Result<WritePlan, Error> {
         // Enforced by construction: `staged.writes` has one producer, and it
@@ -6482,8 +6489,9 @@ impl WriteEngine {
                     && data_addr != UNDEF
                     && data_size == fd.raw.len() as u64
                 {
-                    if let Some(start) = data_addr
-                        .checked_add(base)
+                    if let Some(start) = base
+                        .absolute(data_addr)
+                        .ok()
                         .and_then(|a| usize::try_from(a).ok())
                     {
                         if start
@@ -6503,7 +6511,7 @@ impl WriteEngine {
                 // freed extent is recorded as an absolute file offset (`+ base`) to
                 // match the session free list.
                 let old_extent = if data_addr != UNDEF && data_size > 0 {
-                    Some((data_addr + base, data_size))
+                    Some((base.absolute(data_addr)?, data_size))
                 } else {
                     None
                 };
@@ -6624,7 +6632,7 @@ impl WriteEngine {
                 // the file (so the layout's stored addresses index correctly), and
                 // the returned write offsets are shifted back to absolute file
                 // offsets by adding `base` (a no-op on a base-0 file).
-                let base_off = usize::try_from(base).map_err(|_| {
+                let base_off = usize::try_from(base.get()).map_err(|_| {
                     Error::EditUnsupported("userblock base address exceeds this platform")
                 })?;
                 if let Some(writes) = try_inplace_chunk_writes(
@@ -6679,7 +6687,7 @@ impl WriteEngine {
         src: &S,
         addr: u64,
         ab: &AppendBuilder,
-        base: u64,
+        base: BaseAddress,
     ) -> Result<MovingWrite, Error> {
         if ab.dt_conflict {
             return Err(Error::AppendUnsupported(
@@ -6853,7 +6861,7 @@ impl WriteEngine {
             None => None,
         };
 
-        if base > src.len() {
+        if base.get() > src.len() {
             return Err(Error::AppendUnsupported(
                 "userblock base address past end-of-file",
             ));
@@ -6944,7 +6952,10 @@ impl WriteEngine {
             }
             tail_raw.extend_from_slice(&full[..live_bytes]);
             // The old partial chunk's data block is dead once the new index lands.
-            old_tail_extent = Some((partial.address + base, u64::from(partial.chunk_size)));
+            old_tail_extent = Some((
+                base.absolute(partial.address)?,
+                u64::from(partial.chunk_size),
+            ));
         }
         tail_raw.extend_from_slice(&ab.raw);
 
@@ -7013,7 +7024,11 @@ impl WriteEngine {
     /// data storage ([`reject_external_storage`]), and headers that are neither a
     /// dataset nor a group. (A *chunked* layout is modelled, not rejected —
     /// [`ObjModel::DatasetChunked`].)
-    fn read_object<S: Source + ?Sized>(src: &S, addr: u64, base: u64) -> Result<ObjModel, Error> {
+    fn read_object<S: Source + ?Sized>(
+        src: &S,
+        addr: u64,
+        base: BaseAddress,
+    ) -> Result<ObjModel, Error> {
         let region = Self::gather_oh_messages(src, addr, base)?;
 
         // Ahead of the layout classification below, where external storage and
@@ -7071,7 +7086,7 @@ impl WriteEngine {
             // the base address, so the walk gets the source framed past its
             // userblock — the same view the reader uses. `base` is 0 for a plain
             // file, where this is `src` itself.
-            if base > src.len() {
+            if base.get() > src.len() {
                 return Err(Error::EditUnsupported(
                     "a source file's userblock is larger than the file itself",
                 ));
@@ -7251,7 +7266,7 @@ impl WriteEngine {
         addr: u64,
         depth: u32,
         cross_file: bool,
-        base: u64,
+        base: BaseAddress,
     ) -> Result<CopyTree, Error> {
         if depth >= MAX_COPY_DEPTH {
             return Err(Error::EditUnsupported(
@@ -7307,9 +7322,9 @@ impl WriteEngine {
                 } else {
                     // The stored data address is base-relative; shift it to an absolute
                     // offset into `src` before reading the data block out.
-                    let start = data_addr
-                        .checked_add(base)
-                        .ok_or(Error::EditUnsupported("data address exceeds this platform"))?;
+                    let start = base.absolute(data_addr).map_err(|_| {
+                        Error::EditUnsupported("data address exceeds this platform")
+                    })?;
                     let len = usize::try_from(data_size)
                         .map_err(|_| Error::EditUnsupported("data size exceeds this platform"))?;
                     start
@@ -7439,9 +7454,9 @@ impl WriteEngine {
                 for (name, child) in children {
                     // Child link targets are stored base-relative; re-absolutize
                     // before descending so `addr` stays an absolute offset into `src`.
-                    let child = child.checked_add(base).ok_or(Error::EditUnsupported(
-                        "child address exceeds this platform",
-                    ))?;
+                    let child = base.absolute(child).map_err(|_| {
+                        Error::EditUnsupported("child address exceeds this platform")
+                    })?;
                     kids.push((
                         name,
                         Self::read_copy_subtree(src, child, depth + 1, cross_file, base)?,
@@ -7493,7 +7508,7 @@ impl WriteEngine {
                     // The placement is an absolute offset; the data-layout
                     // address field stores it relative to the userblock base.
                     region[*addr_off..*addr_off + 8]
-                        .copy_from_slice(&(new_data_addr - base).to_le_bytes());
+                        .copy_from_slice(&base.relative(new_data_addr)?.to_le_bytes());
                 }
                 // The dense heap is placed independently of the data — it is
                 // built for whatever address it gets (see `append_dense_attrs`),
@@ -7532,7 +7547,7 @@ impl WriteEngine {
                 for (name, child) in children {
                     let new_child = self.write_copy_subtree(child)?;
                     // The link target is stored relative to the userblock base.
-                    region.extend_from_slice(&encode_link_message(name, new_child - base));
+                    region.extend_from_slice(&encode_link_message(name, base.relative(new_child)?));
                 }
                 // The dense heap is built for whatever address it is placed at
                 // (see `append_dense_attrs`), so it needs no ordering against the
@@ -7682,7 +7697,7 @@ impl WriteEngine {
                 // data-layout field stores it relative to the userblock base (`-
                 // base`, a no-op on a base-0 file).
                 region[*addr_off..*addr_off + 8]
-                    .copy_from_slice(&(new_data_addr - base).to_le_bytes());
+                    .copy_from_slice(&base.relative(new_data_addr)?.to_le_bytes());
                 // The data size field follows the 8-byte address in the contiguous
                 // layout body; keep it in sync with the new length.
                 let size_off = *addr_off + 8;
@@ -7823,7 +7838,7 @@ impl WriteEngine {
         for cb in new_chunk_bytes {
             let abs = self.alloc_or_append_typed(cb, PageType::Raw)?;
             combined.push(WrittenChunk {
-                address: abs - base,
+                address: base.relative(abs)?,
                 compressed_size: cb.len() as u64,
                 // This engine applies every filter to a new chunk (no per-chunk
                 // skipping), so an appended chunk's mask is always 0. Kept chunks
@@ -7833,10 +7848,11 @@ impl WriteEngine {
         }
 
         // Build the fresh Extensible Array for wherever it is placed: its embedded
-        // block addresses are computed from `ea_base` (base-relative), so they
-        // resolve correctly on a userblock (`base != 0`) file too. Its length does
-        // not depend on that base, so `extensible_array_len` gives the reservation
-        // from the array's layout without emitting a byte of it.
+        // block addresses are computed from `ea_stored`, the array's own stored
+        // (base-relative) address, so they resolve correctly on a userblock file
+        // too. Its length does not depend on that address, so
+        // `extensible_array_len` gives the reservation from the array's layout
+        // without emitting a byte of it.
         //
         // The index goes in a *raw* page, not a metadata one: every other writer in
         // this crate places a chunk index in the same run as the chunk data, and
@@ -7855,19 +7871,19 @@ impl WriteEngine {
         let slots = crate::chunked_write::IndexSlots::dense(&combined);
         let ea_len =
             extensible_array_len(&slots, chunk_bytes, OFFSET_SIZE, LENGTH_SIZE, has_filters);
-        let (ea_addr, ()) = self.place_relocatable(ea_len, PageType::Raw, |ea_base| {
+        let (ea_addr, ()) = self.place_relocatable(ea_len, PageType::Raw, |ea_stored| {
             let bytes = build_extensible_array_at(
                 &slots,
                 chunk_bytes,
                 OFFSET_SIZE,
                 LENGTH_SIZE,
                 has_filters,
-                ea_base,
+                ea_stored,
             )
             .map_err(Error::Format)?;
             Ok((bytes, ()))
         })?;
-        let ea_base = ea_addr - base;
+        let ea_stored = base.relative(ea_addr)?;
 
         // Swap the dataspace (grown) and data-layout (repointed at the new index)
         // messages; every other header message is preserved verbatim.
@@ -7877,7 +7893,7 @@ impl WriteEngine {
         )]
         let layout_body = serialize_v4_extensible_array(
             chunk_dims_u32,
-            ea_base,
+            ea_stored,
             OFFSET_SIZE,
             element_size.get() as u32,
         );
@@ -8043,7 +8059,7 @@ impl WriteEngine {
         build: impl FnOnce(u64) -> Result<(Vec<u8>, T), Error>,
     ) -> Result<(u64, T), Error> {
         let at = self.reserve(len, ty)?;
-        let (bytes, extra) = build(at.address() - self.superblock.base_address)?;
+        let (bytes, extra) = build(self.superblock.base_address.relative(at.address())?)?;
         let addr = self.place(at, &bytes)?;
         Ok((addr, extra))
     }
@@ -8063,7 +8079,10 @@ impl WriteEngine {
             .iter()
             .map(|collection| {
                 let addr = self.alloc_or_append_typed(collection, PageType::Meta)?;
-                Ok(addr - self.superblock.base_address)
+                self.superblock
+                    .base_address
+                    .relative(addr)
+                    .map_err(Error::from)
             })
             .collect()
     }
@@ -8120,8 +8139,8 @@ impl WriteEngine {
         let placed = addrs
             .iter()
             .zip(&staging.collections)
-            .map(|(&a, c)| (a + base, c.len() as u64))
-            .collect();
+            .map(|(&a, c)| Ok((base.absolute(a)?, c.len() as u64)))
+            .collect::<Result<Vec<_>, FormatError>>()?;
         self.vl_overwrite_heaps.insert(vlen.path.clone(), placed);
         self.superseded_heaps.extend(superseded);
         Ok(Cow::Owned(raw))
@@ -8270,7 +8289,7 @@ impl WriteEngine {
         let base = superblock.base_address;
         let key = split_path(path);
         if let Some(&addr) = path_addr.get(&key) {
-            return Ok(addr - base);
+            return base.relative(addr).map_err(Error::from);
         }
         if nodes.contains_key(&key)
             || add_targets.iter().any(|t| is_prefix(t, &key))
@@ -8291,7 +8310,7 @@ impl WriteEngine {
             ));
         }
         match crate::group_v2::resolve_path_any_from_source(src, superblock, path) {
-            Ok(addr) => Ok(addr - base),
+            Ok(addr) => base.relative(addr).map_err(Error::from),
             Err(_) => Ok(UNDEF),
         }
     }
@@ -8358,10 +8377,10 @@ impl WriteEngine {
                     }
                     let mut full = key.clone();
                     full.push(fd.name.clone());
-                    sim_addr.insert(full, superblock.base_address);
+                    sim_addr.insert(full, superblock.base_address.get());
                 }
             }
-            sim_addr.insert(key.clone(), superblock.base_address);
+            sim_addr.insert(key.clone(), superblock.base_address.get());
         }
         Ok(())
     }
@@ -8489,7 +8508,7 @@ impl WriteEngine {
             let entries =
                 resolve_group_entries_from_source(&self.image(), &header, os, ls, base).ok()?;
             for e in entries {
-                let child = e.object_header_address.checked_add(base)?;
+                let child = base.absolute(e.object_header_address).ok()?;
                 *counts.entry(child).or_insert(0) += 1;
                 stack.push(child);
             }
@@ -8566,7 +8585,7 @@ impl WriteEngine {
                 // offset before bounds-checking and recording it.
                 if data_addr != u64::MAX && data_size > 0 {
                     if let (Some(abs), Ok(len)) =
-                        (data_addr.checked_add(base), usize::try_from(data_size))
+                        (base.absolute(data_addr).ok(), usize::try_from(data_size))
                     {
                         if let Ok(start) = usize::try_from(abs) {
                             if start.checked_add(len).is_some_and(|e| e as u64 <= file_len) {
@@ -8583,8 +8602,9 @@ impl WriteEngine {
                 // before descending so the recursion keeps working in absolute
                 // offsets (matching `incoming`'s keys and `oh_chunk_spans`).
                 for (_, child) in children {
-                    if let Some(c) = child
-                        .checked_add(base)
+                    if let Some(c) = base
+                        .absolute(child)
+                        .ok()
                         .and_then(|a| usize::try_from(a).ok())
                     {
                         self.collect_free_spans(c, depth + 1, incoming, out);
@@ -8707,11 +8727,11 @@ impl WriteEngine {
         // unreclaimed otherwise.
         let mut data: Vec<(u64, u64)> = Vec::with_capacity(split.data.len());
         for (addr, len) in split.data {
-            data.push((addr.checked_add(base)?, len));
+            data.push((base.absolute(addr).ok()?, len));
         }
         let mut index: Vec<(u64, u64)> = Vec::with_capacity(split.index.len());
         for (addr, len) in split.index {
-            index.push((addr.checked_add(base)?, len));
+            index.push((base.absolute(addr).ok()?, len));
         }
         // Validate both halves together — they must be disjoint from each other as
         // well as internally — before either is trusted, including by the proof.
@@ -8813,7 +8833,7 @@ impl WriteEngine {
         )
         .ok()?;
         for (a, _) in &mut spans {
-            *a = a.checked_add(base)?;
+            *a = base.absolute(*a).ok()?;
         }
         if !spans_disjoint_in_bounds(&mut spans, self.image.len()) {
             return None;
@@ -9013,7 +9033,7 @@ struct InvalidatedAddresses {
     /// The superblock base address. A stored object reference is *base-relative*
     /// and both lists above are absolute, so the comparison needs it; it is zero
     /// for every file without a userblock.
-    base: u64,
+    base: BaseAddress,
 }
 
 impl InvalidatedAddresses {
@@ -9038,7 +9058,7 @@ impl InvalidatedAddresses {
         }
         // An address that cannot even be shifted into the file is not one of
         // ours; leave it to whatever reads it.
-        let abs = stored.checked_add(self.base)?;
+        let abs = self.base.absolute(stored).ok()?;
         if self
             .removed
             .iter()
@@ -10985,7 +11005,7 @@ fn read_oh_chunk0<S: Source + ?Sized>(src: &S, addr: u64) -> Result<OhChunk, Err
 pub(crate) fn read_oh_chunks<S: Source + ?Sized>(
     src: &S,
     addr: u64,
-    base: u64,
+    base: BaseAddress,
 ) -> Result<Vec<OhChunk>, Error> {
     let mut chunks = vec![read_oh_chunk0(src, addr)?];
     let mut i = 0;
@@ -11020,7 +11040,7 @@ fn read_oh_continuation<S: Source + ?Sized>(
     region: &[u8],
     body: usize,
     body_end: usize,
-    base: u64,
+    base: BaseAddress,
 ) -> Result<OhChunk, Error> {
     if body_end - body < (OFFSET_SIZE + LENGTH_SIZE) as usize {
         return Err(Error::EditUnsupported("malformed continuation message"));
@@ -11029,9 +11049,9 @@ fn read_oh_continuation<S: Source + ?Sized>(
     let len = u64::from_le_bytes(region[body + 8..body + 16].try_into().unwrap());
     // The block address is stored relative to the base address; shift it to an
     // absolute file offset before reading.
-    let off = off
-        .checked_add(base)
-        .ok_or(Error::EditUnsupported("continuation address overflow"))?;
+    let off = base
+        .absolute(off)
+        .map_err(|_| Error::EditUnsupported("continuation address overflow"))?;
     // An OCHK block is signature(4) + messages + checksum(4).
     let end = off
         .checked_add(len)
@@ -11623,7 +11643,7 @@ mod tests {
         let invalidated = InvalidatedAddresses {
             removed: vec![(248, 71)],
             moved: Vec::new(),
-            base: 0,
+            base: BaseAddress::ZERO,
         };
         for (address, refused) in [(248u64, true), (318, true), (319, false)] {
             let tree = CopyTree::DatasetVerbatim {
@@ -11685,7 +11705,7 @@ mod tests {
         let invalidated = InvalidatedAddresses {
             removed: vec![(248, 71)],
             moved: Vec::new(),
-            base: 0,
+            base: BaseAddress::ZERO,
         };
         let err = screen_resolved_references(&dt, &raw, &invalidated).unwrap_err();
         assert!(
@@ -11700,7 +11720,7 @@ mod tests {
         let nothing = InvalidatedAddresses {
             removed: Vec::new(),
             moved: Vec::new(),
-            base: 0,
+            base: BaseAddress::ZERO,
         };
         assert!(screen_resolved_references(&dt, &raw, &nothing).is_err());
     }
@@ -11731,7 +11751,7 @@ mod tests {
         let invalidated = InvalidatedAddresses {
             removed: vec![(248, 71)],
             moved: Vec::new(),
-            base: 0,
+            base: BaseAddress::ZERO,
         };
 
         let err = screen_resolved_references(&of_references, &raw, &invalidated).unwrap_err();
@@ -11771,7 +11791,7 @@ mod tests {
         let invalidated = InvalidatedAddresses {
             removed: vec![(248, 71)],
             moved: Vec::new(),
-            base: 0,
+            base: BaseAddress::ZERO,
         };
         let err = screen_resolved_references(&dt, &raw, &invalidated).unwrap_err();
         assert!(
@@ -11784,7 +11804,7 @@ mod tests {
         let nothing = InvalidatedAddresses {
             removed: Vec::new(),
             moved: Vec::new(),
-            base: 0,
+            base: BaseAddress::ZERO,
         };
         assert!(screen_resolved_references(&dt, &raw, &nothing).is_err());
     }
@@ -11878,7 +11898,7 @@ mod tests {
                 &InvalidatedAddresses {
                     removed,
                     moved,
-                    base: 0,
+                    base: BaseAddress::ZERO,
                 },
                 &engine.image(),
                 engine.superblock(),
@@ -11922,7 +11942,7 @@ mod tests {
         let invalidated = InvalidatedAddresses {
             removed: vec![(248, 71)],
             moved: Vec::new(),
-            base: 0,
+            base: BaseAddress::ZERO,
         };
         // 248 is the first byte of the reclaimed span, 318 its last, 319 the
         // byte after it.
@@ -12456,8 +12476,13 @@ mod tests {
         let src = crate::source::BytesSource::new(bytes.as_slice());
         let slot6 = info.manager_addrs[6];
         assert_ne!(slot6, UNDEF, "the C library populated the large manager");
-        let (sections, _) =
-            free_space_manager::read_persisted_sections_source(&src, &[slot6], 0, 8).unwrap();
+        let (sections, _) = free_space_manager::read_persisted_sections_source(
+            &src,
+            &[slot6],
+            BaseAddress::ZERO,
+            8,
+        )
+        .unwrap();
         let fragments: Vec<&FreeSection> = sections
             .iter()
             .filter(|s| s.addr % PAGE != 0 || s.size % PAGE != 0)
@@ -14072,7 +14097,11 @@ mod tests {
         let mut data = std::fs::read(&path).unwrap();
         let off = signature::find_signature(&data).unwrap();
         let mut sb = Superblock::parse(&data, off).unwrap();
-        assert_eq!(sb.base_address, UB, "userblock file must have base == UB");
+        assert_eq!(
+            sb.base_address,
+            BaseAddress::new(UB),
+            "userblock file must have base == UB"
+        );
         sb.root_group_address = u64::MAX;
         let bytes = sb.serialize();
         data[off..off + bytes.len()].copy_from_slice(&bytes);
@@ -14727,7 +14756,8 @@ mod tests {
 
         let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
         assert_eq!(
-            s.superblock.base_address, 4096,
+            s.superblock.base_address,
+            BaseAddress::new(4096),
             "the fixture must have a userblock, or this test holds for a file \
              whose absolute and relative roots are the same number"
         );
@@ -14947,7 +14977,8 @@ mod tests {
 
         let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
         assert_eq!(
-            s.superblock.base_address, 4096,
+            s.superblock.base_address,
+            BaseAddress::new(4096),
             "the fixture must have a userblock, or this test says nothing about \
              the conversion it exists for"
         );

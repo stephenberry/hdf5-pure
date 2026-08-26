@@ -3,8 +3,9 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
+use crate::address::BaseAddress;
 use crate::btree_v1::{collect_symbol_table_nodes, collect_symbol_table_nodes_from_source};
-use crate::convert::{TryToUsize, slice_range};
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::local_heap::LocalHeap;
 use crate::source::Source;
@@ -32,23 +33,19 @@ pub fn resolve_v1_group_entries(
     sym_table_msg: &SymbolTableMessage,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     // Parse local heap (address is relative to base_address)
     let mut heap = LocalHeap::parse(
         file_data,
-        slice_range(sym_table_msg.local_heap_address, base_address)?.end,
+        base_address
+            .absolute(sym_table_msg.local_heap_address)?
+            .to_usize()?,
         offset_size,
         length_size,
     )?;
     // The data segment address stored in the heap is also relative to base_address
-    heap.data_segment_address =
-        heap.data_segment_address
-            .checked_add(base_address)
-            .ok_or(FormatError::OffsetOverflow {
-                offset: heap.data_segment_address,
-                length: base_address,
-            })?;
+    heap.data_segment_address = base_address.absolute(heap.data_segment_address)?;
 
     // Collect all SNOD addresses from B-tree (btree_address is relative to base_address)
     let snod_addrs = collect_symbol_table_nodes(
@@ -64,7 +61,7 @@ pub fn resolve_v1_group_entries(
         // SNOD addresses from B-tree children are also relative to base_address
         let snod = SymbolTableNode::parse(
             file_data,
-            slice_range(snod_addr, base_address)?.end,
+            base_address.absolute(snod_addr)?.to_usize()?,
             offset_size,
         )?;
         for entry in &snod.entries {
@@ -92,25 +89,13 @@ pub fn resolve_v1_group_entries_from_source<S: Source + ?Sized>(
     sym_table_msg: &SymbolTableMessage,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     // Parse local heap (address is relative to base_address).
-    let heap_addr = sym_table_msg
-        .local_heap_address
-        .checked_add(base_address)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: sym_table_msg.local_heap_address,
-            length: base_address,
-        })?;
+    let heap_addr = base_address.absolute(sym_table_msg.local_heap_address)?;
     let mut heap = LocalHeap::parse_from_source(source, heap_addr, offset_size, length_size)?;
     // The data segment address stored in the heap is also relative to base_address.
-    heap.data_segment_address =
-        heap.data_segment_address
-            .checked_add(base_address)
-            .ok_or(FormatError::OffsetOverflow {
-                offset: heap.data_segment_address,
-                length: base_address,
-            })?;
+    heap.data_segment_address = base_address.absolute(heap.data_segment_address)?;
 
     // Read the heap data segment once; every link name is sliced from it.
     let segment = source.read_metadata_at(
@@ -130,13 +115,7 @@ pub fn resolve_v1_group_entries_from_source<S: Source + ?Sized>(
     let mut entries = Vec::new();
     for snod_addr in snod_addrs {
         // SNOD addresses from the B-tree are relative to base_address.
-        let snod_offset =
-            snod_addr
-                .checked_add(base_address)
-                .ok_or(FormatError::OffsetOverflow {
-                    offset: snod_addr,
-                    length: base_address,
-                })?;
+        let snod_offset = base_address.absolute(snod_addr)?;
         let snod = SymbolTableNode::parse_from_source(source, snod_offset, offset_size)?;
         for entry in &snod.entries {
             let name = heap.read_string_in_segment(&segment, entry.link_name_offset)?;
@@ -324,7 +303,7 @@ mod tests {
     #[test]
     fn resolve_entries_two_children() {
         let (file, msg) = build_synthetic_group(&[("alpha", 0x1000, 0), ("beta", 0x2000, 0)], 8, 8);
-        let entries = resolve_v1_group_entries(&file, &msg, 8, 8, 0).unwrap();
+        let entries = resolve_v1_group_entries(&file, &msg, 8, 8, BaseAddress::ZERO).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "alpha");
         assert_eq!(entries[0].object_header_address, 0x1000);
@@ -395,9 +374,14 @@ mod tests {
         let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
         let root_sym = get_root_sym_table(file_data, &sb);
 
-        let entries =
-            resolve_v1_group_entries(file_data, &root_sym, sb.offset_size, sb.length_size, 0)
-                .unwrap();
+        let entries = resolve_v1_group_entries(
+            file_data,
+            &root_sym,
+            sb.offset_size,
+            sb.length_size,
+            BaseAddress::ZERO,
+        )
+        .unwrap();
         let data_entry = entries
             .iter()
             .find(|e| e.name == "data")

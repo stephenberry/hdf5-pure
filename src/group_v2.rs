@@ -6,6 +6,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
+use crate::address::BaseAddress;
 use crate::btree_v2::{
     BTreeV2Header, collect_btree_v2_records, collect_btree_v2_records_from_source,
 };
@@ -35,7 +36,7 @@ pub fn resolve_v2_group_entries(
     object_header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     // Look for Link Info message to determine storage type
     let link_info = find_link_info(object_header, offset_size)?;
@@ -86,11 +87,16 @@ fn resolve_compact_entries(
 ///
 /// Which object the answer is about is left to the caller. Naming it takes the
 /// path walked to reach it, and only the caller has that; a lookup one component
-/// deep knows an address and nothing else. Which address convention `Found`
-/// carries is the producing function's to state, and each does.
+/// deep knows an address and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildLookup {
-    /// The group holds a child of that name, at this address.
+    /// The group holds a child of that name, at this *absolute* file address.
+    ///
+    /// Absolute rather than stored: every consumer wants it that way, and
+    /// [`of`](Self::of) — the one thing in the crate that builds this variant —
+    /// already takes the base address the search itself needed. Back when each
+    /// consumer converted for itself, one of the three did so with an unchecked
+    /// `+`.
     Found(u64),
     /// The group holds no child of that name.
     Absent,
@@ -99,12 +105,16 @@ pub(crate) enum ChildLookup {
 }
 
 impl ChildLookup {
-    /// The answer reached by searching an object that *is* a group.
-    fn of(address: Option<u64>) -> Self {
-        match address {
-            Some(address) => ChildLookup::Found(address),
+    /// The answer reached by searching an object that *is* a group, given the
+    /// stored (base-relative) address the search found.
+    ///
+    /// [`FormatError::OffsetOverflow`] if the base cannot be added to it, which
+    /// a crafted link naming `HADDR_UNDEF` in a file with a userblock arranges.
+    fn of(base: BaseAddress, address: Option<u64>) -> Result<Self, FormatError> {
+        Ok(match address {
+            Some(address) => ChildLookup::Found(base.absolute(address)?),
             None => ChildLookup::Absent,
-        }
+        })
     }
 }
 
@@ -128,15 +138,13 @@ impl ChildLookup {
 /// no group at all answers [`ChildLookup::NotAGroup`] rather than an error the
 /// caller cannot tell from an absent child; see that type.
 ///
-/// A [`ChildLookup::Found`] address is the stored one, relative to the
-/// superblock base address, exactly as [`GroupEntry::object_header_address`]
-/// carries it.
+/// The address answered is absolute; see [`ChildLookup::of`].
 pub(crate) fn find_child_address(
     file_data: &[u8],
     group_address: u64,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
     name: &str,
 ) -> Result<ChildLookup, FormatError> {
     let mut saw_link = false;
@@ -155,18 +163,18 @@ pub(crate) fn find_child_address(
         return Ok(ChildLookup::NotAGroup);
     }
     if holds_compact_links(&header, offset_size)? {
-        return Ok(ChildLookup::of(scan_compact_links(
-            &header,
-            offset_size,
-            name,
-        )?));
+        return ChildLookup::of(
+            base_address,
+            scan_compact_links(&header, offset_size, name)?,
+        );
     }
-    Ok(ChildLookup::of(
+    ChildLookup::of(
+        base_address,
         resolve_group_entries(file_data, &header, offset_size, length_size, base_address)?
             .into_iter()
             .find(|e| e.name == name)
             .map(|e| e.object_header_address),
-    ))
+    )
 }
 
 /// Streaming counterpart of [`find_child_address`].
@@ -175,7 +183,7 @@ pub(crate) fn find_child_address_from_source<S: Source + ?Sized>(
     group_address: u64,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
     name: &str,
 ) -> Result<ChildLookup, FormatError> {
     let mut saw_link = false;
@@ -194,18 +202,18 @@ pub(crate) fn find_child_address_from_source<S: Source + ?Sized>(
         return Ok(ChildLookup::NotAGroup);
     }
     if holds_compact_links(&header, offset_size)? {
-        return Ok(ChildLookup::of(scan_compact_links(
-            &header,
-            offset_size,
-            name,
-        )?));
+        return ChildLookup::of(
+            base_address,
+            scan_compact_links(&header, offset_size, name)?,
+        );
     }
-    Ok(ChildLookup::of(
+    ChildLookup::of(
+        base_address,
         resolve_group_entries_from_source(source, &header, offset_size, length_size, base_address)?
             .into_iter()
             .find(|e| e.name == name)
             .map(|e| e.object_header_address),
-    ))
+    )
 }
 
 /// A message filter that keeps everything except the links this lookup did not
@@ -442,9 +450,7 @@ pub fn resolve_path_any(
 
     for (i, component) in components.iter().enumerate() {
         match find_child_address(file_data, current_addr, os, ls, base, component)? {
-            ChildLookup::Found(stored_addr) => {
-                // Link addresses are relative to base_address; convert to absolute.
-                let abs_addr = stored_addr + base;
+            ChildLookup::Found(abs_addr) => {
                 if i == components.len() - 1 {
                     return Ok(abs_addr);
                 }
@@ -471,7 +477,7 @@ pub fn resolve_group_entries(
     object_header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     if is_v1_group(object_header) {
         // v1: find SymbolTableMessage and use existing v1 code
@@ -534,8 +540,7 @@ pub fn resolve_path_any_from_source<S: Source + ?Sized>(
 
     for (i, component) in components.iter().enumerate() {
         match find_child_address_from_source(source, current_addr, os, ls, base, component)? {
-            ChildLookup::Found(stored_addr) => {
-                let abs_addr = stored_addr + base;
+            ChildLookup::Found(abs_addr) => {
                 if i == components.len() - 1 {
                     return Ok(abs_addr);
                 }
@@ -562,7 +567,7 @@ pub fn resolve_group_entries_from_source<S: Source + ?Sized>(
     object_header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     if is_v1_group(object_header) {
         let sym_msg = object_header
@@ -598,7 +603,7 @@ fn resolve_v2_group_entries_from_source<S: Source + ?Sized>(
     object_header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     let link_info = find_link_info(object_header, offset_size)?;
     if let Some(fh_addr) = link_info.fractal_heap_address {
@@ -744,7 +749,7 @@ mod tests {
             birth_time: None,
         };
 
-        let entries = resolve_v2_group_entries(&[], &oh, 8, 8, 0).unwrap();
+        let entries = resolve_v2_group_entries(&[], &oh, 8, 8, BaseAddress::ZERO).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test");
         assert_eq!(entries[0].object_header_address, 0x1000);
@@ -949,6 +954,110 @@ mod tests {
             err,
             ResolveError::Format(FormatError::PathNotFound(_))
         ));
+    }
+
+    /// A link target that overflows when the superblock base address is added to
+    /// it is reported, not wrapped.
+    ///
+    /// `resolve_path_any` and its streaming twin each did this addition with a
+    /// bare `+`, so a crafted link naming `HADDR_UNDEF` in a file that has a
+    /// userblock panicked in a debug build and wrapped to a near-zero address in
+    /// a release one. `FileInner::group_child` — a third consumer of the same
+    /// stored address — got it right only because someone wrote the check there
+    /// by hand. All three now share [`ChildLookup::of`], so this covers the one
+    /// place the addition happens.
+    ///
+    /// The file needs a userblock for this to be reachable at all: with a base of
+    /// zero the addition is the identity and `HADDR_UNDEF` survives it to be
+    /// refused further down by `ensure_len` as an out-of-range read, which is why
+    /// every base-0 fixture in the suite passed either way.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_link_target_that_overflows_the_base_address_is_refused() {
+        const UB: u64 = 512;
+
+        let mut b = crate::writer::FileBuilder::new();
+        b.with_userblock(UB);
+        b.create_dataset("d")
+            .with_i32_data(&[1, 2, 3])
+            .with_shape(&[3]);
+        let mut bytes = b.finish().unwrap();
+
+        // Find the root group's object header and, inside it, the Link message
+        // naming "d" — by pattern rather than by a recorded offset, so a layout
+        // change moves the test rather than quietly emptying it.
+        let root_oh = bytes
+            .windows(4)
+            .position(|w| w == b"OHDR")
+            .expect("a latest-format file has a version 2 root object header");
+        let link = bytes
+            .windows(2)
+            .position(|w| w == [1, b'd'])
+            .expect("the root header holds a one-character link name");
+        let target = link + 2;
+        let stored = u64::from_le_bytes(bytes[target..target + 8].try_into().unwrap());
+        assert_eq!(
+            stored + UB,
+            bytes
+                .windows(4)
+                .enumerate()
+                .filter(|(_, w)| *w == b"OHDR")
+                .nth(1)
+                .expect("the dataset has an object header too")
+                .0 as u64,
+            "the bytes after the link name must be the dataset's stored address"
+        );
+
+        // The fixture resolves before it is corrupted, through both backends:
+        // what each assertion below observes is the corruption, not a file that
+        // never worked.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ub.h5");
+        std::fs::write(&path, &bytes).unwrap();
+        for read in [
+            crate::reader::File::from_bytes(bytes.clone()).unwrap(),
+            crate::reader::File::open_streaming(&path).unwrap(),
+        ] {
+            assert_eq!(read.dataset("d").unwrap().read::<i32>().unwrap(), [1, 2, 3]);
+        }
+
+        // Point the link at HADDR_UNDEF and repair the header checksum, which
+        // would otherwise refuse the file before the addition is ever reached.
+        bytes[target..target + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let (chunk_at, chunk_len) = crate::edit::read_oh_chunks(
+            &crate::source::BytesSource::new(&bytes[..]),
+            root_oh as u64,
+            BaseAddress::ZERO,
+        )
+        .expect("the root header is readable")[0]
+            .span;
+        let end = (chunk_at + chunk_len).to_usize().unwrap() - 4;
+        let repaired = crate::checksum::jenkins_lookup3(&bytes[chunk_at.to_usize().unwrap()..end]);
+        bytes[end..end + 4].copy_from_slice(&repaired.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Each backend reaches `ChildLookup::of` through its own lookup
+        // (`find_child_address` and `find_child_address_from_source`), so both
+        // are asserted.
+        for (backend, file) in [
+            ("buffered", crate::reader::File::from_bytes(bytes).unwrap()),
+            (
+                "streaming",
+                crate::reader::File::open_streaming(&path).unwrap(),
+            ),
+        ] {
+            let err = file.dataset("d").unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    crate::Error::Format(FormatError::OffsetOverflow {
+                        offset: u64::MAX,
+                        length: UB,
+                    })
+                ),
+                "{backend}: expected the base-address addition to be refused, got {err:?}"
+            );
+        }
     }
 }
 

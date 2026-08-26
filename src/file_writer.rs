@@ -14,6 +14,7 @@ use alloc::collections::BTreeMap as HashMap;
 #[cfg(feature = "std")]
 use std::collections::HashMap;
 
+use crate::address::BaseAddress;
 use crate::attribute::AttributeMessage;
 use crate::btree_v2_write::{self, BTreeV2Plan};
 use crate::chunked_write::{
@@ -418,7 +419,7 @@ pub(crate) fn dense_attrs_check(attrs: &[AttributeMessage]) -> Result<(), Format
 /// where the heap is placed: the serialized attribute messages, the fractal
 /// heap's doubling-table layout, both B-tree v2 layouts, and the blob's length.
 ///
-/// [`DenseAttrPlan::build`] emits the blob at a chosen base address, but no term
+/// [`DenseAttrPlan::build`] emits the blob at a chosen heap address, but no term
 /// of this plan is that address — the length is the same for every base. That is
 /// what lets a caller reserve the span before the bytes exist
 /// ([`DenseAttrPlan::blob_len`]), and take that length from the very computation
@@ -436,7 +437,7 @@ pub(crate) struct DenseAttrPlan {
     huge_plan: Option<BTreeV2Plan>,
     /// `(name hash, attribute index)` in the order the name index is searched.
     order: Vec<(u32, u32)>,
-    /// Where each part of the blob starts, relative to its base address.
+    /// Where each part of the blob starts, relative to the heap's own address.
     managed_off: u64,
     btree_off: u64,
     name_nodes_off: u64,
@@ -530,8 +531,8 @@ pub(crate) fn dense_attrs_plan(attrs: &[AttributeMessage]) -> DenseAttrPlan {
         .expect("a 512-byte node holds 20 huge records, enough to plan any count")
     });
 
-    // Blob layout, all relative to the base address the blob is built for, so
-    // its length is the same for every base: heap header, the managed blocks,
+    // Blob layout, all relative to the heap address the blob is built for, so
+    // its length is the same wherever it lands: heap header, the managed blocks,
     // name index (header + nodes), then — only when there are huge objects — the
     // huge index (header + nodes) and the huge object bytes themselves.
     let managed_off = DENSE_ATTR_FRHP_SIZE as u64;
@@ -619,21 +620,21 @@ const DENSE_ATTR_FRHP_SIZE: usize = {
 };
 
 impl DenseAttrPlan {
-    /// Byte length of the blob [`DenseAttrPlan::build`] produces, at any base
+    /// Byte length of the blob [`DenseAttrPlan::build`] produces, at any heap
     /// address.
     pub(crate) fn blob_len(&self) -> u64 {
         self.total_len
     }
 
     /// The Attribute Info (0x0015) message naming this heap once it is placed at
-    /// `base_address`. Its length does not depend on the address, so an
-    /// object-header sizing pass can take it from a provisional base.
-    pub(crate) fn attr_info_message(&self, base_address: u64) -> Vec<u8> {
-        serialize_attribute_info(base_address, base_address + self.btree_off)
+    /// `heap_address`. Its length does not depend on the address, so an
+    /// object-header sizing pass can take it from a provisional one.
+    pub(crate) fn attr_info_message(&self, heap_address: u64) -> Vec<u8> {
+        serialize_attribute_info(heap_address, heap_address + self.btree_off)
     }
 
-    /// Emit the blob for a heap placed at `base_address`.
-    pub(crate) fn build(&self, base_address: u64) -> DenseAttrBlob {
+    /// Emit the blob for a heap placed at `heap_address`.
+    pub(crate) fn build(&self, heap_address: u64) -> DenseAttrBlob {
         let max_heap_size: u16 = DENSE_ATTR_MAX_HEAP_SIZE_BITS;
         let block_offset_bytes = DENSE_ATTR_BLOCK_OFFSET_BYTES; // 5
         let heap_id_length: u16 = 8;
@@ -651,16 +652,16 @@ impl DenseAttrPlan {
         } = self;
         let huge_count = *huge_count;
 
-        // Every address the blob embeds is `base_address + <plan offset>`, which
+        // Every address the blob embeds is `heap_address + <plan offset>`, which
         // is what makes the bytes relocatable: the same plan emits the same
-        // length at any base.
-        let frhp_addr = base_address;
-        let managed_addr = base_address + self.managed_off;
-        let btree_addr = base_address + self.btree_off;
-        let name_nodes_addr = base_address + self.name_nodes_off;
-        let huge_bthd_addr = base_address + self.huge_bthd_off;
-        let huge_nodes_addr = base_address + self.huge_nodes_off;
-        let huge_data_addr = base_address + self.huge_data_off;
+        // length wherever the heap is placed.
+        let frhp_addr = heap_address;
+        let managed_addr = heap_address + self.managed_off;
+        let btree_addr = heap_address + self.btree_off;
+        let name_nodes_addr = heap_address + self.name_nodes_off;
+        let huge_bthd_addr = heap_address + self.huge_bthd_off;
+        let huge_nodes_addr = heap_address + self.huge_nodes_off;
+        let huge_data_addr = heap_address + self.huge_data_off;
 
         // The reference C library does not read a heap ID's length field at a fixed
         // width: it derives that width from the heap's declared maximum managed
@@ -788,7 +789,7 @@ impl DenseAttrPlan {
         let mut blob = Vec::with_capacity(self.total_len.to_usize().unwrap_or(0));
         blob.extend_from_slice(&frhp);
         blob.extend_from_slice(&managed_blocks);
-        debug_assert_eq!(blob.len() as u64, bthd_addr - base_address);
+        debug_assert_eq!(blob.len() as u64, bthd_addr - heap_address);
         blob.extend_from_slice(&name_tree.header);
         blob.extend_from_slice(&name_tree.nodes);
 
@@ -805,10 +806,10 @@ impl DenseAttrPlan {
             let huge_tree =
                 huge_plan.serialize(&huge_bytes, huge_nodes_addr, OFFSET_SIZE, LENGTH_SIZE);
 
-            debug_assert_eq!(blob.len() as u64, huge_bthd_addr - base_address);
+            debug_assert_eq!(blob.len() as u64, huge_bthd_addr - heap_address);
             blob.extend_from_slice(&huge_tree.header);
             blob.extend_from_slice(&huge_tree.nodes);
-            debug_assert_eq!(blob.len() as u64, huge_data_addr - base_address);
+            debug_assert_eq!(blob.len() as u64, huge_data_addr - heap_address);
             for (s, huge_id) in serialized.iter().zip(huge_id_of) {
                 if huge_id.is_some() {
                     blob.extend_from_slice(s);
@@ -833,7 +834,7 @@ impl DenseAttrPlan {
     }
 }
 
-/// The base address pass 1 of a file build asks a [`DenseAttrPlan`] for its
+/// The heap address pass 1 of a file build asks a [`DenseAttrPlan`] for its
 /// Attribute Info message at, before the heap's real address is known. The
 /// message's *length* is what that pass needs, and that does not depend on the
 /// address; pass 2 emits the real message at the address it reserves.
@@ -844,8 +845,8 @@ const DUMMY_DENSE_BASE: u64 = 0;
 /// A caller that has to reserve the heap's span before its bytes exist wants
 /// [`dense_attrs_plan`] and [`DenseAttrPlan::blob_len`] instead; this is the
 /// one-shot form for callers that already know where the heap goes.
-pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -> DenseAttrBlob {
-    dense_attrs_plan(attrs).build(base_address)
+pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], heap_address: u64) -> DenseAttrBlob {
+    dense_attrs_plan(attrs).build(heap_address)
 }
 
 /// Bytes the reference C library uses to encode a limit of `value`
@@ -1537,7 +1538,7 @@ impl FileWriter {
         /// the bytes written later.
         fn measure_chunked(
             d: &DsFlat,
-            base_address: u64,
+            data_address: u64,
             chunk_set: Option<&CompressedChunkSet>,
         ) -> Result<ChunkedMeasure, FormatError> {
             if let Some(rc) = &d.raw_chunks {
@@ -1551,7 +1552,7 @@ impl FileWriter {
                     &rc.chunk_dims,
                     rc.element_size,
                     rc.pipeline_message.as_deref(),
-                    base_address,
+                    data_address,
                     d.maxshape.as_deref(),
                 )?;
                 Ok(ChunkedMeasure {
@@ -1562,12 +1563,12 @@ impl FileWriter {
             } else {
                 let set = chunk_set
                     .expect("an encode-path chunked dataset must have a precomputed chunk set");
-                measure_chunked_at(set, base_address)
+                measure_chunked_at(set, data_address)
             }
         }
 
         /// Build the chunked data + layout/pipeline messages for one chunked
-        /// dataset at `base_address`, dispatching to the verbatim path when the
+        /// dataset at `data_address`, dispatching to the verbatim path when the
         /// dataset carries a raw-chunk payload, else the normal encode path. The
         /// layout is computed from chunk *sizes* alone, so it is identical
         /// whether the chunks are in memory or streamed.
@@ -1581,7 +1582,7 @@ impl FileWriter {
         /// side and `plan_chunked_data_verbatim` being shared on the other.
         fn build_chunked(
             d: &DsFlat,
-            base_address: u64,
+            data_address: u64,
             chunk_set: Option<&CompressedChunkSet>,
         ) -> Result<ChunkedBuilt, FormatError> {
             if let Some(rc) = &d.raw_chunks {
@@ -1599,7 +1600,7 @@ impl FileWriter {
                     &rc.chunk_dims,
                     rc.element_size,
                     rc.pipeline_message.as_deref(),
-                    base_address,
+                    data_address,
                     d.maxshape.as_deref(),
                 )?;
                 Ok(ChunkedBuilt {
@@ -1612,7 +1613,7 @@ impl FileWriter {
                 // the cached set out at this address (no recompression).
                 let set = chunk_set
                     .expect("an encode-path chunked dataset must have a precomputed chunk set");
-                let result = assemble_chunked_at(set, base_address)?;
+                let result = assemble_chunked_at(set, data_address)?;
                 Ok(ChunkedBuilt {
                     layout_message: result.layout_message,
                     pipeline_message: result.pipeline_message,
@@ -2448,7 +2449,7 @@ impl FileWriter {
         // Pass 1: compute dataset object-header sizes from a dummy layout. No
         // data bytes are materialized here — the object-header size depends only
         // on the layout/pipeline messages, and a chunk index's byte size is a
-        // function of chunk count/size, not of the (dummy) base address. For a
+        // function of chunk count/size, not of the (dummy) data address. For a
         // streamed (lazy) dataset this touches no chunk bytes at all.
         let mut actual_ds_oh_sizes: Vec<usize> = Vec::with_capacity(all_ds.len());
         // Each dataset's data-region byte length, captured here (where chunked
@@ -2757,7 +2758,7 @@ impl FileWriter {
         // physical file reaches the page-aligned end-of-allocation.
         if paged {
             let os = OFFSET_SIZE;
-            let base = ub as u64;
+            let base = BaseAddress::new(ub as u64);
             let mut meta = cursor2 as u64; // metadata cursor, base-relative
 
             // (a) Global-heap collections live in the metadata region. Assign
@@ -2995,7 +2996,7 @@ impl FileWriter {
                 c = align_up(data_end, page_size);
             }
             let eoa_rel = c; // already page-aligned
-            let eof_addr2 = base + eoa_rel;
+            let eof_addr2 = base.absolute(eoa_rel)?;
             let eoa_pre_fsm = eoa_rel;
 
             // (g) Now that the element bytes exist, patch dataset-element VL refs.
@@ -3180,7 +3181,7 @@ impl FileWriter {
                     emit_collections(sink, &staging.collections)?;
                 }
             }
-            debug_assert_eq!(sink.position(), base + ext_addr);
+            debug_assert_eq!(sink.position(), base.get() + ext_addr);
             sink.put(&real_ext_oh)?;
             // Free-space-manager blocks (SUPER, DRAW, generic-large), ascending.
             for blocks in [&super_blocks, &draw_blocks, &large_blocks]
@@ -3190,13 +3191,13 @@ impl FileWriter {
                 sink.put(&blocks.0)?;
                 sink.put(&blocks.1)?;
             }
-            debug_assert_eq!(sink.position(), base + meta_end);
+            debug_assert_eq!(sink.position(), base.get() + meta_end);
 
             // Raw data region: metadata page tail, then small data, DRAW tail,
             // large runs (with their fragments), padded to the page-aligned EOA.
             sink.put_zeros((raw_start - meta_end).to_usize()?)?;
             for &i in &small_indices {
-                debug_assert_eq!(sink.position(), base + ds_layouts[i].data_addr);
+                debug_assert_eq!(sink.position(), base.get() + ds_layouts[i].data_addr);
                 emit_ds_data(
                     sink,
                     &ds_layouts[i].data,
@@ -3209,7 +3210,7 @@ impl FileWriter {
             }
             for &i in &large_indices {
                 let data_addr = ds_layouts[i].data_addr;
-                let gap = (base + data_addr) - sink.position();
+                let gap = base.absolute(data_addr)? - sink.position();
                 sink.put_zeros(gap.to_usize()?)?;
                 emit_ds_data(
                     sink,
@@ -3217,7 +3218,7 @@ impl FileWriter {
                     all_ds[i].raw_chunks.as_ref(),
                     all_ds[i].produced.as_ref(),
                 )?;
-                let end_rel = sink.position() - base;
+                let end_rel = base.relative(sink.position())?;
                 sink.put_zeros((align_up(end_rel, page_size) - end_rel).to_usize()?)?;
             }
             let final_pad = eof_addr2 - sink.position();
@@ -3229,12 +3230,12 @@ impl FileWriter {
         let mut ds_layouts: Vec<DsLayout> = Vec::new();
         for (i, d) in all_ds.iter_mut().enumerate() {
             if is_chunked[i] {
-                let base_address = cursor2 as u64;
-                let built = build_chunked(d, base_address, chunk_sets[i].as_ref())?;
+                let data_address = cursor2 as u64;
+                let built = build_chunked(d, data_address, chunk_sets[i].as_ref())?;
                 cursor2 += built.data.len().to_usize()?;
                 ds_layouts.push(DsLayout {
                     data: built.data,
-                    data_addr: base_address,
+                    data_addr: data_address,
                     chunked_msgs: Some((built.layout_message, built.pipeline_message)),
                 });
             } else {
@@ -3363,7 +3364,7 @@ impl FileWriter {
             version: superblock_version(libver),
             offset_size: OFFSET_SIZE,
             length_size: LENGTH_SIZE,
-            base_address: ub as u64,
+            base_address: BaseAddress::new(ub as u64),
             eof_address: eof_addr2,
             root_group_address: root_group_addr,
             group_leaf_node_k: None,
@@ -3988,7 +3989,7 @@ mod tests {
 
     /// `DenseAttrPlan::blob_len` is the span a caller reserves for a heap before
     /// a byte of it exists, so it has to equal the length `build` goes on to
-    /// emit — at whatever base address the reservation lands on. A reservation
+    /// emit — at whatever heap address the reservation lands on. A reservation
     /// that came out short would place the next object on top of the heap.
     ///
     /// The attribute counts are swept *contiguously* rather than at hand-picked

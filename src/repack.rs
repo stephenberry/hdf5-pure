@@ -1518,7 +1518,7 @@ fn emit_object_reference_dataset(
     // Object references store addresses relative to the base address; the rewrite
     // path assumes a zero base (the universal case), so a userblock file is
     // refused rather than risk a mis-resolved address.
-    if file.base_address() != 0 {
+    if !file.base_address().is_zero() {
         return Err(Error::RepackUnsupported(format!(
             "dataset {path}: object references in a file with a non-zero base address (userblock) \
              cannot be repacked yet"
@@ -1583,7 +1583,7 @@ fn check_embedded_reference_layout(
             "dataset {path}: resizable datasets with an object-reference member cannot be repacked"
         )));
     }
-    if file.base_address() != 0 {
+    if !file.base_address().is_zero() {
         return Err(Error::RepackUnsupported(format!(
             "dataset {path}: object references in a file with a non-zero base address (userblock) \
              cannot be repacked yet"

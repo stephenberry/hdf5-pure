@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::address::BaseAddress;
 use crate::datatype::Datatype;
 use crate::display::{DISPLAY_MAX_MEMBERS, Dims, EscapedName, write_elided};
 
@@ -174,7 +175,7 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
     source: &S,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
 ) -> HashMap<std::string::String, AttrValue> {
     let mut map = HashMap::new();
     for attr in attrs {
@@ -242,7 +243,7 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
     source: &S,
     offset_size: u8,
     length_size: u8,
-    base_address: u64,
+    base_address: BaseAddress,
 ) -> Option<AttrValue> {
     use crate::dataspace::DataspaceType;
     use crate::datatype::Datatype;
@@ -700,7 +701,13 @@ mod tests {
             raw_data,
             datatype_location: crate::shared_message::DatatypeLocation::Inline,
         };
-        decode_attr_value(&attr, &crate::source::BytesSource::new(Vec::new()), 8, 8, 0)
+        decode_attr_value(
+            &attr,
+            &crate::source::BytesSource::new(Vec::new()),
+            8,
+            8,
+            BaseAddress::ZERO,
+        )
     }
 
     /// A slot narrower than the text it decodes to keeps the plain variant.
