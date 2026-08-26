@@ -22,6 +22,14 @@ The refusals fall into two kinds:
 
 These guard against files outside the format-version range `hdf5-pure` models; they are not features to add.
 
+### Numeric element width
+
+| Refused | Error | Why |
+|---|---|---|
+| An integer or float element wider than 8 bytes | `FormatError::NumericElementTooWide` | The typed numeric readers model an element as a 64-bit word taken from its leading eight bytes, and which part of a wider element that is depends on its byte order ([#361](https://github.com/stephenberry/hdf5-pure/issues/361)) |
+
+The refusal keeps a partial value from passing for a whole one: a 9-byte integer holding 2^64 would otherwise read back as `0`, and big-endian it would read back as 2^56, since the bytes kept are the *most* significant ones. It covers datasets and attributes alike, and an attribute this refuses is omitted from `attrs()` while `attr_datatypes()` still reports its width. `read_raw` and `read_u8`/`read_i8` hand back the bytes either way. Decoding these widths is a separate feature rather than a gap here — it means 128-bit variants throughout the `AttrValue` and `read_*` surfaces.
+
 ### Compression
 
 | Refused | Error | Why |

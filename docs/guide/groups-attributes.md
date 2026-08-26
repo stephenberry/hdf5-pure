@@ -137,6 +137,8 @@ What a read cannot recover, because `AttrValue` has no way to express it. Each o
 
 The variant may become **more specific** in a future release as `AttrValue` grows further variants — the numeric widths landed that way — so match with a `_` arm, which the `#[non_exhaustive]` enum requires anyway, or read through the accessors, which are unaffected by such a change.
 
+One case is a refusal rather than a loss of fidelity: a number **wider than 8 bytes** has no `AttrValue` at all. The typed numeric readers model an element as a 64-bit word taken from its leading eight bytes, so a 9-byte integer holding 2^64 would read back as `0` — indistinguishable from one that holds zero — and big-endian it would read back as 2^56, since those leading bytes are the *most* significant ones. `attrs()` omits such an attribute instead; `attr_datatypes()` still reports its full width, which is how it can be told from an attribute that is not there.
+
 ### Reading an attribute's datatype
 
 `attr_datatypes()` reports the on-disk [`Datatype`](../reference/data-types.md#the-datatype-model) of every attribute, keyed by name. It is the type channel to `attrs()`'s value channel, the pair a dataset already has in `datatype()` and its `read_*` methods, and it is where the *datatype* entries in the list above — byte order and precision, string padding and declared width, enumeration member names — can still be read.

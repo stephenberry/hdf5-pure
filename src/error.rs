@@ -517,6 +517,24 @@ pub enum FormatError {
         /// The declared width, in bytes.
         width: u32,
     },
+    /// A numeric element in a file is wider than the 64-bit word the typed
+    /// numeric readers model an element as.
+    ///
+    /// Those readers assemble one element from its leading eight bytes, so a
+    /// wider element would decode from part of itself: a 9-byte integer holding
+    /// 2^64 read back as zero, indistinguishable from one that really holds
+    /// zero. *Which* part survives depends on the byte order — under big-endian
+    /// those leading bytes are the element's **most** significant — so the whole
+    /// class is refused rather than decoded for the orders that happen to work
+    /// out (issue #361).
+    ///
+    /// The bytes are still readable: `Dataset::read_raw` is unaffected, and an
+    /// attribute this refuses is omitted from `attrs` while `attr_datatypes`
+    /// still reports its type.
+    NumericElementTooWide {
+        /// Storage width of one element, in bytes.
+        size: usize,
+    },
 }
 
 /// The largest message a version 2 object header can describe: its per-message
@@ -995,6 +1013,13 @@ impl fmt::Display for FormatError {
                     f,
                     "string element {index} is {len} bytes, past the {width}-byte width declared \
                      for the dataset"
+                )
+            }
+            FormatError::NumericElementTooWide { size } => {
+                write!(
+                    f,
+                    "a {size}-byte numeric element is wider than the 64-bit values these readers \
+                     decode into"
                 )
             }
         }

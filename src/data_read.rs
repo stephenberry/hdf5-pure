@@ -230,8 +230,36 @@ fn get_byte_order(dt: &Datatype) -> DatatypeByteOrder {
     }
 }
 
-fn get_size(dt: &Datatype) -> Result<NonZeroUsize, FormatError> {
-    dt.element_size_usize()
+/// The 64-bit word every numeric decoder below models one element as.
+const DECODED_WORD_BYTES: usize = 8;
+
+/// The element width of a numeric datatype, proven decodable.
+///
+/// A width past [`DECODED_WORD_BYTES`] is refused here rather than returned,
+/// which is what keeps a decoder from being written that skips the check: a
+/// width is the one thing every one of them needs, and this is the only way to
+/// get it. Running before the raw buffer's length is judged is deliberate too —
+/// an element this refuses is undecodable however many bytes arrive with it, so
+/// the datatype is what the error should name. Running *after* [`ensure_numeric`]
+/// matters as much in the other direction: a variable-length datatype reports a
+/// 16-byte element, and it should be refused for not being a number rather than
+/// for being a wide one.
+///
+/// Refusing on the *storage* width rather than on the significant bits is the
+/// substantive choice, and it does over-refuse: a wider element whose
+/// `bit_precision` fits in 64 decoded correctly before this change, under
+/// little-endian order. It did not under big-endian, where [`reorder_bytes`]
+/// takes the element's *leading* eight bytes and those are the most significant
+/// ones — and a reader whose correctness turns on the file's byte order is worse
+/// than one that says no.
+///
+/// Issue #361.
+fn numeric_elem_size(dt: &Datatype) -> Result<NonZeroUsize, FormatError> {
+    let size = dt.element_size_usize()?;
+    if size.get() > DECODED_WORD_BYTES {
+        return Err(FormatError::NumericElementTooWide { size: size.get() });
+    }
+    Ok(size)
 }
 
 /// True when a numeric element is stored in the "standard" full-width layout —
@@ -322,7 +350,7 @@ pub fn read_as_f64_into(
 ) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FloatingPoint or FixedPoint")?;
-    let elem_size = get_size(datatype)?;
+    let elem_size = numeric_elem_size(datatype)?;
     if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
@@ -443,7 +471,7 @@ pub fn read_as_i64_into(
 ) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (signed)")?;
-    let elem_size = get_size(datatype)?;
+    let elem_size = numeric_elem_size(datatype)?;
     if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
@@ -501,7 +529,7 @@ pub fn read_as_u64_into(
 ) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
-    let elem_size = get_size(datatype)?;
+    let elem_size = numeric_elem_size(datatype)?;
     if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
@@ -558,7 +586,7 @@ pub fn read_as_f32_into(
 ) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FloatingPoint")?;
-    let elem_size = get_size(datatype)?;
+    let elem_size = numeric_elem_size(datatype)?;
     if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
@@ -680,7 +708,7 @@ pub fn read_as_i32_into(
 ) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint")?;
-    let elem_size = get_size(datatype)?;
+    let elem_size = numeric_elem_size(datatype)?;
     if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
@@ -742,7 +770,7 @@ pub fn read_as_i16_into(
 ) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint")?;
-    let elem_size = get_size(datatype)?;
+    let elem_size = numeric_elem_size(datatype)?;
     if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
@@ -800,7 +828,7 @@ pub fn read_as_u32_into(
 ) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
-    let elem_size = get_size(datatype)?;
+    let elem_size = numeric_elem_size(datatype)?;
     if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
@@ -856,7 +884,7 @@ pub fn read_as_u16_into(
 ) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
-    let elem_size = get_size(datatype)?;
+    let elem_size = numeric_elem_size(datatype)?;
     if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
@@ -931,6 +959,12 @@ pub fn read_as_strings(raw: &[u8], datatype: &Datatype) -> Result<Vec<String>, F
 
 // --- Low-level byte conversion helpers ---
 
+/// An element's bytes as a little-endian 64-bit word, honoring `order`.
+///
+/// Only the leading eight are taken, and under big-endian order those are an
+/// element's *most* significant bytes — so this is faithful only for an element
+/// no wider than the word itself. [`numeric_elem_size`] is what holds that true
+/// on the fixed-point path; the float callers pass an 8-byte `f64`.
 fn reorder_bytes(bytes: &[u8], order: &DatatypeByteOrder) -> [u8; 8] {
     let mut buf = [0u8; 8];
     let len = bytes.len().min(8);
@@ -989,8 +1023,12 @@ fn int_bits(dt: &Datatype) -> (u16, u16) {
 }
 
 /// Read the raw stored integer word (zero-extended to `u64`), honoring byte
-/// order. Widths beyond 8 bytes keep only the low 8, matching the `u64`/`i64`
-/// element model.
+/// order.
+///
+/// `size` is at most [`DECODED_WORD_BYTES`], since every path here takes its
+/// width from [`numeric_elem_size`], which refuses a wider element rather than
+/// have this keep part of one. The `min` is belt-and-braces against that
+/// changing, not a truncation policy.
 fn read_raw_word(bytes: &[u8], size: usize, order: &DatatypeByteOrder) -> u64 {
     let buf = reorder_bytes(bytes, order);
     let mut val = 0u64;
@@ -1624,5 +1662,178 @@ mod tests {
             };
             assert_eq!(read_as_f32(raw, &dt).unwrap(), vec![-3.0f32]);
         }
+    }
+}
+
+/// Refusing a numeric element wider than the 64-bit word the readers model one
+/// as, rather than decoding it from part of itself (issue #361).
+///
+/// What these widths returned before the refusal, measured with the guard
+/// disabled — the first three rows are the issue's own report, the fourth is
+/// why the refusal is on storage width rather than on significant bits:
+///
+/// | stored | decoded as |
+/// | --- | --- |
+/// | 16-byte unsigned, `[0xFF; 16]` | `18446744073709551615` (2^64 - 1) |
+/// | 16-byte signed, `[0xFF; 16]` | `-1` |
+/// | 9-byte unsigned little-endian, 2^64 | `0` |
+/// | 9-byte unsigned **big-endian**, 2^64 | `72057594037927936` (2^56) |
+#[cfg(test)]
+mod wide_element_tests {
+    use super::*;
+
+    /// A fixed-point type `size` bytes wide, every bit of it significant.
+    fn wide_int(size: u32, signed: bool, byte_order: DatatypeByteOrder) -> Datatype {
+        Datatype::FixedPoint {
+            size,
+            byte_order,
+            signed,
+            bit_offset: 0,
+            bit_precision: u16::try_from(size * 8).expect("test widths fit a u16"),
+        }
+    }
+
+    /// A 16-byte float, the width an 80-bit `long double` is stored at.
+    fn wide_float() -> Datatype {
+        Datatype::FloatingPoint {
+            size: 16,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            bit_offset: 0,
+            bit_precision: 80,
+            exponent_location: 64,
+            exponent_size: 15,
+            mantissa_location: 0,
+            mantissa_size: 64,
+            exponent_bias: 16383,
+        }
+    }
+
+    /// One numeric reader with its output type erased, so every one of them can
+    /// be put to the same buffer in a loop.
+    type Reader = (
+        &'static str,
+        fn(&[u8], &Datatype) -> Result<(), FormatError>,
+    );
+
+    /// Every `read_as_*` a caller can reach.
+    ///
+    /// All eight take their width from [`numeric_elem_size`], so the refusal is
+    /// structural rather than eight remembered calls. What this pins is that
+    /// none of them stops doing so: a reader that reached for
+    /// `element_size_usize` directly would decode a wide element again, and it
+    /// is the only one of the eight that would.
+    const READERS: [Reader; 8] = [
+        ("i64", |raw, dt| read_as_i64(raw, dt).map(|_| ())),
+        ("u64", |raw, dt| read_as_u64(raw, dt).map(|_| ())),
+        ("i32", |raw, dt| read_as_i32(raw, dt).map(|_| ())),
+        ("u32", |raw, dt| read_as_u32(raw, dt).map(|_| ())),
+        ("i16", |raw, dt| read_as_i16(raw, dt).map(|_| ())),
+        ("u16", |raw, dt| read_as_u16(raw, dt).map(|_| ())),
+        ("f64", |raw, dt| read_as_f64(raw, dt).map(|_| ())),
+        ("f32", |raw, dt| read_as_f32(raw, dt).map(|_| ())),
+    ];
+
+    /// Every reader, not just the two the issue was reported through. A wide
+    /// element is undecodable for all of them, and one that let it past would
+    /// hand back bytes the others refuse.
+    #[test]
+    fn every_numeric_reader_refuses_a_wide_element() {
+        let raw = [0xFFu8; 16];
+        for dt in [
+            wide_int(16, false, DatatypeByteOrder::LittleEndian),
+            wide_int(16, true, DatatypeByteOrder::BigEndian),
+            wide_float(),
+        ] {
+            for (name, read) in READERS {
+                assert!(
+                    matches!(
+                        read(&raw, &dt),
+                        Err(FormatError::NumericElementTooWide { size: 16 })
+                    ),
+                    "read_as_{name} accepted a {dt}"
+                );
+            }
+        }
+    }
+
+    /// Eight bytes is the widest element that decodes, and it decodes at full
+    /// range in both signednesses. The ceiling above is only worth having if
+    /// this floor holds: a guard that refused everything would pass every one
+    /// of those assertions.
+    #[test]
+    fn eight_bytes_decodes_at_full_range_and_nine_does_not() {
+        let unsigned = wide_int(8, false, DatatypeByteOrder::LittleEndian);
+        assert_eq!(
+            read_as_u64(&u64::MAX.to_le_bytes(), &unsigned).unwrap(),
+            vec![u64::MAX]
+        );
+        let signed = wide_int(8, true, DatatypeByteOrder::LittleEndian);
+        assert_eq!(
+            read_as_i64(&i64::MIN.to_le_bytes(), &signed).unwrap(),
+            vec![i64::MIN]
+        );
+
+        // One byte more is refused. This is the row that matters most in the
+        // table above: nine bytes holding 2^64 decoded to 0, which reads back
+        // exactly like nine bytes that hold 0.
+        assert!(matches!(
+            read_as_u64(
+                &[0u8; 9],
+                &wide_int(9, false, DatatypeByteOrder::LittleEndian)
+            ),
+            Err(FormatError::NumericElementTooWide { size: 9 })
+        ));
+    }
+
+    /// An enumeration is stored as values of its base type, and the readers
+    /// decode it through that base — so a wide base is a wide element, and the
+    /// unwrapping must not step around the guard.
+    #[test]
+    fn an_enumeration_over_a_wide_base_is_refused() {
+        let dt = Datatype::Enumeration {
+            size: 16,
+            base_type: Box::new(wide_int(16, false, DatatypeByteOrder::LittleEndian)),
+            members: Vec::new(),
+        };
+        assert!(matches!(
+            read_as_u64(&[0xFFu8; 16], &dt),
+            Err(FormatError::NumericElementTooWide { size: 16 })
+        ));
+    }
+
+    /// A variable-length datatype reports a 16-byte element, so it reaches the
+    /// width check as a wide one. It must still be refused for not being a
+    /// number: the width check runs after `ensure_numeric`, and swapping the two
+    /// would report a wide element for a datatype that is not numeric at all.
+    #[test]
+    fn a_non_numeric_datatype_is_refused_for_its_class_not_its_width() {
+        let vlen = Datatype::VariableLength {
+            is_string: true,
+            padding: None,
+            charset: None,
+            base_type: Box::new(wide_int(1, false, DatatypeByteOrder::LittleEndian)),
+        };
+        assert_eq!(
+            vlen.type_size(),
+            16,
+            "the premise: it looks like a wide one"
+        );
+        assert!(matches!(
+            read_as_u64(&[0u8; 16], &vlen),
+            Err(FormatError::TypeMismatch { .. })
+        ));
+    }
+
+    /// The datatype is judged before the buffer. A wide element is undecodable
+    /// however many bytes arrive with it, so reporting a length mismatch first
+    /// would name the wrong thing and hide the real one behind a fixed buffer.
+    #[test]
+    fn a_wide_element_is_refused_before_its_length_is_judged() {
+        let dt = wide_int(16, false, DatatypeByteOrder::LittleEndian);
+        // Three bytes is not a whole number of 16-byte elements either.
+        assert!(matches!(
+            read_as_u64(&[0xFFu8; 3], &dt),
+            Err(FormatError::NumericElementTooWide { size: 16 })
+        ));
     }
 }
