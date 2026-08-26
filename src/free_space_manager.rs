@@ -51,6 +51,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
+use crate::address::BaseAddress;
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::file_space_info::NUM_FILE_FSM_MANAGERS;
@@ -349,7 +350,7 @@ pub(crate) fn parse_fsse(
 pub(crate) fn read_persisted_sections(
     data: &[u8],
     manager_addrs: &[u64],
-    base: u64,
+    base: BaseAddress,
     offset_size: u8,
 ) -> Result<Vec<FreeSection>, FormatError> {
     let bad = || FormatError::InvalidFreeSpaceManager;
@@ -358,14 +359,14 @@ pub(crate) fn read_persisted_sections(
         if addr == u64::MAX {
             continue;
         }
-        let a = base.checked_add(addr).ok_or_else(bad)?.to_usize()?;
+        let a = base.absolute(addr).map_err(|_| bad())?.to_usize()?;
         let header = FsmHeader::parse(data.get(a..).ok_or_else(bad)?, offset_size)?;
         if header.fsse_addr == u64::MAX {
             continue;
         }
         let fa = base
-            .checked_add(header.fsse_addr)
-            .ok_or_else(bad)?
+            .absolute(header.fsse_addr)
+            .map_err(|_| bad())?
             .to_usize()?;
         let end = fa
             .checked_add(header.fsse_used.to_usize()?)
@@ -389,7 +390,7 @@ pub(crate) type PersistedSections = (Vec<FreeSection>, Vec<(u64, u64)>);
 pub(crate) fn read_persisted_sections_source<S: crate::source::Source>(
     src: &S,
     manager_addrs: &[u64],
-    base: u64,
+    base: BaseAddress,
     offset_size: u8,
 ) -> Result<PersistedSections, FormatError> {
     let bad = || FormatError::InvalidFreeSpaceManager;
@@ -400,14 +401,14 @@ pub(crate) fn read_persisted_sections_source<S: crate::source::Source>(
         if addr == u64::MAX {
             continue;
         }
-        let a = base.checked_add(addr).ok_or_else(bad)?;
+        let a = base.absolute(addr).map_err(|_| bad())?;
         let fshd = src.read_exact_at(a, hdr_len.to_usize()?)?;
         let header = FsmHeader::parse(&fshd, offset_size)?;
         blocks.push((a, hdr_len));
         if header.fsse_addr == u64::MAX {
             continue;
         }
-        let fa = base.checked_add(header.fsse_addr).ok_or_else(bad)?;
+        let fa = base.absolute(header.fsse_addr).map_err(|_| bad())?;
         let used = header.fsse_used;
         let block = src.read_exact_at(fa, used.to_usize()?)?;
         sections.extend(parse_fsse(&block, &header, offset_size)?);
@@ -667,7 +668,8 @@ mod tests {
         buf[619..619 + fshd.len()].copy_from_slice(&fshd);
         buf[701..701 + fsse.len()].copy_from_slice(&fsse);
 
-        let got = read_persisted_sections(&buf, &[619, u64::MAX, u64::MAX], 0, 8).unwrap();
+        let got = read_persisted_sections(&buf, &[619, u64::MAX, u64::MAX], BaseAddress::ZERO, 8)
+            .unwrap();
         assert_eq!(
             got,
             vec![FreeSection {
@@ -677,7 +679,7 @@ mod tests {
         );
         // No defined managers -> no sections.
         assert!(
-            read_persisted_sections(&buf, &[u64::MAX], 0, 8)
+            read_persisted_sections(&buf, &[u64::MAX], BaseAddress::ZERO, 8)
                 .unwrap()
                 .is_empty()
         );
@@ -766,7 +768,7 @@ mod tests {
         let mut buf = vec![0u8; 1100 + fsse.len()];
         buf[1000..1000 + fshd.len()].copy_from_slice(&fshd);
         buf[1100..1100 + fsse.len()].copy_from_slice(&fsse);
-        let mut got = read_persisted_sections(&buf, &[1000], 0, 8).unwrap();
+        let mut got = read_persisted_sections(&buf, &[1000], BaseAddress::ZERO, 8).unwrap();
         got.sort_by_key(|s| s.addr);
         let mut want = sections.to_vec();
         want.sort_by_key(|s| s.addr);
@@ -812,7 +814,7 @@ mod tests {
             let mut buf = vec![0u8; 1100 + fsse.len()];
             buf[1000..1000 + fshd.len()].copy_from_slice(&fshd);
             buf[1100..1100 + fsse.len()].copy_from_slice(&fsse);
-            let got = read_persisted_sections(&buf, &[1000], 0, 8).unwrap();
+            let got = read_persisted_sections(&buf, &[1000], BaseAddress::ZERO, 8).unwrap();
             assert_eq!(got, sections, "class {class} round-trips");
         }
     }

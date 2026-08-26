@@ -341,7 +341,7 @@ mod tests {
             version,
             offset_size: 8,
             length_size: 8,
-            base_address: 0,
+            base_address: crate::address::BaseAddress::ZERO,
             eof_address: 0,
             root_group_address: 0,
             group_leaf_node_k: None,

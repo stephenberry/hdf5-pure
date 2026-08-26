@@ -74,6 +74,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::address::BaseAddress;
 use crate::attribute::AttributeMessage;
 use crate::checksum::jenkins_lookup3;
 use crate::data_layout::{COMPACT_DATA_OFFSET, DataLayout};
@@ -338,7 +339,7 @@ pub(crate) fn plan<S: Source + ?Sized>(
             continue;
         };
         for e in entries {
-            if let Some(child) = e.object_header_address.checked_add(base) {
+            if let Ok(child) = base.absolute(e.object_header_address) {
                 stack.push(child);
             }
         }
@@ -369,7 +370,7 @@ pub(crate) fn plan<S: Source + ?Sized>(
 fn scan_parsed_header<S: Source + ?Sized>(
     src: &S,
     header: &ObjectHeader,
-    base: u64,
+    base: BaseAddress,
     relocations: &BTreeMap<u64, u64>,
     plan: &mut Plan,
 ) -> bool {
@@ -437,7 +438,7 @@ fn scan_parsed_header<S: Source + ?Sized>(
     else {
         return holds;
     };
-    let (Some(at), Ok(want)) = (a.checked_add(base), usize::try_from(size)) else {
+    let (Ok(at), Ok(want)) = (base.absolute(a), usize::try_from(size)) else {
         return holds;
     };
     let Ok(raw) = src.read_exact_at(at, want) else {
@@ -490,7 +491,7 @@ struct Scanned {
 fn scan_object<S: Source + ?Sized>(
     src: &S,
     addr: u64,
-    base: u64,
+    base: BaseAddress,
     relocations: &BTreeMap<u64, u64>,
     plan: &mut Plan,
 ) -> Result<Scanned, Error> {
@@ -663,7 +664,7 @@ fn scan_object<S: Source + ?Sized>(
         } => {
             // A contiguous data block sits outside the header and carries no
             // checksum, so its elements are patched with nothing else to fix.
-            let Some(at) = a.checked_add(base) else {
+            let Ok(at) = base.absolute(a) else {
                 return Ok(out);
             };
             let Ok(want) = usize::try_from(size) else {
@@ -768,7 +769,7 @@ fn collect_slots(
     slots: &[usize],
     raw: &[u8],
     raw_at: u64,
-    base: u64,
+    base: BaseAddress,
     relocations: &BTreeMap<u64, u64>,
     out: &mut Vec<(u64, u64)>,
 ) {
@@ -779,13 +780,13 @@ fn collect_slots(
         if stored == 0 || stored == u64::MAX {
             continue;
         }
-        let Some(abs) = stored.checked_add(base) else {
+        let Ok(abs) = base.absolute(stored) else {
             continue;
         };
         let Some(&new) = relocations.get(&abs) else {
             continue;
         };
-        let Some(value) = new.checked_sub(base) else {
+        let Ok(value) = base.relative(new) else {
             continue;
         };
         out.push((raw_at + offset as u64, value));
@@ -882,7 +883,7 @@ mod tests {
     fn scan(src: &BytesSource<Vec<u8>>, relocations: &[(u64, u64)]) -> (Plan, Scanned) {
         let mut plan = Plan::default();
         let map: BTreeMap<u64, u64> = relocations.iter().copied().collect();
-        let scanned = scan_object(src, HEADER_AT, 0, &map, &mut plan).unwrap();
+        let scanned = scan_object(src, HEADER_AT, BaseAddress::ZERO, &map, &mut plan).unwrap();
         (plan, scanned)
     }
 
@@ -1107,7 +1108,7 @@ mod tests {
     /// is exactly why the bug survived one.
     #[test]
     fn a_committed_datatype_is_resolved_through_the_base_address() {
-        for base in [0u64, 1024] {
+        for base in [BaseAddress::ZERO, BaseAddress::new(1024)] {
             const TYPE_AT: u64 = 2048;
             let committed = build_v2_object_header(&message_record(
                 MessageType::Datatype,
@@ -1120,7 +1121,7 @@ mod tests {
             let mut shared = message_record(
                 MessageType::Datatype,
                 &crate::shared_message::encode_committed_ref(
-                    TYPE_AT - base,
+                    base.relative(TYPE_AT).unwrap(),
                     crate::file_writer::OFFSET_SIZE,
                 ),
             );
@@ -1137,15 +1138,20 @@ mod tests {
             bytes.extend_from_slice(&dataset);
 
             let mut plan = Plan::default();
-            let map: BTreeMap<u64, u64> = [(300 + base, 900 + base)].into_iter().collect();
+            let map: BTreeMap<u64, u64> =
+                [(300 + base.get(), 900 + base.get())].into_iter().collect();
             let scanned =
                 scan_object(&BytesSource::new(bytes), HEADER_AT, base, &map, &mut plan).unwrap();
             assert!(
                 scanned.holds_a_reference,
-                "base {base}: the committed type must be followed far enough to \
+                "base {base:?}: the committed type must be followed far enough to \
                  see it names a reference"
             );
-            assert_eq!(plan.len(), 1, "base {base}: the element must be repointed");
+            assert_eq!(
+                plan.len(),
+                1,
+                "base {base:?}: the element must be repointed"
+            );
         }
     }
 

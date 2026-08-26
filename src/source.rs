@@ -75,6 +75,7 @@ use alloc::{vec, vec::Vec};
 #[cfg(feature = "std")]
 use std::collections::BTreeMap;
 
+use crate::address::BaseAddress;
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 
@@ -430,18 +431,18 @@ impl<S: Source + ?Sized> Source for std::boxed::Box<S> {
 /// data does not evict metadata.
 pub(crate) struct BaseOffsetSource<'a, S: Source + ?Sized> {
     pub(crate) inner: &'a S,
-    pub(crate) base: u64,
+    pub(crate) base: BaseAddress,
 }
 
 /// A base-relative view of an in-memory file: `bytes` with its first `base` bytes
 /// (the userblock) cut off, so every address stored relative to the base address
 /// indexes it directly. The in-memory counterpart of [`BaseOffsetSource`], and the
 /// identity for a plain file.
-pub(crate) fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
-    if base == 0 {
+pub(crate) fn frame(bytes: &[u8], base: BaseAddress) -> Result<&[u8], FormatError> {
+    if base.is_zero() {
         return Ok(bytes);
     }
-    let start = base.to_usize()?;
+    let start = base.get().to_usize()?;
     bytes.get(start..).ok_or(FormatError::UnexpectedEof {
         expected: start,
         available: bytes.len(),
@@ -450,27 +451,16 @@ pub(crate) fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
 
 impl<S: Source + ?Sized> Source for BaseOffsetSource<'_, S> {
     fn len(&self) -> u64 {
-        self.inner.len().saturating_sub(self.base)
+        self.inner.len().saturating_sub(self.base.get())
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
-        let abs = offset
-            .checked_add(self.base)
-            .ok_or(FormatError::OffsetOverflow {
-                offset,
-                length: buf.len() as u64,
-            })?;
-        self.inner.read_at(abs, buf)
+        self.inner.read_at(self.base.absolute(offset)?, buf)
     }
 
     fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
-        let abs = offset
-            .checked_add(self.base)
-            .ok_or(FormatError::OffsetOverflow {
-                offset,
-                length: len as u64,
-            })?;
-        self.inner.read_metadata_at(abs, len)
+        self.inner
+            .read_metadata_at(self.base.absolute(offset)?, len)
     }
 
     // The metadata reads above are the inner source's, so its cache is the one
@@ -1407,7 +1397,7 @@ mod tests {
         // them too.
         let framed = BaseOffsetSource {
             inner: &source,
-            base: 512,
+            base: BaseAddress::new(512),
         };
         framed.read_metadata_at(0, 64).unwrap();
         framed.read_metadata_at(0, 64).unwrap();

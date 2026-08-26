@@ -360,6 +360,16 @@ pub enum FormatError {
         /// Second operand (typically the length/size).
         length: u64,
     },
+    /// An absolute file position lies below the superblock's base address, so it
+    /// has no stored (base-relative) form: the bytes below the base are the
+    /// userblock, where no HDF5 structure can live. Reported instead of wrapping
+    /// the subtraction into a near-`u64::MAX` address.
+    AddressBelowBase {
+        /// The absolute file position that could not be made base-relative.
+        address: u64,
+        /// The superblock base address it was below.
+        base: u64,
+    },
     /// A random-access byte source failed to
     /// supply the requested bytes. The string carries a backend-specific reason
     /// (e.g. an underlying `std::io::Error` rendered to text), so this stays
@@ -927,6 +937,13 @@ impl fmt::Display for FormatError {
                 write!(
                     f,
                     "offset arithmetic overflow: {offset} + {length} exceeds u64"
+                )
+            }
+            FormatError::AddressBelowBase { address, base } => {
+                write!(
+                    f,
+                    "file address {address} is below the superblock base address \
+                     {base}, so it names no stored (base-relative) position"
                 )
             }
             FormatError::Source(msg) => {

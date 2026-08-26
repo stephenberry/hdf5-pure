@@ -5,8 +5,9 @@ use alloc::vec::Vec;
 
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::address::BaseAddress;
 use crate::bytes::{ensure_len, read_length, read_offset, read_uint_width};
-use crate::convert::{TryToUsize, slice_range};
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::message_type::MessageType;
 use crate::source::Source;
@@ -16,19 +17,6 @@ const OHDR_SIGNATURE: [u8; 4] = *b"OHDR";
 
 /// OCHK signature for v2 continuation chunks.
 const OCHK_SIGNATURE: [u8; 4] = *b"OCHK";
-
-/// The absolute file position of a stored file address.
-///
-/// Addresses in an HDF5 file are relative to the superblock's base address, which
-/// is zero for a plain file and the userblock size for a file that has one.
-fn absolute(stored: u64, base_address: u64) -> Result<u64, FormatError> {
-    stored
-        .checked_add(base_address)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: stored,
-            length: base_address,
-        })
-}
 
 /// Which of a header's messages a parse keeps.
 ///
@@ -124,7 +112,7 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
     ) -> Result<ObjectHeader, FormatError> {
-        Self::parse_with_base(data, offset, offset_size, length_size, 0)
+        Self::parse_with_base(data, offset, offset_size, length_size, BaseAddress::ZERO)
     }
 
     /// Parse an object header, applying `base_address` to continuation offsets.
@@ -143,7 +131,7 @@ impl ObjectHeader {
         offset: usize,
         offset_size: u8,
         length_size: u8,
-        base_address: u64,
+        base_address: BaseAddress,
     ) -> Result<ObjectHeader, FormatError> {
         Self::parse_filtered(
             data,
@@ -166,7 +154,7 @@ impl ObjectHeader {
         offset: usize,
         offset_size: u8,
         length_size: u8,
-        base_address: u64,
+        base_address: BaseAddress,
         mut filter: MessageFilter<'_>,
     ) -> Result<ObjectHeader, FormatError> {
         ensure_len(data, offset, 4)?;
@@ -196,7 +184,7 @@ impl ObjectHeader {
         offset: usize,
         offset_size: u8,
         length_size: u8,
-        base_address: u64,
+        base_address: BaseAddress,
         filter: &mut MessageFilter<'_>,
     ) -> Result<ObjectHeader, FormatError> {
         // version(1) + reserved(1) + num_messages(2) + ref_count(4) + header_size(4) = 12
@@ -293,7 +281,7 @@ impl ObjectHeader {
                 && msg_body.len() >= (offset_size as usize + length_size as usize)
             {
                 let cont_offset_raw = read_offset(msg_body, 0, offset_size)?;
-                let cont_offset = slice_range(cont_offset_raw, base_address)?.end;
+                let cont_offset = base_address.absolute(cont_offset_raw)?.to_usize()?;
                 let cont_length =
                     read_length(msg_body, offset_size as usize, length_size)?.to_usize()?;
                 // Parse continuation block (v1: just raw messages, no signature)
@@ -330,7 +318,7 @@ impl ObjectHeader {
         length: usize,
         offset_size: u8,
         length_size: u8,
-        base_address: u64,
+        base_address: BaseAddress,
         depth_remaining: u16,
         filter: &mut MessageFilter<'_>,
     ) -> Result<Vec<HeaderMessage>, FormatError> {
@@ -379,7 +367,7 @@ impl ObjectHeader {
                 && msg_body.len() >= (offset_size as usize + length_size as usize)
             {
                 let cont_offset_raw = read_offset(msg_body, 0, offset_size)?;
-                let cont_offset = slice_range(cont_offset_raw, base_address)?.end;
+                let cont_offset = base_address.absolute(cont_offset_raw)?.to_usize()?;
                 let cont_length =
                     read_length(msg_body, offset_size as usize, length_size)?.to_usize()?;
                 let cont_msgs = Self::parse_v1_continuation(
@@ -404,7 +392,7 @@ impl ObjectHeader {
         offset: usize,
         offset_size: u8,
         length_size: u8,
-        base_address: u64,
+        base_address: BaseAddress,
         filter: &mut MessageFilter<'_>,
     ) -> Result<ObjectHeader, FormatError> {
         // signature(4) + version(1) + flags(1) = 6
@@ -500,7 +488,7 @@ impl ObjectHeader {
                 return Err(FormatError::NestingDepthExceeded);
             }
             cont_remaining -= 1;
-            let cont_offset = absolute(cont_offset, base_address)?;
+            let cont_offset = base_address.absolute(cont_offset)?;
             Self::parse_v2_continuation(
                 data,
                 cont_offset.to_usize()?,
@@ -705,7 +693,7 @@ impl ObjectHeader {
         address: u64,
         offset_size: u8,
         length_size: u8,
-        base_address: u64,
+        base_address: BaseAddress,
     ) -> Result<ObjectHeader, FormatError> {
         Self::parse_from_source_filtered(
             source,
@@ -723,7 +711,7 @@ impl ObjectHeader {
         address: u64,
         offset_size: u8,
         length_size: u8,
-        base_address: u64,
+        base_address: BaseAddress,
         mut filter: MessageFilter<'_>,
     ) -> Result<ObjectHeader, FormatError> {
         let mut sig = [0u8; 4];
@@ -754,7 +742,7 @@ impl ObjectHeader {
         address: u64,
         offset_size: u8,
         length_size: u8,
-        base_address: u64,
+        base_address: BaseAddress,
         filter: &mut MessageFilter<'_>,
     ) -> Result<ObjectHeader, FormatError> {
         // The v2 prefix is bounded: sig(4) + ver(1) + flags(1) + optional
@@ -860,7 +848,7 @@ impl ObjectHeader {
             }
             cont_remaining -= 1;
             let cont_len = cont_len.to_usize()?;
-            let region = source.read_metadata_at(absolute(cont_off, base_address)?, cont_len)?;
+            let region = source.read_metadata_at(base_address.absolute(cont_off)?, cont_len)?;
             Self::parse_v2_continuation(
                 &region,
                 0,
@@ -891,7 +879,7 @@ impl ObjectHeader {
         address: u64,
         offset_size: u8,
         length_size: u8,
-        base_address: u64,
+        base_address: BaseAddress,
         filter: &mut MessageFilter<'_>,
     ) -> Result<ObjectHeader, FormatError> {
         // version(1) + reserved(1) + num_messages(2) + ref_count(4) +
@@ -948,7 +936,7 @@ impl ObjectHeader {
         max_messages: u16,
         offset_size: u8,
         length_size: u8,
-        base_address: u64,
+        base_address: BaseAddress,
         depth_remaining: u16,
         messages: &mut Vec<HeaderMessage>,
         filter: &mut MessageFilter<'_>,
@@ -1006,13 +994,7 @@ impl ObjectHeader {
             }
 
             if let Some((off_raw, len)) = cont {
-                let cont_off =
-                    off_raw
-                        .checked_add(base_address)
-                        .ok_or(FormatError::OffsetOverflow {
-                            offset: off_raw,
-                            length: base_address,
-                        })?;
+                let cont_off = base_address.absolute(off_raw)?;
                 Self::parse_v1_chunk_from_source(
                     source,
                     cont_off,
@@ -1382,7 +1364,7 @@ mod tests {
     }
 
     #[cfg(feature = "std")]
-    fn parse_three_ways(file_data: Vec<u8>, os: u8, ls: u8, base: u64) {
+    fn parse_three_ways(file_data: Vec<u8>, os: u8, ls: u8, base: BaseAddress) {
         use crate::source::{BytesSource, ReadSeekSource};
         let buffered = ObjectHeader::parse_with_base(&file_data, 0, os, ls, base).unwrap();
         let from_mem =
@@ -1404,7 +1386,7 @@ mod tests {
     #[test]
     fn streaming_v2_simple_matches_buffered() {
         let header = build_v2_header(0x20, &[(0x01, &[1, 2, 3], 0)], Some((1, 2, 3, 4)));
-        parse_three_ways(header, 8, 8, 0);
+        parse_three_ways(header, 8, 8, BaseAddress::ZERO);
     }
 
     #[cfg(feature = "std")]
@@ -1433,7 +1415,7 @@ mod tests {
         file_data[..header.len()].copy_from_slice(&header);
         file_data[ochk_offset..ochk_offset + ochk_buf.len()].copy_from_slice(&ochk_buf);
 
-        parse_three_ways(file_data, 8, 8, 0);
+        parse_three_ways(file_data, 8, 8, BaseAddress::ZERO);
     }
 
     #[cfg(feature = "std")]
@@ -1461,7 +1443,7 @@ mod tests {
         file_data[..header.len()].copy_from_slice(&header);
         file_data[cont_offset..cont_offset + cont_chunk.len()].copy_from_slice(&cont_chunk);
 
-        parse_three_ways(file_data, 8, 8, 0);
+        parse_three_ways(file_data, 8, 8, BaseAddress::ZERO);
     }
 
     #[cfg(feature = "std")]
@@ -1509,8 +1491,9 @@ mod tests {
         // All three backends must agree — and, with the overrunning message
         // dropped, agree on an empty message list (the continuation is never
         // followed, so its Datatype message is unreachable too).
-        parse_three_ways(file_data.clone(), 8, 8, 0);
-        let buffered = ObjectHeader::parse_with_base(&file_data, 0, 8, 8, 0).unwrap();
+        parse_three_ways(file_data.clone(), 8, 8, BaseAddress::ZERO);
+        let buffered =
+            ObjectHeader::parse_with_base(&file_data, 0, 8, 8, BaseAddress::ZERO).unwrap();
         assert_eq!(buffered.messages.len(), 0);
     }
 }

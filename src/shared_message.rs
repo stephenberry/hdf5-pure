@@ -21,6 +21,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
+use crate::address::BaseAddress;
 use crate::bytes::{ensure_len, read_offset};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
@@ -283,7 +284,7 @@ impl<S: Source + ?Sized> SharedResolver for SourceResolver<'_, S> {
             addr,
             self.offset_size,
             self.length_size,
-            0,
+            BaseAddress::ZERO,
         )?;
         select_shared_message(&header, target, addr)
     }

@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::address::BaseAddress;
 use crate::bytes::{ensure_len, read_offset};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
@@ -27,7 +28,7 @@ pub struct Superblock {
     /// Size of lengths in bytes (2, 4, or 8).
     pub length_size: u8,
     /// File base address.
-    pub base_address: u64,
+    pub base_address: BaseAddress,
     /// End-of-file address.
     pub eof_address: u64,
     /// Root group object header address (v2/v3) or from symbol table entry (v0/v1).
@@ -76,7 +77,7 @@ impl Superblock {
         )]
         buf.push(self.consistency_flags as u8);
         // base_address
-        Self::write_offset(&mut buf, self.base_address, self.offset_size);
+        Self::write_offset(&mut buf, self.base_address.get(), self.offset_size);
         // superblock extension address
         let ext_addr = self.superblock_extension_address.unwrap_or(u64::MAX);
         Self::write_offset(&mut buf, ext_addr, self.offset_size);
@@ -166,7 +167,7 @@ impl Superblock {
         ensure_len(d, 0, total)?;
 
         let mut pos = var_start;
-        let base_address = read_offset(d, pos, offset_size)?;
+        let base_address = BaseAddress::new(read_offset(d, pos, offset_size)?);
         pos += os;
         let free_space_address = read_offset(d, pos, offset_size)?;
         pos += os;
@@ -226,7 +227,7 @@ impl Superblock {
         ensure_len(d, 0, total)?;
 
         let mut pos = var_start;
-        let base_address = read_offset(d, pos, offset_size)?;
+        let base_address = BaseAddress::new(read_offset(d, pos, offset_size)?);
         pos += os;
         let free_space_address = read_offset(d, pos, offset_size)?;
         pos += os;
@@ -273,7 +274,7 @@ impl Superblock {
         ensure_len(d, 0, total)?;
 
         let mut pos = 12;
-        let base_address = read_offset(d, pos, offset_size)?;
+        let base_address = BaseAddress::new(read_offset(d, pos, offset_size)?);
         pos += os;
         let superblock_extension_address = read_offset(d, pos, offset_size)?;
         pos += os;
@@ -416,7 +417,7 @@ mod tests {
         let sb = Superblock::parse(&data, 0).unwrap();
         assert_eq!(sb.version, 0);
         assert_eq!(sb.offset_size, 8);
-        assert_eq!(sb.base_address, 0);
+        assert_eq!(sb.base_address, BaseAddress::ZERO);
         assert_eq!(sb.eof_address, 4096);
         assert_eq!(sb.root_group_address, 96);
         assert_eq!(sb.group_leaf_node_k, Some(4));
@@ -505,7 +506,7 @@ mod tests {
         // than that the file opens.
         assert_eq!(sb.consistency_flags, 0);
 
-        assert_eq!(sb.base_address, 0);
+        assert_eq!(sb.base_address, BaseAddress::ZERO);
         assert_eq!(sb.eof_address, data.len() as u64);
     }
 
