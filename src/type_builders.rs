@@ -1023,6 +1023,17 @@ fn build_global_heap_collection_bytes(objects: &[&[u8]]) -> Vec<u8> {
 /// position selects (see [`build_global_heap_collections_from_bytes`]);
 /// `collection_addresses` gives those collections' placed addresses in order.
 pub(crate) fn patch_vl_refs(raw_data: &mut [u8], collection_addresses: &[u64]) {
+    // Only a value that writes whole variable-length references reaches a heap,
+    // and [`AttrValue::var_len_strings`] is what decides which values those are.
+    // A fixed-width value wrongly reported there would arrive with element bytes
+    // narrower than a reference, and the truncating division below would patch
+    // its *data* — or, for a value narrower than one reference, patch nothing and
+    // leave the collection it caused to be written unreferenced.
+    debug_assert_eq!(
+        raw_data.len() % VL_REF_SIZE,
+        0,
+        "a value routed through the global heap must hold whole variable-length references"
+    );
     let count = raw_data.len() / VL_REF_SIZE;
     for i in 0..count {
         let address = collection_addresses[i / MAX_HEAP_OBJECTS];
