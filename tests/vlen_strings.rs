@@ -197,32 +197,35 @@ fn repack_preserves_multi_collection_vlen_dataset() {
     assert_split_labels_roundtrip(&read, SPLIT_COUNT);
 }
 
-/// A variable-length *attribute* is capped well below the heap-object boundary
-/// by the compact attribute message's 65,535-byte size field (16 bytes of
-/// reference per element binds at ~4,090 elements), so its refusal is a size
-/// refusal, not a heap one. Pinned so the ordering stays deliberate.
+/// A variable-length *attribute* outgrows the compact attribute message's
+/// 65,535-byte size field long before it reaches any heap-object boundary (16
+/// bytes of reference per element binds at ~4,090 elements). Past that field it
+/// is stored in a fractal heap rather than refused (issue #102), and its
+/// elements still point into as many global-heap collections as they need — the
+/// two heaps are independent, which is what this pins.
 #[test]
-fn vlen_attribute_is_bounded_by_compact_message_size() {
+fn a_vlen_attribute_past_the_compact_message_size_is_stored_in_a_heap() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("ga.h5");
     let mut builder = hdf5_pure::FileBuilder::new();
     builder.create_dataset("d").with_f64_data(&[1.0]);
     builder.write(&path).unwrap();
 
-    let file = File::open_rw(&path).unwrap();
-    let error = file
-        .root()
-        .set_attr(
-            "labels",
-            hdf5_pure::AttrValue::VarLenAsciiArray(labels(u16::MAX as usize + 1)),
-        )
-        .and_then(|()| file.commit())
-        .expect_err("expected the oversized attribute to be refused");
-    match error {
-        Error::EditUnsupported(msg) => assert!(
-            msg.contains("too large"),
-            "expected the compact-size refusal, got {msg:?}"
-        ),
-        other => panic!("expected EditUnsupported, got {other:?}"),
+    let values = labels(u16::MAX as usize + 1);
+    {
+        let file = File::open_rw(&path).unwrap();
+        file.root()
+            .set_attr(
+                "labels",
+                hdf5_pure::AttrValue::VarLenAsciiArray(values.clone()),
+            )
+            .unwrap();
+        file.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    match file.root().attrs().unwrap().get("labels") {
+        Some(hdf5_pure::AttrValue::VarLenAsciiArray(read)) => assert_eq!(*read, values),
+        other => panic!("expected the variable-length attribute back, got {other:?}"),
     }
 }

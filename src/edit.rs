@@ -114,13 +114,15 @@
 //!   written, rather than resolved to a stale or wrong address; a path that
 //!   resolves nowhere at all becomes an undefined reference, matching the
 //!   whole-file writer. Every
-//!   added dataset must have a fixed-size datatype, few enough attributes
-//!   (compact or variable-length) to stay in compact storage. Group, root, and
-//!   **dataset** attribute edits (`set_group_attr` / `set_dataset_attr`) may
-//!   likewise be fixed-size or variable-length, under the same compact-storage
-//!   limit; dense (fractal-heap) attribute storage is not editable. A dataset
-//!   attribute edit relocates the dataset header and so requires a single hard
-//!   link.
+//!   added dataset must have a fixed-size datatype. Group, root, and **dataset**
+//!   attribute edits (`set_group_attr` / `set_dataset_attr`) may be fixed-size or
+//!   variable-length. An attribute set larger than an object header holds
+//!   compactly — more than [`MAX_COMPACT_ATTRS`] of them, or one whose message
+//!   overflows the header's 2-byte size field — is stored in a fractal heap, on
+//!   an object this engine adds and on one whose edit takes it past the
+//!   threshold alike, and an object already storing its attributes densely is
+//!   rebuilt the same way ([`plan_attr_ops`], issue #102). A dataset attribute
+//!   edit relocates the dataset header and so requires a single hard link.
 //! - A new group's parent must already exist or be created in the same session
 //!   (each level created explicitly); intermediate groups are not auto-created.
 //! - Rows can be appended to an existing chunked, unlimited, Extensible-Array
@@ -4224,7 +4226,7 @@ impl WriteEngine {
                     }
                 }
                 let region = Self::gather_oh_messages(&self.image(), addr as u64, base)?;
-                let (region, pending_vl_attrs) = apply_group_attr_ops(&region, &ops)?;
+                let edits = plan_attr_ops(&self.image(), base, Some(addr as u64), &region, &ops)?;
                 let leaf = full.last().unwrap().clone();
                 let parent = full[..full.len() - 1].to_vec();
                 moving_writes.push((
@@ -4232,8 +4234,9 @@ impl WriteEngine {
                     leaf,
                     addr as u64,
                     MovingWrite::AttrEdit {
-                        region,
-                        pending_vl_attrs,
+                        region: edits.region,
+                        pending_vl_attrs: edits.pending_vl,
+                        dense_attrs: edits.dense,
                     },
                 ));
                 write_targets.push(full);
@@ -4630,13 +4633,29 @@ impl WriteEngine {
         // is self-contained, no address needed yet) but placed and patched into
         // `base_region` only in the apply loop below, once its address is known.
         let attrs_by_group = group_by_parent(staged.group_attrs.iter().map(|(p, op)| (p, op)));
+        // The pre-commit header address of each group this commit rewrites. An
+        // edit that sends a group's attributes to a fractal heap reads the set it
+        // rebuilds back out of the file, which needs the address; a group this
+        // commit *creates* has neither an address nor any stored attribute, and
+        // its `None` says so.
+        let existing_group_addrs: HashMap<PathKey, u64> = superseded_addrs
+            .iter()
+            .map(|(key, addr)| (key.clone(), *addr as u64))
+            .collect();
         for key in &keys {
             if let Some(ops) = attrs_by_group.get(key) {
+                let region = std::mem::take(&mut nodes.get_mut(key).unwrap().base_region);
+                let edits = plan_attr_ops(
+                    &self.image(),
+                    base,
+                    existing_group_addrs.get(key).copied(),
+                    &region,
+                    ops,
+                )?;
                 let node = nodes.get_mut(key).unwrap();
-                let region = std::mem::take(&mut node.base_region);
-                let (region, pending_vl_attrs) = apply_group_attr_ops(&region, ops)?;
-                node.base_region = region;
-                node.pending_vl_attrs = pending_vl_attrs;
+                node.base_region = edits.region;
+                node.pending_vl_attrs = edits.pending_vl;
+                node.dense_attrs = edits.dense;
             }
         }
 
@@ -4987,7 +5006,7 @@ impl WriteEngine {
         let mut by_depth = keys.clone();
         by_depth.sort_by_key(|k| std::cmp::Reverse(k.len())); // deepest first
         for key in &by_depth {
-            let (mut region, deletes, copies, writes, pending_vl_attrs) = {
+            let (mut region, deletes, copies, writes, pending_vl_attrs, dense_attrs) = {
                 let node = nodes.get_mut(key).unwrap();
                 (
                     std::mem::take(&mut node.base_region),
@@ -4995,6 +5014,7 @@ impl WriteEngine {
                     std::mem::take(&mut node.copies),
                     std::mem::take(&mut node.writes),
                     std::mem::take(&mut node.pending_vl_attrs),
+                    node.dense_attrs.take(),
                 )
             };
 
@@ -5091,6 +5111,11 @@ impl WriteEngine {
                     } else {
                         base.relative(self.alloc_or_append_typed(&fd.raw, PageType::Raw)?)?
                     };
+                    // Attributes this dataset keeps in a fractal heap are placed
+                    // now — after the variable-length patching above, so the heap
+                    // holds resolved references — and the header names the heap
+                    // instead of carrying them inline.
+                    let attr_info = self.place_dense_attrs_if_needed(&fd.attrs)?;
                     build_dataset_oh(
                         &fd.dt,
                         // Committed datatypes are refused when a dataset is
@@ -5101,7 +5126,7 @@ impl WriteEngine {
                         data_addr,
                         fd.raw.len() as u64,
                         &fd.attrs,
-                        None,
+                        attr_info.as_deref(),
                         fd.fill.as_deref(),
                         self.libver(),
                     )?
@@ -5149,6 +5174,11 @@ impl WriteEngine {
                     &msg.serialize(LENGTH_SIZE),
                 ));
             }
+
+            // A rebuilt dense (fractal-heap) attribute set: place it and name it
+            // from this group's header. `region` carries no attribute message at
+            // all at this point — `plan_attr_ops` stripped them for exactly this.
+            self.place_edited_dense_attrs(&mut region, dense_attrs.as_ref())?;
 
             let oh = build_v2_object_header(&region)?;
             let addr = self.alloc_or_append_typed(&oh, PageType::Meta)?;
@@ -7662,17 +7692,75 @@ impl WriteEngine {
         if attrs.is_empty() {
             return Ok(());
         }
+        let attr_info_message = self.place_dense_attrs(attrs)?;
+        region.extend_from_slice(&region_message(
+            MessageType::AttributeInfo,
+            &attr_info_message,
+        ));
+        Ok(())
+    }
+
+    /// Place dense attribute storage for a *new* object's attributes when its set
+    /// needs it, returning the Attribute Info message naming the heap — or `None`
+    /// when the set belongs in the object header, where the header builders write
+    /// it inline. Whichever it is, `flatten_dataset` has already checked that the
+    /// set can be represented.
+    fn place_dense_attrs_if_needed(
+        &mut self,
+        attrs: &[crate::attribute::AttributeMessage],
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if !crate::file_writer::needs_dense_attrs(attrs) {
+            return Ok(None);
+        }
+        self.place_dense_attrs(attrs).map(Some)
+    }
+
+    /// Build a fresh dense attribute blob for `attrs`, place it, and return the
+    /// Attribute Info message naming it — the header's whole share of dense
+    /// storage. See [`append_dense_attrs`](Self::append_dense_attrs) for why the
+    /// blob may be placed anywhere.
+    fn place_dense_attrs(
+        &mut self,
+        attrs: &[crate::attribute::AttributeMessage],
+    ) -> Result<Vec<u8>, Error> {
         let plan = crate::file_writer::dense_attrs_plan(attrs);
         let (_addr, attr_info_message) =
             self.place_relocatable(plan.blob_len(), PageType::Meta, |stored_base| {
                 let blob = plan.build(stored_base);
                 Ok((blob.blob, blob.attr_info_message))
             })?;
-        region.extend_from_slice(&region_message(
-            MessageType::AttributeInfo,
-            &attr_info_message,
-        ));
-        Ok(())
+        Ok(attr_info_message)
+    }
+
+    /// Resolve an attribute edit that landed in dense storage
+    /// ([`plan_attr_ops`]): place each variable-length attribute's global heap
+    /// collection and patch the placeholder references in its message, then build
+    /// the heap over the finished set and name it from `region`.
+    ///
+    /// The patching has to come first. The heap stores each attribute's *message
+    /// bytes*, references and all, so a heap built before them would hold the
+    /// placeholders — the same ordering the whole-file writer keeps for the same
+    /// reason.
+    ///
+    /// A no-op when the edit stayed compact or left the object with no attributes
+    /// at all, which is what makes it safe to call on every rebuilt header.
+    fn place_edited_dense_attrs(
+        &mut self,
+        region: &mut Vec<u8>,
+        dense: Option<&DenseAttrEdit>,
+    ) -> Result<(), Error> {
+        let Some(dense) = dense else {
+            return Ok(());
+        };
+        if dense.vl.is_empty() {
+            return self.append_dense_attrs(region, &dense.attrs);
+        }
+        let mut attrs = dense.attrs.clone();
+        for (idx, collections) in &dense.vl {
+            let addrs = self.place_vl_collections(collections)?;
+            patch_vl_refs(&mut attrs[*idx].raw_data, &addrs);
+        }
+        self.append_dense_attrs(region, &attrs)
     }
 
     /// Apply a relocating value overwrite (`write_dataset` resize / compact
@@ -7782,6 +7870,7 @@ impl WriteEngine {
             MovingWrite::AttrEdit {
                 region,
                 pending_vl_attrs,
+                dense_attrs,
             } => {
                 // `region` already carries the fixed-size attribute edits (applied
                 // in the commit preflight). Place each variable-length attribute's
@@ -7800,6 +7889,7 @@ impl WriteEngine {
                         &msg.serialize(LENGTH_SIZE),
                     ));
                 }
+                self.place_edited_dense_attrs(&mut region, dense_attrs.as_ref())?;
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
@@ -8432,6 +8522,9 @@ impl WriteEngine {
                     (result.layout_message, result.pipeline_message),
                 ))
             })?;
+        // As in the contiguous branch: a set too large for the header goes to a
+        // fractal heap, which the header then names instead of carrying it.
+        let attr_info = self.place_dense_attrs_if_needed(&fd.attrs)?;
         Ok(build_chunked_dataset_oh(
             &fd.dt,
             &DatatypeLocation::Inline,
@@ -8439,7 +8532,7 @@ impl WriteEngine {
             &layout_message,
             pipeline_message.as_deref(),
             &fd.attrs,
-            None,
+            attr_info.as_deref(),
             fd.fill.as_deref(),
         )?)
     }
@@ -8877,6 +8970,12 @@ struct Node {
     /// appends the collection, then the patched message is appended to
     /// `base_region`.
     pending_vl_attrs: PendingVlAttrs,
+    /// A rebuilt dense (fractal-heap) attribute set for this group, staged by
+    /// [`plan_attr_ops`]. Resolved in the apply loop right after
+    /// `pending_vl_attrs`: the heap is placed and `base_region` is given the
+    /// Attribute Info message naming it. The two are mutually exclusive — a
+    /// dense rebuild carries its own variable-length attributes.
+    dense_attrs: Option<DenseAttrEdit>,
 }
 
 /// A staged compact attribute edit for a group or dataset (shared by
@@ -9242,6 +9341,12 @@ enum MovingWrite {
     AttrEdit {
         region: Vec<u8>,
         pending_vl_attrs: PendingVlAttrs,
+        /// A rebuilt dense (fractal-heap) attribute set, when the edit put the
+        /// dataset's attributes in a heap (or the dataset already kept them in
+        /// one). Placed in [`WriteEngine::write_moving`] before the header is
+        /// built. Mutually exclusive with `pending_vl_attrs`, which is the
+        /// compact form's route for the same kind of attribute.
+        dense_attrs: Option<DenseAttrEdit>,
     },
 }
 
@@ -9826,22 +9931,13 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         };
         attrs.extend(p.build_attrs(&raw));
     }
-    // The object-header message-size field is 2 bytes wide, so an oversized
-    // attribute (most reachable via a `VarLenAsciiArray` with many/long
-    // strings) would silently truncate and corrupt the header if written
-    // as-is; refuse it instead, mirroring `apply_group_attr_ops`'s and
-    // `encode_attr_message`'s equivalent checks for group/root attributes.
-    for a in &attrs {
-        if a.serialize(LENGTH_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX {
-            return Err(Error::EditUnsupported(
-                "dataset attribute is too large to encode in place",
-            ));
-        }
-    }
-    if attrs.len() > MAX_COMPACT_ATTRS {
-        return Err(Error::EditUnsupported(
-            "datasets with dense (many) attributes cannot be added in place yet",
-        ));
+    // More attributes than an object header keeps compactly, or one whose message
+    // overflows its 2-byte message-size field, sends the set to a fractal heap —
+    // the same disjunction, and the same heap, the whole-file writer uses. What
+    // that heap cannot represent is refused here, in the preflight, so a staged
+    // dataset that cannot be written is refused before the commit places a byte.
+    if crate::file_writer::needs_dense_attrs(&attrs) {
+        crate::file_writer::dense_attrs_check(&attrs).map_err(Error::Format)?;
     }
 
     // A committed datatype is an object of its own, which an in-place edit has no
@@ -10641,22 +10737,28 @@ fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
     Ok(out)
 }
 
-/// Apply compact attribute edits to a group message `region`, preserving every
-/// non-attribute message verbatim. A fixed-size `Set`/`Remove` is resolved
+/// Apply attribute edits to an object's header `region` *compactly*, preserving
+/// every non-attribute message verbatim. A fixed-size `Set`/`Remove` is resolved
 /// into `region` directly; a variable-length `Set` (`VarLenAsciiArray`) is
 /// instead collected into the returned `pending_vl_attrs` — its placeholder
-/// heap address is only patched, and the message appended to the group's
+/// heap address is only patched, and the message appended to the object's
 /// header, by the apply loop once its global heap collection's real address
 /// is known (see [`WriteEngine::place_vl_collection`]). A later op for the
 /// same name (another `Set`, fixed-size or not, or a `Remove`) replaces or
 /// cancels an earlier still-pending variable-length entry, keeping the net
-/// effect the same regardless of op order within one commit. `region`'s
-/// fixed-size portion is a complete compact-attribute header on return; dense
-/// attribute storage and shared attribute messages are refused.
-fn apply_group_attr_ops(
+/// effect the same regardless of op order within one commit.
+///
+/// Only [`plan_attr_ops`] calls this, and only for an object whose attributes
+/// are stored compactly: appending an inline Attribute message to an object
+/// whose set lives in a fractal heap would leave it carrying two storage forms,
+/// so a dense object is routed to a heap rebuild there instead. The third
+/// element of the return says whether any attribute was *written*, which is what
+/// decides whether the result still fits compact storage — a removal can only
+/// take the count down.
+fn apply_compact_attr_ops(
     region: &[u8],
     ops: &[&AttrOp],
-) -> Result<(Vec<u8>, PendingVlAttrs), Error> {
+) -> Result<(Vec<u8>, PendingVlAttrs, bool), Error> {
     let mut out = region.to_vec();
     let mut pending_vl: PendingVlAttrs = Vec::new();
     let mut wrote_attr = false;
@@ -10690,12 +10792,257 @@ fn apply_group_attr_ops(
             }
         }
     }
-    if wrote_attr && compact_attr_count(&out)? + pending_vl.len() > MAX_COMPACT_ATTRS {
+    Ok((out, pending_vl, wrote_attr))
+}
+
+/// The attribute storage an edit resolves to, and the header region that carries
+/// it. Produced by [`plan_attr_ops`] in the commit preflight, so the apply phase
+/// only places bytes.
+struct AttrEdits {
+    /// The object's chunk-0 message region with the edit applied. Compact: it
+    /// already carries every fixed-size attribute. Dense: it carries no attribute
+    /// message at all — `dense` holds the whole set, and the Attribute Info
+    /// message naming its heap is appended once that heap is placed.
+    region: Vec<u8>,
+    /// Compact only: the variable-length attributes still to be placed and
+    /// appended by the apply phase.
+    pending_vl: PendingVlAttrs,
+    /// The set to rebuild into a fresh fractal heap. `None` for a compact result,
+    /// and for an object this edit leaves with no attributes at all.
+    dense: Option<DenseAttrEdit>,
+}
+
+/// A dense (fractal-heap) attribute set an edit rebuilds, staged by
+/// [`plan_attr_ops`] and placed by the apply phase.
+struct DenseAttrEdit {
+    /// Every attribute the object will carry: the ones it already had, in the
+    /// order it had them, with this edit's applied over them by name.
+    attrs: Vec<crate::attribute::AttributeMessage>,
+    /// `(index into `attrs`, its global heap collections)` for each
+    /// variable-length attribute this edit *sets*. The heap is built over the
+    /// attribute message bytes, so each of these has to be patched with its
+    /// collection's real address before the build rather than after it, which is
+    /// why they are carried to the apply phase instead of resolved here.
+    ///
+    /// A variable-length attribute the object already had is not in this list and
+    /// needs no patch: it was read back carrying the addresses it is stored with,
+    /// and they name collections in this same file.
+    vl: Vec<(usize, Vec<Vec<u8>>)>,
+}
+
+/// Apply attribute edits to an object's header `region`, choosing the storage
+/// the result belongs in (issue #102).
+///
+/// `addr` is the object's pre-commit object-header address, or `None` for a
+/// group this commit creates, which has no stored attributes to read.
+///
+/// Three outcomes, in the order they are tried:
+///
+/// - **Compact.** The region is rewritten message by message, so every attribute
+///   the edit does not name keeps its exact bytes. An ordinary `set_attr` on an
+///   ordinary object takes this route.
+/// - **Dense.** The object already stores its attributes in a fractal heap, or
+///   this edit takes it past what an object header holds compactly — more than
+///   [`MAX_COMPACT_ATTRS`] attributes, or one whose message overflows the
+///   header's 2-byte message-size field. The object's whole attribute set is read
+///   back, the edits are applied to it, and the apply phase builds a fresh heap
+///   for the result. Those are the two halves of the disjunction
+///   `file_writer::needs_dense_attrs` selects on, so an object an edit sends to a
+///   heap is one the whole-file writer would have written to a heap — measured
+///   here over the ops as staged, which is why setting an oversized attribute and
+///   removing it again in one commit still sends the object to a heap.
+/// - **Neither.** The edit removes the object's last attribute, so the rebuilt
+///   header carries no attribute message and no Attribute Info message — what
+///   this crate and the reference C library both write for an object with none.
+///
+/// A dense rebuild is a re-encoding rather than a byte copy: the attributes are
+/// read into messages and re-serialized, as [`WriteEngine::read_object`] already
+/// does for a copied object's heap. Name, datatype, dataspace and value survive
+/// it; a version 1 or 2 message becomes the version 3 one dense storage holds,
+/// and attribute creation order — which this crate indexes for neither storage
+/// form — does not.
+///
+/// An object that is dense stays dense, even where the edit takes its set back
+/// under the threshold. The reference C library keeps one dense down to its
+/// `min_dense` (6 by default) as well, and re-encoding a set that is only losing
+/// members buys nothing.
+fn plan_attr_ops<S: Source + ?Sized>(
+    src: &S,
+    base: BaseAddress,
+    addr: Option<u64>,
+    region: &[u8],
+    ops: &[&AttrOp],
+) -> Result<AttrEdits, Error> {
+    if !region_uses_dense_attrs(region)? {
+        // An attribute past the header's message-size field has no compact form
+        // at all, so the compact pass would refuse it rather than report a count
+        // this could act on. Ask before running it, not after.
+        let oversized = ops.iter().any(|op| match op {
+            AttrOp::Set { name, value } => {
+                build_attr_message(name, value).serialize(LENGTH_SIZE).len()
+                    > OBJECT_HEADER_MESSAGE_MAX
+            }
+            AttrOp::Remove { .. } => false,
+        });
+        if !oversized {
+            let (out, pending_vl, wrote_attr) = apply_compact_attr_ops(region, ops)?;
+            // An edit that only *removes* stays compact whatever the count is.
+            // A region already holding more attributes than this writer would
+            // emit came from another writer — the C library's `max_compact` is a
+            // property list setting — and taking one away is no reason to
+            // re-encode the ones that remain.
+            if !wrote_attr || compact_attr_count(&out)? + pending_vl.len() <= MAX_COMPACT_ATTRS {
+                return Ok(AttrEdits {
+                    region: out,
+                    pending_vl,
+                    dense: None,
+                });
+            }
+        }
+    }
+
+    // A heap is rebuilt from the object's whole attribute set — half of which may
+    // live in a heap the header only names — so read that set back before
+    // applying the edits to it. A group this commit creates has none.
+    let existing = match addr {
+        Some(addr) => read_object_attrs(src, addr, base)?,
+        None => Vec::new(),
+    };
+    // Each attribute travels with the global heap collections it still needs
+    // placed (`Some` only for a variable-length attribute this edit sets), so no
+    // removal can shift one away from the bytes it belongs to.
+    let mut set: Vec<(crate::attribute::AttributeMessage, Option<Vec<Vec<u8>>>)> =
+        existing.into_iter().map(|a| (a, None)).collect();
+    for op in ops {
+        match op {
+            AttrOp::Set { name, value } => {
+                let msg = build_attr_message(name, value);
+                let collections = match value {
+                    AttrValue::VarLenAsciiArray(strings) => {
+                        let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+                        Some(build_global_heap_collections(&str_refs))
+                    }
+                    _ => None,
+                };
+                match set.iter_mut().find(|(a, _)| &a.name == name) {
+                    // Setting an attribute the object already has replaces it
+                    // where it stands, so a repeated `set_attr` does not reorder
+                    // the set.
+                    Some(slot) => *slot = (msg, collections),
+                    None => set.push((msg, collections)),
+                }
+            }
+            AttrOp::Remove { name } => {
+                let before = set.len();
+                set.retain(|(a, _)| &a.name != name);
+                if set.len() == before {
+                    return Err(Error::EditUnsupported("attribute to remove was not found"));
+                }
+            }
+        }
+    }
+
+    // Every attribute message is rebuilt from the set above, so the region keeps
+    // none of them, nor the Attribute Info message naming the storage they were
+    // in.
+    let region = strip_attr_messages(region)?;
+    if set.is_empty() {
+        return Ok(AttrEdits {
+            region,
+            pending_vl: Vec::new(),
+            dense: None,
+        });
+    }
+    let mut attrs = Vec::with_capacity(set.len());
+    let mut vl = Vec::new();
+    for (i, (msg, collections)) in set.into_iter().enumerate() {
+        if let Some(collections) = collections {
+            vl.push((i, collections));
+        }
+        attrs.push(msg);
+    }
+    // What the heap itself cannot represent is the last refusal, and it belongs
+    // in the preflight: past here the commit is placing bytes.
+    crate::file_writer::dense_attrs_check(&attrs).map_err(Error::Format)?;
+    Ok(AttrEdits {
+        region,
+        pending_vl: Vec::new(),
+        dense: Some(DenseAttrEdit { attrs, vl }),
+    })
+}
+
+/// Whether an object's chunk-0 message `region` stores its attributes densely —
+/// an Attribute Info message naming a fractal heap. See
+/// [`attribute_info_is_dense`] for why the message's mere presence is not that.
+fn region_uses_dense_attrs(region: &[u8]) -> Result<bool, Error> {
+    let mut p = 0;
+    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        if msg_type == MessageType::AttributeInfo
+            && attribute_info_is_dense(&region[body..body_end])
+        {
+            return Ok(true);
+        }
+        p = body_end;
+    }
+    Ok(false)
+}
+
+/// Copy a chunk-0 message `region`, dropping every Attribute message and the
+/// Attribute Info message that names their storage. What the object carries in
+/// their place is [`plan_attr_ops`]'s decision, appended by the apply phase.
+fn strip_attr_messages(region: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(region.len());
+    let mut p = 0;
+    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+        if !matches!(
+            msg_type,
+            MessageType::Attribute | MessageType::AttributeInfo
+        ) {
+            out.extend_from_slice(&region[p..body_end]);
+        }
+        p = body_end;
+    }
+    if p < region.len() {
+        out.extend_from_slice(&region[p..]);
+    }
+    Ok(out)
+}
+
+/// Every attribute an object carries, compact or dense, parsed into messages.
+///
+/// This read is what makes a dense edit possible at all: the set an edit works
+/// from is the object's whole attribute set, and for a dense object none of it
+/// is in the header — `extract_attributes_full_from_source` walks the fractal
+/// heap the Attribute Info message names. It reads both storage forms, so no
+/// caller has to ask which one an object uses.
+fn read_object_attrs<S: Source + ?Sized>(
+    src: &S,
+    addr: u64,
+    base: BaseAddress,
+) -> Result<Vec<crate::attribute::AttributeMessage>, Error> {
+    let header = ObjectHeader::parse_from_source(src, addr, OFFSET_SIZE, LENGTH_SIZE, base)
+        .map_err(|_| {
+            Error::EditUnsupported("an object header could not be parsed for an attribute edit")
+        })?;
+    if base.get() > src.len() {
         return Err(Error::EditUnsupported(
-            "attributes would exceed compact storage; dense attribute edits are not supported in place yet",
+            "this file's userblock is larger than the file itself",
         ));
     }
-    Ok((out, pending_vl))
+    // Heap addresses in the Attribute Info message are stored relative to the
+    // base address, so the walk gets the file framed past its userblock — the
+    // same view the reader uses. `base` is 0 for a plain file, where this is
+    // `src` itself.
+    let framed = BaseOffsetSource { inner: src, base };
+    crate::attribute::extract_attributes_full_from_source(
+        &framed,
+        &header,
+        OFFSET_SIZE,
+        LENGTH_SIZE,
+    )
+    .map_err(|_| {
+        Error::EditUnsupported("an object's attributes could not be read for an attribute edit")
+    })
 }
 
 /// Whether an Attribute Info (0x0015) message body denotes *dense* (fractal-heap)
@@ -10720,25 +11067,12 @@ fn set_attr_in_region(region: &[u8], name: &str, value: &AttrValue) -> Result<Ve
     let mut out = Vec::with_capacity(region.len() + new_msg.len());
     let mut p = 0;
     while let Some((msg_type, body, body_end)) = next_message(region, p)? {
-        match msg_type {
-            MessageType::AttributeInfo => {
-                if attribute_info_is_dense(&region[body..body_end]) {
-                    return Err(Error::EditUnsupported(
-                        "a target object uses dense (fractal-heap) attribute storage (not supported in place yet)",
-                    ));
-                }
-                // An undefined-heap Attribute Info message is creation-order
-                // metadata, not dense storage; preserve it verbatim (fall through
-                // to copy the message below).
+        if msg_type == MessageType::Attribute {
+            let attr_name = parse_compact_attr_name(region, p, body, body_end)?;
+            if attr_name == name {
+                p = body_end;
+                continue;
             }
-            MessageType::Attribute => {
-                let attr_name = parse_compact_attr_name(region, p, body, body_end)?;
-                if attr_name == name {
-                    p = body_end;
-                    continue;
-                }
-            }
-            _ => {}
         }
         out.extend_from_slice(&region[p..body_end]);
         p = body_end;
@@ -10761,24 +11095,12 @@ fn remove_attr_from_region(region: &[u8], name: &str, required: bool) -> Result<
     let mut removed = false;
     while let Some((msg_type, body, body_end)) = next_message(region, p)? {
         let mut skip = false;
-        match msg_type {
-            MessageType::AttributeInfo => {
-                if attribute_info_is_dense(&region[body..body_end]) {
-                    return Err(Error::EditUnsupported(
-                        "a target object uses dense (fractal-heap) attribute storage (not supported in place yet)",
-                    ));
-                }
-                // An undefined-heap Attribute Info message is creation-order
-                // metadata, not dense storage; preserve it verbatim.
+        if msg_type == MessageType::Attribute {
+            let attr_name = parse_compact_attr_name(region, p, body, body_end)?;
+            if attr_name == name {
+                skip = true;
+                removed = true;
             }
-            MessageType::Attribute => {
-                let attr_name = parse_compact_attr_name(region, p, body, body_end)?;
-                if attr_name == name {
-                    skip = true;
-                    removed = true;
-                }
-            }
-            _ => {}
         }
         if !skip {
             out.extend_from_slice(&region[p..body_end]);
@@ -10794,17 +11116,14 @@ fn remove_attr_from_region(region: &[u8], name: &str, required: bool) -> Result<
     Ok(out)
 }
 
+/// How many attributes an object's message `region` carries inline. Only a
+/// compact region is ever counted this way: a dense object carries no inline
+/// Attribute message at all, and would count zero — which is why
+/// [`plan_attr_ops`] decides an object's storage before it reaches here.
 fn compact_attr_count(region: &[u8]) -> Result<usize, Error> {
     let mut count = 0usize;
     let mut p = 0;
-    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
-        if msg_type == MessageType::AttributeInfo
-            && attribute_info_is_dense(&region[body..body_end])
-        {
-            return Err(Error::EditUnsupported(
-                "a target object uses dense (fractal-heap) attribute storage (not supported in place yet)",
-            ));
-        }
+    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
         if msg_type == MessageType::Attribute {
             count += 1;
         }

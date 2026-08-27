@@ -107,7 +107,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 
 | Capability | Tracking |
 |---|---|
-| **Dense** (fractal-heap) link & attribute storage | [#102](https://github.com/stephenberry/hdf5-pure/issues/102) |
+| **Dense** (fractal-heap) **link** storage — a group with more links than it keeps compactly. Dense **attribute** storage is supported: an attribute edit that outgrows the object header moves the whole set to a heap, an object already using one is rebuilt, and an object created in place may carry one ([#102](https://github.com/stephenberry/hdf5-pure/issues/102)) | [#102](https://github.com/stephenberry/hdf5-pure/issues/102) |
 | Editing across **soft / external links** | [#103](https://github.com/stephenberry/hdf5-pure/issues/103) |
 | Creation-order tracking, shared/SOHM messages, copying a **version-1** object | [#104](https://github.com/stephenberry/hdf5-pure/issues/104) |
 | Adding **chunked/extensible variable-length-string** datasets | [#105](https://github.com/stephenberry/hdf5-pure/issues/105) |

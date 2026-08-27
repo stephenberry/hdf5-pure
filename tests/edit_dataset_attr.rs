@@ -2,11 +2,15 @@
 //! (issue #146): compact dataset-attribute add / update / remove, staged and
 //! applied on commit by relocating the dataset's object header while preserving its
 //! data and chunk index. C-library interop — undefined-`AttributeInfo` acceptance
-//! (dataset and group), the dense-storage refusal, and the single-hard-link refusal
-//! — lives in `edit_crosscheck.rs`.
+//! (dataset and group) and the single-hard-link refusal — lives in
+//! `edit_crosscheck.rs`; edits that land in dense (fractal-heap) storage live in
+//! `edit_dense_attr.rs`.
 
 use hdf5_pure::{AttrValue, Error, File, FileBuilder, FormatError};
 use tempfile::tempdir;
+
+mod common;
+use common::heap::has_fractal_heap;
 
 fn build_contig(path: &std::path::Path) {
     let mut b = FileBuilder::new();
@@ -181,25 +185,55 @@ fn attr_edit_plus_append_dataset_same_commit_refused() {
 }
 
 #[test]
-fn compact_limit_refused() {
+fn the_ninth_attribute_moves_the_set_out_of_the_header() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("d.h5");
     {
         let mut b = FileBuilder::new();
         let ds = b.create_dataset("d").with_i32_data(&[1, 2, 3, 4]);
-        for i in 0..8i64 {
+        for i in 0..7i64 {
             ds.set_attr(&format!("a{i}"), AttrValue::I64(i));
         }
         b.write(&p).unwrap();
     }
 
-    let s = File::open_rw(&p).unwrap();
-    s.dataset("d")
-        .unwrap()
-        .set_attr("overflow", AttrValue::I64(9))
-        .unwrap(); // would be the 9th
-    let err = s.commit().unwrap_err();
-    assert!(matches!(err, Error::EditUnsupported(_)));
+    // Eight is what an object header holds compactly, so this edit stays in it.
+    {
+        let s = File::open_rw(&p).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr("a7", AttrValue::I64(7))
+            .unwrap();
+        s.commit().unwrap();
+    }
+    assert!(
+        !has_fractal_heap(&std::fs::read(&p).unwrap()),
+        "eight attributes still fit the object header",
+    );
+
+    // The ninth does not, so the whole set moves to a fractal heap rather than
+    // being refused (issue #102). The values are checked either side of the move.
+    {
+        let s = File::open_rw(&p).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr("overflow", AttrValue::I64(9))
+            .unwrap();
+        s.commit().unwrap();
+    }
+    assert!(
+        has_fractal_heap(&std::fs::read(&p).unwrap()),
+        "the ninth attribute must move the set into a fractal heap",
+    );
+    let f = File::open(&p).unwrap();
+    let d = f.dataset("d").unwrap();
+    assert_eq!(d.read_i32().unwrap(), vec![1, 2, 3, 4]);
+    let attrs = d.attrs().unwrap();
+    assert_eq!(attrs.len(), 9);
+    for i in 0..8i64 {
+        assert_eq!(attrs.get(&format!("a{i}")), Some(&AttrValue::I64(i)));
+    }
+    assert_eq!(attrs.get("overflow"), Some(&AttrValue::I64(9)));
 }
 
 #[test]

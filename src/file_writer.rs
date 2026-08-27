@@ -314,7 +314,7 @@ const DENSE_ATTR_BLOCK_OFFSET_BYTES: usize = fractal_heap_write::BLOCK_OFFSET_BY
 /// before their global-heap references were patched embedded the placeholders and
 /// this crate's reader then dropped the attribute; the writer now builds each
 /// heap after that patching, so there is nothing to exclude.
-fn needs_dense_attrs(attrs: &[AttributeMessage]) -> bool {
+pub(crate) fn needs_dense_attrs(attrs: &[AttributeMessage]) -> bool {
     attrs.len() > DENSE_ATTR_THRESHOLD
         || attrs
             .iter()
