@@ -18,8 +18,20 @@ use crate::source::Source;
 /// tiny, fixed window to pull from a streaming source.
 const MAX_SUPERBLOCK_LEN: u64 = 128;
 
-/// Parsed HDF5 superblock (all versions).
+/// A file's parsed superblock, as reported by
+/// [`File::superblock`](crate::File::superblock).
+///
+/// The superblock is the first HDF5 structure in a file and fixes the format
+/// every other structure is read in: the version, the width of the offsets and
+/// lengths in every message, and the [base address](Self::base_address) the
+/// rest of the file's addresses are relative to. This is a read-only view of
+/// what was found there; a field a given superblock version does not carry is
+/// `None`, and the fields carry the values as stored rather than as validated.
+///
+/// `#[non_exhaustive]` because the format's later versions may add fields, and
+/// growing this struct should not be a breaking change.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Superblock {
     /// Superblock version (0–3).
     pub version: u8,
@@ -65,7 +77,7 @@ impl Superblock {
     /// Serialize this superblock to bytes.
     ///
     /// Always writes v2/v3 format. Computes and appends Jenkins lookup3 checksum.
-    pub fn serialize(&self) -> Vec<u8> {
+    pub(crate) fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(48);
         buf.extend_from_slice(&HDF5_SIGNATURE);
         buf.push(self.version);
@@ -112,7 +124,7 @@ impl Superblock {
     /// window ([`MAX_SUPERBLOCK_LEN`] bytes, clamped to the bytes available) is
     /// read. This lets the entry point be parsed from a lazy streaming source
     /// without materializing the whole file.
-    pub fn parse_from_source<S: Source + ?Sized>(
+    pub(crate) fn parse_from_source<S: Source + ?Sized>(
         source: &S,
         signature_offset: u64,
     ) -> Result<Superblock, FormatError> {
@@ -126,7 +138,7 @@ impl Superblock {
     /// Parse a superblock from `data` starting at `signature_offset`.
     ///
     /// The signature must be present at the given offset.
-    pub fn parse(data: &[u8], signature_offset: usize) -> Result<Superblock, FormatError> {
+    pub(crate) fn parse(data: &[u8], signature_offset: usize) -> Result<Superblock, FormatError> {
         let d = &data[signature_offset..];
         ensure_len(d, 0, 9)?; // signature(8) + version(1)
 

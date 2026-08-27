@@ -9,14 +9,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `AttrValue::VarLenString`, `VarLenStringArray`, `VarLenAsciiString` and `VarLenAsciiStringArray` write an attribute in the standard variable-length string datatype (`H5T_STRING` with `STRSIZE = H5T_VARIABLE`), the one h5py and the reference C library write; `VarLenAsciiCharArray` still writes MATLAB's sequence-of-one-byte-strings shape ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
+- `Superblock`, `MessageType` and `BaseAddress` are exported from the crate root, so the types `File::superblock` and `Error::MissingMessage` hand back can be named in a signature and stored, not only read in place. Both `Superblock` and `MessageType` are `#[non_exhaustive]`, since the format they describe can grow ([#323](https://github.com/stephenberry/hdf5-pure/issues/323)).
 - `Group::set_attr` and `Dataset::set_attr` write an attribute set the object header cannot hold — more than eight attributes, or one whose message overflows its 2-byte size field — into a fractal heap on `commit`, and rebuild an object that already stores its attributes in one, where both were refused before. A dataset or group created in place may carry such a set too. Moving an attribute that holds a repointable object reference out of the header is refused rather than putting it beyond the reference repointing a commit does, the heap a rebuild replaces is left for `repack` to reclaim, and dense (fractal-heap) *link* storage is still refused ([#102](https://github.com/stephenberry/hdf5-pure/issues/102)).
 
 ### Fixed
 
+- `File::superblock().base_address` reads as a number again, through `BaseAddress::get`. 0.40.0 changed that field from a `u64` to a type whose every accessor was crate-internal, so a consumer could see the value and do nothing with it ([#323](https://github.com/stephenberry/hdf5-pure/issues/323)).
 - `FileBuilder::set_attr_committed` and its `DatasetBuilder`/`GroupBuilder` siblings stage a variable-length string attribute's strings into the file's global heap. Such an attribute was written with every element pointing at address 0, so the file was accepted, the attribute vanished from `attrs`, and the C library read it as empty ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
 
 ### Changed
 
+- **Breaking:** `Superblock::serialize` is internal: it was callable on the value `File::superblock` returns, and writes the v2/v3 format whatever superblock it is given. The `parse` constructors beside it are internal too ([#323](https://github.com/stephenberry/hdf5-pure/issues/323)).
 - **Breaking:** A variable-length string attribute reads back as a `VarLenString` variant rather than as the fixed-width variant of its charset and arity, so writing the value back keeps the datatype it was found in ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
 - **Breaking:** `AttrValue::VarLenAsciiArray` is renamed `VarLenAsciiCharArray`, and its `type_name` is now `"vlen_ascii_char[]"`. It writes MATLAB's VLEN sequence of one-byte strings, not the variable-length ASCII string the old name implied — that is `VarLenAsciiStringArray` ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
 

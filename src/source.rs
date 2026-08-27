@@ -277,11 +277,6 @@ pub trait Source {
     /// Total number of bytes the source can supply.
     fn len(&self) -> u64;
 
-    /// Whether the source is empty (zero bytes).
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Read exactly `buf.len()` bytes starting at absolute offset `offset`,
     /// filling `buf`.
     ///
@@ -911,7 +906,6 @@ mod tests {
         let data = (0u8..=255).collect::<Vec<u8>>();
         let src = BytesSource::new(data.clone());
         assert_eq!(src.len(), 256);
-        assert!(!src.is_empty());
 
         let mut buf = [0u8; 4];
         src.read_at(10, &mut buf).unwrap();
@@ -963,7 +957,6 @@ mod tests {
     fn empty_source() {
         let src = BytesSource::new(Vec::<u8>::new());
         assert_eq!(src.len(), 0);
-        assert!(src.is_empty());
     }
 
     #[test]

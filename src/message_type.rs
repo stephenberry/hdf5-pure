@@ -2,8 +2,18 @@
 
 use core::fmt;
 
-/// Recognized HDF5 header message types.
+/// An HDF5 object header message type, as carried by
+/// [`Error::MissingMessage`](crate::Error::MissingMessage).
+///
+/// Every piece of an object's metadata — its dataspace, its datatype, where its
+/// data lives — is a message in its object header, identified by one of these.
+/// A type this crate does not recognize is reported as [`Unknown`](Self::Unknown)
+/// with its raw identifier rather than discarded.
+///
+/// `#[non_exhaustive]` because a type now reported as `Unknown` may later get a
+/// name of its own, and that should not be a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MessageType {
     Nil,
     Dataspace,
