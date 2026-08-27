@@ -386,7 +386,9 @@ The payload limit covers bytes referenced by VL elements and excludes Rust conta
 | `AttrValue::U8` / `U16` / `U32` / `U64` (+ `…Array`) | Unsigned integer scalar/array, at that width |
 | `AttrValue::String` / `StringArray` | UTF-8 null-padded string |
 | `AttrValue::AsciiString` | Fixed-length ASCII string |
-| `AttrValue::VarLenAsciiArray` | Variable-length ASCII string array (global heap) |
+| `AttrValue::VarLenString` / `VarLenStringArray` | Variable-length UTF-8 string, scalar or array (global heap) |
+| `AttrValue::VarLenAsciiString` / `VarLenAsciiStringArray` | The same, with `CSET = ASCII` |
+| `AttrValue::VarLenAsciiArray` | MATLAB's VLEN sequence of one-byte ASCII strings (global heap) |
 
 ## Compression
 

@@ -6,12 +6,13 @@
 //!
 //! `H5T_STRING` with `STRSIZE = H5T_VARIABLE` is what h5py, the reference C
 //! library and this crate's own `DatasetBuilder::with_vlen_strings` write, and
-//! before `AttrValue::VarLenString` and its three siblings no attribute API
-//! wrote it: the only variable-length attribute variant was
+//! before `AttrValue::VarLenString` and its three siblings no `AttrValue`
+//! originated it: the only variable-length attribute variant was
 //! `VarLenAsciiArray`, which writes MATLAB's `H5T_VLEN { H5T_STRING { STRSIZE
-//! = 1 } }` sequence instead. The element bytes are the same either way, so
-//! every assertion here is about the datatype the reader is handed — which is
-//! what decides whether the C library can convert it at all.
+//! = 1 } }` sequence instead. (`repack` already carried a C-written one across
+//! verbatim; nothing could write one from a value.) The element bytes are the
+//! same either way, so every assertion here is about the datatype the reader is
+//! handed — which is what decides whether the C library can convert it at all.
 
 use hdf5::types::{TypeDescriptor, VarLenAscii, VarLenUnicode};
 use hdf5_pure::{AttrValue, File, FileBuilder};
@@ -196,9 +197,10 @@ fn the_matlab_shape_keeps_its_own_datatype() {
     );
 }
 
-/// An empty variable-length string is a real value, not an absent one: it has
-/// no heap object of its own, and it must still read back as an empty string
-/// rather than dropping the attribute.
+/// An empty variable-length string is a real value, not an absent one: it takes
+/// a zero-length heap object at an index of its own, where a *null* element
+/// would take no object at all, and it must read back as an empty string rather
+/// than dropping the attribute.
 #[test]
 fn an_empty_variable_length_string_round_trips() {
     let dir = tempdir().unwrap();
@@ -342,8 +344,9 @@ fn a_dense_rebuild_keeps_the_standard_datatype() {
 }
 
 /// Repack restages every attribute's payload into the destination's heap while
-/// keeping the source datatype, so the standard encoding must survive it rather
-/// than arriving as the fixed-width variant the decode used to report.
+/// keeping the source datatype, which it did before this change too. What is new
+/// is what comes back out: the four variants, rather than the fixed-width ones
+/// the decode used to report for them.
 #[test]
 fn repack_keeps_the_standard_datatype() {
     let dir = tempdir().unwrap();
@@ -363,4 +366,80 @@ fn repack_keeps_the_standard_datatype() {
 
     let c = hdf5::File::open(&dst).unwrap();
     assert_c_reads_the_cases(&c.as_group().unwrap(), "repacked root");
+}
+
+/// An attribute whose datatype is a *committed* one still keeps its strings in
+/// the global heap, and the writer must stage them.
+///
+/// The committed path encodes the value and then moves its datatype out of the
+/// message, which used to hand the result to the writer as already-final bytes.
+/// For a variable-length value those bytes are not final: every element still
+/// held the placeholder heap address 0. `write` returned `Ok` on a file whose
+/// attribute this crate then dropped from `attrs` entirely and the C library
+/// read as an empty string. It applies to MATLAB's shape as much as to the
+/// standard one, so both are pinned here.
+#[test]
+fn a_committed_datatype_attribute_stages_its_heap() {
+    use hdf5_pure::{CharacterSet, Datatype, DatatypeByteOrder, StringPadding};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("committed.h5");
+    let standard = Datatype::VariableLength {
+        is_string: true,
+        padding: Some(StringPadding::NullTerminate),
+        charset: Some(CharacterSet::Utf8),
+        base_type: Box::new(Datatype::FixedPoint {
+            size: 1,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 8,
+        }),
+    };
+    let matlab = Datatype::VariableLength {
+        is_string: false,
+        padding: None,
+        charset: None,
+        base_type: Box::new(Datatype::String {
+            size: 1,
+            padding: StringPadding::NullTerminate,
+            charset: CharacterSet::Ascii,
+        }),
+    };
+
+    let mut b = FileBuilder::new();
+    b.commit_datatype("vlstr", standard);
+    b.commit_datatype("vlchar", matlab);
+    b.create_dataset("d").with_f64_data(&[1.0]);
+    b.set_attr_committed("units", AttrValue::VarLenString("m/s".into()), "/vlstr");
+    b.set_attr_committed(
+        "fields",
+        AttrValue::VarLenAsciiArray(vec!["a".into(), "bb".into()]),
+        "/vlchar",
+    );
+    b.write(&path).unwrap();
+
+    let f = File::open(&path).unwrap();
+    let attrs = f.root().attrs().unwrap();
+    assert_eq!(
+        attrs.get("units"),
+        Some(&AttrValue::VarLenString("m/s".into())),
+        "a committed-datatype attribute must not be dropped for an unresolvable heap address"
+    );
+    assert_eq!(
+        attrs.get("fields"),
+        Some(&AttrValue::VarLenAsciiArray(vec!["a".into(), "bb".into()]))
+    );
+    drop(f);
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.attr("units")
+            .unwrap()
+            .read_scalar::<VarLenUnicode>()
+            .unwrap()
+            .as_str(),
+        "m/s",
+        "the C library resolves the heap reference the committed path staged"
+    );
 }

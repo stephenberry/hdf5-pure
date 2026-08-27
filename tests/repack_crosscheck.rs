@@ -1393,9 +1393,9 @@ fn repack_refuses_chunked_compound_with_both_vlen_and_reference_members() {
 /// (issue #241).
 ///
 /// This is the half of the fidelity contract no pure-Rust test can reach.
-/// `AttrValue` has no narrow integer array, no variable-length string, and no
-/// rank above one, so a source this crate *writes* cannot exhibit those losses
-/// at all — only a C-written file can, which is exactly the file a user repacks.
+/// `AttrValue` has no byte order, no sub-width precision and no rank above one,
+/// so a source this crate *writes* cannot exhibit those losses at all — only a
+/// C-written file can, which is exactly the file a user repacks.
 /// Every assertion is made through the C library's own type system, so it states
 /// what a consumer sees rather than what this crate's reader reports.
 #[test]
@@ -1461,8 +1461,8 @@ fn c_written_attribute_encodings_survive_a_repack() {
                 .unwrap()
                 .write_raw(&[1i32, 2, 3, 4, 5, 6])
                 .unwrap();
-            // A true variable-length string, which this crate's writer never
-            // emits and a decode turns into a fixed-width one.
+            // A true variable-length string. Repack carries it across verbatim,
+            // and a decode now reports it as `AttrValue::VarLenString` (#383).
             owner
                 .new_attr::<VarLenUnicode>()
                 .create("vlstr")

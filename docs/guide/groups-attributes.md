@@ -86,8 +86,7 @@ The `AttrValue` variants and their HDF5 encodings are:
 !!! note
     `AttrValue::AsciiString`, `AttrValue::AsciiStringArray`, and `AttrValue::VarLenAsciiArray` exist for compatibility with MATLAB and matio, which expect fixed-width or variable-length ASCII rather than UTF-8 for certain conventional attributes. See the [data types reference](../reference/data-types.md) for the full type mapping.
 
-!!! note
-    The two variable-length families differ in datatype, not in bytes. `VarLenString` and its siblings write `H5T_STRING` with `STRSIZE = H5T_VARIABLE` — what h5py and the C library write, and what they read back into a `VarLenUnicode` or `VarLenAscii`. `VarLenAsciiArray` writes `H5T_VLEN { H5T_STRING { STRSIZE = 1 } }`, which MATLAB and matio expect for `MATLAB_fields` and its neighbours ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
+    The two variable-length families differ in datatype, not in bytes. `VarLenString` and its siblings write `H5T_STRING` with `STRSIZE = H5T_VARIABLE` — what h5py and the C library write, and what h5py reads back as a `str` and the C library as a `char *`. `VarLenAsciiArray` writes `H5T_VLEN { H5T_STRING { STRSIZE = 1 } }`, which MATLAB and matio expect for `MATLAB_fields` and its neighbours ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
 
 ## Reading the hierarchy back
 

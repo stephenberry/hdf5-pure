@@ -9896,8 +9896,7 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     let mut vl_attrs: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
     for (i, (_, v)) in db.attrs.iter().enumerate() {
         if let Some(strings) = v.var_len_strings() {
-            let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-            vl_attrs.push((i, build_global_heap_collections(&str_refs)));
+            vl_attrs.push((i, build_global_heap_collections(strings)));
         }
     }
     #[cfg(feature = "provenance")]
@@ -10753,8 +10752,7 @@ fn apply_compact_attr_ops(
                             "attribute is too large to encode in place",
                         ));
                     }
-                    let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-                    pending_vl.push((msg, build_global_heap_collections(&str_refs)));
+                    pending_vl.push((msg, build_global_heap_collections(strings)));
                 } else {
                     out = set_attr_in_region(&out, name, value)?;
                 }
@@ -10922,10 +10920,7 @@ fn plan_attr_ops<S: Source + ?Sized>(
         match op {
             AttrOp::Set { name, value } => {
                 let msg = build_attr_message(name, value);
-                let collections = value.var_len_strings().map(|strings| {
-                    let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-                    build_global_heap_collections(&str_refs)
-                });
+                let collections = value.var_len_strings().map(build_global_heap_collections);
                 match set.iter_mut().find(|(a, _)| &a.name == name) {
                     // Setting an attribute the object already has replaces it
                     // where it stands, so a repeated `set_attr` does not reorder
