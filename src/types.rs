@@ -327,6 +327,15 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
                 crate::vl_data::VlenStringReadOptions::default(),
             )
             .ok()?;
+            // Each shape decodes into the variant that writes it back as it was
+            // found, so reading an attribute and setting it again keeps its
+            // datatype rather than rewriting a variable-length string as a
+            // fixed-width one.
+            //
+            // The one exception is a *scalar* in MATLAB's sequence-of-chars
+            // shape, which has no variant: that shape exists for `MATLAB_fields`
+            // and its neighbours, which are always arrays, and giving it one
+            // would mean a scalar variant no builder needs.
             match (
                 vlen_string_shape(*is_string, base_type, charset.as_ref()),
                 scalar,
@@ -334,12 +343,17 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
                 (VlenStringShape::AsciiCharSequence, false) => {
                     Some(AttrValue::VarLenAsciiArray(strings))
                 }
-                (VlenStringShape::AsciiCharSequence | VlenStringShape::Ascii, true) => {
+                (VlenStringShape::AsciiCharSequence, true) => {
                     Some(AttrValue::AsciiString(one_or_empty(strings)))
                 }
-                (VlenStringShape::Ascii, false) => Some(AttrValue::AsciiStringArray(strings)),
-                (VlenStringShape::Utf8, true) => Some(AttrValue::String(one_or_empty(strings))),
-                (VlenStringShape::Utf8, false) => Some(AttrValue::StringArray(strings)),
+                (VlenStringShape::Ascii, true) => {
+                    Some(AttrValue::VarLenAsciiString(one_or_empty(strings)))
+                }
+                (VlenStringShape::Ascii, false) => Some(AttrValue::VarLenAsciiStringArray(strings)),
+                (VlenStringShape::Utf8, true) => {
+                    Some(AttrValue::VarLenString(one_or_empty(strings)))
+                }
+                (VlenStringShape::Utf8, false) => Some(AttrValue::VarLenStringArray(strings)),
             }
         }
         _ => None,
@@ -429,13 +443,13 @@ fn narrow_elements<S: Copy, T: TryFrom<S>>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VlenStringShape {
     /// A VLEN *sequence* of 1-byte ASCII strings — the encoding MATLAB and matio
-    /// use, and the one this crate writes for
-    /// [`AttrValue::VarLenAsciiArray`]. Only this shape has a variant that
-    /// preserves it.
+    /// use, and the one this crate writes for [`AttrValue::VarLenAsciiArray`].
     AsciiCharSequence,
-    /// A true variable-length ASCII string (`H5T_STRING`, `STRSIZE = VAR`).
+    /// A true variable-length ASCII string (`H5T_STRING`, `STRSIZE = VAR`),
+    /// written by [`AttrValue::VarLenAsciiString`] and its array form.
     Ascii,
-    /// A true variable-length UTF-8 string, or one whose charset is unstated.
+    /// A true variable-length UTF-8 string, or one whose charset is unstated,
+    /// written by [`AttrValue::VarLenString`] and its array form.
     Utf8,
 }
 
@@ -618,6 +632,22 @@ mod tests {
             (
                 "vlen_three",
                 AttrValue::VarLenAsciiArray(vec!["x".into(), "y".into(), "velocity".into()]),
+            ),
+            // The standard variable-length string, whose datatype the MATLAB
+            // shape above does not write (#383). Charset and arity separate the
+            // four the same way they separate the fixed-width variants.
+            ("vlen_utf8_scalar", AttrValue::VarLenString("mètre".into())),
+            (
+                "vlen_utf8_one",
+                AttrValue::VarLenStringArray(vec!["mètre".into()]),
+            ),
+            (
+                "vlen_ascii_scalar",
+                AttrValue::VarLenAsciiString("double".into()),
+            ),
+            (
+                "vlen_ascii_two",
+                AttrValue::VarLenAsciiStringArray(vec!["x".into(), "yy".into()]),
             ),
             // A declared width is stored and recovered too, or a slot would
             // shrink to its content the next time it was written (#359).
@@ -1044,8 +1074,13 @@ mod tests {
             ("scalar", AttrValue::AsciiString("double".into())),
             ("one", AttrValue::StringArray(vec!["double".into()])),
             ("vlen", AttrValue::VarLenAsciiArray(vec!["double".into()])),
+            ("vlen_std", AttrValue::VarLenAsciiString("double".into())),
+            (
+                "vlen_std_one",
+                AttrValue::VarLenStringArray(vec!["double".into()]),
+            ),
         ]);
-        for name in ["scalar", "one", "vlen"] {
+        for name in ["scalar", "one", "vlen", "vlen_std", "vlen_std_one"] {
             assert_eq!(
                 read.get(name).and_then(AttrValue::as_str),
                 Some("double"),

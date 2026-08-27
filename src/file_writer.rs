@@ -1925,7 +1925,7 @@ impl FileWriter {
             )?);
         }
 
-        // Build global heap collections for VarLenAsciiArray attributes.
+        // Build global heap collections for variable-length string attributes.
         // Track which attribute messages need VL patching, across root, groups, and datasets.
         struct VlPatch {
             /// The attribute's collections, in the order their objects appear.
