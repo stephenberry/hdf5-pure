@@ -1400,6 +1400,14 @@ pub(crate) fn simple_1d(n: u64) -> Dataspace {
 /// stay the same size across rewrites (issue #359). The accessors span both, so
 /// code that only wants the text need not know which it was handed.
 ///
+/// A variable-length string keeps its datatype the same way. The `VarLen*`
+/// variants write the standard `H5T_STRING` with `STRSIZE = H5T_VARIABLE`,
+/// which is what h5py and the reference C library write and read;
+/// [`VarLenAsciiArray`](AttrValue::VarLenAsciiArray) writes MATLAB's sequence
+/// of one-byte strings over identical element bytes (issue #383). Both keep
+/// their strings in a global heap collection rather than in the attribute
+/// message.
+///
 /// Non-exhaustive: variants are added as this crate supports more attribute
 /// datatypes, so match a read-back value with a `_` arm. Constructing the
 /// variants below is unaffected.

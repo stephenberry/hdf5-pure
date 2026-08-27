@@ -219,9 +219,12 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
 ///   type, so its codes survive and the member names do not. This is how h5py's
 ///   `np.bool_` attributes arrive, written as `enum[FALSE, TRUE]`: as `0`/`1` of
 ///   the base type's width.
-/// - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR`,
-///   which this crate's writer never emits, has no variant of its own and reads
-///   as the fixed-width variant of the same charset and arity.
+/// - **A scalar in MATLAB's sequence-of-one-byte-strings shape.** Its array
+///   form reads as [`VarLenAsciiArray`](AttrValue::VarLenAsciiArray), which is
+///   the form MATLAB writes; a scalar in that shape has no variant and reads as
+///   [`AsciiString`](AttrValue::AsciiString), which writes a fixed-width slot.
+///   A *standard* variable-length string keeps its datatype at either arity
+///   (issue #383).
 /// - **Rank.** Every array variant is one-dimensional, so a rank-2 attribute
 ///   reads as its elements flattened.
 /// - **String padding.** A fixed-width string reports its content and the
