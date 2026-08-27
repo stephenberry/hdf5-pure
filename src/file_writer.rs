@@ -66,7 +66,7 @@ const MSG_SHARED: u8 = 0x02;
 const MSG_DONTSHARE: u8 = 0x04;
 
 /// Threshold for switching from compact (inline) to dense attribute storage.
-const DENSE_ATTR_THRESHOLD: usize = 8;
+pub(crate) const DENSE_ATTR_THRESHOLD: usize = 8;
 
 /// Round `value` up to the next multiple of `page` (a power of two). Used by the
 /// paged file-space writer to page-align region starts and the end-of-allocation.
@@ -314,7 +314,7 @@ const DENSE_ATTR_BLOCK_OFFSET_BYTES: usize = fractal_heap_write::BLOCK_OFFSET_BY
 /// before their global-heap references were patched embedded the placeholders and
 /// this crate's reader then dropped the attribute; the writer now builds each
 /// heap after that patching, so there is nothing to exclude.
-fn needs_dense_attrs(attrs: &[AttributeMessage]) -> bool {
+pub(crate) fn needs_dense_attrs(attrs: &[AttributeMessage]) -> bool {
     attrs.len() > DENSE_ATTR_THRESHOLD
         || attrs
             .iter()

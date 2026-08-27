@@ -10,6 +10,10 @@ use hdf5_pure::{
 mod temp_fixture;
 use temp_fixture::temp_path;
 
+#[path = "common/heap.rs"]
+mod heap;
+use heap::has_fractal_heap;
+
 /// Write a starter file with one dataset, returning its path.
 fn write_starter(path: &std::path::Path) {
     let mut b = FileBuilder::new();
@@ -843,7 +847,7 @@ fn add_variable_length_root_attribute_via_edit_session() {
 fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
     // A Set/Remove/Set sequence for the same name in one commit must leave
     // only the final value, whether or not the intermediate states are
-    // variable-length — exercising `apply_group_attr_ops`'s pending-VL-attr
+    // variable-length — exercising `apply_compact_attr_ops`'s pending-VL-attr
     // bookkeeping (a plain region edit alone cannot represent an unresolved
     // variable-length attribute).
     let path = temp_path("hdf5_pure_edit_vlen_group_attr_sequence.h5");
@@ -891,7 +895,7 @@ fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
 
 /// A `Set` with a variable-length value must correctly drop a *fixed-size*
 /// on-disk attribute of the same name, not just an existing pending
-/// variable-length one: `apply_group_attr_ops`'s `remove_attr_from_region`
+/// variable-length one: `apply_compact_attr_ops`'s `remove_attr_from_region`
 /// call is otherwise only exercised by the plain `Remove` op, never by a
 /// variable-length `Set` replacing a fixed-size value.
 #[test]
@@ -987,13 +991,12 @@ fn add_variable_length_group_attributes_at_budget_boundary_in_one_commit() {
 }
 
 /// One variable-length attribute past the boundary above (6 existing fixed +
-/// 3 new variable-length = 9) is refused; since the 6 existing attributes
-/// alone are under the budget, this specifically exercises the
-/// `+ pending_vl.len()` term of the check (a regression here would let an
-/// over-budget commit through without ever touching `compact_attr_count`'s
-/// own counting logic).
+/// 3 new variable-length = 9) sends the set to a fractal heap. Since the 6
+/// existing attributes alone are under the budget, this specifically exercises
+/// the `+ pending_vl.len()` term of the count: a regression there would leave the
+/// set compact, which is what the heap assertion catches.
 #[test]
-fn add_variable_length_group_attributes_over_budget_is_rejected_without_writing() {
+fn add_variable_length_group_attributes_over_budget_use_a_heap() {
     let path = temp_path("hdf5_pure_edit_vlen_group_attr_over_budget.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
@@ -1002,7 +1005,7 @@ fn add_variable_length_group_attributes_over_budget_is_rejected_without_writing(
     }
     b.add_group(g.finish());
     b.write(&path).unwrap();
-    let before = std::fs::read(&path).unwrap();
+    assert!(!has_fractal_heap(&std::fs::read(&path).unwrap()));
 
     {
         let session = File::open_rw(&path).unwrap();
@@ -1012,23 +1015,38 @@ fn add_variable_length_group_attributes_over_budget_is_rejected_without_writing(
                 .unwrap()
                 .set_attr(
                     &format!("b{i}"),
-                    AttrValue::VarLenAsciiArray(vec!["x".into()]),
+                    AttrValue::VarLenAsciiArray(vec![format!("x{i}")]),
                 )
                 .unwrap();
         }
-        let err = session.commit().unwrap_err();
-        assert!(err.to_string().contains("dense"), "got: {err}");
+        session.commit().unwrap();
     }
 
-    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(
+        has_fractal_heap(&std::fs::read(&path).unwrap()),
+        "six fixed plus three variable-length attributes are past the compact budget",
+    );
+    let file = File::open(&path).unwrap();
+    let attrs = file.group("grp").unwrap().attrs().unwrap();
+    assert_eq!(attrs.len(), 9);
+    for i in 0..6i64 {
+        assert_eq!(attrs.get(&format!("a{i}")), Some(&AttrValue::I64(i)));
+    }
+    for i in 0..3 {
+        assert_eq!(
+            attrs.get(&format!("b{i}")),
+            Some(&AttrValue::VarLenAsciiArray(vec![format!("x{i}")])),
+            "a variable-length attribute rebuilt into the heap kept its strings",
+        );
+    }
 }
 
+/// A group already storing its attributes in a fractal heap takes an edit by
+/// rebuilding that heap, variable-length attributes included (issue #102): the
+/// variable-length `Set` path added for issue #105 has to reach the same rebuild
+/// the fixed-size one does.
 #[test]
-fn dense_group_attribute_storage_is_still_rejected_without_writing() {
-    // Dense (fractal-heap) attribute storage stays out of scope regardless of
-    // whether the edit is fixed-size or variable-length; this guards that the
-    // variable-length `Set` path added for issue #105 still refuses it rather
-    // than silently mishandling it.
+fn dense_group_attribute_storage_takes_a_variable_length_edit() {
     let path = temp_path("hdf5_pure_edit_dense_group_attr.h5");
     let mut b = FileBuilder::new();
     let mut g = b.create_group("grp");
@@ -1037,7 +1055,7 @@ fn dense_group_attribute_storage_is_still_rejected_without_writing() {
     }
     b.add_group(g.finish());
     b.write(&path).unwrap();
-    let before = std::fs::read(&path).unwrap();
+    assert!(has_fractal_heap(&std::fs::read(&path).unwrap()));
 
     {
         let session = File::open_rw(&path).unwrap();
@@ -1049,11 +1067,19 @@ fn dense_group_attribute_storage_is_still_rejected_without_writing() {
                 AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]),
             )
             .unwrap();
-        let err = session.commit().unwrap_err();
-        assert!(err.to_string().contains("dense"), "got: {err}");
+        session.commit().unwrap();
     }
 
-    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let file = File::open(&path).unwrap();
+    let attrs = file.group("grp").unwrap().attrs().unwrap();
+    assert_eq!(attrs.len(), 13);
+    assert_eq!(
+        attrs.get("fields"),
+        Some(&AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()])),
+    );
+    for i in 0..12 {
+        assert_eq!(attrs.get(&format!("a{i}")), Some(&AttrValue::I64(i)));
+    }
 }
 
 #[test]
@@ -2871,18 +2897,20 @@ fn add_provenance_dataset_at_attr_budget_boundary_via_edit_session() {
     );
 }
 
-/// One attribute past the boundary above (9 total, once provenance is
-/// appended) is refused, and the refusal must not write anything.
+/// One attribute past the boundary above (9 total, once provenance is appended)
+/// no longer fits the object header, so the whole set moves to a fractal heap —
+/// provenance attributes counting toward the budget exactly like the caller's own
+/// (issue #102).
 #[cfg(feature = "provenance")]
 #[test]
-fn add_provenance_dataset_over_attr_budget_is_rejected_without_writing() {
+fn add_provenance_dataset_over_attr_budget_uses_a_heap() {
     let path = temp_path("hdf5_pure_edit_add_provenance_over_budget.h5");
     write_starter(&path);
-    let before = std::fs::read(&path).unwrap();
+    assert!(!has_fractal_heap(&std::fs::read(&path).unwrap()));
 
     {
         let session = File::open_rw(&path).unwrap();
-        let err = session
+        session
             .root()
             .create_dataset("sensor_over_budget", |ds| {
                 ds.with_f64_data(&[1.0, 2.0]);
@@ -2892,12 +2920,24 @@ fn add_provenance_dataset_over_attr_budget_is_rejected_without_writing() {
                 }
                 ds.with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
             })
-            .unwrap_err();
-        assert!(err.to_string().contains("dense"), "got: {err}");
+            .unwrap();
         session.commit().unwrap();
     }
 
-    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(
+        has_fractal_heap(&std::fs::read(&path).unwrap()),
+        "nine attributes are one past what the object header holds",
+    );
+    let file = File::open(&path).unwrap();
+    let attrs = file.dataset("sensor_over_budget").unwrap().attrs().unwrap();
+    assert_eq!(attrs.len(), 9);
+    for i in 0..5 {
+        assert_eq!(attrs.get(&format!("plain_{i}")), Some(&AttrValue::I32(i)));
+    }
+    assert_eq!(
+        attrs.get("_provenance_creator"),
+        Some(&AttrValue::String("test-suite".into())),
+    );
 }
 
 /// A dataset with a variable-length attribute (issue #105) can be added in
@@ -2981,34 +3021,46 @@ fn add_chunked_dataset_with_variable_length_attribute_via_edit_session() {
 }
 
 /// A dataset attribute whose serialized message overflows the object header's
-/// 2-byte message-size field is refused rather than silently truncated (a
-/// `VarLenAsciiArray` with enough strings is the practical way to reach this;
-/// each string element serializes to a fixed-size global-heap reference, so
-/// enough of them push the message past `u16::MAX` bytes).
+/// 2-byte message-size field cannot be stored compactly, so it goes to a fractal
+/// heap instead of being refused (issue #102). A `VarLenAsciiArray` with enough
+/// strings is the practical way to reach that: each element serializes to a
+/// fixed-size global-heap reference, so enough of them push the message past
+/// `u16::MAX` bytes.
 #[test]
-fn add_dataset_with_oversized_variable_length_attribute_is_rejected_without_writing() {
+fn add_dataset_with_oversized_variable_length_attribute_uses_a_heap() {
     let path = temp_path("hdf5_pure_edit_add_oversized_vlen_attr.h5");
     write_starter(&path);
-    let before = std::fs::read(&path).unwrap();
+    assert!(!has_fractal_heap(&std::fs::read(&path).unwrap()));
 
+    // Each element serializes to a fixed-size 16-byte global-heap reference;
+    // 5000 of them (80000 bytes) comfortably overflows the object header's
+    // 2-byte (`u16::MAX` = 65535) message-size field.
+    let strings: Vec<String> = (0..5000).map(|i| i.to_string()).collect();
     {
         let session = File::open_rw(&path).unwrap();
-        // Each element serializes to a fixed-size 16-byte global-heap
-        // reference; 5000 of them (80000 bytes) comfortably overflows the
-        // object header's 2-byte (`u16::MAX` = 65535) message-size field.
-        let strings: Vec<String> = (0..5000).map(|i| i.to_string()).collect();
-        let err = session
+        session
             .root()
             .create_dataset("oversized", |b| {
                 b.with_i32_data(&[1])
-                    .set_attr("tags", AttrValue::VarLenAsciiArray(strings));
+                    .set_attr("tags", AttrValue::VarLenAsciiArray(strings.clone()));
             })
-            .unwrap_err();
-        assert!(err.to_string().contains("too large"), "got: {err}");
+            .unwrap();
         session.commit().unwrap();
     }
 
-    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(
+        has_fractal_heap(&std::fs::read(&path).unwrap()),
+        "an attribute the object header cannot describe belongs in a heap",
+    );
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("oversized")
+            .unwrap()
+            .attrs()
+            .unwrap()
+            .get("tags"),
+        Some(&AttrValue::VarLenAsciiArray(strings)),
+    );
 }
 
 /// Regression test for issue #105's silent-corruption bug: a variable-length

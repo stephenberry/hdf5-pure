@@ -336,7 +336,7 @@ fn a_slot_read_back_can_be_rewritten_without_measuring_it() {
 /// A group attribute takes a declared width through the edit path too.
 ///
 /// `Group::set_attr` reaches the object header by a different route than
-/// `Dataset::set_attr` — `apply_group_attr_ops` rather than the dataset
+/// `Dataset::set_attr` — `apply_compact_attr_ops` rather than the dataset
 /// rebuild — so the dataset tests above say nothing about it.
 #[test]
 fn a_group_attribute_keeps_a_declared_width_through_an_edit() {

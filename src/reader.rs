@@ -3490,19 +3490,21 @@ impl Group {
         self.with_child_session(name, |session, child| session.delete(child))
     }
 
-    /// Add or update a compact attribute on this group, staged until
-    /// [`File::commit`]. Use [`remove_attr`](Self::remove_attr) to remove one.
-    /// The [`root`](File::root) group's attributes are edited the same way.
+    /// Add or update an attribute on this group, staged until [`File::commit`].
+    /// Use [`remove_attr`](Self::remove_attr) to remove one. The
+    /// [`root`](File::root) group's attributes are edited the same way.
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly). An attribute set too large
-    /// for compact storage, or a group using dense (fractal-heap) attribute
-    /// storage, is refused on [`File::commit`].
+    /// for the object header — more than eight attributes, or one whose message
+    /// the header's 2-byte size field cannot describe — is written to a fractal
+    /// heap on `commit`, as it is when the whole file is written, and a group
+    /// already storing its attributes in one is rebuilt.
     pub fn set_attr(&self, name: &str, value: AttrValue) -> Result<(), Error> {
         self.with_own_session(|session, path| session.set_group_attr(path, name, value))
     }
 
-    /// Remove a compact attribute from this group, staged until [`File::commit`].
+    /// Remove an attribute from this group, staged until [`File::commit`].
     /// See [`set_attr`](Self::set_attr) for the file-mode rules.
     pub fn remove_attr(&self, name: &str) -> Result<(), Error> {
         self.with_own_session(|session, path| session.remove_group_attr(path, name))
@@ -4170,8 +4172,10 @@ impl Dataset {
         self.with_session_mut(|session, path| session.stage_dataset_append(path, builder))
     }
 
-    /// Add or update a compact attribute on this dataset, staged until
+    /// Add or update an attribute on this dataset, staged until
     /// [`File::commit`]. Use [`remove_attr`](Self::remove_attr) to remove one.
+    /// An attribute set too large for the object header is written to a fractal
+    /// heap, exactly as [`Group::set_attr`] does.
     ///
     /// The file must have been opened with [`File::open_rw`], else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
@@ -4179,8 +4183,8 @@ impl Dataset {
         self.with_session_mut(|session, path| session.set_dataset_attr(path, name, value))
     }
 
-    /// Remove a compact attribute from this dataset, staged until
-    /// [`File::commit`]. See [`set_attr`](Self::set_attr) for the file-mode rules.
+    /// Remove an attribute from this dataset, staged until [`File::commit`].
+    /// See [`set_attr`](Self::set_attr) for the file-mode rules.
     pub fn remove_attr(&mut self, name: &str) -> Result<(), Error> {
         self.with_session_mut(|session, path| session.remove_dataset_attr(path, name))
     }
