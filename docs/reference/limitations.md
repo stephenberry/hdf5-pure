@@ -93,6 +93,8 @@ The writer emits the same heap geometry the reference C library uses for an attr
 - An attribute whose **name, datatype, or dataspace** serializes past **65,535 bytes** is refused with `FormatError::AttributeFieldTooLong`, naming the attribute and the field. Each has a 2-byte length field in the attribute message, and huge storage lifts the limit on an attribute's data, not on the fields that describe it.
 - About a terabyte of *managed* attributes on one object is refused with `FormatError::DenseAttributeHeapTooLarge`: the heap's offsets are 40 bits wide, so its blocks cannot span more than that between them.
 
+The [in-place editor](../guide/editing.md) emits the same storage through the same builder: an attribute edit that outgrows the object header moves the whole set to a heap, an object already using one is rebuilt around the edit, and a dataset or group created in place may carry one ([#102](https://github.com/stephenberry/hdf5-pure/issues/102)). Three things are refused there rather than written: an attribute holding an object reference a commit could still repoint is not moved out of the header, a shared (SOHM) attribute message is not rewritten, and the heap's own bounds above apply as they do to the whole-file writer. The heap a rebuild supersedes is left as dead bytes for `repack`, like every dense heap this editor replaces.
+
 The *total* is otherwise not limited, and it no longer rounds the whole heap up to a power of two: the table adds blocks rather than growing one. Space is still lost per block, though. An attribute that does not fit what remains of a block moves to the next one, and an attribute just over half of the largest block's size leaves most of a block unused, so a set of such attributes can still occupy close to twice its own size. The writer only ever appends to the block it filled last; it does not go back and reuse an earlier block's remainder the way the reference C library's free-space manager does.
 
 ### Group creation property list (GCPL)
@@ -107,7 +109,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 
 | Capability | Tracking |
 |---|---|
-| **Dense** (fractal-heap) **link** storage — a group with more links than it keeps compactly. Dense **attribute** storage is supported: an attribute edit that outgrows the object header moves the whole set to a heap, an object already using one is rebuilt, and an object created in place may carry one ([#102](https://github.com/stephenberry/hdf5-pure/issues/102)) | [#102](https://github.com/stephenberry/hdf5-pure/issues/102) |
+| **Dense** (fractal-heap) **link** storage — a group with more links than it keeps compactly | [#102](https://github.com/stephenberry/hdf5-pure/issues/102) |
 | Editing across **soft / external links** | [#103](https://github.com/stephenberry/hdf5-pure/issues/103) |
 | Creation-order tracking, shared/SOHM messages, copying a **version-1** object | [#104](https://github.com/stephenberry/hdf5-pure/issues/104) |
 | Adding **chunked/extensible variable-length-string** datasets | [#105](https://github.com/stephenberry/hdf5-pure/issues/105) |

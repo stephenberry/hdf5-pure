@@ -66,7 +66,7 @@ const MSG_SHARED: u8 = 0x02;
 const MSG_DONTSHARE: u8 = 0x04;
 
 /// Threshold for switching from compact (inline) to dense attribute storage.
-const DENSE_ATTR_THRESHOLD: usize = 8;
+pub(crate) const DENSE_ATTR_THRESHOLD: usize = 8;
 
 /// Round `value` up to the next multiple of `page` (a power of two). Used by the
 /// paged file-space writer to page-align region starts and the end-of-allocation.

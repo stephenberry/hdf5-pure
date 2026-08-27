@@ -847,7 +847,7 @@ fn add_variable_length_root_attribute_via_edit_session() {
 fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
     // A Set/Remove/Set sequence for the same name in one commit must leave
     // only the final value, whether or not the intermediate states are
-    // variable-length — exercising `apply_group_attr_ops`'s pending-VL-attr
+    // variable-length — exercising `apply_compact_attr_ops`'s pending-VL-attr
     // bookkeeping (a plain region edit alone cannot represent an unresolved
     // variable-length attribute).
     let path = temp_path("hdf5_pure_edit_vlen_group_attr_sequence.h5");
@@ -895,7 +895,7 @@ fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
 
 /// A `Set` with a variable-length value must correctly drop a *fixed-size*
 /// on-disk attribute of the same name, not just an existing pending
-/// variable-length one: `apply_group_attr_ops`'s `remove_attr_from_region`
+/// variable-length one: `apply_compact_attr_ops`'s `remove_attr_from_region`
 /// call is otherwise only exercised by the plain `Remove` op, never by a
 /// variable-length `Set` replacing a fixed-size value.
 #[test]
