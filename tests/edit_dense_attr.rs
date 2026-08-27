@@ -19,7 +19,7 @@ use hdf5_pure::{
 use tempfile::tempdir;
 
 mod common;
-use common::heap::has_fractal_heap;
+use common::heap::{frhp_offsets, has_fractal_heap};
 
 /// Past the writer's eight-attribute compact threshold.
 const DENSE_COUNT: usize = 12;
@@ -234,7 +234,22 @@ fn removing_one_dense_attribute_keeps_the_rest() {
 fn removing_every_dense_attribute_leaves_an_object_with_none() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("d.h5");
-    write_dense(&p);
+    // Only the dataset is dense here, so the heaps in the file can be counted:
+    // `write_dense`'s group would contribute one of its own.
+    {
+        let mut b = FileBuilder::new();
+        let ds = b.create_dataset("d");
+        ds.with_i32_data(&[1, 2, 3, 4]);
+        for (i, name) in dense_names().into_iter().enumerate() {
+            ds.set_attr(&name, AttrValue::I64(i as i64));
+        }
+        b.write(&p).unwrap();
+    }
+    let heaps_before = frhp_offsets(&std::fs::read(&p).unwrap()).len();
+    assert_eq!(
+        heaps_before, 1,
+        "the fixture has exactly one attribute heap"
+    );
 
     {
         let s = File::open_rw(&p).unwrap();
@@ -245,12 +260,18 @@ fn removing_every_dense_attribute_leaves_an_object_with_none() {
         s.commit().unwrap();
     }
 
+    // An object with no attributes carries no Attribute Info message and no heap
+    // — an *empty* heap would read back as zero attributes just the same, which
+    // is why the count is what says which of the two was written. The one still
+    // in the file is the superseded heap the rebuild left behind.
+    assert!(
+        frhp_offsets(&std::fs::read(&p).unwrap()).len() <= heaps_before,
+        "removing the last attribute must not build a heap to hold none",
+    );
     let f = File::open(&p).unwrap();
     let d = f.dataset("d").unwrap();
     assert!(d.attrs().unwrap().is_empty());
     assert_eq!(d.read_i32().unwrap(), vec![1, 2, 3, 4]);
-    // An object with no attributes carries no Attribute Info message at all, so
-    // the C library must report a count of zero rather than an empty heap.
     let c = hdf5::File::open(&p).unwrap();
     assert_eq!(c.dataset("d").unwrap().attr_names().unwrap().len(), 0);
 }

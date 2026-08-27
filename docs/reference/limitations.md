@@ -82,7 +82,7 @@ A version 2 object header describes each message's length in a 2-byte field, so 
 
 An attribute that would exceed the limit is not refused, though: it selects fractal-heap storage instead, where no such field bounds it. See [dense attribute storage](#dense-attribute-storage) below. `AttributeMessageTooLarge` is therefore a backstop no input reaches today — the writer sends exactly those attributes to a heap — kept because the limit it describes is a real property of the object header. Only `ObjectHeaderMessageTooLarge`, which covers messages with no heap alternative, is reachable on size.
 
-The [in-place editor](../guide/editing.md) enforces the same limit separately, reporting `Error::EditUnsupported`.
+The [in-place editor](../guide/editing.md) answers the limit the same way: an attribute whose message would exceed it is written to a heap rather than refused, and the messages with no heap alternative are refused with `Error::EditUnsupported`. What no storage lifts is the 2-byte *field* inside the attribute message that describes its name, datatype or dataspace — `FormatError::AttributeFieldTooLong`, on either path.
 
 ### Dense attribute storage
 

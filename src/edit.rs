@@ -10946,6 +10946,10 @@ fn plan_attr_ops<S: Source + ?Sized>(
     // none of them, nor the Attribute Info message naming the storage they were
     // in.
     let region = strip_attr_messages(region)?;
+    // No attributes left: the header carries neither an Attribute message nor an
+    // Attribute Info one. `append_dense_attrs` would decline to build a heap for
+    // an empty set anyway; saying `None` here is what makes that a property of
+    // this decision rather than of the emitter that carries it out.
     if set.is_empty() {
         return Ok(AttrEdits {
             region,
