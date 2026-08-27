@@ -244,6 +244,16 @@ pub(crate) mod ndarray_support;
 pub use error::Error;
 pub use error::{FormatError, OBJECT_HEADER_MESSAGE_MAX};
 
+// Reached by value through `File::superblock` and `Error::MissingMessage`, so
+// exported alongside them rather than left nameless — see the public API surface
+// section of CLAUDE.md, and `scripts/check-api-surface.sh`, which enforces it.
+#[cfg(feature = "std")]
+pub use address::BaseAddress;
+#[cfg(feature = "std")]
+pub use message_type::MessageType;
+#[cfg(feature = "std")]
+pub use superblock::Superblock;
+
 #[cfg(feature = "std")]
 pub use reader::{
     Dataset, DatasetAccessProperties, File, FileAccessProperties, Group, Object, StagedGroup,

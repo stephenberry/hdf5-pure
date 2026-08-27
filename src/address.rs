@@ -65,17 +65,19 @@
 
 use crate::error::FormatError;
 
-/// The superblock's base address: the byte offset at which the HDF5 image
-/// begins within the file.
+/// The byte offset at which a file's HDF5 image begins, as reported by
+/// [`Superblock::base_address`](crate::Superblock::base_address).
 ///
-/// Zero for a plain file, and the userblock size for a file that has one. See
-/// the [module documentation](self) for why this is a type rather than a `u64`.
+/// Zero for a plain file, and the userblock size for a file that has one — 512
+/// bytes for every `.mat` file this crate writes. Every address stored in a
+/// file's metadata is relative to it, so an absolute position in the file is
+/// the stored address plus this. [`get`](Self::get) is the number.
 ///
-/// `pub` rather than `pub(crate)` only because
-/// [`Superblock`](crate::superblock::Superblock) names it in a `pub` field and
-/// that struct lives in a `pub(crate)` module. It is not re-exported from
-/// `lib.rs`, so it is no part of the crate's public API; its members stay
-/// `pub(crate)`.
+/// It is a type of its own rather than a `u64` because the base and the
+/// addresses it shifts are both file offsets that mean different things, and
+/// mixing them is a defect this crate hit three separate times: a reader that
+/// forgets the base lands inside the userblock, and every test written against
+/// a file without one passes anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BaseAddress(u64);
 
@@ -94,9 +96,9 @@ impl BaseAddress {
         Self(base)
     }
 
-    /// The base as a plain integer, for serialization and for the arithmetic
-    /// that is neither of the two conversions below.
-    pub(crate) const fn get(self) -> u64 {
+    /// The base as a plain integer: zero for a plain file, the userblock size
+    /// for a file that has one.
+    pub const fn get(self) -> u64 {
         self.0
     }
 
