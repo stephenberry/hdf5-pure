@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-08-27
+
+Variable-length string attributes and oversized attribute sets both work now. `AttrValue::VarLenString` and its three siblings write the standard variable-length string datatype (`H5T_STRING` with `STRSIZE = H5T_VARIABLE`), the one h5py and the reference C library write, where the only variable-length attribute this crate produced before was MATLAB's sequence-of-one-byte-strings shape ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)). `Group::set_attr` and `Dataset::set_attr` write an attribute set the object header cannot hold into a fractal heap on `commit`, and rebuild an object that already stores its attributes in one, where both were refused ([#102](https://github.com/stephenberry/hdf5-pure/issues/102)). Three types the API hands back without exporting are now exported, `Superblock`, `MessageType` and `BaseAddress`, which makes `File::superblock().base_address` usable as a number again after 0.40.0 changed it to a type with no public accessor ([#323](https://github.com/stephenberry/hdf5-pure/issues/323)). **Breaking:** a variable-length string attribute reads back as a `VarLenString` variant rather than as the fixed-width variant of its charset and arity, `AttrValue::VarLenAsciiArray` is renamed `VarLenAsciiCharArray`, and `Superblock::serialize` is internal.
+
 ### Added
 
 - `AttrValue::VarLenString`, `VarLenStringArray`, `VarLenAsciiString` and `VarLenAsciiStringArray` write an attribute in the standard variable-length string datatype (`H5T_STRING` with `STRSIZE = H5T_VARIABLE`), the one h5py and the reference C library write; `VarLenAsciiCharArray` still writes MATLAB's sequence-of-one-byte-strings shape ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
@@ -825,7 +829,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.40.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.41.0...HEAD
+[0.41.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.36.0...v0.38.0
