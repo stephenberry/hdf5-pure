@@ -407,10 +407,21 @@ fn a_committed_datatype_attribute_stages_its_heap() {
         }),
     };
 
+    // A fixed-width string under a committed datatype is the other side of the
+    // same decision: it must keep taking the verbatim path, since staging a heap
+    // for it would replace its padded bytes with heap references.
+    let fixed = Datatype::String {
+        size: 6,
+        padding: StringPadding::NullPad,
+        charset: CharacterSet::Ascii,
+    };
+
     let mut b = FileBuilder::new();
     b.commit_datatype("vlstr", standard);
     b.commit_datatype("vlchar", matlab);
+    b.commit_datatype("class", fixed);
     b.create_dataset("d").with_f64_data(&[1.0]);
+    b.set_attr_committed("class", AttrValue::AsciiString("double".into()), "/class");
     b.set_attr_committed("units", AttrValue::VarLenString("m/s".into()), "/vlstr");
     b.set_attr_committed(
         "fields",
@@ -429,6 +440,11 @@ fn a_committed_datatype_attribute_stages_its_heap() {
     assert_eq!(
         attrs.get("fields"),
         Some(&AttrValue::VarLenAsciiArray(vec!["a".into(), "bb".into()]))
+    );
+    assert_eq!(
+        attrs.get("class"),
+        Some(&AttrValue::AsciiString("double".into())),
+        "a fixed-width committed attribute keeps its own bytes"
     );
     drop(f);
 
