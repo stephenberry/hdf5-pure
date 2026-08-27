@@ -16,7 +16,7 @@ use temp_fixture::temp_path;
 /// what the reader reports. While a variable-length array read as a
 /// fixed-width one, repack kept the strings and silently re-encoded the
 /// layout — which is the encoding MATLAB and matio require for
-/// `MATLAB_fields`. Only the VLEN read path yields `VarLenAsciiArray`, so
+/// `MATLAB_fields`. Only the VLEN read path yields `VarLenAsciiCharArray`, so
 /// asserting the variant asserts the encoding, not just the values.
 #[test]
 fn carries_a_variable_length_attribute_without_re_encoding_it() {
@@ -25,10 +25,10 @@ fn carries_a_variable_length_attribute_without_re_encoding_it() {
     let fields: Vec<String> = vec!["x".into(), "y".into(), "velocity".into()];
     let mut b = FileBuilder::new();
     b.create_dataset("x").with_f64_data(&[1.0]);
-    b.set_attr("fields", AttrValue::VarLenAsciiArray(fields.clone()));
+    b.set_attr("fields", AttrValue::VarLenAsciiCharArray(fields.clone()));
     let mut g = b.create_group("grp");
     g.create_dataset("inner").with_f64_data(&[2.0]);
-    g.set_attr("fields", AttrValue::VarLenAsciiArray(fields.clone()));
+    g.set_attr("fields", AttrValue::VarLenAsciiCharArray(fields.clone()));
     b.add_group(g.finish());
     b.write(&src).unwrap();
 
@@ -37,12 +37,12 @@ fn carries_a_variable_length_attribute_without_re_encoding_it() {
     let f = hdf5_pure::File::open(&dst).unwrap();
     assert_eq!(
         f.root().attrs().unwrap().get("fields"),
-        Some(&AttrValue::VarLenAsciiArray(fields.clone())),
+        Some(&AttrValue::VarLenAsciiCharArray(fields.clone())),
         "root attribute must stay variable-length"
     );
     assert_eq!(
         f.group("grp").unwrap().attrs().unwrap().get("fields"),
-        Some(&AttrValue::VarLenAsciiArray(fields)),
+        Some(&AttrValue::VarLenAsciiCharArray(fields)),
         "group attribute must stay variable-length"
     );
 }

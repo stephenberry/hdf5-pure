@@ -804,7 +804,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
         AttrValue::AsciiStringArraySized { values, width } => {
             fixed_string_array_attr(name, values, Some(*width), CharacterSet::Ascii)
         }
-        AttrValue::VarLenAsciiArray(values) => {
+        AttrValue::VarLenAsciiCharArray(values) => {
             vlen_string_array_attr(name, values, make_matlab_vlen_ascii_type())
         }
         AttrValue::VarLenString(value) => vlen_string_scalar_attr(name, value, CharacterSet::Utf8),
@@ -1401,7 +1401,7 @@ pub(crate) fn simple_1d(n: u64) -> Dataspace {
 /// [`VarLenAsciiString`](AttrValue::VarLenAsciiString) variants write the
 /// standard `H5T_STRING` with `STRSIZE = H5T_VARIABLE`, which is what h5py and
 /// the reference C library write and read;
-/// [`VarLenAsciiArray`](AttrValue::VarLenAsciiArray) writes MATLAB's sequence
+/// [`VarLenAsciiCharArray`](AttrValue::VarLenAsciiCharArray) writes MATLAB's sequence
 /// of one-byte strings over identical element bytes (issue #383). Both keep
 /// their strings in a global heap collection rather than in the attribute
 /// message.
@@ -1505,18 +1505,18 @@ pub enum AttrValue {
         /// The declared `STRSIZE`, in bytes, shared by every element.
         width: NonZeroU32,
     },
-    /// Array of variable-length ASCII strings in MATLAB's shape:
-    /// `H5T_VLEN { H5T_STRING { STRSIZE = 1, NULLTERM, ASCII } }`, a sequence of
-    /// one-byte strings. MATLAB v7.3 and matio expect `MATLAB_fields` and its
-    /// neighbours in exactly this datatype.
+    /// Array of variable-length ASCII **char sequences** in MATLAB's shape:
+    /// `H5T_VLEN { H5T_STRING { STRSIZE = 1, NULLTERM, ASCII } }`. Each element
+    /// is a sequence of one-byte strings rather than one variable-length string,
+    /// and MATLAB v7.3 and matio expect `MATLAB_fields` and its neighbours in
+    /// exactly this datatype.
     ///
-    /// Not the standard variable-length string, which is a `H5T_STRING` of
-    /// variable size rather than a sequence: that is
-    /// [`VarLenAsciiStringArray`](AttrValue::VarLenAsciiStringArray), whose
-    /// element bytes are identical and whose datatype is what h5py and the
-    /// reference C library write. Both need a global heap collection in the
-    /// file.
-    VarLenAsciiArray(Vec<String>),
+    /// For the standard variable-length string — a `H5T_STRING` of variable size,
+    /// which is what h5py and the reference C library write — reach for
+    /// [`VarLenAsciiStringArray`](AttrValue::VarLenAsciiStringArray) instead.
+    /// Its element bytes are identical to these; only the datatype differs. Both
+    /// need a global heap collection in the file.
+    VarLenAsciiCharArray(Vec<String>),
     /// A variable-length UTF-8 string: `H5T_STRING` with
     /// `STRSIZE = H5T_VARIABLE`, `NULLTERM`, `CSET = UTF-8`.
     ///
@@ -1547,7 +1547,7 @@ pub enum AttrValue {
     /// `H5T_STRING`/`STRSIZE = H5T_VARIABLE` datatype. The one-dimensional form
     /// of [`VarLenAsciiString`](AttrValue::VarLenAsciiString).
     ///
-    /// [`VarLenAsciiArray`](AttrValue::VarLenAsciiArray) writes MATLAB's
+    /// [`VarLenAsciiCharArray`](AttrValue::VarLenAsciiCharArray) writes MATLAB's
     /// sequence-of-one-byte-strings shape over the same element bytes.
     VarLenAsciiStringArray(Vec<String>),
 }
@@ -1758,7 +1758,7 @@ impl AttrValue {
             | Self::VarLenAsciiString(s) => Some(core::slice::from_ref(s)),
             Self::StringArray(v)
             | Self::AsciiStringArray(v)
-            | Self::VarLenAsciiArray(v)
+            | Self::VarLenAsciiCharArray(v)
             | Self::VarLenStringArray(v)
             | Self::VarLenAsciiStringArray(v)
             | Self::StringArraySized { values: v, .. }
@@ -1778,7 +1778,7 @@ impl AttrValue {
     /// emit its placeholder addresses as though they were real ones.
     pub(crate) fn var_len_strings(&self) -> Option<&[String]> {
         match self {
-            Self::VarLenAsciiArray(v)
+            Self::VarLenAsciiCharArray(v)
             | Self::VarLenStringArray(v)
             | Self::VarLenAsciiStringArray(v) => Some(v),
             Self::VarLenString(s) | Self::VarLenAsciiString(s) => Some(core::slice::from_ref(s)),
@@ -1948,7 +1948,7 @@ impl AttrValue {
             Self::AsciiStringSized { .. } => "sized_ascii_string",
             Self::AsciiStringArray(_) => "ascii_string[]",
             Self::AsciiStringArraySized { .. } => "sized_ascii_string[]",
-            Self::VarLenAsciiArray(_) => "vlen_ascii_char[]",
+            Self::VarLenAsciiCharArray(_) => "vlen_ascii_char[]",
             Self::VarLenString(_) => "vlen_string",
             Self::VarLenStringArray(_) => "vlen_string[]",
             Self::VarLenAsciiString(_) => "vlen_ascii_string",
@@ -2007,7 +2007,7 @@ impl fmt::Display for AttrValue {
             Self::U64Array(v) => write_elements(f, v),
             Self::StringArray(v)
             | Self::AsciiStringArray(v)
-            | Self::VarLenAsciiArray(v)
+            | Self::VarLenAsciiCharArray(v)
             | Self::VarLenStringArray(v)
             | Self::VarLenAsciiStringArray(v)
             | Self::StringArraySized { values: v, .. }
@@ -3247,7 +3247,7 @@ impl DatasetBuilder {
 /// }
 ///
 /// // Attribute set after all children are created
-/// grp.set_attr("MATLAB_fields", AttrValue::VarLenAsciiArray(fields));
+/// grp.set_attr("MATLAB_fields", AttrValue::VarLenAsciiCharArray(fields));
 /// builder.add_group(grp.finish());
 /// ```
 pub struct GroupBuilder {
@@ -3412,7 +3412,7 @@ mod attr_value_accessor_tests {
             AttrValue::AsciiString("double".into()),
             AttrValue::StringArray(vec!["double".into()]),
             AttrValue::AsciiStringArray(vec!["double".into()]),
-            AttrValue::VarLenAsciiArray(vec!["double".into()]),
+            AttrValue::VarLenAsciiCharArray(vec!["double".into()]),
             AttrValue::string_sized("double", 32).unwrap(),
             AttrValue::ascii_string_sized("double", 32).unwrap(),
             AttrValue::string_array_sized(vec!["double".into()], 32).unwrap(),
@@ -3429,7 +3429,7 @@ mod attr_value_accessor_tests {
         for value in [
             AttrValue::StringArray(vec!["a".into(), "b".into()]),
             AttrValue::AsciiStringArray(vec!["a".into(), "b".into()]),
-            AttrValue::VarLenAsciiArray(vec![]),
+            AttrValue::VarLenAsciiCharArray(vec![]),
             AttrValue::string_array_sized(vec!["a".into(), "b".into()], 8).unwrap(),
             AttrValue::ascii_string_array_sized(vec![], 8).unwrap(),
             AttrValue::F64(1.5),
@@ -3461,7 +3461,7 @@ mod attr_value_accessor_tests {
         for value in [
             AttrValue::StringArray(fields.clone()),
             AttrValue::AsciiStringArray(fields.clone()),
-            AttrValue::VarLenAsciiArray(fields.clone()),
+            AttrValue::VarLenAsciiCharArray(fields.clone()),
             AttrValue::string_array_sized(fields.clone(), 16).unwrap(),
             AttrValue::ascii_string_array_sized(fields.clone(), 16).unwrap(),
         ] {
@@ -3733,7 +3733,7 @@ mod attr_value_display_tests {
             AttrValue::ascii_string_sized("", 4).unwrap(),
             AttrValue::AsciiStringArray(vec![]),
             AttrValue::ascii_string_array_sized(vec![], 4).unwrap(),
-            AttrValue::VarLenAsciiArray(vec![]),
+            AttrValue::VarLenAsciiCharArray(vec![]),
             AttrValue::VarLenString(String::new()),
             AttrValue::VarLenStringArray(vec![]),
             AttrValue::VarLenAsciiString(String::new()),
@@ -3755,7 +3755,7 @@ mod attr_value_display_tests {
                 AttrValue::StringSized { .. } | AttrValue::StringArraySized { .. } => {}
                 AttrValue::AsciiString(_) | AttrValue::AsciiStringArray(_) => {}
                 AttrValue::AsciiStringSized { .. } | AttrValue::AsciiStringArraySized { .. } => {}
-                AttrValue::VarLenAsciiArray(_) => {}
+                AttrValue::VarLenAsciiCharArray(_) => {}
                 AttrValue::VarLenString(_) | AttrValue::VarLenStringArray(_) => {}
                 AttrValue::VarLenAsciiString(_) | AttrValue::VarLenAsciiStringArray(_) => {}
             }

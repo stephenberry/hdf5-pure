@@ -8,7 +8,7 @@
 //! library and this crate's own `DatasetBuilder::with_vlen_strings` write, and
 //! before `AttrValue::VarLenString` and its three siblings no `AttrValue`
 //! originated it: the only variable-length attribute variant was
-//! `VarLenAsciiArray`, which writes MATLAB's `H5T_VLEN { H5T_STRING { STRSIZE
+//! `VarLenAsciiCharArray`, which writes MATLAB's `H5T_VLEN { H5T_STRING { STRSIZE
 //! = 1 } }` sequence instead. (`repack` already carried a C-written one across
 //! verbatim; nothing could write one from a value.) The element bytes are the
 //! same either way, so every assertion here is about the datatype the reader is
@@ -159,7 +159,7 @@ fn the_matlab_shape_keeps_its_own_datatype() {
 
     let mut b = FileBuilder::new();
     b.create_dataset("d").with_f64_data(&[1.0]);
-    b.set_attr("matlab", AttrValue::VarLenAsciiArray(words.clone()));
+    b.set_attr("matlab", AttrValue::VarLenAsciiCharArray(words.clone()));
     b.set_attr("standard", AttrValue::VarLenAsciiStringArray(words.clone()));
     b.write(&path).unwrap();
 
@@ -189,7 +189,7 @@ fn the_matlab_shape_keeps_its_own_datatype() {
     let attrs = f.root().attrs().unwrap();
     assert_eq!(
         attrs.get("matlab"),
-        Some(&AttrValue::VarLenAsciiArray(words.clone()))
+        Some(&AttrValue::VarLenAsciiCharArray(words.clone()))
     );
     assert_eq!(
         attrs.get("standard"),
@@ -425,7 +425,7 @@ fn a_committed_datatype_attribute_stages_its_heap() {
     b.set_attr_committed("units", AttrValue::VarLenString("m/s".into()), "/vlstr");
     b.set_attr_committed(
         "fields",
-        AttrValue::VarLenAsciiArray(vec!["a".into(), "bb".into()]),
+        AttrValue::VarLenAsciiCharArray(vec!["a".into(), "bb".into()]),
         "/vlchar",
     );
     b.write(&path).unwrap();
@@ -439,7 +439,10 @@ fn a_committed_datatype_attribute_stages_its_heap() {
     );
     assert_eq!(
         attrs.get("fields"),
-        Some(&AttrValue::VarLenAsciiArray(vec!["a".into(), "bb".into()]))
+        Some(&AttrValue::VarLenAsciiCharArray(vec![
+            "a".into(),
+            "bb".into()
+        ]))
     );
     assert_eq!(
         attrs.get("class"),

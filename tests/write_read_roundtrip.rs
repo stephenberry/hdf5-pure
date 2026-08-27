@@ -798,7 +798,7 @@ fn roundtrip_varlen_ascii_array_attr() {
     let mut builder = FileBuilder::new();
     builder.set_attr(
         "MATLAB_fields",
-        AttrValue::VarLenAsciiArray(vec!["x".into(), "y".into(), "z".into()]),
+        AttrValue::VarLenAsciiCharArray(vec!["x".into(), "y".into(), "z".into()]),
     );
     builder.create_dataset("x").with_f64_data(&[1.0]);
     let bytes = builder.finish().unwrap();
@@ -961,7 +961,7 @@ fn roundtrip_varlen_ascii_on_nested_group() {
     grp.set_attr("MATLAB_class", AttrValue::AsciiString("struct".into()));
     grp.set_attr(
         "MATLAB_fields",
-        AttrValue::VarLenAsciiArray(vec!["x".into(), "y".into()]),
+        AttrValue::VarLenAsciiCharArray(vec!["x".into(), "y".into()]),
     );
     builder.add_group(grp.finish());
 

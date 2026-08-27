@@ -2231,7 +2231,7 @@ mod attribute_fidelity_tests {
         // Bulk that only the source carries, so the destination's heap cannot
         // land at the source's address by coincidence.
         b.create_dataset("bulk").with_f64_data(&vec![0.0; 4096]);
-        b.set_attr("fields", AttrValue::VarLenAsciiArray(fields.clone()));
+        b.set_attr("fields", AttrValue::VarLenAsciiCharArray(fields.clone()));
         b.write(&src).unwrap();
 
         repack(&src, &dst, &RepackOptions::new().drop_path("bulk")).unwrap();
@@ -2249,7 +2249,7 @@ mod attribute_fidelity_tests {
         );
         assert_eq!(
             File::open(&dst).unwrap().root().attrs().unwrap()["fields"],
-            AttrValue::VarLenAsciiArray(fields),
+            AttrValue::VarLenAsciiCharArray(fields),
             "and it must still resolve to its own strings"
         );
     }

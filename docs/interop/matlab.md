@@ -373,7 +373,7 @@ Nothing in a v7.3 userblock depends on the file that follows it, so it can be em
 
 ### Struct pattern
 
-A MATLAB struct is an HDF5 group carrying `MATLAB_class = "struct"` and a `MATLAB_fields` list naming its fields, with each field a child dataset that carries its own `MATLAB_class`. Use `AttrValue::AsciiString` for the fixed-length ASCII class names and `AttrValue::VarLenAsciiArray` for the variable-length field-name array. Not `AttrValue::VarLenAsciiStringArray`, which writes the *standard* variable-length string datatype: MATLAB expects the sequence-of-one-byte-strings shape here.
+A MATLAB struct is an HDF5 group carrying `MATLAB_class = "struct"` and a `MATLAB_fields` list naming its fields, with each field a child dataset that carries its own `MATLAB_class`. Use `AttrValue::AsciiString` for the fixed-length ASCII class names and `AttrValue::VarLenAsciiCharArray` for the variable-length field-name array. Not `AttrValue::VarLenAsciiStringArray`, which writes the *standard* variable-length string datatype: MATLAB expects the sequence-of-one-byte-strings shape here.
 
 ```rust
 use hdf5_pure::{FileBuilder, AttrValue};
@@ -389,7 +389,7 @@ for (name, data) in [("x", vec![1.0, 2.0]), ("y", vec![3.0, 4.0])] {
 }
 
 grp.set_attr("MATLAB_class", AttrValue::AsciiString("struct".into()));
-grp.set_attr("MATLAB_fields", AttrValue::VarLenAsciiArray(fields));
+grp.set_attr("MATLAB_fields", AttrValue::VarLenAsciiCharArray(fields));
 builder.add_group(grp.finish());
 ```
 

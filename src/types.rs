@@ -220,7 +220,7 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
 ///   `np.bool_` attributes arrive, written as `enum[FALSE, TRUE]`: as `0`/`1` of
 ///   the base type's width.
 /// - **A scalar in MATLAB's sequence-of-one-byte-strings shape.** Its array
-///   form reads as [`VarLenAsciiArray`](AttrValue::VarLenAsciiArray), which is
+///   form reads as [`VarLenAsciiCharArray`](AttrValue::VarLenAsciiCharArray), which is
 ///   the form MATLAB writes; a scalar in that shape has no variant and reads as
 ///   [`AsciiString`](AttrValue::AsciiString), which writes a fixed-width slot.
 ///   A *standard* variable-length string keeps its datatype at either arity
@@ -347,7 +347,7 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
                     Some(AttrValue::AsciiString(one_or_empty(strings)))
                 }
                 (VlenStringShape::AsciiCharSequence, false) => {
-                    Some(AttrValue::VarLenAsciiArray(strings))
+                    Some(AttrValue::VarLenAsciiCharArray(strings))
                 }
                 (VlenStringShape::Ascii, true) => {
                     Some(AttrValue::VarLenAsciiString(one_or_empty(strings)))
@@ -446,7 +446,7 @@ fn narrow_elements<S: Copy, T: TryFrom<S>>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VlenStringShape {
     /// A VLEN *sequence* of 1-byte ASCII strings — the encoding MATLAB and matio
-    /// use, and the one this crate writes for [`AttrValue::VarLenAsciiArray`].
+    /// use, and the one this crate writes for [`AttrValue::VarLenAsciiCharArray`].
     AsciiCharSequence,
     /// A true variable-length ASCII string (`H5T_STRING`, `STRSIZE = VAR`),
     /// written by [`AttrValue::VarLenAsciiString`] and its array form.
@@ -635,10 +635,13 @@ mod tests {
                 "ascii_two",
                 AttrValue::AsciiStringArray(vec!["double".into(), "int16".into()]),
             ),
-            ("vlen_one", AttrValue::VarLenAsciiArray(vec!["x".into()])),
+            (
+                "vlen_one",
+                AttrValue::VarLenAsciiCharArray(vec!["x".into()]),
+            ),
             (
                 "vlen_three",
-                AttrValue::VarLenAsciiArray(vec!["x".into(), "y".into(), "velocity".into()]),
+                AttrValue::VarLenAsciiCharArray(vec!["x".into(), "y".into(), "velocity".into()]),
             ),
             // The standard variable-length string, whose datatype the MATLAB
             // shape above does not write (#383). Charset and arity separate the
@@ -924,7 +927,7 @@ mod tests {
         };
 
         // What MATLAB and matio write, and what this crate writes for
-        // `AttrValue::VarLenAsciiArray`.
+        // `AttrValue::VarLenAsciiCharArray`.
         assert_eq!(
             vlen_string_shape(false, &char_base, None),
             VlenStringShape::AsciiCharSequence
@@ -1088,7 +1091,10 @@ mod tests {
         let read = round_trip(&[
             ("scalar", AttrValue::AsciiString("double".into())),
             ("one", AttrValue::StringArray(vec!["double".into()])),
-            ("vlen", AttrValue::VarLenAsciiArray(vec!["double".into()])),
+            (
+                "vlen",
+                AttrValue::VarLenAsciiCharArray(vec!["double".into()]),
+            ),
             ("vlen_std", AttrValue::VarLenAsciiString("double".into())),
             (
                 "vlen_std_one",

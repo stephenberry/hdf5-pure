@@ -15,11 +15,11 @@ use hdf5_pure::{AttrValue, Error, File, FileBuilder, FormatError, OBJECT_HEADER_
 mod common;
 use common::heap::has_fractal_heap;
 
-/// A `VarLenAsciiArray` past the message-size limit: each element contributes a
+/// A `VarLenAsciiCharArray` past the message-size limit: each element contributes a
 /// 16-byte global-heap reference, so ~4,100 elements cross it. This is the shape
 /// from the issue report, where the attribute silently disappeared.
 fn oversized_vlen() -> AttrValue {
-    AttrValue::VarLenAsciiArray((0..4_200).map(|i| format!("s{i}")).collect())
+    AttrValue::VarLenAsciiCharArray((0..4_200).map(|i| format!("s{i}")).collect())
 }
 
 /// A fixed-width string array past the message-size limit. No variable-length
@@ -35,7 +35,7 @@ fn oversized_fixed() -> AttrValue {
 #[track_caller]
 fn strings(attrs: &std::collections::HashMap<String, AttrValue>, name: &str) -> Vec<String> {
     match attrs.get(name) {
-        Some(AttrValue::VarLenAsciiArray(v) | AttrValue::StringArray(v)) => v.clone(),
+        Some(AttrValue::VarLenAsciiCharArray(v) | AttrValue::StringArray(v)) => v.clone(),
         other => panic!("expected an array-of-strings attribute {name:?}, got {other:?}"),
     }
 }
@@ -47,7 +47,7 @@ fn strings(attrs: &std::collections::HashMap<String, AttrValue>, name: &str) -> 
 #[test]
 fn root_vlen_attr_past_the_limit_moves_to_heap_storage() {
     let expected = match oversized_vlen() {
-        AttrValue::VarLenAsciiArray(v) => v,
+        AttrValue::VarLenAsciiCharArray(v) => v,
         other => panic!("fixture changed shape: {other:?}"),
     };
 
@@ -142,7 +142,7 @@ fn a_small_vlen_attribute_swept_into_the_heap_keeps_its_values() {
     builder.set_attr("big", oversized_fixed());
     builder.set_attr(
         "labels",
-        AttrValue::VarLenAsciiArray(vec!["a".to_string(), "b".to_string()]),
+        AttrValue::VarLenAsciiCharArray(vec!["a".to_string(), "b".to_string()]),
     );
     builder.create_dataset("x").with_f64_data(&[1.0]);
 
@@ -184,13 +184,13 @@ fn large_but_fitting_attrs_still_round_trip() {
     let expected = labels.clone();
 
     let mut builder = FileBuilder::new();
-    builder.set_attr("labels", AttrValue::VarLenAsciiArray(labels.clone()));
+    builder.set_attr("labels", AttrValue::VarLenAsciiCharArray(labels.clone()));
     builder
         .create_dataset("x")
         .with_f64_data(&[1.0])
-        .set_attr("labels", AttrValue::VarLenAsciiArray(labels.clone()));
+        .set_attr("labels", AttrValue::VarLenAsciiCharArray(labels.clone()));
     let mut group = builder.create_group("g");
-    group.set_attr("labels", AttrValue::VarLenAsciiArray(labels));
+    group.set_attr("labels", AttrValue::VarLenAsciiCharArray(labels));
     group.create_dataset("y").with_f64_data(&[2.0]);
     builder.add_group(group.finish());
 

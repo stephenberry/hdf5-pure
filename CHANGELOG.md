@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `AttrValue::VarLenString`, `VarLenStringArray`, `VarLenAsciiString` and `VarLenAsciiStringArray` write an attribute in the standard variable-length string datatype (`H5T_STRING` with `STRSIZE = H5T_VARIABLE`), the one h5py and the reference C library write; `VarLenAsciiArray` still writes MATLAB's sequence-of-one-byte-strings shape ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
+- `AttrValue::VarLenString`, `VarLenStringArray`, `VarLenAsciiString` and `VarLenAsciiStringArray` write an attribute in the standard variable-length string datatype (`H5T_STRING` with `STRSIZE = H5T_VARIABLE`), the one h5py and the reference C library write; `VarLenAsciiCharArray` still writes MATLAB's sequence-of-one-byte-strings shape ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
 - `Group::set_attr` and `Dataset::set_attr` write an attribute set the object header cannot hold — more than eight attributes, or one whose message overflows its 2-byte size field — into a fractal heap on `commit`, and rebuild an object that already stores its attributes in one, where both were refused before. A dataset or group created in place may carry such a set too. Moving an attribute that holds a repointable object reference out of the header is refused rather than putting it beyond the reference repointing a commit does, the heap a rebuild replaces is left for `repack` to reclaim, and dense (fractal-heap) *link* storage is still refused ([#102](https://github.com/stephenberry/hdf5-pure/issues/102)).
 
 ### Fixed
@@ -17,7 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **Breaking:** A variable-length string attribute reads back as a `VarLenString` variant rather than as the fixed-width variant of its charset and arity, so writing the value back keeps the datatype it was found in. `AttrValue::VarLenAsciiArray::type_name` is now `"vlen_ascii_char[]"`, freeing `"vlen_ascii_string[]"` for `VarLenAsciiStringArray` ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
+- **Breaking:** A variable-length string attribute reads back as a `VarLenString` variant rather than as the fixed-width variant of its charset and arity, so writing the value back keeps the datatype it was found in ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
+- **Breaking:** `AttrValue::VarLenAsciiArray` is renamed `VarLenAsciiCharArray`, and its `type_name` is now `"vlen_ascii_char[]"`. It writes MATLAB's VLEN sequence of one-byte strings, not the variable-length ASCII string the old name implied — that is `VarLenAsciiStringArray` ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
 
 ## [0.40.0] - 2026-08-26
 

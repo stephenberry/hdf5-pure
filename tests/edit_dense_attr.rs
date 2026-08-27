@@ -340,7 +340,7 @@ fn a_variable_length_attribute_survives_a_dense_rebuild() {
         // The variable-length attribute is set *before* the edit crosses the
         // threshold, so it is rebuilt into the heap from a message whose element
         // references were still placeholders: the ordering this path has to keep.
-        d.set_attr("names", AttrValue::VarLenAsciiArray(strings.clone()))
+        d.set_attr("names", AttrValue::VarLenAsciiCharArray(strings.clone()))
             .unwrap();
         for i in 3..DENSE_COUNT {
             d.set_attr(&format!("attr_{i:02}"), AttrValue::I64(i as i64))
@@ -357,7 +357,7 @@ fn a_variable_length_attribute_survives_a_dense_rebuild() {
     let attrs = f.dataset("d").unwrap().attrs().unwrap();
     assert_eq!(
         attrs.get("names"),
-        Some(&AttrValue::VarLenAsciiArray(strings.clone())),
+        Some(&AttrValue::VarLenAsciiCharArray(strings.clone())),
     );
 
     // And again, editing the object that now stores it densely: the existing
@@ -375,12 +375,12 @@ fn a_variable_length_attribute_survives_a_dense_rebuild() {
     let attrs = f.dataset("d").unwrap().attrs().unwrap();
     assert_eq!(
         attrs.get("names"),
-        Some(&AttrValue::VarLenAsciiArray(strings.clone())),
+        Some(&AttrValue::VarLenAsciiCharArray(strings.clone())),
         "the heap-resident variable-length attribute survived a second rebuild",
     );
 
     // The C library's view of the heap-resident attribute. This crate encodes a
-    // `VarLenAsciiArray` as a variable-length sequence of one-character ASCII
+    // `VarLenAsciiCharArray` as a variable-length sequence of one-character ASCII
     // strings, which is the type named here; what the read proves is that the
     // element references the rebuild patched resolve to the right heap bytes.
     let c = hdf5::File::open(&p).unwrap();

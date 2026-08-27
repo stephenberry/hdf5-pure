@@ -894,7 +894,7 @@ fn crosscheck_varlen_ascii_array_attr() {
     let mut builder = FileBuilder::new();
     builder.set_attr(
         "MATLAB_fields",
-        AttrValue::VarLenAsciiArray(vec!["x".into(), "y".into(), "velocity".into()]),
+        AttrValue::VarLenAsciiCharArray(vec!["x".into(), "y".into(), "velocity".into()]),
     );
     builder.create_dataset("x").with_f64_data(&[1.0]);
     builder.write(&path).unwrap();
@@ -924,7 +924,7 @@ fn crosscheck_varlen_ascii_array_attr_in_dense_storage() {
     let mut builder = FileBuilder::new();
     builder.set_attr(
         "MATLAB_fields",
-        AttrValue::VarLenAsciiArray(expected.iter().map(|s| (*s).to_string()).collect()),
+        AttrValue::VarLenAsciiCharArray(expected.iter().map(|s| (*s).to_string()).collect()),
     );
     // Past the eight-attribute threshold, so the set is stored in a fractal heap.
     for i in 0..12 {
@@ -1185,7 +1185,7 @@ fn crosscheck_matlab_refs_subsystem_pattern() {
     assert_eq!(class_val.as_str(), "string");
 }
 
-/// Verify forge VarLenAsciiArray GCOL encoding: minimum size, structure, and
+/// Verify forge VarLenAsciiCharArray GCOL encoding: minimum size, structure, and
 /// that the C library can read back the exact string values.
 #[test]
 fn crosscheck_varlen_ascii_array_encoding_vs_metno() {
@@ -1196,7 +1196,10 @@ fn crosscheck_varlen_ascii_array_encoding_vs_metno() {
 
     // --- Write with hdf5-pure ---
     let mut builder = FileBuilder::new();
-    builder.set_attr("MATLAB_fields", AttrValue::VarLenAsciiArray(fields.clone()));
+    builder.set_attr(
+        "MATLAB_fields",
+        AttrValue::VarLenAsciiCharArray(fields.clone()),
+    );
     builder.create_dataset("dummy").with_f64_data(&[1.0]);
     builder.write(&forge_path).unwrap();
 
@@ -1252,7 +1255,7 @@ fn crosscheck_varlen_ascii_on_nested_group() {
     grp.set_attr("MATLAB_class", AttrValue::AsciiString("struct".into()));
     grp.set_attr(
         "MATLAB_fields",
-        AttrValue::VarLenAsciiArray(vec!["x".into(), "y".into()]),
+        AttrValue::VarLenAsciiCharArray(vec!["x".into(), "y".into()]),
     );
     builder.add_group(grp.finish());
     builder.write(&path).unwrap();
@@ -1291,7 +1294,7 @@ fn crosscheck_varlen_ascii_on_nested_group() {
 }
 
 /// Comprehensive userblock address test: exercises every address type
-/// (contiguous data, group links, path references, VarLenAsciiArray GCOL)
+/// (contiguous data, group links, path references, VarLenAsciiCharArray GCOL)
 /// with a 512-byte userblock. A single off-by-userblock address would
 /// cause the C library to fail.
 #[test]
@@ -1305,7 +1308,7 @@ fn crosscheck_userblock_all_address_types() {
     // Root VL attr (GCOL address must be relative to base)
     builder.set_attr(
         "MATLAB_fields",
-        AttrValue::VarLenAsciiArray(vec!["alpha".into(), "beta".into()]),
+        AttrValue::VarLenAsciiCharArray(vec!["alpha".into(), "beta".into()]),
     );
     builder.set_attr("MATLAB_class", AttrValue::AsciiString("struct".into()));
 
@@ -1316,7 +1319,7 @@ fn crosscheck_userblock_all_address_types() {
     grp.create_dataset("ids").with_i32_data(&[1, 2, 3]);
     grp.set_attr(
         "MATLAB_fields",
-        AttrValue::VarLenAsciiArray(vec!["vals".into(), "ids".into()]),
+        AttrValue::VarLenAsciiCharArray(vec!["vals".into(), "ids".into()]),
     );
     builder.add_group(grp.finish());
 
@@ -1483,7 +1486,7 @@ fn crosscheck_matlab_struct_pattern() {
         .set_attr("MATLAB_class", AttrValue::AsciiString("int32".into()));
     g.set_attr(
         "MATLAB_fields",
-        AttrValue::VarLenAsciiArray(vec!["field1".into(), "field2".into()]),
+        AttrValue::VarLenAsciiCharArray(vec!["field1".into(), "field2".into()]),
     );
     builder.add_group(g.finish());
     builder.write(&path).unwrap();

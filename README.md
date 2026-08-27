@@ -388,7 +388,7 @@ The payload limit covers bytes referenced by VL elements and excludes Rust conta
 | `AttrValue::AsciiString` | Fixed-length ASCII string |
 | `AttrValue::VarLenString` / `VarLenStringArray` | Variable-length UTF-8 string, scalar or array (global heap) |
 | `AttrValue::VarLenAsciiString` / `VarLenAsciiStringArray` | The same, with `CSET = ASCII` |
-| `AttrValue::VarLenAsciiArray` | MATLAB's VLEN sequence of one-byte ASCII strings (global heap) |
+| `AttrValue::VarLenAsciiCharArray` | MATLAB's VLEN sequence of one-byte ASCII strings (global heap) |
 
 ## Compression
 
@@ -510,7 +510,7 @@ for (name, data) in [("x", vec![1.0, 2.0]), ("y", vec![3.0, 4.0])] {
 }
 
 grp.set_attr("MATLAB_class", AttrValue::AsciiString("struct".into()));
-grp.set_attr("MATLAB_fields", AttrValue::VarLenAsciiArray(fields));
+grp.set_attr("MATLAB_fields", AttrValue::VarLenAsciiCharArray(fields));
 builder.add_group(grp.finish());
 ```
 

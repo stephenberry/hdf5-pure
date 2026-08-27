@@ -81,12 +81,12 @@ The `AttrValue` variants and their HDF5 encodings are:
 | `AttrValue::AsciiStringArray` | Array of fixed-width ASCII strings (null-padded to the longest element) |
 | `AttrValue::VarLenString` / `AttrValue::VarLenStringArray` | Variable-length UTF-8 string scalar / array (uses a global heap collection) |
 | `AttrValue::VarLenAsciiString` / `AttrValue::VarLenAsciiStringArray` | Variable-length ASCII string scalar / array (uses a global heap collection) |
-| `AttrValue::VarLenAsciiArray` | MATLAB's array of variable-length ASCII strings: a VLEN *sequence of one-byte strings* (uses a global heap collection) |
+| `AttrValue::VarLenAsciiCharArray` | MATLAB's array of variable-length ASCII strings: a VLEN *sequence of one-byte strings* (uses a global heap collection) |
 
 !!! note
-    `AttrValue::AsciiString`, `AttrValue::AsciiStringArray`, and `AttrValue::VarLenAsciiArray` exist for compatibility with MATLAB and matio, which expect fixed-width or variable-length ASCII rather than UTF-8 for certain conventional attributes. See the [data types reference](../reference/data-types.md) for the full type mapping.
+    `AttrValue::AsciiString`, `AttrValue::AsciiStringArray`, and `AttrValue::VarLenAsciiCharArray` exist for compatibility with MATLAB and matio, which expect fixed-width or variable-length ASCII rather than UTF-8 for certain conventional attributes. See the [data types reference](../reference/data-types.md) for the full type mapping.
 
-    The two variable-length families differ in datatype, not in bytes. `VarLenString` and its siblings write `H5T_STRING` with `STRSIZE = H5T_VARIABLE` — what h5py and the C library write, and what h5py reads back as a `str` and the C library as a `char *`. `VarLenAsciiArray` writes `H5T_VLEN { H5T_STRING { STRSIZE = 1 } }`, which MATLAB and matio expect for `MATLAB_fields` and its neighbours ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
+    The two variable-length families differ in datatype, not in bytes. `VarLenString` and its siblings write `H5T_STRING` with `STRSIZE = H5T_VARIABLE` — what h5py and the C library write, and what h5py reads back as a `str` and the C library as a `char *`. `VarLenAsciiCharArray` writes `H5T_VLEN { H5T_STRING { STRSIZE = 1 } }`, which MATLAB and matio expect for `MATLAB_fields` and its neighbours ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)).
 
 ## Reading the hierarchy back
 
@@ -114,7 +114,7 @@ println!("attributes:   {:?}", sensors.attrs().unwrap());
 
 ### Reading an attribute value
 
-An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, the datatype's charset selects the `Ascii` variants, and a number's width selects among `I8` … `U64` and `F32` / `F64`. A `VarLenAsciiArray` of one element stays a `VarLenAsciiArray`, an `AsciiString` does not arrive as a `String`, and a 16-bit integer does not arrive as an `I64`. A variable-length string is not a fixed-width one either: an h5py or C-library attribute arrives as `VarLenString` or `VarLenAsciiString` (or their array forms), so setting the value back writes the datatype it was found in rather than a fixed-width slot.
+An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, the datatype's charset selects the `Ascii` variants, and a number's width selects among `I8` … `U64` and `F32` / `F64`. A `VarLenAsciiCharArray` of one element stays a `VarLenAsciiCharArray`, an `AsciiString` does not arrive as a `String`, and a 16-bit integer does not arrive as an `I64`. A variable-length string is not a fixed-width one either: an h5py or C-library attribute arrives as `VarLenString` or `VarLenAsciiString` (or their array forms), so setting the value back writes the datatype it was found in rather than a fixed-width slot.
 
 A fixed-width string carries its width the same way. `AttrValue::ascii_string_sized("ok", 64)` declares a 64-byte slot — `H5T_C_S1` plus `H5Tset_size(64)` — and a slot whose width is not the one its content implies reads back as `AsciiStringSized` (or `StringSized`, or the array forms) carrying that width, so writing the value back reproduces the slot rather than shrinking it to the content. A slot sized exactly to its content reads back as the plain `AsciiString`, which writes the same bytes.
 
@@ -136,7 +136,7 @@ What a read cannot recover, because `AttrValue` has no way to express it. Each o
 
 - **Byte order and precision.** Every numeric variant writes back little-endian at its full width, so a big-endian attribute, one storing fewer bits than its bytes hold, or a float laid out other than the way IEEE 754 lays it out, reads correctly but would be re-encoded in this crate's own layout.
 - **Unrepresentable integer widths.** A number keeps its width at 1, 2, 4 and 8 bytes; an integer width with no Rust integer of its own — 3 bytes, say — widens to 64-bit.
-- **A scalar in MATLAB's sequence-of-one-byte-strings shape.** Its array form reads as `VarLenAsciiArray`, the form MATLAB writes; a scalar in that shape has no variant and reads as `AsciiString`, which writes a fixed-width slot. A standard variable-length string keeps its datatype at either arity.
+- **A scalar in MATLAB's sequence-of-one-byte-strings shape.** Its array form reads as `VarLenAsciiCharArray`, the form MATLAB writes; a scalar in that shape has no variant and reads as `AsciiString`, which writes a fixed-width slot. A standard variable-length string keeps its datatype at either arity.
 - **Rank.** Every array variant is one-dimensional, so a rank-2 attribute reads as its elements flattened.
 - **String padding.** A fixed-width string reports its content and the `STRSIZE` it was stored at, but not which padding rule filled the bytes past the content: every variant writes back `NULLPAD`.
 - **Enumeration member names.** An enum attribute decodes through its integer base, so its codes arrive and its labels do not.
@@ -188,4 +188,4 @@ See the [reading guide](reading.md) for the dataset read API (`read_f64`, `shape
 
 ## MATLAB struct convention
 
-The ASCII attribute variants exist primarily so that groups can follow MATLAB's struct convention: a struct is a group carrying `MATLAB_class = "struct"` and a `MATLAB_fields` attribute (typically `AttrValue::VarLenAsciiArray`) listing the field names, with each field stored as a child dataset tagged with its own `MATLAB_class`. See the [MATLAB interop page](../interop/matlab.md) for the full convention and worked examples.
+The ASCII attribute variants exist primarily so that groups can follow MATLAB's struct convention: a struct is a group carrying `MATLAB_class = "struct"` and a `MATLAB_fields` attribute (typically `AttrValue::VarLenAsciiCharArray`) listing the field names, with each field stored as a child dataset tagged with its own `MATLAB_class`. See the [MATLAB interop page](../interop/matlab.md) for the full convention and worked examples.

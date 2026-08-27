@@ -93,7 +93,7 @@ Two accessors describe an existing dataset's type:
 | `AttrValue::StringArray` | UTF-8 null-padded string array |
 | `AttrValue::AsciiString` | Fixed-width ASCII string |
 | `AttrValue::AsciiStringArray` | Array of fixed-width ASCII strings (null-padded to the longest element) |
-| `AttrValue::VarLenAsciiArray` | MATLAB's variable-length ASCII string array — a VLEN sequence of one-byte strings (stored in a global heap collection) |
+| `AttrValue::VarLenAsciiCharArray` | MATLAB's variable-length ASCII string array — a VLEN sequence of one-byte strings (stored in a global heap collection) |
 | `AttrValue::VarLenString` / `AttrValue::VarLenStringArray` | Variable-length UTF-8 string, scalar or array: `H5T_STRING` with `STRSIZE = H5T_VARIABLE` (stored in a global heap collection) |
 | `AttrValue::VarLenAsciiString` / `AttrValue::VarLenAsciiStringArray` | The same, with `CSET = ASCII` |
 | `AttrValue::StringSized` / `AsciiStringSized` (and their `*ArraySized` forms) | Fixed-width string of a width you declare, built by `AttrValue::string_sized` / `ascii_string_sized` and their array siblings |
@@ -113,7 +113,7 @@ builder.set_attr("label", AttrValue::ascii_string_sized("ok", 64).unwrap());
 
 The `*_sized` constructors return a `Result`: a value longer than the declared width is refused with `FormatError::FixedStringTooLong` rather than stored as a prefix, and a width of zero with `FormatError::ZeroFixedStringWidth`. `width` counts bytes, so a UTF-8 value with multi-byte characters takes more of it than its character count suggests.
 
-`AsciiStringArray` and `VarLenAsciiArray` exist for MATLAB interoperability (the `MATLAB_fields` pattern); the `VarLenString` family writes the standard variable-length string datatype instead, which is the one h5py and the C library write and read. See the [groups and attributes guide](../guide/groups-attributes.md).
+`AsciiStringArray` and `VarLenAsciiCharArray` exist for MATLAB interoperability (the `MATLAB_fields` pattern); the `VarLenString` family writes the standard variable-length string datatype instead, which is the one h5py and the C library write and read. See the [groups and attributes guide](../guide/groups-attributes.md).
 
 ## The datatype model
 

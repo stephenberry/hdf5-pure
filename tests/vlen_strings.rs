@@ -217,7 +217,7 @@ fn a_vlen_attribute_past_the_compact_message_size_is_stored_in_a_heap() {
         file.root()
             .set_attr(
                 "labels",
-                hdf5_pure::AttrValue::VarLenAsciiArray(values.clone()),
+                hdf5_pure::AttrValue::VarLenAsciiCharArray(values.clone()),
             )
             .unwrap();
         file.commit().unwrap();
@@ -225,7 +225,7 @@ fn a_vlen_attribute_past_the_compact_message_size_is_stored_in_a_heap() {
 
     let file = File::open(&path).unwrap();
     match file.root().attrs().unwrap().get("labels") {
-        Some(hdf5_pure::AttrValue::VarLenAsciiArray(read)) => assert_eq!(*read, values),
+        Some(hdf5_pure::AttrValue::VarLenAsciiCharArray(read)) => assert_eq!(*read, values),
         other => panic!("expected the variable-length attribute back, got {other:?}"),
     }
 }
