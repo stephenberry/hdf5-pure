@@ -855,7 +855,7 @@ impl MatBuilder {
             AttrValue::AsciiString(MatClass::Struct.as_str().into()),
         );
         s.group
-            .set_attr("MATLAB_fields", AttrValue::VarLenAsciiArray(s.fields));
+            .set_attr("MATLAB_fields", AttrValue::VarLenAsciiCharArray(s.fields));
         let finished = s.group.finish();
         match s.parent {
             ParentKind::Root => self.file.add_group(finished),

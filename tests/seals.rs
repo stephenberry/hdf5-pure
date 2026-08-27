@@ -104,7 +104,7 @@ fn sealed_enums_still_require_a_wildcard_arm() {
             | AttrValue::StringArray(_)
             | AttrValue::AsciiString(_)
             | AttrValue::AsciiStringArray(_)
-            | AttrValue::VarLenAsciiArray(_) => {}
+            | AttrValue::VarLenAsciiCharArray(_) => {}
             _ => {}
         }
     }

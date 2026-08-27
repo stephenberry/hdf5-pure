@@ -219,9 +219,12 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
 ///   type, so its codes survive and the member names do not. This is how h5py's
 ///   `np.bool_` attributes arrive, written as `enum[FALSE, TRUE]`: as `0`/`1` of
 ///   the base type's width.
-/// - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR`,
-///   which this crate's writer never emits, has no variant of its own and reads
-///   as the fixed-width variant of the same charset and arity.
+/// - **A scalar in MATLAB's sequence-of-one-byte-strings shape.** Its array
+///   form reads as [`VarLenAsciiCharArray`](AttrValue::VarLenAsciiCharArray), which is
+///   the form MATLAB writes; a scalar in that shape has no variant and reads as
+///   [`AsciiString`](AttrValue::AsciiString), which writes a fixed-width slot.
+///   A *standard* variable-length string keeps its datatype at either arity
+///   (issue #383).
 /// - **Rank.** Every array variant is one-dimensional, so a rank-2 attribute
 ///   reads as its elements flattened.
 /// - **String padding.** A fixed-width string reports its content and the
@@ -327,19 +330,33 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
                 crate::vl_data::VlenStringReadOptions::default(),
             )
             .ok()?;
+            // Each shape decodes into the variant that writes it back as it was
+            // found, so reading an attribute and setting it again keeps its
+            // datatype rather than rewriting a variable-length string as a
+            // fixed-width one.
+            //
+            // The one exception is a *scalar* in MATLAB's sequence-of-chars
+            // shape, which has no variant: that shape exists for `MATLAB_fields`
+            // and its neighbours, which are always arrays, and giving it one
+            // would mean a scalar variant no builder needs.
             match (
                 vlen_string_shape(*is_string, base_type, charset.as_ref()),
                 scalar,
             ) {
-                (VlenStringShape::AsciiCharSequence, false) => {
-                    Some(AttrValue::VarLenAsciiArray(strings))
-                }
-                (VlenStringShape::AsciiCharSequence | VlenStringShape::Ascii, true) => {
+                (VlenStringShape::AsciiCharSequence, true) => {
                     Some(AttrValue::AsciiString(one_or_empty(strings)))
                 }
-                (VlenStringShape::Ascii, false) => Some(AttrValue::AsciiStringArray(strings)),
-                (VlenStringShape::Utf8, true) => Some(AttrValue::String(one_or_empty(strings))),
-                (VlenStringShape::Utf8, false) => Some(AttrValue::StringArray(strings)),
+                (VlenStringShape::AsciiCharSequence, false) => {
+                    Some(AttrValue::VarLenAsciiCharArray(strings))
+                }
+                (VlenStringShape::Ascii, true) => {
+                    Some(AttrValue::VarLenAsciiString(one_or_empty(strings)))
+                }
+                (VlenStringShape::Ascii, false) => Some(AttrValue::VarLenAsciiStringArray(strings)),
+                (VlenStringShape::Utf8, true) => {
+                    Some(AttrValue::VarLenString(one_or_empty(strings)))
+                }
+                (VlenStringShape::Utf8, false) => Some(AttrValue::VarLenStringArray(strings)),
             }
         }
         _ => None,
@@ -429,13 +446,13 @@ fn narrow_elements<S: Copy, T: TryFrom<S>>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VlenStringShape {
     /// A VLEN *sequence* of 1-byte ASCII strings — the encoding MATLAB and matio
-    /// use, and the one this crate writes for
-    /// [`AttrValue::VarLenAsciiArray`]. Only this shape has a variant that
-    /// preserves it.
+    /// use, and the one this crate writes for [`AttrValue::VarLenAsciiCharArray`].
     AsciiCharSequence,
-    /// A true variable-length ASCII string (`H5T_STRING`, `STRSIZE = VAR`).
+    /// A true variable-length ASCII string (`H5T_STRING`, `STRSIZE = VAR`),
+    /// written by [`AttrValue::VarLenAsciiString`] and its array form.
     Ascii,
-    /// A true variable-length UTF-8 string, or one whose charset is unstated.
+    /// A true variable-length UTF-8 string, or one whose charset is unstated,
+    /// written by [`AttrValue::VarLenString`] and its array form.
     Utf8,
 }
 
@@ -458,9 +475,13 @@ fn vlen_string_shape(
     if !is_string && is_ascii_char_vlen_base(base_type) {
         return VlenStringShape::AsciiCharSequence;
     }
-    // A VL string states its own charset; a sequence of ASCII chars carries it
-    // on the base type instead.
-    if charset == Some(&CharacterSet::Ascii) || is_ascii_char_vlen_base(base_type) {
+    // A variable-length string states its own charset, and the base type must
+    // not be consulted for it: a writer may give one the same 1-byte string base
+    // the sequence uses, and reading the charset off that base would report
+    // ASCII for a datatype whose own field says UTF-8 — rewriting the value in a
+    // charset it was not stored in. A sequence carries its charset on the base
+    // type instead, which is why the branch above reads it there.
+    if charset == Some(&CharacterSet::Ascii) {
         VlenStringShape::Ascii
     } else {
         VlenStringShape::Utf8
@@ -614,10 +635,29 @@ mod tests {
                 "ascii_two",
                 AttrValue::AsciiStringArray(vec!["double".into(), "int16".into()]),
             ),
-            ("vlen_one", AttrValue::VarLenAsciiArray(vec!["x".into()])),
+            (
+                "vlen_one",
+                AttrValue::VarLenAsciiCharArray(vec!["x".into()]),
+            ),
             (
                 "vlen_three",
-                AttrValue::VarLenAsciiArray(vec!["x".into(), "y".into(), "velocity".into()]),
+                AttrValue::VarLenAsciiCharArray(vec!["x".into(), "y".into(), "velocity".into()]),
+            ),
+            // The standard variable-length string, whose datatype the MATLAB
+            // shape above does not write (#383). Charset and arity separate the
+            // four the same way they separate the fixed-width variants.
+            ("vlen_utf8_scalar", AttrValue::VarLenString("mètre".into())),
+            (
+                "vlen_utf8_one",
+                AttrValue::VarLenStringArray(vec!["mètre".into()]),
+            ),
+            (
+                "vlen_ascii_scalar",
+                AttrValue::VarLenAsciiString("double".into()),
+            ),
+            (
+                "vlen_ascii_two",
+                AttrValue::VarLenAsciiStringArray(vec!["x".into(), "yy".into()]),
             ),
             // A declared width is stored and recovered too, or a slot would
             // shrink to its content the next time it was written (#359).
@@ -870,7 +910,7 @@ mod tests {
     /// ambiguous case — which is exactly why this is asserted here rather than
     /// left to the C crosscheck, where the branch cannot be reached.
     #[test]
-    fn only_a_sequence_of_ascii_chars_claims_the_varlen_variant() {
+    fn only_a_sequence_of_ascii_chars_claims_the_matlab_shape() {
         use crate::datatype::{CharacterSet, Datatype, DatatypeByteOrder, StringPadding};
 
         let char_base = Datatype::String {
@@ -886,7 +926,8 @@ mod tests {
             bit_precision: 8,
         };
 
-        // What MATLAB and matio write, and what this crate writes.
+        // What MATLAB and matio write, and what this crate writes for
+        // `AttrValue::VarLenAsciiCharArray`.
         assert_eq!(
             vlen_string_shape(false, &char_base, None),
             VlenStringShape::AsciiCharSequence
@@ -896,6 +937,13 @@ mod tests {
         assert_eq!(
             vlen_string_shape(true, &char_base, Some(&CharacterSet::Ascii)),
             VlenStringShape::Ascii
+        );
+        // And its charset comes from its own field, not from that base: reading
+        // it off the base reported ASCII here, which rewrote a UTF-8 attribute
+        // as an ASCII one.
+        assert_eq!(
+            vlen_string_shape(true, &char_base, Some(&CharacterSet::Utf8)),
+            VlenStringShape::Utf8
         );
         // What libhdf5 actually writes for a variable-length string.
         assert_eq!(
@@ -1043,9 +1091,17 @@ mod tests {
         let read = round_trip(&[
             ("scalar", AttrValue::AsciiString("double".into())),
             ("one", AttrValue::StringArray(vec!["double".into()])),
-            ("vlen", AttrValue::VarLenAsciiArray(vec!["double".into()])),
+            (
+                "vlen",
+                AttrValue::VarLenAsciiCharArray(vec!["double".into()]),
+            ),
+            ("vlen_std", AttrValue::VarLenAsciiString("double".into())),
+            (
+                "vlen_std_one",
+                AttrValue::VarLenStringArray(vec!["double".into()]),
+            ),
         ]);
-        for name in ["scalar", "one", "vlen"] {
+        for name in ["scalar", "one", "vlen", "vlen_std", "vlen_std_one"] {
             assert_eq!(
                 read.get(name).and_then(AttrValue::as_str),
                 Some("double"),

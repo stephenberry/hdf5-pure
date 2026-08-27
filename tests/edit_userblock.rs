@@ -349,7 +349,7 @@ fn userblock_add_dataset_with_vlen_attribute_roundtrip() {
             .create_dataset("labeled", |b| {
                 b.with_i32_data(&[1, 2, 3]).set_attr(
                     "tags",
-                    AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
+                    AttrValue::VarLenAsciiCharArray(vec!["one".into(), "two".into()]),
                 );
             })
             .unwrap();
@@ -361,7 +361,7 @@ fn userblock_add_dataset_with_vlen_attribute_roundtrip() {
     assert_eq!(ds.read_i32().unwrap(), vec![1, 2, 3]);
     assert_eq!(
         ds.attrs().unwrap().get("tags"),
-        Some(&AttrValue::VarLenAsciiArray(vec![
+        Some(&AttrValue::VarLenAsciiCharArray(vec![
             "one".into(),
             "two".into()
         ]))

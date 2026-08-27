@@ -31,7 +31,7 @@ fn root_with_vlen(others: usize, labels: &[&str]) -> FileBuilder {
 }
 
 fn vlen(labels: &[&str]) -> AttrValue {
-    AttrValue::VarLenAsciiArray(labels.iter().map(|s| (*s).to_string()).collect())
+    AttrValue::VarLenAsciiCharArray(labels.iter().map(|s| (*s).to_string()).collect())
 }
 
 /// The strings of an array-of-strings attribute, whichever variant the reader
@@ -40,7 +40,7 @@ fn vlen(labels: &[&str]) -> AttrValue {
 #[track_caller]
 fn labels(attrs: &std::collections::HashMap<String, AttrValue>, name: &str) -> Vec<String> {
     match attrs.get(name) {
-        Some(AttrValue::VarLenAsciiArray(v) | AttrValue::StringArray(v)) => v.clone(),
+        Some(AttrValue::VarLenAsciiCharArray(v) | AttrValue::StringArray(v)) => v.clone(),
         other => panic!("expected an array-of-strings attribute {name:?}, got {other:?}"),
     }
 }
@@ -114,7 +114,7 @@ fn group_and_dataset_variable_length_attributes_survive_too() {
 fn a_huge_variable_length_attribute_keeps_its_values() {
     let expected: Vec<String> = (0..4_200).map(|i| format!("s{i}")).collect();
     let mut builder = FileBuilder::new();
-    builder.set_attr("labels", AttrValue::VarLenAsciiArray(expected.clone()));
+    builder.set_attr("labels", AttrValue::VarLenAsciiCharArray(expected.clone()));
     builder.create_dataset("x").with_f64_data(&[1.0]);
 
     let bytes = builder.finish().unwrap();
@@ -138,7 +138,10 @@ fn several_variable_length_attributes_keep_their_own_values() {
         .map(|i| (0..3).map(|j| format!("v{i}_{j}")).collect())
         .collect();
     for (i, set) in sets.iter().enumerate() {
-        builder.set_attr(&format!("l{i}"), AttrValue::VarLenAsciiArray(set.clone()));
+        builder.set_attr(
+            &format!("l{i}"),
+            AttrValue::VarLenAsciiCharArray(set.clone()),
+        );
     }
     for i in 0..12 {
         builder.set_attr(&format!("a{i}"), AttrValue::I64(i));

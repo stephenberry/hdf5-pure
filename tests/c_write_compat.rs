@@ -236,8 +236,8 @@ fn pure_reads_every_attribute_encoding_the_c_library_writes() {
             ])
             .unwrap();
 
-        // True variable-length strings — what h5py writes, and what this crate
-        // has no variant for.
+        // True variable-length strings — what h5py writes, and what
+        // `AttrValue::VarLenAsciiString` and its siblings write (#383).
         file.new_attr::<VarLenAscii>()
             .shape(())
             .create("vlen_ascii_scalar")
@@ -310,16 +310,20 @@ fn pure_reads_every_attribute_encoding_the_c_library_writes() {
         Some(&AttrValue::ascii_string_array_sized(vec!["ab".into(), "cd".into()], 8).unwrap())
     );
 
-    // A true variable-length string has no variant of its own, so it reads as
-    // the fixed-width variant of its charset and arity. This pins the documented
-    // limitation against what libhdf5 actually writes.
+    // A true variable-length string reads as the variable-length variant of its
+    // charset and arity, so setting the value back writes the datatype libhdf5
+    // wrote rather than a fixed-width slot (#383). Before that it read as the
+    // fixed-width variant, which is what made the rewrite silent.
     assert_eq!(
         attrs.get("vlen_ascii_scalar"),
-        Some(&AttrValue::AsciiString("double".into()))
+        Some(&AttrValue::VarLenAsciiString("double".into()))
     );
     assert_eq!(
         attrs.get("vlen_ascii_two"),
-        Some(&AttrValue::AsciiStringArray(vec!["x".into(), "yy".into()])),
+        Some(&AttrValue::VarLenAsciiStringArray(vec![
+            "x".into(),
+            "yy".into()
+        ])),
         "a variable-length string array is not MATLAB's VLEN-of-char encoding"
     );
 
@@ -329,7 +333,7 @@ fn pure_reads_every_attribute_encoding_the_c_library_writes() {
     );
     assert_eq!(
         attrs.get("vlen_utf8_scalar"),
-        Some(&AttrValue::String("m/s".into()))
+        Some(&AttrValue::VarLenString("m/s".into()))
     );
 
     // The full-range unsigned value reads exactly, at either arity.

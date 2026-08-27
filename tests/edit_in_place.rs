@@ -824,7 +824,7 @@ fn add_variable_length_root_attribute_via_edit_session() {
             .root()
             .set_attr(
                 "fields",
-                AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]),
+                AttrValue::VarLenAsciiCharArray(vec!["a".into(), "b".into()]),
             )
             .unwrap();
         session.commit().unwrap();
@@ -834,7 +834,10 @@ fn add_variable_length_root_attribute_via_edit_session() {
     let attrs = file.root().attrs().unwrap();
     assert_eq!(
         attrs.get("fields"),
-        Some(&AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]))
+        Some(&AttrValue::VarLenAsciiCharArray(vec![
+            "a".into(),
+            "b".into()
+        ]))
     );
     // The rest of the file is untouched.
     assert_eq!(
@@ -855,7 +858,7 @@ fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
     let mut g = b.create_group("grp");
     g.set_attr(
         "fields",
-        AttrValue::VarLenAsciiArray(vec!["old1".into(), "old2".into()]),
+        AttrValue::VarLenAsciiCharArray(vec!["old1".into(), "old2".into()]),
     );
     b.add_group(g.finish());
     b.write(&path).unwrap();
@@ -875,7 +878,7 @@ fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
             .unwrap()
             .set_attr(
                 "fields",
-                AttrValue::VarLenAsciiArray(vec!["new1".into(), "new2".into(), "new3".into()]),
+                AttrValue::VarLenAsciiCharArray(vec!["new1".into(), "new2".into(), "new3".into()]),
             )
             .unwrap();
         session.commit().unwrap();
@@ -885,7 +888,7 @@ fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
     let attrs = file.root().group("grp").unwrap().attrs().unwrap();
     assert_eq!(
         attrs.get("fields"),
-        Some(&AttrValue::VarLenAsciiArray(vec![
+        Some(&AttrValue::VarLenAsciiCharArray(vec![
             "new1".into(),
             "new2".into(),
             "new3".into()
@@ -914,7 +917,7 @@ fn set_variable_length_group_attribute_over_existing_fixed_attribute_in_one_comm
             .unwrap()
             .set_attr(
                 "fields",
-                AttrValue::VarLenAsciiArray(vec!["new1".into(), "new2".into()]),
+                AttrValue::VarLenAsciiCharArray(vec!["new1".into(), "new2".into()]),
             )
             .unwrap();
         session.commit().unwrap();
@@ -927,7 +930,7 @@ fn set_variable_length_group_attribute_over_existing_fixed_attribute_in_one_comm
     assert_eq!(attrs.len(), 1);
     assert_eq!(
         attrs.get("fields"),
-        Some(&AttrValue::VarLenAsciiArray(vec![
+        Some(&AttrValue::VarLenAsciiCharArray(vec![
             "new1".into(),
             "new2".into()
         ]))
@@ -960,7 +963,7 @@ fn add_variable_length_group_attributes_at_budget_boundary_in_one_commit() {
             .unwrap()
             .set_attr(
                 "b0",
-                AttrValue::VarLenAsciiArray(vec!["x0".into(), "x1".into()]),
+                AttrValue::VarLenAsciiCharArray(vec!["x0".into(), "x1".into()]),
             )
             .unwrap();
         session
@@ -968,7 +971,7 @@ fn add_variable_length_group_attributes_at_budget_boundary_in_one_commit() {
             .unwrap()
             .set_attr(
                 "b1",
-                AttrValue::VarLenAsciiArray(vec!["y0".into(), "y1".into()]),
+                AttrValue::VarLenAsciiCharArray(vec!["y0".into(), "y1".into()]),
             )
             .unwrap();
         session.commit().unwrap();
@@ -982,11 +985,17 @@ fn add_variable_length_group_attributes_at_budget_boundary_in_one_commit() {
     }
     assert_eq!(
         attrs.get("b0"),
-        Some(&AttrValue::VarLenAsciiArray(vec!["x0".into(), "x1".into()]))
+        Some(&AttrValue::VarLenAsciiCharArray(vec![
+            "x0".into(),
+            "x1".into()
+        ]))
     );
     assert_eq!(
         attrs.get("b1"),
-        Some(&AttrValue::VarLenAsciiArray(vec!["y0".into(), "y1".into()]))
+        Some(&AttrValue::VarLenAsciiCharArray(vec![
+            "y0".into(),
+            "y1".into()
+        ]))
     );
 }
 
@@ -1015,7 +1024,7 @@ fn add_variable_length_group_attributes_over_budget_use_a_heap() {
                 .unwrap()
                 .set_attr(
                     &format!("b{i}"),
-                    AttrValue::VarLenAsciiArray(vec![format!("x{i}")]),
+                    AttrValue::VarLenAsciiCharArray(vec![format!("x{i}")]),
                 )
                 .unwrap();
         }
@@ -1035,7 +1044,7 @@ fn add_variable_length_group_attributes_over_budget_use_a_heap() {
     for i in 0..3 {
         assert_eq!(
             attrs.get(&format!("b{i}")),
-            Some(&AttrValue::VarLenAsciiArray(vec![format!("x{i}")])),
+            Some(&AttrValue::VarLenAsciiCharArray(vec![format!("x{i}")])),
             "a variable-length attribute rebuilt into the heap kept its strings",
         );
     }
@@ -1064,7 +1073,7 @@ fn dense_group_attribute_storage_takes_a_variable_length_edit() {
             .unwrap()
             .set_attr(
                 "fields",
-                AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]),
+                AttrValue::VarLenAsciiCharArray(vec!["a".into(), "b".into()]),
             )
             .unwrap();
         session.commit().unwrap();
@@ -1075,7 +1084,10 @@ fn dense_group_attribute_storage_takes_a_variable_length_edit() {
     assert_eq!(attrs.len(), 13);
     assert_eq!(
         attrs.get("fields"),
-        Some(&AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()])),
+        Some(&AttrValue::VarLenAsciiCharArray(vec![
+            "a".into(),
+            "b".into()
+        ])),
     );
     for i in 0..12 {
         assert_eq!(attrs.get(&format!("a{i}")), Some(&AttrValue::I64(i)));
@@ -1491,7 +1503,7 @@ fn copy_from_file_rejects_variable_length() {
         ds.with_i32_data(&[1, 2, 3]);
         ds.set_attr(
             "tags",
-            AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
+            AttrValue::VarLenAsciiCharArray(vec!["one".into(), "two".into()]),
         );
         b.write(&src_path).unwrap();
     }
@@ -1616,7 +1628,7 @@ fn copy_same_file_still_allows_variable_length_attribute() {
         ds.with_i32_data(&[1, 2, 3]);
         ds.set_attr(
             "tags",
-            AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
+            AttrValue::VarLenAsciiCharArray(vec!["one".into(), "two".into()]),
         );
         b.write(&path).unwrap();
     }
@@ -2956,7 +2968,11 @@ fn add_dataset_with_variable_length_attribute_via_edit_session() {
                 ds.with_i32_data(&[1, 2, 3]);
                 ds.set_attr(
                     "tags",
-                    AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into(), "three".into()]),
+                    AttrValue::VarLenAsciiCharArray(vec![
+                        "one".into(),
+                        "two".into(),
+                        "three".into(),
+                    ]),
                 );
                 ds.set_attr("scale", AttrValue::F64(2.5));
             })
@@ -2970,7 +2986,7 @@ fn add_dataset_with_variable_length_attribute_via_edit_session() {
     let attrs = ds.attrs().unwrap();
     assert_eq!(
         attrs.get("tags"),
-        Some(&AttrValue::VarLenAsciiArray(vec![
+        Some(&AttrValue::VarLenAsciiCharArray(vec![
             "one".into(),
             "two".into(),
             "three".into()
@@ -3001,7 +3017,7 @@ fn add_chunked_dataset_with_variable_length_attribute_via_edit_session() {
             .create_dataset("chunky_labeled", |b| {
                 b.with_f64_data(&data).with_chunks(&[25]).set_attr(
                     "tags",
-                    AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
+                    AttrValue::VarLenAsciiCharArray(vec!["one".into(), "two".into()]),
                 );
             })
             .unwrap();
@@ -3013,7 +3029,7 @@ fn add_chunked_dataset_with_variable_length_attribute_via_edit_session() {
     assert_eq!(ds.read_f64().unwrap(), data);
     assert_eq!(
         ds.attrs().unwrap().get("tags"),
-        Some(&AttrValue::VarLenAsciiArray(vec![
+        Some(&AttrValue::VarLenAsciiCharArray(vec![
             "one".into(),
             "two".into()
         ]))
@@ -3022,7 +3038,7 @@ fn add_chunked_dataset_with_variable_length_attribute_via_edit_session() {
 
 /// A dataset attribute whose serialized message overflows the object header's
 /// 2-byte message-size field cannot be stored compactly, so it goes to a fractal
-/// heap instead of being refused (issue #102). A `VarLenAsciiArray` with enough
+/// heap instead of being refused (issue #102). A `VarLenAsciiCharArray` with enough
 /// strings is the practical way to reach that: each element serializes to a
 /// fixed-size global-heap reference, so enough of them push the message past
 /// `u16::MAX` bytes.
@@ -3042,7 +3058,7 @@ fn add_dataset_with_oversized_variable_length_attribute_uses_a_heap() {
             .root()
             .create_dataset("oversized", |b| {
                 b.with_i32_data(&[1])
-                    .set_attr("tags", AttrValue::VarLenAsciiArray(strings.clone()));
+                    .set_attr("tags", AttrValue::VarLenAsciiCharArray(strings.clone()));
             })
             .unwrap();
         session.commit().unwrap();
@@ -3059,7 +3075,7 @@ fn add_dataset_with_oversized_variable_length_attribute_uses_a_heap() {
             .attrs()
             .unwrap()
             .get("tags"),
-        Some(&AttrValue::VarLenAsciiArray(strings)),
+        Some(&AttrValue::VarLenAsciiCharArray(strings)),
     );
 }
 

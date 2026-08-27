@@ -182,7 +182,7 @@ fn build_struct_group(
         "MATLAB_class",
         AttrValue::AsciiString(MatClass::Struct.as_str().into()),
     );
-    group.set_attr("MATLAB_fields", AttrValue::VarLenAsciiArray(live_names));
+    group.set_attr("MATLAB_fields", AttrValue::VarLenAsciiCharArray(live_names));
     Ok(group.finish())
 }
 

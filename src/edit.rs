@@ -3551,10 +3551,9 @@ impl WriteEngine {
     /// `path` names the group to edit; `""` or `"/"` names the root group. The
     /// group may already exist or may be created earlier in the same session
     /// with [`create_group`](Self::create_group). Attributes — fixed-size or
-    /// variable-length (`AttrValue::VarLenAsciiArray`) — are stored compactly in
-    /// the rebuilt group header; an edit that would exceed the compact-attribute
-    /// limit, or a group using dense (fractal-heap) attribute storage, is
-    /// refused before any file bytes are changed.
+    /// variable-length — are stored compactly in the rebuilt group header while
+    /// they fit it, and in a fractal heap past that, on the terms
+    /// [`plan_attr_ops`] sets out.
     pub fn set_group_attr(
         &mut self,
         path: &str,
@@ -3594,8 +3593,8 @@ impl WriteEngine {
     /// Stage an attribute add or replacement on an **existing dataset**, applied on
     /// the next [`commit`](Self::commit).
     ///
-    /// `path` names the dataset to edit. Attributes — fixed-size or variable-length
-    /// (`AttrValue::VarLenAsciiArray`) — are stored in the rebuilt dataset header
+    /// `path` names the dataset to edit. Attributes — fixed-size or
+    /// variable-length — are stored in the rebuilt dataset header
     /// while they fit it, and in a fractal heap past that, on the terms
     /// [`plan_attr_ops`] sets out. Applying it relocates the dataset's object
     /// header (the header is rewritten and its single naming link repointed; the
@@ -9897,8 +9896,7 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     let mut vl_attrs: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
     for (i, (_, v)) in db.attrs.iter().enumerate() {
         if let Some(strings) = v.var_len_strings() {
-            let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-            vl_attrs.push((i, build_global_heap_collections(&str_refs)));
+            vl_attrs.push((i, build_global_heap_collections(strings)));
         }
     }
     #[cfg(feature = "provenance")]
@@ -10720,7 +10718,8 @@ fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
 
 /// Apply attribute edits to an object's header `region` *compactly*, preserving
 /// every non-attribute message verbatim. A fixed-size `Set`/`Remove` is resolved
-/// into `region` directly; a variable-length `Set` (`VarLenAsciiArray`) is
+/// into `region` directly; a variable-length `Set` (one whose value reports
+/// [`AttrValue::var_len_strings`]) is
 /// instead collected into the returned `pending_vl_attrs` — its placeholder
 /// heap address is only patched, and the message appended to the object's
 /// header, by the apply loop once its global heap collection's real address
@@ -10743,7 +10742,7 @@ fn apply_compact_attr_ops(
         match op {
             AttrOp::Set { name, value } => {
                 pending_vl.retain(|(msg, _)| &msg.name != name);
-                if let AttrValue::VarLenAsciiArray(strings) = value {
+                if let Some(strings) = value.var_len_strings() {
                     // Nothing yet to remove from `region` if this name has
                     // never been set as a fixed-size attribute.
                     out = remove_attr_from_region(&out, name, false)?;
@@ -10753,8 +10752,7 @@ fn apply_compact_attr_ops(
                             "attribute is too large to encode in place",
                         ));
                     }
-                    let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-                    pending_vl.push((msg, build_global_heap_collections(&str_refs)));
+                    pending_vl.push((msg, build_global_heap_collections(strings)));
                 } else {
                     out = set_attr_in_region(&out, name, value)?;
                 }
@@ -10922,13 +10920,7 @@ fn plan_attr_ops<S: Source + ?Sized>(
         match op {
             AttrOp::Set { name, value } => {
                 let msg = build_attr_message(name, value);
-                let collections = match value {
-                    AttrValue::VarLenAsciiArray(strings) => {
-                        let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-                        Some(build_global_heap_collections(&str_refs))
-                    }
-                    _ => None,
-                };
+                let collections = value.var_len_strings().map(build_global_heap_collections);
                 match set.iter_mut().find(|(a, _)| &a.name == name) {
                     // Setting an attribute the object already has replaces it
                     // where it stands, so a repeated `set_attr` does not reorder
@@ -11193,12 +11185,12 @@ fn parse_compact_attr_name(
 
 fn encode_attr_message(name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> {
     // `apply_compact_attr_ops`'s `Set` branch — this function's only caller —
-    // handles `VarLenAsciiArray` itself (staging it into `pending_vl` instead
-    // of calling `set_attr_in_region`/here), so this value is always
-    // fixed-size by construction, not by a check made at this call site.
+    // handles a value that needs the global heap itself (staging it into
+    // `pending_vl` instead of calling `set_attr_in_region`/here), so this value
+    // is always inline by construction, not by a check made at this call site.
     debug_assert!(
-        !matches!(value, AttrValue::VarLenAsciiArray(_)),
-        "VarLenAsciiArray must be intercepted by apply_compact_attr_ops before reaching encode_attr_message"
+        value.var_len_strings().is_none(),
+        "a variable-length attribute must be intercepted by apply_compact_attr_ops before reaching encode_attr_message"
     );
     let body = build_attr_message(name, value).serialize(LENGTH_SIZE);
     if body.len() > OBJECT_HEADER_MESSAGE_MAX {

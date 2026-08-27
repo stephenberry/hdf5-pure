@@ -41,8 +41,7 @@ use crate::shared_message::DatatypeLocation;
 use crate::superblock::Superblock;
 use crate::type_builders::{
     AttrSpec, CommittedDatatype, DatasetBuilder, FinishedGroup, GroupBuilder, VlStringStaging,
-    build_global_heap_collections, committed_attr_message, patch_vl_refs, patch_vl_refs_masked,
-    write_reference_address,
+    build_global_heap_collections, patch_vl_refs, patch_vl_refs_masked, write_reference_address,
 };
 
 // `AttrValue` lives in `type_builders`; `types` and `mat` reference it through
@@ -1203,7 +1202,10 @@ impl FileWriter {
     /// Attach a root-group attribute whose datatype is the committed one at
     /// `path`. See [`DatasetBuilder::set_attr_committed`].
     pub fn set_root_attr_committed(&mut self, name: &str, value: AttrValue, path: &str) {
-        self.set_root_attr_verbatim(committed_attr_message(name, &value, path));
+        self.root_attrs.push((
+            name.to_string(),
+            crate::type_builders::committed_attr_spec(name, &value, path),
+        ));
     }
 
     pub fn set_root_attr(&mut self, name: &str, value: AttrValue) {
@@ -1925,7 +1927,7 @@ impl FileWriter {
             )?);
         }
 
-        // Build global heap collections for VarLenAsciiArray attributes.
+        // Build global heap collections for variable-length string attributes.
         // Track which attribute messages need VL patching, across root, groups, and datasets.
         struct VlPatch {
             /// The attribute's collections, in the order their objects appear.
@@ -1953,9 +1955,8 @@ impl FileWriter {
             let mut patches = Vec::new();
             for (i, (_n, v)) in attrs_raw.iter().enumerate() {
                 if let Some(strings) = v.var_len_strings() {
-                    let str_refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
                     patches.push(VlPatch {
-                        collections: build_global_heap_collections(&str_refs),
+                        collections: build_global_heap_collections(strings),
                         attr_index: i,
                     });
                 }

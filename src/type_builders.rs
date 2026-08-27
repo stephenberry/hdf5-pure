@@ -611,9 +611,9 @@ fn int_fits(v: i64, width: usize, signed: bool) -> bool {
 /// so the datatype, dataspace and element bytes reach the file exactly as
 /// given. Repack uses it to copy an attribute across without routing it through
 /// [`AttrValue`], which is a decoded view and cannot express a byte order, a
-/// sub-width precision, a variable-length string, a rank above one, or a
-/// string's padding — every one of which the value path would therefore rewrite
-/// (see [`AttrValue`]'s docs on what a decode does not recover).
+/// sub-width precision, a rank above one, or a string's padding — every one of
+/// which the value path would therefore rewrite (see [`AttrValue`]'s docs on
+/// what a decode does not recover).
 ///
 /// The element bytes are copied as-is, so a verbatim message is only correct for
 /// a datatype whose bytes mean the same thing in another file: anything holding
@@ -631,9 +631,11 @@ pub(crate) enum AttrSpec {
     /// This is the middle ground a variable-length string attribute needs. Its
     /// datatype and dataspace *can* travel — they say "variable-length UTF-8",
     /// or "scalar" — while its element bytes cannot, because they address the
-    /// source file's heap. `Verbatim` would carry a dangling address across and
-    /// `Value` would rewrite a variable-length string as a fixed-width one (and
-    /// a scalar as a one-element array), so neither alone is faithful.
+    /// source file's heap. `Verbatim` would carry a dangling address across, and
+    /// `Value` would re-render the datatype from whichever variant the decode
+    /// chose, losing a rank above one, a padding rule other than `NULLTERM`, and
+    /// the arity of a scalar in MATLAB's sequence shape. Neither alone is
+    /// faithful.
     ///
     /// `message.raw_data` must already be [`vl_string_reference_bytes`] over the
     /// same `strings`, so the placeholder count matches the heap objects the
@@ -658,9 +660,9 @@ impl AttrSpec {
     /// build and patch, or `None` when the attribute needs no heap.
     pub(crate) fn var_len_strings(&self) -> Option<&[String]> {
         match self {
-            Self::Value(AttrValue::VarLenAsciiArray(strings))
-            | Self::VerbatimVarLen { strings, .. } => Some(strings),
-            _ => None,
+            Self::Value(v) => v.var_len_strings(),
+            Self::VerbatimVarLen { strings, .. } => Some(strings),
+            Self::Verbatim(_) => None,
         }
     }
 }
@@ -802,33 +804,81 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
         AttrValue::AsciiStringArraySized { values, width } => {
             fixed_string_array_attr(name, values, Some(*width), CharacterSet::Ascii)
         }
-        AttrValue::VarLenAsciiArray(strings) => {
-            // MATLAB v7.3 (and matio) expect MATLAB_fields and similar
-            // variable-length ASCII arrays encoded as:
-            //   H5T_VLEN { H5T_STRING { STRSIZE=1, NULLTERM, ASCII } }
-            // — a VLEN sequence of 1-byte fixed strings. The on-disk byte
-            // layout is identical to H5T_STRING{STRSIZE=VAR} (length + heap
-            // address + object index per element; heap object holds raw
-            // bytes without null terminator), so only the datatype
-            // descriptor changes.
-            AttributeMessage {
-                name: name.to_string(),
-                raw_data: vl_string_reference_bytes(strings),
-                datatype: Datatype::VariableLength {
-                    is_string: false,
-                    padding: None,
-                    charset: None,
-                    base_type: Box::new(Datatype::String {
-                        size: 1,
-                        padding: StringPadding::NullTerminate,
-                        charset: CharacterSet::Ascii,
-                    }),
-                },
-                dataspace: simple_1d(strings.len() as u64),
-                datatype_location: DatatypeLocation::Inline,
-            }
+        AttrValue::VarLenAsciiCharArray(values) => {
+            vlen_string_array_attr(name, values, make_matlab_vlen_ascii_type())
+        }
+        AttrValue::VarLenString(value) => vlen_string_scalar_attr(name, value, CharacterSet::Utf8),
+        AttrValue::VarLenAsciiString(value) => {
+            vlen_string_scalar_attr(name, value, CharacterSet::Ascii)
+        }
+        AttrValue::VarLenStringArray(values) => {
+            vlen_string_array_attr(name, values, make_vlen_string_type(CharacterSet::Utf8))
+        }
+        AttrValue::VarLenAsciiStringArray(values) => {
+            vlen_string_array_attr(name, values, make_vlen_string_type(CharacterSet::Ascii))
         }
     }
+}
+
+/// MATLAB v7.3 and matio expect `MATLAB_fields` and similar variable-length
+/// ASCII arrays as `H5T_VLEN { H5T_STRING { STRSIZE = 1, NULLTERM, ASCII } }` —
+/// a VLEN sequence of 1-byte fixed strings rather than a variable-length string.
+///
+/// Only the descriptor differs from [`make_vlen_string_type`]: the elements
+/// underneath are [`vl_string_reference_bytes`] either way.
+fn make_matlab_vlen_ascii_type() -> Datatype {
+    Datatype::VariableLength {
+        is_string: false,
+        padding: None,
+        charset: None,
+        base_type: Box::new(Datatype::String {
+            size: 1,
+            padding: StringPadding::NullTerminate,
+            charset: CharacterSet::Ascii,
+        }),
+    }
+}
+
+/// A variable-length string attribute: one 16-byte global-heap reference per
+/// element, under the `datatype` that says how to read them back.
+///
+/// The datatype is a parameter because both variable-length string encodings
+/// this crate writes stand over the same element bytes, and
+/// [`vl_string_reference_bytes`] is the one encoder for those. The heap
+/// addresses in them are placeholders the writer patches once it has placed the
+/// collections.
+fn vlen_string_attr(
+    name: &str,
+    strings: &[String],
+    datatype: Datatype,
+    dataspace: Dataspace,
+) -> AttributeMessage {
+    AttributeMessage {
+        name: name.to_string(),
+        raw_data: vl_string_reference_bytes(strings),
+        datatype,
+        dataspace,
+        datatype_location: DatatypeLocation::Inline,
+    }
+}
+
+/// One variable-length string under a scalar dataspace — the standard
+/// `H5T_STRING` with `STRSIZE = H5T_VARIABLE`.
+fn vlen_string_scalar_attr(name: &str, value: &String, charset: CharacterSet) -> AttributeMessage {
+    vlen_string_attr(
+        name,
+        core::slice::from_ref(value),
+        make_vlen_string_type(charset),
+        scalar_ds(),
+    )
+}
+
+/// An array of variable-length strings under `datatype`, with a 1-D dataspace of
+/// their own count — taken here rather than passed in, so the dataspace cannot
+/// disagree with the references below it. Both encodings go through this, which
+/// is what keeps that guarantee true of MATLAB's shape as well.
+fn vlen_string_array_attr(name: &str, values: &[String], datatype: Datatype) -> AttributeMessage {
+    vlen_string_attr(name, values, datatype, simple_1d(values.len() as u64))
 }
 
 /// The element bytes of a variable-length string value: one 16-byte global-heap
@@ -875,7 +925,7 @@ pub(crate) const MAX_HEAP_OBJECTS: usize = u16::MAX as usize;
 
 /// Build the global heap collections holding the given strings, splitting them
 /// across as many collections as their count needs.
-pub(crate) fn build_global_heap_collections(strings: &[&str]) -> Vec<Vec<u8>> {
+pub(crate) fn build_global_heap_collections(strings: &[String]) -> Vec<Vec<u8>> {
     let objects: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
     build_global_heap_collections_from_bytes(&objects)
 }
@@ -968,6 +1018,18 @@ fn build_global_heap_collection_bytes(objects: &[&[u8]]) -> Vec<u8> {
 /// position selects (see [`build_global_heap_collections_from_bytes`]);
 /// `collection_addresses` gives those collections' placed addresses in order.
 pub(crate) fn patch_vl_refs(raw_data: &mut [u8], collection_addresses: &[u64]) {
+    // Only a value that writes whole variable-length references reaches a heap,
+    // and [`AttrValue::var_len_strings`] is what decides which values those are.
+    // This is a screen on that decision, not a proof of it: it catches a value
+    // whose element bytes are not a whole number of references — the division
+    // below would then patch its *data*, or patch nothing and leave the
+    // collection it caused to be written unreferenced — but a fixed-width value
+    // whose bytes happen to be a multiple of 16, two `u64`s say, passes it.
+    debug_assert_eq!(
+        raw_data.len() % VL_REF_SIZE,
+        0,
+        "a value routed through the global heap must hold whole variable-length references"
+    );
     let count = raw_data.len() / VL_REF_SIZE;
     for i in 0..count {
         let address = collection_addresses[i / MAX_HEAP_OBJECTS];
@@ -1334,6 +1396,16 @@ pub(crate) fn simple_1d(n: u64) -> Dataspace {
 /// stay the same size across rewrites (issue #359). The accessors span both, so
 /// code that only wants the text need not know which it was handed.
 ///
+/// A variable-length string keeps its datatype the same way. The four
+/// [`VarLenString`](AttrValue::VarLenString) and
+/// [`VarLenAsciiString`](AttrValue::VarLenAsciiString) variants write the
+/// standard `H5T_STRING` with `STRSIZE = H5T_VARIABLE`, which is what h5py and
+/// the reference C library write and read;
+/// [`VarLenAsciiCharArray`](AttrValue::VarLenAsciiCharArray) writes MATLAB's sequence
+/// of one-byte strings over identical element bytes (issue #383). Both keep
+/// their strings in a global heap collection rather than in the attribute
+/// message.
+///
 /// Non-exhaustive: variants are added as this crate supports more attribute
 /// datatypes, so match a read-back value with a `_` arm. Constructing the
 /// variants below is unaffected.
@@ -1433,10 +1505,51 @@ pub enum AttrValue {
         /// The declared `STRSIZE`, in bytes, shared by every element.
         width: NonZeroU32,
     },
-    /// Array of variable-length ASCII strings (MATLAB_fields pattern).
-    /// Each element is a variable-length sequence of ASCII bytes.
-    /// Requires a global heap collection in the file.
-    VarLenAsciiArray(Vec<String>),
+    /// Array of variable-length ASCII **char sequences** in MATLAB's shape:
+    /// `H5T_VLEN { H5T_STRING { STRSIZE = 1, NULLTERM, ASCII } }`. Each element
+    /// is a sequence of one-byte strings rather than one variable-length string,
+    /// and MATLAB v7.3 and matio expect `MATLAB_fields` and its neighbours in
+    /// exactly this datatype.
+    ///
+    /// For the standard variable-length string — a `H5T_STRING` of variable size,
+    /// which is what h5py and the reference C library write — reach for
+    /// [`VarLenAsciiStringArray`](AttrValue::VarLenAsciiStringArray) instead.
+    /// Its element bytes are identical to these; only the datatype differs. Both
+    /// need a global heap collection in the file.
+    VarLenAsciiCharArray(Vec<String>),
+    /// A variable-length UTF-8 string: `H5T_STRING` with
+    /// `STRSIZE = H5T_VARIABLE`, `NULLTERM`, `CSET = UTF-8`.
+    ///
+    /// The standard encoding — what h5py, the reference C library and this
+    /// crate's own `DatasetBuilder::with_vlen_strings` write, and what h5py
+    /// hands back as a `str`. The value lives in a global heap collection, and
+    /// the attribute holds one 16-byte reference to it.
+    ///
+    /// [`String`](AttrValue::String) writes a *fixed*-width slot sized to the
+    /// value instead, which readers generally accept too; reach for this one
+    /// when the file's consumer expects a variable-length string specifically.
+    VarLenString(String),
+    /// Array of variable-length UTF-8 strings. The one-dimensional form of
+    /// [`VarLenString`](AttrValue::VarLenString), with one heap reference per
+    /// element.
+    VarLenStringArray(Vec<String>),
+    /// A variable-length ASCII string: `H5T_STRING` with
+    /// `STRSIZE = H5T_VARIABLE`, `NULLTERM`, `CSET = ASCII` — the
+    /// `H5Tcopy(H5T_C_S1)` plus `H5Tset_size(H5T_VARIABLE)` idiom, which h5py
+    /// hands back as `bytes`.
+    ///
+    /// The charset is the only difference from
+    /// [`VarLenString`](AttrValue::VarLenString): the bytes written are the
+    /// same, and this crate does not check that they are ASCII, exactly as
+    /// [`AsciiString`](AttrValue::AsciiString) does not.
+    VarLenAsciiString(String),
+    /// Array of variable-length ASCII strings, in the standard
+    /// `H5T_STRING`/`STRSIZE = H5T_VARIABLE` datatype. The one-dimensional form
+    /// of [`VarLenAsciiString`](AttrValue::VarLenAsciiString).
+    ///
+    /// [`VarLenAsciiCharArray`](AttrValue::VarLenAsciiCharArray) writes MATLAB's
+    /// sequence-of-one-byte-strings shape over the same element bytes.
+    VarLenAsciiStringArray(Vec<String>),
 }
 
 /// Constructors for the variants that declare a string width rather than
@@ -1615,24 +1728,17 @@ pub(crate) fn decoded_fixed_string_array(
 impl AttrValue {
     /// The value as one string, when it holds exactly one.
     ///
-    /// Spans both charsets and all three array kinds, scalar or one element.
+    /// Spans both charsets, fixed-width and variable-length, scalar or one
+    /// element.
     /// Returns `None` for a non-string value, or for an array whose length is
     /// not 1.
     pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Self::String(s)
-            | Self::AsciiString(s)
-            | Self::StringSized { value: s, .. }
-            | Self::AsciiStringSized { value: s, .. } => Some(s),
-            Self::StringArray(v)
-            | Self::AsciiStringArray(v)
-            | Self::VarLenAsciiArray(v)
-            | Self::StringArraySized { values: v, .. }
-            | Self::AsciiStringArraySized { values: v, .. }
-                if v.len() == 1 =>
-            {
-                Some(&v[0])
-            }
+        // Exactly [`as_strings`](AttrValue::as_strings) narrowed to one element,
+        // rather than a second list of every string variant to keep in step with
+        // it: a scalar is viewed there as a one-element slice, so both shapes
+        // land in the same arm here.
+        match self.as_strings()? {
+            [one] => Some(one),
             _ => None,
         }
     }
@@ -1647,12 +1753,35 @@ impl AttrValue {
             Self::String(s)
             | Self::AsciiString(s)
             | Self::StringSized { value: s, .. }
-            | Self::AsciiStringSized { value: s, .. } => Some(core::slice::from_ref(s)),
+            | Self::AsciiStringSized { value: s, .. }
+            | Self::VarLenString(s)
+            | Self::VarLenAsciiString(s) => Some(core::slice::from_ref(s)),
             Self::StringArray(v)
             | Self::AsciiStringArray(v)
-            | Self::VarLenAsciiArray(v)
+            | Self::VarLenAsciiCharArray(v)
+            | Self::VarLenStringArray(v)
+            | Self::VarLenAsciiStringArray(v)
             | Self::StringArraySized { values: v, .. }
             | Self::AsciiStringArraySized { values: v, .. } => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The strings this value stores in a global heap collection rather than
+    /// inline, or `None` for every value written into the attribute message
+    /// itself.
+    ///
+    /// This is the one predicate that decides whether writing a value needs a
+    /// heap collection built and its placeholder addresses patched afterwards.
+    /// Every writer asks it rather than naming variants of its own, so a
+    /// variable-length variant added later cannot reach a writer that would
+    /// emit its placeholder addresses as though they were real ones.
+    pub(crate) fn var_len_strings(&self) -> Option<&[String]> {
+        match self {
+            Self::VarLenAsciiCharArray(v)
+            | Self::VarLenStringArray(v)
+            | Self::VarLenAsciiStringArray(v) => Some(v),
+            Self::VarLenString(s) | Self::VarLenAsciiString(s) => Some(core::slice::from_ref(s)),
             _ => None,
         }
     }
@@ -1819,7 +1948,11 @@ impl AttrValue {
             Self::AsciiStringSized { .. } => "sized_ascii_string",
             Self::AsciiStringArray(_) => "ascii_string[]",
             Self::AsciiStringArraySized { .. } => "sized_ascii_string[]",
-            Self::VarLenAsciiArray(_) => "vlen_ascii_string[]",
+            Self::VarLenAsciiCharArray(_) => "vlen_ascii_char[]",
+            Self::VarLenString(_) => "vlen_string",
+            Self::VarLenStringArray(_) => "vlen_string[]",
+            Self::VarLenAsciiString(_) => "vlen_ascii_string",
+            Self::VarLenAsciiStringArray(_) => "vlen_ascii_string[]",
         }
     }
 }
@@ -1859,7 +1992,9 @@ impl fmt::Display for AttrValue {
             Self::String(v)
             | Self::AsciiString(v)
             | Self::StringSized { value: v, .. }
-            | Self::AsciiStringSized { value: v, .. } => write!(f, "{v:?}"),
+            | Self::AsciiStringSized { value: v, .. }
+            | Self::VarLenString(v)
+            | Self::VarLenAsciiString(v) => write!(f, "{v:?}"),
             Self::F32Array(v) => write_elements(f, v),
             Self::F64Array(v) => write_elements(f, v),
             Self::I8Array(v) => write_elements(f, v),
@@ -1872,7 +2007,9 @@ impl fmt::Display for AttrValue {
             Self::U64Array(v) => write_elements(f, v),
             Self::StringArray(v)
             | Self::AsciiStringArray(v)
-            | Self::VarLenAsciiArray(v)
+            | Self::VarLenAsciiCharArray(v)
+            | Self::VarLenStringArray(v)
+            | Self::VarLenAsciiStringArray(v)
             | Self::StringArraySized { values: v, .. }
             | Self::AsciiStringArraySized { values: v, .. } => write_elements(f, v),
         }
@@ -2091,7 +2228,9 @@ impl DatasetBuilder {
     /// applies: `value` decides the attribute's type, and it must be the type
     /// committed at `path`.
     pub fn set_attr_committed(&mut self, name: &str, value: AttrValue, path: &str) -> &mut Self {
-        self.set_attr_verbatim(committed_attr_message(name, &value, path))
+        self.attrs
+            .push((name.to_string(), committed_attr_spec(name, &value, path)));
+        self
     }
 
     pub fn with_f64_data(&mut self, data: &[f64]) -> &mut Self {
@@ -3108,7 +3247,7 @@ impl DatasetBuilder {
 /// }
 ///
 /// // Attribute set after all children are created
-/// grp.set_attr("MATLAB_fields", AttrValue::VarLenAsciiArray(fields));
+/// grp.set_attr("MATLAB_fields", AttrValue::VarLenAsciiCharArray(fields));
 /// builder.add_group(grp.finish());
 /// ```
 pub struct GroupBuilder {
@@ -3163,7 +3302,8 @@ impl GroupBuilder {
     ///
     /// See [`DatasetBuilder::set_attr_committed`].
     pub fn set_attr_committed(&mut self, name: &str, value: AttrValue, path: &str) {
-        self.set_attr_verbatim(committed_attr_message(name, &value, path));
+        self.attrs
+            .push((name.to_string(), committed_attr_spec(name, &value, path)));
     }
 
     /// Attach a variable-length string attribute with the given datatype and
@@ -3232,20 +3372,31 @@ pub(crate) fn normalize_object_path(path: &str) -> String {
     path.trim_matches('/').to_string()
 }
 
-/// An attribute message carrying `value`, named after the committed datatype at
-/// `path` instead of spelling its type out.
+/// How an attribute named after the committed datatype at `path` is written:
+/// an already-encoded message whose datatype has moved out of it.
 ///
 /// The value still decides the message's dataspace and raw bytes; only the
-/// datatype moves out of the message. The writer checks the two agree before it
-/// lays anything out.
-pub(crate) fn committed_attr_message(
-    name: &str,
-    value: &AttrValue,
-    path: &str,
-) -> AttributeMessage {
+/// datatype moves out. The writer checks the two agree before it lays anything
+/// out.
+///
+/// A value that keeps its data in the global heap takes
+/// [`VerbatimVarLen`](AttrSpec::VerbatimVarLen) rather than
+/// [`Verbatim`](AttrSpec::Verbatim), so the writer stages its collections and
+/// patches the placeholder addresses [`build_attr_message`] wrote. Plain
+/// `Verbatim` is for bytes that are already final, and carrying a
+/// variable-length value through it wrote every element pointing at address 0 —
+/// a file that returned `Ok`, dropped the attribute from `attrs`, and read as
+/// an empty string in the C library.
+pub(crate) fn committed_attr_spec(name: &str, value: &AttrValue, path: &str) -> AttrSpec {
     let mut message = build_attr_message(name, value);
     message.datatype_location = DatatypeLocation::CommittedPath(normalize_object_path(path));
-    message
+    match value.var_len_strings() {
+        Some(strings) => AttrSpec::VerbatimVarLen {
+            message,
+            strings: strings.to_vec(),
+        },
+        None => AttrSpec::Verbatim(message),
+    }
 }
 
 #[cfg(test)]
@@ -3261,7 +3412,7 @@ mod attr_value_accessor_tests {
             AttrValue::AsciiString("double".into()),
             AttrValue::StringArray(vec!["double".into()]),
             AttrValue::AsciiStringArray(vec!["double".into()]),
-            AttrValue::VarLenAsciiArray(vec!["double".into()]),
+            AttrValue::VarLenAsciiCharArray(vec!["double".into()]),
             AttrValue::string_sized("double", 32).unwrap(),
             AttrValue::ascii_string_sized("double", 32).unwrap(),
             AttrValue::string_array_sized(vec!["double".into()], 32).unwrap(),
@@ -3278,7 +3429,7 @@ mod attr_value_accessor_tests {
         for value in [
             AttrValue::StringArray(vec!["a".into(), "b".into()]),
             AttrValue::AsciiStringArray(vec!["a".into(), "b".into()]),
-            AttrValue::VarLenAsciiArray(vec![]),
+            AttrValue::VarLenAsciiCharArray(vec![]),
             AttrValue::string_array_sized(vec!["a".into(), "b".into()], 8).unwrap(),
             AttrValue::ascii_string_array_sized(vec![], 8).unwrap(),
             AttrValue::F64(1.5),
@@ -3310,7 +3461,7 @@ mod attr_value_accessor_tests {
         for value in [
             AttrValue::StringArray(fields.clone()),
             AttrValue::AsciiStringArray(fields.clone()),
-            AttrValue::VarLenAsciiArray(fields.clone()),
+            AttrValue::VarLenAsciiCharArray(fields.clone()),
             AttrValue::string_array_sized(fields.clone(), 16).unwrap(),
             AttrValue::ascii_string_array_sized(fields.clone(), 16).unwrap(),
         ] {
@@ -3582,7 +3733,11 @@ mod attr_value_display_tests {
             AttrValue::ascii_string_sized("", 4).unwrap(),
             AttrValue::AsciiStringArray(vec![]),
             AttrValue::ascii_string_array_sized(vec![], 4).unwrap(),
-            AttrValue::VarLenAsciiArray(vec![]),
+            AttrValue::VarLenAsciiCharArray(vec![]),
+            AttrValue::VarLenString(String::new()),
+            AttrValue::VarLenStringArray(vec![]),
+            AttrValue::VarLenAsciiString(String::new()),
+            AttrValue::VarLenAsciiStringArray(vec![]),
         ];
         for value in &values {
             match value {
@@ -3600,7 +3755,9 @@ mod attr_value_display_tests {
                 AttrValue::StringSized { .. } | AttrValue::StringArraySized { .. } => {}
                 AttrValue::AsciiString(_) | AttrValue::AsciiStringArray(_) => {}
                 AttrValue::AsciiStringSized { .. } | AttrValue::AsciiStringArraySized { .. } => {}
-                AttrValue::VarLenAsciiArray(_) => {}
+                AttrValue::VarLenAsciiCharArray(_) => {}
+                AttrValue::VarLenString(_) | AttrValue::VarLenStringArray(_) => {}
+                AttrValue::VarLenAsciiString(_) | AttrValue::VarLenAsciiStringArray(_) => {}
             }
         }
         values
