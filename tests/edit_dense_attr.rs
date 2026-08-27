@@ -707,6 +707,10 @@ fn an_attribute_holding_an_object_reference_is_not_moved_to_a_heap() {
         err.to_string().contains("object reference"),
         "expected the reference refusal, got: {err}",
     );
+    // The dataset handle keeps the session — and its exclusive lock on the file —
+    // alive, so it has to go before the read below: mandatory on Windows,
+    // advisory (and so invisible) everywhere else.
+    drop(d);
     drop(s);
     assert_eq!(
         std::fs::read(&p).unwrap(),
