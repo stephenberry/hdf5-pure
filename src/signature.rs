@@ -32,7 +32,16 @@ pub fn find_signature_in<S: Source + ?Sized>(source: &S) -> Result<u64, FormatEr
         if sig == HDF5_SIGNATURE {
             return Ok(offset);
         }
-        offset *= 2;
+        // `len` is whatever the source reports, and `Source` is public, so a
+        // caller supplies it. A source that overstates its length past 2^63
+        // would otherwise wrap this doubling to zero and re-read offset zero
+        // forever in a release build (a debug build panics on the multiply).
+        // There is no candidate offset past 2^63, so stop: the search falls
+        // through to `SignatureNotFound`, which is the answer either way.
+        let Some(next) = offset.checked_mul(2) else {
+            break;
+        };
+        offset = next;
     }
 
     Err(FormatError::SignatureNotFound)
@@ -110,6 +119,57 @@ mod tests {
         data[..8].copy_from_slice(&HDF5_SIGNATURE);
         data[512..520].copy_from_slice(&HDF5_SIGNATURE);
         assert_eq!(find_signature(&data), Ok(0));
+    }
+
+    /// A source that reports a length it cannot serve is searched a bounded
+    /// number of times and then given up on.
+    ///
+    /// `Source` is public, so `len` is a number a caller supplies rather than
+    /// one a file measured. The candidate offsets double, and doubling past
+    /// 2^63 used to wrap to zero: a release build then re-read offset zero
+    /// forever, and a debug build panicked on the multiply. The read counter is
+    /// what separates the fix from that — the search has to *stop*, not merely
+    /// return the same verdict, and a source that keeps answering cannot be
+    /// told from one that is being asked forever any other way.
+    #[test]
+    fn a_source_that_overstates_its_length_is_searched_a_bounded_number_of_times() {
+        use core::cell::Cell;
+
+        struct Overstating {
+            reads: Cell<u32>,
+        }
+
+        impl Source for Overstating {
+            fn len(&self) -> u64 {
+                u64::MAX
+            }
+
+            fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+                let n = self.reads.get();
+                self.reads.set(n + 1);
+                // Fail rather than hang if the search does not terminate, so
+                // the defect this test covers surfaces as a failure.
+                if n > 1_000 {
+                    return Err(FormatError::SignatureNotFound);
+                }
+                buf.fill(0);
+                Ok(())
+            }
+        }
+
+        let source = Overstating {
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            find_signature_in(&source),
+            Err(FormatError::SignatureNotFound)
+        );
+        // Offset 0 plus the 55 powers of two from 512 to 2^63.
+        assert_eq!(
+            source.reads.get(),
+            56,
+            "the signature search did not stop at the last representable offset"
+        );
     }
 
     #[cfg(feature = "std")]

@@ -202,6 +202,31 @@ let access = FileAccessProperties::new()
 let file = File::open_streaming_with_options("huge.h5", access).unwrap();
 ```
 
+When the bytes are not a file at all — an object store addressed by range request, a WebAssembly guest handed byte ranges by its host — implement the `Source` trait over them and open with `File::from_source`. It is the same lazy backing store; only where the bytes come from differs. `Source` asks for a total length and the bytes at an absolute offset, and `ReadSeekSource` already implements it for any `Read + Seek`. Turn the metadata cache on through `File::from_source_with_options` for a remote source: without one, every read a parser makes is a round trip.
+
+```rust
+use hdf5_pure::{File, FormatError, Source};
+
+struct Remote {
+    len: u64,
+}
+
+impl Source for Remote {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        // Fill the whole request or fail: a short read is an error.
+        let bytes = fetch(offset, buf.len()).map_err(FormatError::Source)?;
+        buf.copy_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+let file = File::from_source(Remote { len: 1 << 30 }).unwrap();
+```
+
 To override the chunk cache for a single dataset (HDF5's per-dataset access property list, `H5Pset_chunk_cache`), open it with `dataset_with_options`. The override replaces the file-wide default for that one dataset; other datasets keep the default. `Dataset::chunk_cache_config()` reports the effective setting (`H5Pget_chunk_cache`).
 
 ```rust

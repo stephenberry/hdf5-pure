@@ -436,4 +436,81 @@ fn from_source_matches_streaming_and_reads_on_demand() {
         "served {served} of {} bytes: the source was drained, not read on demand",
         whole.len()
     );
+    // And the floor: the window's own bytes came through this source, so a
+    // count that collapses toward zero means the counter stopped counting, not
+    // that the read got cheaper.
+    let window_bytes = (64 * cols * size_of::<f64>()) as u64;
+    assert!(
+        served >= window_bytes,
+        "served {served} bytes, fewer than the {window_bytes} the window itself is: \
+         the count is not measuring the read"
+    );
+}
+
+/// A source that returns fewer bytes than it was asked for is refused, not
+/// followed into a parser.
+///
+/// `Source::read_exact_at` and `read_metadata_at` have default bodies that
+/// cannot come back short, but they are overridable, and a source that batches
+/// or coalesces remote reads is exactly the caller with a reason to override
+/// them. The parsers index what comes back at offsets computed from the length
+/// they *asked* for, so an unchecked short buffer is a slice panic inside the
+/// object-header parser, blaming the file format for what the source did.
+#[test]
+fn a_source_that_returns_a_short_buffer_is_refused() {
+    use hdf5_pure::{FormatError, Source};
+
+    struct Short(Vec<u8>);
+
+    impl Source for Short {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+            let at = usize::try_from(offset).expect("the fixture fits this platform");
+            let end = at + buf.len();
+            if end > self.0.len() {
+                return Err(FormatError::UnexpectedEof {
+                    expected: end,
+                    available: self.0.len(),
+                });
+            }
+            buf.copy_from_slice(&self.0[at..end]);
+            Ok(())
+        }
+
+        /// One byte short of the request, which is the whole defect.
+        fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+            let at = usize::try_from(offset).expect("the fixture fits this platform");
+            let end = (at + len).min(self.0.len()).saturating_sub(1);
+            Ok(self.0[at.min(end)..end].to_vec())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("short_reads.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("values")
+            .with_f64_data(&(0..256).map(f64::from).collect::<Vec<_>>())
+            .with_shape(&[256]);
+        b.write(&path).unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+
+    // Whichever read reaches the short buffer first, the answer is an error
+    // that names the source rather than a panic inside a parser.
+    let err = match File::from_source(Short(bytes)) {
+        Err(err) => err,
+        Ok(file) => file
+            .dataset("values")
+            .and_then(|d| d.read_f64())
+            .expect_err("a source returning short buffers read a dataset successfully"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bytes for a") && msg.contains("read at offset"),
+        "the refusal does not say the source came back short: {msg}"
+    );
 }

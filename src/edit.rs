@@ -2111,7 +2111,11 @@ impl WriteEngine {
         // Refuse a file a writer already holds, before anything is mutated. This
         // is the one exclusion the OS lock above cannot make: a SWMR writer
         // takes no lock, so its file is lock-free but flagged (issue #245).
-        file_lock::check_status_flags(&superblock, file_lock::OpenIntent::Write, &path.display())?;
+        file_lock::check_status_flags(
+            &superblock,
+            file_lock::OpenIntent::Write,
+            file_lock::OpenTarget::Path(path),
+        )?;
         if superblock.offset_size != OFFSET_SIZE || superblock.length_size != LENGTH_SIZE {
             return Err(Error::EditUnsupported(
                 "only 8-byte offsets and lengths are supported for in-place editing",

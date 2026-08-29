@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `File::from_source` and `File::from_source_with_options` open a file for streaming reads from any `Source`, so bytes that are not a filesystem path — an object store addressed by range request, a WebAssembly guest handed byte ranges by its host — get the same on-demand metadata and chunk reads `File::open_streaming` gives a path. `Source` and `ReadSeekSource` are exported to implement and to reuse, and a file marked as held by a writer is refused here too, naming the source where an open by path names the path ([#27](https://github.com/stephenberry/hdf5-pure/issues/27)).
+- `File::from_source` and `File::from_source_with_options` open a file for streaming reads from any `Source` — an object store addressed by range request, a WebAssembly guest handed byte ranges by its host — with the same on-demand metadata and chunk reads `File::open_streaming` gives a path. `Source` and `ReadSeekSource` are exported to implement and to reuse; a file the superblock marks as held by a writer is refused here too, and a source that answers a read short or overstates its length is refused rather than followed ([#27](https://github.com/stephenberry/hdf5-pure/issues/27)).
 
 ## [0.41.0] - 2026-08-27
 
