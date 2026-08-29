@@ -26,7 +26,7 @@ use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, ReferenceType};
 use crate::error::{Error, FormatError};
 use crate::file_create_properties::FileCreateProperties;
-use crate::file_lock::{self, FileLocking, OpenIntent};
+use crate::file_lock::{self, FileLocking, OpenIntent, OpenTarget};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterPipeline;
@@ -42,7 +42,7 @@ use crate::shared_message::{self, BufferedResolver, SharedResolver, SourceResolv
 use crate::signature;
 use crate::source::{
     BaseOffsetSource, BytesSource, MetadataCacheConfig, MetadataCacheStats, MetadataCachingSource,
-    ReadSeekSource, Source, frame,
+    ReadSeekSource, Source, ValidatedSource, frame,
 };
 use crate::superblock::Superblock;
 use crate::vl_data::{self, VlenStringReadOptions};
@@ -723,14 +723,18 @@ impl FileInner {
     ) -> Result<Self, Error> {
         let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
         let inner = Self::from_bytes_with_options(bytes, properties)?;
-        // The status-flag check belongs to the *path* opens, not to
-        // `from_bytes_with_options` (issue #245). A caller who already holds the
-        // bytes has taken its own snapshot: there is no live file to coordinate
-        // over, and the recovery this refusal would name — `clear_swmr_flag`,
-        // which needs write access to a path — is not available to it either.
-        // This is a deliberate divergence from the C library, which checks under
-        // its in-memory core driver too.
-        file_lock::check_status_flags(&inner.superblock, OpenIntent::Read, path.as_ref())?;
+        // The status-flag check belongs to every open that reads the live file
+        // — this one, `open_streaming` and `from_source` — and not to
+        // `from_bytes_with_options` (issue #245). The line is snapshot against
+        // live, not path against no path: a caller who already holds the bytes
+        // has taken its own snapshot, and there is no live file left to
+        // coordinate over. This is a deliberate divergence from the C library,
+        // which checks under its in-memory core driver too.
+        file_lock::check_status_flags(
+            &inner.superblock,
+            OpenIntent::Read,
+            OpenTarget::Path(path.as_ref()),
+        )?;
         Ok(inner)
     }
 
@@ -765,6 +769,37 @@ impl FileInner {
     ) -> Result<Self, Error> {
         let handle = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
         let source = ReadSeekSource::new(handle).map_err(Error::Format)?;
+        Self::streaming(source, properties, OpenTarget::Path(path.as_ref()))
+    }
+
+    /// Open an HDF5 file from any [`Source`], reading metadata and chunks on
+    /// demand as [`open_streaming`](Self::open_streaming) does.
+    pub fn from_source<S: Source + Send + Sync + 'static>(source: S) -> Result<Self, Error> {
+        Self::from_source_with_options(source, FileAccessProperties::new())
+    }
+
+    /// Open an HDF5 file from any [`Source`] with explicit access properties.
+    pub fn from_source_with_options<S: Source + Send + Sync + 'static>(
+        source: S,
+        properties: FileAccessProperties,
+    ) -> Result<Self, Error> {
+        // The only source that reaches the parsers from outside the crate, and
+        // so the only one whose reads are length-checked: see `ValidatedSource`.
+        Self::streaming(ValidatedSource::new(source), properties, OpenTarget::Source)
+    }
+
+    /// The body both streaming opens share.
+    ///
+    /// Wraps the source in whatever metadata cache the properties ask for,
+    /// parses the superblock through it, and refuses a file a writer holds.
+    /// The two differ in where the source came from and in `target`, which does
+    /// nothing but name the file in that refusal; one body is what keeps the
+    /// rest of it from drifting apart.
+    fn streaming<S: Source + Send + Sync + 'static>(
+        source: S,
+        properties: FileAccessProperties,
+        target: OpenTarget<'_>,
+    ) -> Result<Self, Error> {
         let source: Box<dyn Source + Send + Sync> = if properties.metadata_cache.is_enabled() {
             Box::new(MetadataCachingSource::new(
                 source,
@@ -774,7 +809,7 @@ impl FileInner {
             Box::new(source)
         };
         let (superblock, addr_offset) = Self::parse_superblock_source(source.as_ref())?;
-        file_lock::check_status_flags(&superblock, OpenIntent::Read, path.as_ref())?;
+        file_lock::check_status_flags(&superblock, OpenIntent::Read, target)?;
         Ok(Self::from_parts(
             Backend::Streaming(source),
             superblock,
@@ -810,7 +845,11 @@ impl FileInner {
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
         let (superblock, addr_offset) = Self::parse_superblock(&data)?;
-        file_lock::check_status_flags(&superblock, OpenIntent::SwmrRead, path.as_ref())?;
+        file_lock::check_status_flags(
+            &superblock,
+            OpenIntent::SwmrRead,
+            OpenTarget::Path(path.as_ref()),
+        )?;
         Ok(Self::from_parts(
             Backend::InMemory(data),
             superblock,
@@ -2036,6 +2075,81 @@ impl File {
     ) -> Result<Self, Error> {
         Ok(File {
             inner: Arc::new(FileInner::open_streaming_with_options(path, properties)?),
+        })
+    }
+
+    /// Open an HDF5 file from any [`Source`], reading metadata and chunks on
+    /// demand exactly as [`open_streaming`](Self::open_streaming) does.
+    ///
+    /// This is the streaming open for a caller whose bytes are not a path: an
+    /// object store addressed by HTTP range request, a sandboxed guest that
+    /// receives byte ranges from its host, a decrypting layer. A [`Source`]
+    /// supplies a length and reads at an absolute offset, which is all the
+    /// reader asks of a file, so peak memory stays at the metadata being parsed
+    /// plus the chunks a read touches — not the file. Wrap a `Read + Seek` in
+    /// [`ReadSeekSource`] rather than writing that impl again.
+    ///
+    /// A file marked as held by a writer is refused here as it is by
+    /// [`open_streaming`](Self::open_streaming); with no path to report, the
+    /// error names the source instead. Recovering such a file in place needs a
+    /// path, through [`File::clear_swmr_flag`], so a caller that has none is
+    /// left with [`File::from_bytes`](Self::from_bytes) and the whole file in
+    /// memory.
+    ///
+    /// The metadata cache is **off** unless
+    /// [`from_source_with_options`](Self::from_source_with_options) turns it
+    /// on, which matters more here than it does for a local file: without one,
+    /// every read a parser makes is a round trip. See
+    /// [`MetadataCacheConfig`].
+    ///
+    /// ```no_run
+    /// use hdf5_pure::{File, FormatError, Source};
+    ///
+    /// // However the bytes actually arrive: a range request, a host call, a
+    /// // decrypting layer over a file.
+    /// # fn fetch(offset: u64, len: usize) -> Result<Vec<u8>, String> { unimplemented!() }
+    ///
+    /// struct Remote {
+    ///     len: u64,
+    /// }
+    ///
+    /// impl Source for Remote {
+    ///     fn len(&self) -> u64 {
+    ///         self.len
+    ///     }
+    ///
+    ///     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+    ///         // Fill the whole request or fail: a short read is an error.
+    ///         let bytes = fetch(offset, buf.len()).map_err(FormatError::Source)?;
+    ///         buf.copy_from_slice(&bytes);
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let file = File::from_source(Remote { len: 1 << 30 })?;
+    /// let rows = file.dataset("frames")?.read_f64_rows(0, 64)?;
+    /// # Ok::<(), hdf5_pure::Error>(())
+    /// ```
+    ///
+    /// A `Read + Seek` needs none of that: wrap it in [`ReadSeekSource`].
+    /// Reading a *file* that way is [`open_streaming`](Self::open_streaming),
+    /// which does the wrapping for you.
+    pub fn from_source<S: Source + Send + Sync + 'static>(source: S) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::from_source(source)?),
+        })
+    }
+
+    /// Open an HDF5 file from any [`Source`] with explicit access properties.
+    ///
+    /// The metadata cache is what a remote source wants tuned: every parser
+    /// read becomes a round trip without one. See [`MetadataCacheConfig`].
+    pub fn from_source_with_options<S: Source + Send + Sync + 'static>(
+        source: S,
+        properties: FileAccessProperties,
+    ) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::from_source_with_options(source, properties)?),
         })
     }
 
@@ -7558,22 +7672,15 @@ mod tests {
         counts: &ReadCounts,
         access: FileAccessProperties,
     ) -> File {
-        let source: Box<dyn Source + Send + Sync> = Box::new(CountingSource {
-            bytes,
-            reads: Arc::clone(&counts.reads),
-            bytes_read: Arc::clone(&counts.bytes),
-        });
-        let (superblock, addr_offset) =
-            FileInner::parse_superblock_source(source.as_ref()).expect("parse superblock");
-        File {
-            inner: Arc::new(FileInner::from_parts(
-                Backend::Streaming(source),
-                superblock,
-                addr_offset,
-                None,
-                access,
-            )),
-        }
+        File::from_source_with_options(
+            CountingSource {
+                bytes,
+                reads: Arc::clone(&counts.reads),
+                bytes_read: Arc::clone(&counts.bytes),
+            },
+            access,
+        )
+        .expect("open from source")
     }
 
     /// An `n`-element f64 dataset in chunks of `chunk` elements.

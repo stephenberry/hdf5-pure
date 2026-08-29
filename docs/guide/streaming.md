@@ -23,6 +23,44 @@ The reading API is identical to `File::open`; only the backing store differs. Ev
 !!! note
     `open_streaming` requires the `std` filesystem and is therefore unavailable in `no_std` builds. See [Features](../reference/features.md) for the feature matrix.
 
+## Streaming from something that is not a path
+
+`File::from_source(source)` opens the same lazy backing store over anything that implements `Source`, for a caller whose bytes are not a file: an object store addressed by HTTP range request, a WebAssembly guest that receives byte ranges from its host and has no filesystem at all, a decrypting layer.
+
+`Source` asks for two answers — the total length, and the bytes at an absolute offset — which is all the reader ever asks of a file:
+
+```rust
+use hdf5_pure::{File, FormatError, Source};
+
+struct Remote {
+    len: u64,
+}
+
+impl Source for Remote {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        // However the bytes arrive: a range request, a host call, a decrypting
+        // layer. Fill the whole request or fail — a short read is an error.
+        let bytes = fetch(offset, buf.len()).map_err(FormatError::Source)?;
+        buf.copy_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+let file = File::from_source(Remote { len: 1 << 30 })?;
+let values = file.dataset("signal")?.read_f64()?;
+```
+
+A `Read + Seek` needs no implementation of its own: `ReadSeekSource` wraps one. (Doing that to a `std::fs::File` is exactly `File::open_streaming`, which wraps it for you.)
+
+Two things are worth knowing before pointing this at a remote store:
+
+- **Turn the metadata cache on**, through `File::from_source_with_options`. It is off by default, and without one every read a parser makes is a round trip. See `MetadataCacheConfig`.
+- **A file the superblock marks as held by a writer is refused here too**, with `Error::FileMarkedInUse`. The recoveries a path open would name do not apply: `File::open_swmr` and `File::clear_swmr_flag` both need a path, so a source is left with `File::from_bytes` and the whole file in memory. The refusal says so.
+
 ## What streaming supports
 
 Dataset reads are fully supported across every storage layout:

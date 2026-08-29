@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `File::from_source` and `File::from_source_with_options` open a file for streaming reads from any `Source` — an object store addressed by range request, a WebAssembly guest handed byte ranges by its host — with the same on-demand metadata and chunk reads `File::open_streaming` gives a path. `Source` and `ReadSeekSource` are exported to implement and to reuse; a file the superblock marks as held by a writer is refused here too, and a source that answers a read short is refused rather than followed into a parser ([#27](https://github.com/stephenberry/hdf5-pure/issues/27)).
+
 ## [0.41.0] - 2026-08-27
 
 Variable-length string attributes and oversized attribute sets both work now. `AttrValue::VarLenString` and its three siblings write the standard variable-length string datatype (`H5T_STRING` with `STRSIZE = H5T_VARIABLE`), the one h5py and the reference C library write, where the only variable-length attribute this crate produced before was MATLAB's sequence-of-one-byte-strings shape ([#383](https://github.com/stephenberry/hdf5-pure/issues/383)). `Group::set_attr` and `Dataset::set_attr` write an attribute set the object header cannot hold into a fractal heap on `commit`, and rebuild an object that already stores its attributes in one, where both were refused ([#102](https://github.com/stephenberry/hdf5-pure/issues/102)). Three types the API hands back without exporting are now exported, `Superblock`, `MessageType` and `BaseAddress`, which makes `File::superblock().base_address` usable as a number again after 0.40.0 changed it to a type with no public accessor ([#323](https://github.com/stephenberry/hdf5-pure/issues/323)). **Breaking:** a variable-length string attribute reads back as a `VarLenString` variant rather than as the fixed-width variant of its charset and arity, `AttrValue::VarLenAsciiArray` is renamed `VarLenAsciiCharArray`, and `Superblock::serialize` is internal.

@@ -74,6 +74,16 @@ fn a_flagged_file_is_refused_by_the_reading_and_writing_opens() {
         File::open_swmr_writer(&path).unwrap_err(),
         "a second File::open_swmr_writer",
     );
+
+    // A path is what an open by path reports, not what it decides by: the same
+    // superblock byte refuses a source, which names itself instead.
+    let handle = std::fs::File::open(&path).unwrap();
+    let err = File::from_source(hdf5_pure::ReadSeekSource::new(handle).unwrap()).unwrap_err();
+    assert!(
+        matches!(&err, Error::FileMarkedInUse(said) if said.contains("byte source")),
+        "File::from_source reported {err:?} rather than naming the source it refused"
+    );
+    assert_marked_in_use(err, "File::from_source");
 }
 
 /// The bounded editor reaches the same refusal as the mirrored one: both open the
@@ -141,6 +151,10 @@ fn clearing_the_flag_restores_every_open() {
         (0..4).collect::<Vec<_>>()
     );
     File::open_streaming(&path).unwrap();
+    {
+        let handle = std::fs::File::open(&path).unwrap();
+        File::from_source(hdf5_pure::ReadSeekSource::new(handle).unwrap()).unwrap();
+    }
     File::open_swmr(&path).unwrap();
     drop(File::open_rw(&path).unwrap());
     File::open_swmr_writer(&path).unwrap().close().unwrap();

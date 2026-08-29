@@ -181,6 +181,58 @@ pub(crate) enum OpenIntent {
     Write,
 }
 
+/// What an open was asked to open, for the refusal to name.
+///
+/// The companion of [`OpenIntent`]: that says why the file was being opened,
+/// this says what the file *was*. Neither reaches the decision — the superblock
+/// makes that alone — but both shape what the error can usefully say, and the
+/// difference is not only cosmetic. Two of the three recoveries a refused
+/// snapshot read would otherwise be told to try, [`crate::File::open_swmr`] and
+/// [`crate::File::clear_swmr_flag`], need a filesystem path; naming them to a
+/// caller who opened a byte source would be advice it cannot take.
+///
+/// A closed set rather than a `&dyn Display`, so the wording every refusal
+/// leads with lives here beside the reasons it is concatenated with, and a
+/// third kind of open arrives as a variant a reviewer sees.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum OpenTarget<'a> {
+    /// A file opened by name, which the refusal reports and whose flag
+    /// [`crate::File::clear_swmr_flag`] can clear in place.
+    Path(&'a Path),
+    /// Bytes handed to [`crate::File::from_source`], which have no name and no
+    /// in-place recovery.
+    Source,
+}
+
+impl OpenTarget<'_> {
+    /// What a caller refused a snapshot read can do instead, which is not the
+    /// same list for both: a source has no path for `open_swmr` to follow or
+    /// for `clear_swmr_flag` to write to.
+    fn read_recovery(self) -> &'static str {
+        match self {
+            Self::Path(_) => {
+                "Use File::open_swmr to follow a live SWMR writer, or File::from_bytes to read \
+                 the bytes as they stand; if a writer exited without closing the file, clear \
+                 the flag with File::clear_swmr_flag"
+            }
+            Self::Source => {
+                "Use File::from_bytes to read the bytes as they stand; following a live writer \
+                 with File::open_swmr, and clearing a flag a writer left behind with \
+                 File::clear_swmr_flag, both need a filesystem path"
+            }
+        }
+    }
+}
+
+impl core::fmt::Display for OpenTarget<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Path(path) => write!(f, "{}", path.display()),
+            Self::Source => f.write_str("a byte source"),
+        }
+    }
+}
+
 /// Refuse an open the superblock's status-flags byte says is unsafe, matching
 /// `H5F_open`'s check of the same byte (issue #245).
 ///
@@ -212,10 +264,14 @@ pub(crate) enum OpenIntent {
 /// [`crate::File::open_swmr_writer`]), and a page buffer because it refuses to
 /// buffer behind a mark no reader would honor — so no flag this crate raises
 /// falls outside the gate.
+///
+/// `target` does not enter the decision, which the superblock makes alone. It
+/// shapes the error: what to call the file that was refused, and which
+/// recoveries to name, since two of the three need a filesystem path.
 pub(crate) fn check_status_flags(
     superblock: &Superblock,
     intent: OpenIntent,
-    path: &Path,
+    target: OpenTarget<'_>,
 ) -> Result<(), Error> {
     if superblock.version < 3 {
         return Ok(());
@@ -234,9 +290,8 @@ pub(crate) fn check_status_flags(
         ),
         OpenIntent::Read if write || swmr => format!(
             "the superblock marks the file as open for write (status flags {flags:#04x}), so a \
-             snapshot read is not safe. Use File::open_swmr to follow a live SWMR writer, or \
-             File::from_bytes to read the bytes as they stand; if a writer exited without \
-             closing the file, clear the flag with File::clear_swmr_flag"
+             snapshot read is not safe. {}",
+            target.read_recovery()
         ),
         OpenIntent::SwmrRead if write != swmr => format!(
             "the superblock's status flags disagree ({flags:#04x}): a SWMR reader needs a SWMR \
@@ -245,10 +300,7 @@ pub(crate) fn check_status_flags(
         ),
         _ => return Ok(()),
     };
-    Err(Error::FileMarkedInUse(format!(
-        "{}: {reason}.",
-        path.display(),
-    )))
+    Err(Error::FileMarkedInUse(format!("{target}: {reason}.")))
 }
 
 /// Clear a stale status flag left in `path` by a writer that exited without a
@@ -356,7 +408,12 @@ mod tests {
     }
 
     fn allows(version: u8, flags: u32, intent: OpenIntent) -> bool {
-        check_status_flags(&flagged(version, flags), intent, Path::new("f.h5")).is_ok()
+        check_status_flags(
+            &flagged(version, flags),
+            intent,
+            OpenTarget::Path(Path::new("f.h5")),
+        )
+        .is_ok()
     }
 
     /// The full rule, stated per intent rather than per flag value, so a table
@@ -411,8 +468,12 @@ mod tests {
     /// recovery a user would otherwise have to find in the C library's docs.
     #[test]
     fn the_refusal_names_the_recovery() {
-        let err = check_status_flags(&flagged(3, 0x05), OpenIntent::Read, Path::new("d.h5"))
-            .expect_err("a flagged file is refused for a snapshot read");
+        let err = check_status_flags(
+            &flagged(3, 0x05),
+            OpenIntent::Read,
+            OpenTarget::Path(Path::new("d.h5")),
+        )
+        .expect_err("a flagged file is refused for a snapshot read");
         let msg = err.to_string();
         assert!(matches!(err, Error::FileMarkedInUse(_)), "got {err:?}");
         // `from_bytes` is named because it is the only way through for a flagged
@@ -421,6 +482,33 @@ mod tests {
         for part in ["d.h5", "0x05", "clear_swmr_flag", "open_swmr", "from_bytes"] {
             assert!(msg.contains(part), "refusal does not mention {part}: {msg}");
         }
+    }
+
+    /// The recovery a source is offered is the one a source can reach.
+    ///
+    /// Two of the three the path refusal names — `open_swmr` to follow the
+    /// writer, `clear_swmr_flag` to clear what one left behind — take a path,
+    /// so handing them to a caller that opened a byte source would be advice it
+    /// cannot take. The refusal has to say which half applies, and the check
+    /// below is that it does: the path wording contains none of this text, so
+    /// a `Source` target falling back to it fails here.
+    #[test]
+    fn a_source_is_told_which_recovery_it_can_reach() {
+        let err = check_status_flags(&flagged(3, 0x05), OpenIntent::Read, OpenTarget::Source)
+            .expect_err("a flagged file is refused for a snapshot read");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("file is marked in use: a byte source:"),
+            "the refusal does not name the source it refused: {msg}"
+        );
+        assert!(
+            msg.contains("File::from_bytes to read the bytes as they stand"),
+            "the refusal does not name the one recovery a source can reach: {msg}"
+        );
+        assert!(
+            msg.contains("both need a filesystem path"),
+            "the refusal offers path-only recoveries without saying they need a path: {msg}"
+        );
     }
 
     /// Write a file at `path` whose superblock carries `version` and `flags`,

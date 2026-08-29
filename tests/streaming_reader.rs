@@ -343,3 +343,174 @@ fn streaming_matches_buffered_groups_and_attributes_across_fixtures() {
         );
     }
 }
+
+/// `File::from_source` reads what `open_streaming` reads, and reads no more of
+/// the file than the work needs.
+///
+/// The point of the entry is a caller whose bytes are not a path — an object
+/// store, or a guest that receives byte ranges from its host — so the source
+/// here is neither a file nor a slice the reader could have mapped: it serves
+/// the bytes from behind a counter.
+///
+/// That counter is what makes this test load-bearing rather than decorative. A
+/// read that quietly materialized the file would still return the right
+/// numbers; only the byte count separates that from reading on demand.
+#[test]
+fn from_source_matches_streaming_and_reads_on_demand() {
+    use hdf5_pure::{FormatError, Source};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Counting {
+        bytes: Vec<u8>,
+        served: Arc<AtomicU64>,
+    }
+
+    impl Source for Counting {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+            let at = usize::try_from(offset).expect("the fixture fits this platform");
+            let end = at + buf.len();
+            if end > self.bytes.len() {
+                return Err(FormatError::UnexpectedEof {
+                    expected: end,
+                    available: self.bytes.len(),
+                });
+            }
+            buf.copy_from_slice(&self.bytes[at..end]);
+            self.served.fetch_add(buf.len() as u64, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("from_source.h5");
+
+    // Rows enough that one window is a small share of the file: the read below
+    // asks for 64 of 8,000, each row 32 columns of f64.
+    let rows = 8_000usize;
+    let cols = 32usize;
+    let data: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("frames")
+            .with_f64_data(&data)
+            .with_shape(&[rows as u64, cols as u64])
+            .with_chunks(&[64, cols as u64]);
+        b.write(&path).unwrap();
+    }
+
+    let whole = std::fs::read(&path).unwrap();
+    let served = Arc::new(AtomicU64::new(0));
+    let file = File::from_source(Box::new(Counting {
+        bytes: whole.clone(),
+        served: Arc::clone(&served),
+    }))
+    .unwrap();
+
+    let window = file
+        .dataset("frames")
+        .unwrap()
+        .read_f64_rows(100, 64)
+        .unwrap();
+    assert_eq!(
+        window,
+        data[100 * cols..164 * cols],
+        "a source read differs from what was written"
+    );
+
+    let by_path = File::open_streaming(&path)
+        .unwrap()
+        .dataset("frames")
+        .unwrap()
+        .read_f64_rows(100, 64)
+        .unwrap();
+    assert_eq!(window, by_path, "a source read differs from a path read");
+
+    let served = served.load(Ordering::Relaxed);
+    assert!(
+        served < whole.len() as u64 / 4,
+        "served {served} of {} bytes: the source was drained, not read on demand",
+        whole.len()
+    );
+    // And the floor: the window's own bytes came through this source, so a
+    // count that collapses toward zero means the counter stopped counting, not
+    // that the read got cheaper.
+    let window_bytes = (64 * cols * size_of::<f64>()) as u64;
+    assert!(
+        served >= window_bytes,
+        "served {served} bytes, fewer than the {window_bytes} the window itself is: \
+         the count is not measuring the read"
+    );
+}
+
+/// A source that returns fewer bytes than it was asked for is refused, not
+/// followed into a parser.
+///
+/// `Source::read_exact_at` and `read_metadata_at` have default bodies that
+/// cannot come back short, but they are overridable, and a source that batches
+/// or coalesces remote reads is exactly the caller with a reason to override
+/// them. The parsers index what comes back at offsets computed from the length
+/// they *asked* for, so an unchecked short buffer is a slice panic inside the
+/// object-header parser, blaming the file format for what the source did.
+#[test]
+fn a_source_that_returns_a_short_buffer_is_refused() {
+    use hdf5_pure::{FormatError, Source};
+
+    struct Short(Vec<u8>);
+
+    impl Source for Short {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+            let at = usize::try_from(offset).expect("the fixture fits this platform");
+            let end = at + buf.len();
+            if end > self.0.len() {
+                return Err(FormatError::UnexpectedEof {
+                    expected: end,
+                    available: self.0.len(),
+                });
+            }
+            buf.copy_from_slice(&self.0[at..end]);
+            Ok(())
+        }
+
+        /// One byte short of the request, which is the whole defect.
+        fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+            let at = usize::try_from(offset).expect("the fixture fits this platform");
+            let end = (at + len).min(self.0.len()).saturating_sub(1);
+            Ok(self.0[at.min(end)..end].to_vec())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("short_reads.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("values")
+            .with_f64_data(&(0..256).map(f64::from).collect::<Vec<_>>())
+            .with_shape(&[256]);
+        b.write(&path).unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+
+    // Whichever read reaches the short buffer first, the answer is an error
+    // that names the source rather than a panic inside a parser.
+    let err = match File::from_source(Short(bytes)) {
+        Err(err) => err,
+        Ok(file) => file
+            .dataset("values")
+            .and_then(|d| d.read_f64())
+            .expect_err("a source returning short buffers read a dataset successfully"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bytes for a") && msg.contains("read at offset"),
+        "the refusal does not say the source came back short: {msg}"
+    );
+}

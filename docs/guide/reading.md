@@ -21,8 +21,9 @@ This page covers opening HDF5 files, navigating their group hierarchy, and readi
 | `File::from_bytes(bytes)` | An in-memory `Vec<u8>` | No filesystem needed — the in-memory path, e.g. for WebAssembly. |
 | `File::open_streaming(path)` | A file on disk, read on demand | Fetches metadata and chunks lazily; never buffers the whole file. See [Streaming](streaming.md). |
 | `File::open_swmr(path)` | A file being appended to | Re-readable with `refresh()` to pick up new data. See [SWMR](swmr.md). |
+| `File::from_source(source)` | Any `Source` — bytes with no path | The streaming reader over an object store, a sandboxed host, anything that answers "how long" and "bytes at this offset". See [Streaming](streaming.md). |
 
-`File::open` and `File::open_streaming` refuse a file whose superblock marks it as held by a writer, with `Error::FileMarkedInUse` — the check `H5Fopen` makes of the same byte. `File::open_swmr` follows such a file instead, refusing only a half-set mark, and `File::from_bytes` does not consult the byte at all. Recover a file a writer left flagged when it exited with `File::clear_swmr_flag`; see [SWMR](swmr.md#recovering-a-flagged-file).
+`File::open`, `File::open_streaming` and `File::from_source` refuse a file whose superblock marks it as held by a writer, with `Error::FileMarkedInUse` — the check `H5Fopen` makes of the same byte. `File::open_swmr` follows such a file instead, refusing only a half-set mark, and `File::from_bytes` does not consult the byte at all. Recover a file a writer left flagged when it exited with `File::clear_swmr_flag`; see [SWMR](swmr.md#recovering-a-flagged-file).
 
 ```rust
 use hdf5_pure::File;

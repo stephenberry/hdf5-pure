@@ -85,10 +85,9 @@
 //! buffer (for example a multi-gigabyte file on a 32-bit host, where it exceeds
 //! the address space), use [`File::open_streaming`], which fetches metadata and
 //! dataset chunks from the file on demand instead of buffering it whole. The
-//! reading API is identical; only the backing store differs. Reads of
-//! contiguous, compact, and chunked datasets are supported; the streaming
-//! backend currently resolves only latest-format (v2) groups and does not yet
-//! read attributes.
+//! reading API is identical; only the backing store differs. Contiguous,
+//! compact, and every chunked layout read the same way, as do both group forms
+//! and attributes.
 //!
 //! ```rust,no_run
 //! use hdf5_pure::File;
@@ -96,6 +95,11 @@
 //! let file = File::open_streaming("huge.h5").unwrap();
 //! let values = file.dataset("signal").unwrap().read_f64().unwrap();
 //! ```
+//!
+//! When the bytes are not a path at all — an object store addressed by range
+//! request, a sandboxed guest handed byte ranges by its host — implement
+//! [`Source`] over them and open with [`File::from_source`], which is the same
+//! lazy backing store fed from somewhere else.
 //!
 //! # N-dimensional arrays (`ndarray` feature)
 //!
@@ -271,7 +275,13 @@ pub use file_lock::FileLocking;
 
 pub use chunk_cache::{ChunkCacheConfig, ChunkCacheStats};
 
-pub use source::{MetadataCacheConfig, MetadataCacheStats};
+pub use source::{MetadataCacheConfig, MetadataCacheStats, Source};
+
+// The `Read + Seek` backend, for a caller who has one but no path. Exported
+// beside `Source` because without it every such caller reimplements the
+// seek-and-read the crate already carries.
+#[cfg(feature = "std")]
+pub use source::ReadSeekSource;
 
 #[cfg(feature = "std")]
 pub use vl_data::VlenStringReadOptions;

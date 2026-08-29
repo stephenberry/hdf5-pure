@@ -49,6 +49,12 @@ The path-based entry points (`File::open`, `FileBuilder::write`, `File::open_rw`
 filesystem at runtime in the browser. Build your WASM code around `finish` and
 `from_bytes`.
 
+`from_bytes` needs the whole file in memory, which a large one will not be. When
+the host can serve byte ranges — a `fetch` with a `Range` header, or a WASI
+import — implement `Source` over it and open the file with `File::from_source`
+instead: metadata and chunks are then read on demand and peak memory tracks what
+you actually read. See [Streaming](../guide/streaming.md#streaming-from-something-that-is-not-a-path).
+
 !!! tip "Trimming the build"
 
     `deflate` is on by default (a pure-Rust backend, so it compiles to WASM
@@ -79,6 +85,7 @@ shown above, is available on `wasm32-unknown-unknown`.
 | Datatype & builder primitives | `make_*_type`, `DatasetBuilder`, `GroupBuilder`, `ScaleOffset` | no (`alloc` only) |
 | Build a whole file in memory | `FileBuilder::new` / `FileBuilder::finish` | yes |
 | Parse a file from memory | `File::from_bytes` | yes |
+| Streaming read from host-served byte ranges | `File::from_source`, `Source` | yes |
 | Open a file by path | `File::open` | yes |
 | Streaming read by path | `File::open_streaming` | yes |
 | SWMR follow read by path | `File::open_swmr` | yes |

@@ -273,8 +273,54 @@ impl MetadataCacheStats {
 /// are `usize` (they must fit in a caller-provided buffer). Implementations must
 /// either fill the whole request or return an error — a short read is always an
 /// error, never silently truncated.
+///
+/// # Implementing one
+///
+/// Two methods carry the whole trait: [`len`](Source::len) and
+/// [`read_at`](Source::read_at). The rest are conveniences with default bodies,
+/// and every method added later will have one too, so an implementation written
+/// today keeps compiling.
+///
+/// The reader treats a source as an immutable file for as long as it holds one:
+/// [`len`](Source::len) is expected to stay put and to be true — the reader
+/// bounds allocations with it — and bytes already read are expected to read
+/// back the same. A source over something that grows underneath it — a file a
+/// writer is appending to — is what [`File::open_swmr`](crate::File::open_swmr)
+/// is for instead. `read_at` takes `&self` so a `File` can be shared, so an
+/// implementation over a mutable handle owns its own synchronisation, the way
+/// [`ReadSeekSource`] wraps its reader in a mutex.
+///
+/// Leave the last three defaulted unless you mean to cache.
+/// [`read_metadata_at`](Source::read_metadata_at),
+/// [`metadata_cache_stats`](Source::metadata_cache_stats) and
+/// [`reset_metadata_cache_stats`](Source::reset_metadata_cache_stats) are the
+/// seam this crate's own bounded metadata cache hangs on, and they come as a
+/// set: overriding the first without the other two reports *no* cache where
+/// there is a full one. To have metadata reads cached, ask for it with a
+/// [`MetadataCacheConfig`](crate::MetadataCacheConfig) through
+/// [`File::from_source_with_options`](crate::File::from_source_with_options),
+/// which wraps the source in an implementation of all three.
+#[expect(
+    clippy::len_without_is_empty,
+    reason = "`len` here is a file's byte length, not a container's count — the shape of \
+              `std::fs::Metadata::len`, which ships without an `is_empty` for the same \
+              reason. An HDF5 file is never empty (the signature alone is eight bytes), so \
+              an `is_empty` on this trait would be a public method with no caller, and one \
+              an implementation could contradict its own `len` with"
+)]
 pub trait Source {
     /// Total number of bytes the source can supply.
+    ///
+    /// Report the true length: the reader bounds allocations with it. Metadata
+    /// lengths come out of the file being read, and
+    /// [`read_exact_at`](Source::read_exact_at) rejects one that runs past the
+    /// end *before* reserving a buffer for it, so a malformed file cannot name
+    /// a multi-gigabyte read and have it reserved. A `len` larger than what the
+    /// source can actually serve passes that check and the reservation happens,
+    /// which leaves the file choosing the size of an allocation. A length that
+    /// arrives over a channel the caller does not control — a `Content-Length`
+    /// header, a size a host reports — should be held to what the source can
+    /// really serve before it is reported here.
     fn len(&self) -> u64;
 
     /// Read exactly `buf.len()` bytes starting at absolute offset `offset`,
@@ -402,6 +448,74 @@ impl<S: Source + ?Sized> Source for std::boxed::Box<S> {
 
     fn reset_metadata_cache_stats(&self) {
         (**self).reset_metadata_cache_stats();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Caller-supplied sources
+// ---------------------------------------------------------------------------
+
+/// Holds a caller-supplied [`Source`] to the part of the trait's contract the
+/// parsers above it cannot check for themselves.
+///
+/// [`Source::read_exact_at`] and [`Source::read_metadata_at`] have default
+/// bodies that return exactly the bytes asked for, and every source this crate
+/// builds either uses those bodies or forwards to one that does. An
+/// implementation from outside may override them, and has a reason to — a
+/// remote source that batches or coalesces its reads is the case
+/// [`crate::File::from_source`] exists for. The parsers then index the returned
+/// buffer at offsets derived from the length they *requested*, so a buffer that
+/// comes back short is a slice panic inside a header parser, blaming a file
+/// format for what the source did.
+///
+/// One length comparison per read turns that into [`FormatError::Source`],
+/// which names the source instead. This wraps only what a caller hands in;
+/// the crate's own sources have no override to check.
+#[cfg(feature = "std")]
+pub(crate) struct ValidatedSource<S>(S);
+
+#[cfg(feature = "std")]
+impl<S> ValidatedSource<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Self(inner)
+    }
+
+    /// Refuse a buffer whose length is not the one that was asked for.
+    fn check(offset: u64, len: usize, bytes: Vec<u8>) -> Result<Vec<u8>, FormatError> {
+        if bytes.len() == len {
+            return Ok(bytes);
+        }
+        Err(FormatError::Source(std::format!(
+            "the source returned {} bytes for a {len}-byte read at offset {offset}",
+            bytes.len()
+        )))
+    }
+}
+
+#[cfg(feature = "std")]
+impl<S: Source> Source for ValidatedSource<S> {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        self.0.read_at(offset, buf)
+    }
+
+    fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        Self::check(offset, len, self.0.read_exact_at(offset, len)?)
+    }
+
+    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        Self::check(offset, len, self.0.read_metadata_at(offset, len)?)
+    }
+
+    fn metadata_cache_stats(&self) -> Option<MetadataCacheStats> {
+        self.0.metadata_cache_stats()
+    }
+
+    fn reset_metadata_cache_stats(&self) {
+        self.0.reset_metadata_cache_stats();
     }
 }
 
