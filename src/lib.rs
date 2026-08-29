@@ -271,7 +271,13 @@ pub use file_lock::FileLocking;
 
 pub use chunk_cache::{ChunkCacheConfig, ChunkCacheStats};
 
-pub use source::{MetadataCacheConfig, MetadataCacheStats};
+pub use source::{MetadataCacheConfig, MetadataCacheStats, Source};
+
+// The `Read + Seek` backend, for a caller who has one but no path. Exported
+// beside `Source` because without it every such caller reimplements the
+// seek-and-read the crate already carries.
+#[cfg(feature = "std")]
+pub use source::ReadSeekSource;
 
 #[cfg(feature = "std")]
 pub use vl_data::VlenStringReadOptions;

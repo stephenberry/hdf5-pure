@@ -23,6 +23,22 @@ The reading API is identical to `File::open`; only the backing store differs. Ev
 !!! note
     `open_streaming` requires the `std` filesystem and is therefore unavailable in `no_std` builds. See [Features](../reference/features.md) for the feature matrix.
 
+## Streaming from something that is not a path
+
+`File::from_source(source)` opens the same lazy backing store over anything that implements `Source`, for a caller whose bytes are not a file: an object store addressed by HTTP range request, a WebAssembly guest that receives byte ranges from its host and has no filesystem at all, a decrypting layer.
+
+`Source` asks for two answers — the total length, and the bytes at an absolute offset — which is all the reader ever asks of a file. A `Read + Seek` needs no implementation of its own: `ReadSeekSource` wraps one.
+
+```rust
+use hdf5_pure::{File, ReadSeekSource};
+
+let handle = std::fs::File::open("huge.h5").unwrap();
+let file = File::from_source(ReadSeekSource::new(handle).unwrap()).unwrap();
+let values = file.dataset("signal").unwrap().read_f64().unwrap();
+```
+
+A remote source wants its metadata cache turned on, through `File::from_source_with_options`: without one every parser read is a round trip. See `MetadataCacheConfig`.
+
 ## What streaming supports
 
 Dataset reads are fully supported across every storage layout:

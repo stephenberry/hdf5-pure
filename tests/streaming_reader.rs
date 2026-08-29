@@ -343,3 +343,97 @@ fn streaming_matches_buffered_groups_and_attributes_across_fixtures() {
         );
     }
 }
+
+/// `File::from_source` reads what `open_streaming` reads, and reads no more of
+/// the file than the work needs.
+///
+/// The point of the entry is a caller whose bytes are not a path — an object
+/// store, or a guest that receives byte ranges from its host — so the source
+/// here is neither a file nor a slice the reader could have mapped: it serves
+/// the bytes from behind a counter.
+///
+/// That counter is what makes this test load-bearing rather than decorative. A
+/// read that quietly materialized the file would still return the right
+/// numbers; only the byte count separates that from reading on demand.
+#[test]
+fn from_source_matches_streaming_and_reads_on_demand() {
+    use hdf5_pure::{FormatError, Source};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Counting {
+        bytes: Vec<u8>,
+        served: Arc<AtomicU64>,
+    }
+
+    impl Source for Counting {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+            let at = usize::try_from(offset).expect("the fixture fits this platform");
+            let end = at + buf.len();
+            if end > self.bytes.len() {
+                return Err(FormatError::UnexpectedEof {
+                    expected: end,
+                    available: self.bytes.len(),
+                });
+            }
+            buf.copy_from_slice(&self.bytes[at..end]);
+            self.served.fetch_add(buf.len() as u64, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("from_source.h5");
+
+    // Rows enough that one window is a small share of the file: the read below
+    // asks for 64 of 8,000, each row 32 columns of f64.
+    let rows = 8_000usize;
+    let cols = 32usize;
+    let data: Vec<f64> = (0..rows * cols).map(|i| i as f64).collect();
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("frames")
+            .with_f64_data(&data)
+            .with_shape(&[rows as u64, cols as u64])
+            .with_chunks(&[64, cols as u64]);
+        b.write(&path).unwrap();
+    }
+
+    let whole = std::fs::read(&path).unwrap();
+    let served = Arc::new(AtomicU64::new(0));
+    let file = File::from_source(Box::new(Counting {
+        bytes: whole.clone(),
+        served: Arc::clone(&served),
+    }))
+    .unwrap();
+
+    let window = file
+        .dataset("frames")
+        .unwrap()
+        .read_f64_rows(100, 64)
+        .unwrap();
+    assert_eq!(
+        window,
+        data[100 * cols..164 * cols],
+        "a source read differs from what was written"
+    );
+
+    let by_path = File::open_streaming(&path)
+        .unwrap()
+        .dataset("frames")
+        .unwrap()
+        .read_f64_rows(100, 64)
+        .unwrap();
+    assert_eq!(window, by_path, "a source read differs from a path read");
+
+    let served = served.load(Ordering::Relaxed);
+    assert!(
+        served < whole.len() as u64 / 4,
+        "served {served} of {} bytes: the source was drained, not read on demand",
+        whole.len()
+    );
+}

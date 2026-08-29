@@ -212,10 +212,12 @@ pub(crate) enum OpenIntent {
 /// [`crate::File::open_swmr_writer`]), and a page buffer because it refuses to
 /// buffer behind a mark no reader would honor — so no flag this crate raises
 /// falls outside the gate.
+/// `named` appears only in the error, naming what was refused: a path for a
+/// file open, some other description for an open that has no path.
 pub(crate) fn check_status_flags(
     superblock: &Superblock,
     intent: OpenIntent,
-    path: &Path,
+    named: &dyn core::fmt::Display,
 ) -> Result<(), Error> {
     if superblock.version < 3 {
         return Ok(());
@@ -245,10 +247,7 @@ pub(crate) fn check_status_flags(
         ),
         _ => return Ok(()),
     };
-    Err(Error::FileMarkedInUse(format!(
-        "{}: {reason}.",
-        path.display(),
-    )))
+    Err(Error::FileMarkedInUse(format!("{named}: {reason}.")))
 }
 
 /// Clear a stale status flag left in `path` by a writer that exited without a
@@ -356,7 +355,12 @@ mod tests {
     }
 
     fn allows(version: u8, flags: u32, intent: OpenIntent) -> bool {
-        check_status_flags(&flagged(version, flags), intent, Path::new("f.h5")).is_ok()
+        check_status_flags(
+            &flagged(version, flags),
+            intent,
+            &Path::new("f.h5").display(),
+        )
+        .is_ok()
     }
 
     /// The full rule, stated per intent rather than per flag value, so a table
@@ -411,8 +415,12 @@ mod tests {
     /// recovery a user would otherwise have to find in the C library's docs.
     #[test]
     fn the_refusal_names_the_recovery() {
-        let err = check_status_flags(&flagged(3, 0x05), OpenIntent::Read, Path::new("d.h5"))
-            .expect_err("a flagged file is refused for a snapshot read");
+        let err = check_status_flags(
+            &flagged(3, 0x05),
+            OpenIntent::Read,
+            &Path::new("d.h5").display(),
+        )
+        .expect_err("a flagged file is refused for a snapshot read");
         let msg = err.to_string();
         assert!(matches!(err, Error::FileMarkedInUse(_)), "got {err:?}");
         // `from_bytes` is named because it is the only way through for a flagged

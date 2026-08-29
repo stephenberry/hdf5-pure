@@ -273,9 +273,32 @@ impl MetadataCacheStats {
 /// are `usize` (they must fit in a caller-provided buffer). Implementations must
 /// either fill the whole request or return an error — a short read is always an
 /// error, never silently truncated.
+/// # Implementing one
+///
+/// Two methods carry the whole trait: [`len`](Source::len) and
+/// [`read_at`](Source::read_at). The rest are conveniences with default bodies,
+/// and every method added later will have one too, so an implementation written
+/// today keeps compiling.
+///
+/// The reader treats a source as an immutable file for as long as it holds one:
+/// `len` is expected to stay put, and bytes already read are expected to read
+/// back the same. A source over something that grows underneath it — a file a
+/// writer is appending to — is what [`File::open_swmr`](crate::File::open_swmr)
+/// is for instead. `read_at` takes `&self` so a `File` can be shared, so an
+/// implementation over a mutable handle owns its own synchronisation, the way
+/// [`ReadSeekSource`] wraps its reader in a mutex.
 pub trait Source {
     /// Total number of bytes the source can supply.
     fn len(&self) -> u64;
+
+    /// Whether the source is empty.
+    ///
+    /// A file never is — the signature alone is eight bytes — so this exists
+    /// for completeness beside [`len`](Source::len) rather than as a check the
+    /// reader makes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Read exactly `buf.len()` bytes starting at absolute offset `offset`,
     /// filling `buf`.

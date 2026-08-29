@@ -730,7 +730,11 @@ impl FileInner {
         // which needs write access to a path — is not available to it either.
         // This is a deliberate divergence from the C library, which checks under
         // its in-memory core driver too.
-        file_lock::check_status_flags(&inner.superblock, OpenIntent::Read, path.as_ref())?;
+        file_lock::check_status_flags(
+            &inner.superblock,
+            OpenIntent::Read,
+            &path.as_ref().display(),
+        )?;
         Ok(inner)
     }
 
@@ -774,7 +778,39 @@ impl FileInner {
             Box::new(source)
         };
         let (superblock, addr_offset) = Self::parse_superblock_source(source.as_ref())?;
-        file_lock::check_status_flags(&superblock, OpenIntent::Read, path.as_ref())?;
+        file_lock::check_status_flags(&superblock, OpenIntent::Read, &path.as_ref().display())?;
+        Ok(Self::from_parts(
+            Backend::Streaming(source),
+            superblock,
+            addr_offset,
+            None,
+            properties,
+        ))
+    }
+
+    /// Open an HDF5 file from any [`Source`], reading metadata and chunks on
+    /// demand as [`open_streaming`](Self::open_streaming) does.
+    pub fn from_source<S: Source + Send + Sync + 'static>(source: S) -> Result<Self, Error> {
+        Self::from_source_with_options(source, FileAccessProperties::new())
+    }
+
+    /// Open an HDF5 file from any [`Source`] with explicit access properties.
+    pub fn from_source_with_options<S: Source + Send + Sync + 'static>(
+        source: S,
+        properties: FileAccessProperties,
+    ) -> Result<Self, Error> {
+        let source: Box<dyn Source + Send + Sync> = if properties.metadata_cache.is_enabled() {
+            Box::new(MetadataCachingSource::new(
+                source,
+                properties.metadata_cache,
+            ))
+        } else {
+            Box::new(source)
+        };
+        let (superblock, addr_offset) = Self::parse_superblock_source(source.as_ref())?;
+        // The same refusal an open by path makes. The source has no path to
+        // report, so it names itself instead.
+        file_lock::check_status_flags(&superblock, OpenIntent::Read, &"a byte source")?;
         Ok(Self::from_parts(
             Backend::Streaming(source),
             superblock,
@@ -810,7 +846,7 @@ impl FileInner {
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
         let (superblock, addr_offset) = Self::parse_superblock(&data)?;
-        file_lock::check_status_flags(&superblock, OpenIntent::SwmrRead, path.as_ref())?;
+        file_lock::check_status_flags(&superblock, OpenIntent::SwmrRead, &path.as_ref().display())?;
         Ok(Self::from_parts(
             Backend::InMemory(data),
             superblock,
@@ -2036,6 +2072,49 @@ impl File {
     ) -> Result<Self, Error> {
         Ok(File {
             inner: Arc::new(FileInner::open_streaming_with_options(path, properties)?),
+        })
+    }
+
+    /// Open an HDF5 file from any [`Source`], reading metadata and chunks on
+    /// demand exactly as [`open_streaming`](Self::open_streaming) does.
+    ///
+    /// This is the streaming open for a caller whose bytes are not a path: an
+    /// object store addressed by HTTP range request, a sandboxed guest that
+    /// receives byte ranges from its host, a decrypting layer. A [`Source`]
+    /// supplies a length and reads at an absolute offset, which is all the
+    /// reader asks of a file, so peak memory stays at the metadata being parsed
+    /// plus the chunks a read touches — not the file. Wrap a `Read + Seek` in
+    /// [`ReadSeekSource`] rather than writing that impl again.
+    ///
+    /// A file marked as held by a writer is refused here as it is by
+    /// [`open_streaming`](Self::open_streaming); with no path to report, the
+    /// error names the source instead. Recovering such a file still needs a
+    /// path, through [`File::clear_swmr_flag`].
+    ///
+    /// ```no_run
+    /// use hdf5_pure::{File, ReadSeekSource};
+    ///
+    /// let handle = std::fs::File::open("data.h5")?;
+    /// let file = File::from_source(ReadSeekSource::new(handle)?)?;
+    /// let rows = file.dataset("frames")?.read_f64_rows(0, 64)?;
+    /// # Ok::<(), hdf5_pure::Error>(())
+    /// ```
+    pub fn from_source<S: Source + Send + Sync + 'static>(source: S) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::from_source(source)?),
+        })
+    }
+
+    /// Open an HDF5 file from any [`Source`] with explicit access properties.
+    ///
+    /// The metadata cache is what a remote source wants tuned: every parser
+    /// read becomes a round trip without one. See [`MetadataCacheConfig`].
+    pub fn from_source_with_options<S: Source + Send + Sync + 'static>(
+        source: S,
+        properties: FileAccessProperties,
+    ) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::from_source_with_options(source, properties)?),
         })
     }
 
@@ -7558,22 +7637,15 @@ mod tests {
         counts: &ReadCounts,
         access: FileAccessProperties,
     ) -> File {
-        let source: Box<dyn Source + Send + Sync> = Box::new(CountingSource {
-            bytes,
-            reads: Arc::clone(&counts.reads),
-            bytes_read: Arc::clone(&counts.bytes),
-        });
-        let (superblock, addr_offset) =
-            FileInner::parse_superblock_source(source.as_ref()).expect("parse superblock");
-        File {
-            inner: Arc::new(FileInner::from_parts(
-                Backend::Streaming(source),
-                superblock,
-                addr_offset,
-                None,
-                access,
-            )),
-        }
+        File::from_source_with_options(
+            CountingSource {
+                bytes,
+                reads: Arc::clone(&counts.reads),
+                bytes_read: Arc::clone(&counts.bytes),
+            },
+            access,
+        )
+        .expect("open from source")
     }
 
     /// An `n`-element f64 dataset in chunks of `chunk` elements.
