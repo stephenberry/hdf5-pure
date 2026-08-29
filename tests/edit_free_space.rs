@@ -8,7 +8,7 @@
 
 use hdf5_pure::{
     AttrValue, EditBacking, File, FileAccessProperties, FileBuilder, FileSpaceStrategy,
-    MemoryStrategy,
+    MemoryStrategy, SyncPolicy,
 };
 
 #[path = "common/temp_fixture.rs"]
@@ -1434,9 +1434,18 @@ fn a_paged_tail_conserves_free_space_across_layouts() {
         // The first commit settles the tail into the file's own free space; from
         // the second on, each tail replaces the previous one and nothing else
         // moves.
+        //
+        // `OnClose` for the same reason as the flat sweep below: what these
+        // sessions are read for is the free space each one leaves recorded, and
+        // the ordering `Always` buys with two or three `fsync`s a commit is not
+        // something any assertion here looks at.
         let mut totals = Vec::new();
         for i in 0..3 {
-            let f = File::open_rw(&path).unwrap();
+            let f = File::open_rw_with_options(
+                &path,
+                FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose),
+            )
+            .unwrap();
             f.root().set_attr("n", AttrValue::I64(i)).unwrap();
             f.commit().unwrap();
             drop(f);
@@ -1632,8 +1641,23 @@ fn a_persisting_tail_holds_its_size_across_layouts() {
         }
         b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
         b.write(&path).unwrap();
+
+        // Nine sessions per filler, 576 across the sweep, and what each one is
+        // read for is the size of the file it leaves behind. `SyncPolicy::Always`
+        // would spend two or three `fsync`s per commit establishing an ordering
+        // no assertion here looks at; `OnClose` keeps the one barrier that is
+        // load-bearing, at the close before each size is read, and writes the
+        // same bytes either way (`tests/sync_policy.rs`).
+        let open = |path: &std::path::Path| {
+            File::open_rw_with_options(
+                path,
+                FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose),
+            )
+            .unwrap()
+        };
+
         for i in 0..3 {
-            let f = File::open_rw(&path).unwrap();
+            let f = open(&path);
             f.root().delete(&format!("scratch{i}")).unwrap();
             f.commit().unwrap();
         }
@@ -1642,7 +1666,7 @@ fn a_persisting_tail_holds_its_size_across_layouts() {
         // each commit replaces an earlier tail and nothing else moves.
         let mut sizes = Vec::new();
         for i in 0..6 {
-            let f = File::open_rw(&path).unwrap();
+            let f = open(&path);
             f.root().set_attr("n", AttrValue::I64(i)).unwrap();
             f.commit().unwrap();
             drop(f);
