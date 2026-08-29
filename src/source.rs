@@ -282,7 +282,8 @@ impl MetadataCacheStats {
 /// today keeps compiling.
 ///
 /// The reader treats a source as an immutable file for as long as it holds one:
-/// `len` is expected to stay put, and bytes already read are expected to read
+/// [`len`](Source::len) is expected to stay put and to be true — the reader
+/// bounds allocations with it — and bytes already read are expected to read
 /// back the same. A source over something that grows underneath it — a file a
 /// writer is appending to — is what [`File::open_swmr`](crate::File::open_swmr)
 /// is for instead. `read_at` takes `&self` so a `File` can be shared, so an
@@ -309,6 +310,17 @@ impl MetadataCacheStats {
 )]
 pub trait Source {
     /// Total number of bytes the source can supply.
+    ///
+    /// Report the true length: the reader bounds allocations with it. Metadata
+    /// lengths come out of the file being read, and
+    /// [`read_exact_at`](Source::read_exact_at) rejects one that runs past the
+    /// end *before* reserving a buffer for it, so a malformed file cannot name
+    /// a multi-gigabyte read and have it reserved. A `len` larger than what the
+    /// source can actually serve passes that check and the reservation happens,
+    /// which leaves the file choosing the size of an allocation. A length that
+    /// arrives over a channel the caller does not control — a `Content-Length`
+    /// header, a size a host reports — should be held to what the source can
+    /// really serve before it is reported here.
     fn len(&self) -> u64;
 
     /// Read exactly `buf.len()` bytes starting at absolute offset `offset`,
