@@ -106,13 +106,15 @@ fn append_fletcher32() {
 fn append_scale_offset_f64() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("d.h5");
+    // Float D-scale is lossy, so the length has to be chunk-aligned: growing a
+    // partial trailing chunk is refused (see the test below).
     let init: Vec<f64> = (0..6).map(|i| i as f64 * 0.25).collect();
     let mut b = FileBuilder::new();
     b.create_dataset("d")
         .with_f64_data(&init)
         .with_shape(&[6])
         .with_maxshape(&[u64::MAX])
-        .with_chunks(&[4])
+        .with_chunks(&[3])
         .with_scale_offset(ScaleOffset::FloatDScale(2));
     b.write(&path).unwrap();
 
@@ -138,6 +140,87 @@ fn append_scale_offset_f64() {
     for (a, b) in back.iter().zip(expected.iter()) {
         assert!((a - b).abs() < 1e-9, "{a} != {b}");
     }
+}
+
+/// A staged append onto a partial trailing chunk decodes that chunk and encodes
+/// it again with the new elements, and under float D-scale that is not the
+/// identity: the filter packs each value as an offset from the chunk's minimum,
+/// and a smaller appended value moves that minimum, so a committed value is
+/// rounded again from a different origin. Measured on this fixture before the
+/// refusal existed: the committed `1.45` and `1.55` read back as `1.5` and `1.6`
+/// once `1.0` joined their chunk. So the rewrite is refused at `commit`, the
+/// file is left as it was, and the same dataset grows from a chunk-aligned
+/// length (issue #407).
+#[test]
+fn a_staged_append_onto_a_lossy_partial_tail_is_refused() {
+    let dir = tempdir().unwrap();
+    // Clear of the default fill value's tolerance window, so every element is
+    // stored as itself.
+    let written = [1.05f64, 1.15, 1.25, 1.35, 1.45, 1.55];
+    let build = |path: &std::path::Path, data: &[f64]| {
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_f64_data(data)
+            .with_shape(&[data.len() as u64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[4])
+            .with_scale_offset(ScaleOffset::FloatDScale(1));
+        b.write(path).unwrap();
+    };
+    let read = |path: &std::path::Path| {
+        File::open(path)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_f64()
+            .unwrap()
+    };
+
+    // Six of a chunk of four: 1.45 and 1.55 sit in a partial trailing chunk.
+    let path = dir.path().join("unaligned.h5");
+    build(&path, &written);
+    let before = std::fs::read(&path).unwrap();
+    let committed = read(&path);
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_f64(&[1.0, 2.0]);
+            })
+            .unwrap();
+        let err = s
+            .commit()
+            .expect_err("a lossy pipeline must not have its trailing chunk re-encoded");
+        assert!(
+            matches!(&err, Error::AppendUnsupported(m) if m.contains("lossy")),
+            "got: {err:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the refusal wrote bytes"
+    );
+    assert_eq!(read(&path), committed);
+
+    // From a chunk-aligned length the append touches no committed chunk.
+    let path = dir.path().join("aligned.h5");
+    build(&path, &written[..4]);
+    let committed = read(&path);
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_f64(&[1.0, 2.0]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+    let back = read(&path);
+    assert_eq!(back[..4], committed[..], "an untouched chunk changed");
+    assert_eq!(back[4..], [1.0, 2.0]);
 }
 
 #[test]

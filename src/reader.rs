@@ -4634,9 +4634,11 @@ impl Dataset {
     ///
     /// Unlike [`append`](Self::append) (immediate, amortized `O(1)`,
     /// Extensible-Array only), this rebuilds the chunk index on commit and so
-    /// also grows datasets whose Extensible-Array index is not yet allocated,
-    /// and — unlike it — rewrites a partial trailing chunk under a lossy filter
-    /// pipeline as well.
+    /// also grows datasets whose Extensible-Array index is not yet allocated.
+    /// Like it, a dataset under a **lossy** pipeline (ZFP, or float D-scale
+    /// scale-offset) whose length is not a whole multiple of its chunk length
+    /// is refused: growing that trailing chunk would decode and re-encode
+    /// values that are already committed, changing them.
     /// Configure the appended elements through `build` on the
     /// [`AppendBuilder`]; repeated calls within the builder concatenate in
     /// order. The dataset must be chunked, unlimited

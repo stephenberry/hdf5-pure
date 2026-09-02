@@ -475,7 +475,9 @@ fn c_create_typed<T: hdf5::H5Type + Copy>(
         builder = builder.fill_value(f);
     }
     let ds = builder.create("col").unwrap();
-    ds.write_raw(data).unwrap();
+    if !data.is_empty() {
+        ds.write_raw(data).unwrap();
+    }
     file.close().unwrap();
 }
 
@@ -512,14 +514,27 @@ where
     let c_written = dir.path().join("c.h5");
     let appended = dir.path().join("appended.h5");
     c_create_typed(&c_written, values, values.len(), mode, Some(fill));
-    c_create_typed(&appended, &values[..1], values.len(), mode, Some(fill));
-    append(&appended, &values[1..]);
+    let seed = seed_len(mode);
+    c_create_typed(&appended, &values[..seed], values.len(), mode, Some(fill));
+    append(&appended, &values[seed..]);
 
     assert_eq!(
         raw_chunks(&appended),
         raw_chunks(&c_written),
         "compressed chunk bytes diverge from the C encoder (fill {fill:?})"
     );
+}
+
+/// How many elements the C library writes before this crate appends the rest.
+/// The lossless integer mode seeds one, so the append re-encodes a partial
+/// chunk; the lossy float modes seed none, because a staged append refuses to
+/// re-encode a partial trailing chunk under them (issue #407), and grow the
+/// whole chunk from an empty dataset instead.
+fn seed_len(mode: CScaleOffset) -> usize {
+    match mode {
+        CScaleOffset::Integer(_) => 1,
+        _ => 0,
+    }
 }
 
 fn assert_byte_identical_encoding<T, A>(
@@ -632,12 +647,12 @@ fn a_residual_just_below_one_half_rounds_the_way_the_c_library_rounds() {
     let path = dir.path().join("value.h5");
     c_create_typed(
         &path,
-        &values[..1],
+        &[],
         values.len(),
         CScaleOffset::FloatDScale(0),
         Some(values[0]),
     );
-    pure_append_f64(&path, &values[1..]);
+    pure_append_f64(&path, &values);
     assert_eq!(
         hdf5_pure::File::open(&path)
             .unwrap()
@@ -731,8 +746,8 @@ fn the_f32_tolerance_window_between_the_two_precisions_matches() {
     let appended = dir.path().join("appended.h5");
     let mode = CScaleOffset::FloatDScale(2);
     c_create_typed(&c_written, &values, values.len(), mode, Some(fill));
-    c_create_typed(&appended, &values[..1], values.len(), mode, Some(fill));
-    pure_append_f32(&appended, &values[1..]);
+    c_create_typed(&appended, &[], values.len(), mode, Some(fill));
+    pure_append_f32(&appended, &values);
 
     assert_eq!(raw_chunks(&appended), raw_chunks(&c_written));
 }
@@ -752,24 +767,24 @@ fn float_dscale_with_a_defined_fill_value() {
             .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
             .create(&path)
             .unwrap();
-        let ds = file
-            .new_dataset::<f64>()
+        file.new_dataset::<f64>()
             .scale_offset(CScaleOffset::FloatDScale(decimals))
             .chunk((8,))
-            .shape((Extent::resizable(3),))
+            .shape((Extent::resizable(0),))
             .fill_value(fill)
             .create("col")
             .unwrap();
-        ds.write_raw(&[1.5f64, 2.25, 3.125]).unwrap();
         file.close().unwrap();
     }
 
+    // The whole chunk comes from this crate: D-scale is lossy, so a staged
+    // append does not re-encode a partial chunk the C library wrote.
     {
         let f = hdf5_pure::File::open_rw(&path).unwrap();
         f.dataset("col")
             .unwrap()
             .append_staged(|b| {
-                b.append_f64(&[4.0, fill, 5.5, fill, 6.75]);
+                b.append_f64(&[1.5, 2.25, 3.125, 4.0, fill, 5.5, fill, 6.75]);
             })
             .unwrap();
         f.commit().unwrap();
