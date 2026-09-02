@@ -314,21 +314,23 @@ fn duplicate_name_is_rejected_without_writing() {
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
 
-    // Collide with the existing "original" dataset.
+    // Collide with the existing "original" dataset. Refused where it is staged,
+    // since `create_dataset` returns a handle onto what it stages and there is
+    // no new object for one to address.
     {
         let session = File::open_rw(&path).unwrap();
-        session
+        let err = session
             .root()
             .create_dataset("original", |b| {
                 b.with_i32_data(&[1, 2]);
             })
-            .unwrap();
-        let err = session.commit().unwrap_err();
+            .unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {err}");
     }
     assert_eq!(std::fs::read(&path).unwrap(), before);
 
-    // Collide between two datasets staged in the same commit.
+    // Collide between two datasets staged in the same commit. Neither shadows
+    // an object in the file, so this one is still the commit's to refuse.
     {
         let session = File::open_rw(&path).unwrap();
         session
@@ -2808,6 +2810,64 @@ fn add_provenance_dataset_via_edit_session() {
     let ds = file.dataset("sensor").unwrap();
     assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0]);
     assert_eq!(ds.verify_provenance().unwrap(), VerifyResult::Ok);
+    let attrs = ds.attrs().unwrap();
+    assert_eq!(
+        attrs.get("_provenance_creator"),
+        Some(&AttrValue::String("test-suite".into()))
+    );
+    assert_eq!(
+        attrs.get("_provenance_timestamp"),
+        Some(&AttrValue::String("2026-02-19T12:00:00Z".into()))
+    );
+    assert_eq!(
+        attrs.get("_provenance_source"),
+        Some(&AttrValue::String("bench".into()))
+    );
+}
+
+/// `Dataset::append_staged` folds elements into a dataset staged in the same
+/// session, and the provenance digest covers what is written rather than what
+/// was first staged: the attributes are computed from the raw bytes, so growing
+/// them without recomputing left `verify_provenance` reporting a mismatch on an
+/// uncorrupted file (issue #392).
+#[cfg(feature = "provenance")]
+#[test]
+fn appending_to_a_staged_provenance_dataset_keeps_its_hash_true() {
+    use hdf5_pure::VerifyResult;
+
+    let path = temp_path("hdf5_pure_edit_provenance_append_staged.h5");
+    write_starter(&path);
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let mut col = session
+            .root()
+            .create_dataset("col", |b| {
+                b.with_f64_data(&[1.0, 2.0])
+                    .with_shape(&[2])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[4])
+                    .with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+            })
+            .unwrap();
+        col.append_staged(|a| {
+            a.append_f64(&[3.0, 4.0]);
+        })
+        .unwrap();
+        assert_eq!(col.shape().unwrap(), vec![4]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("col").unwrap();
+    assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(
+        ds.verify_provenance().unwrap(),
+        VerifyResult::Ok,
+        "the stored digest must cover the appended elements too"
+    );
+    // The rest of the provenance set is rebuilt from the same inputs, so it is
+    // unchanged by the append.
     let attrs = ds.attrs().unwrap();
     assert_eq!(
         attrs.get("_provenance_creator"),
@@ -6965,48 +7025,119 @@ fn appending_through_a_handle_onto_a_replaced_dataset_is_refused() {
 }
 
 #[test]
-fn a_creation_colliding_with_a_surviving_link_does_not_shadow_it() {
+fn a_creation_colliding_with_a_surviving_link_is_refused_at_the_call() {
     let path = temp_path("hdf5_pure_staged_visible_collision.h5");
     write_starter(&path);
 
     let session = File::open_rw(&path).unwrap();
-    // No `delete` beside it, so `commit` refuses this for the name it collides
-    // with. Until then `original` still means the object in the file.
-    session
+    // No `delete` beside it, so this creation collides with a link the commit
+    // keeps — and `create_dataset` hands back a handle onto what it stages, so
+    // the refusal has to come from the call rather than from the commit. A
+    // handle onto a creation that never lands would answer for the file's own
+    // `original` while claiming to address the new dataset.
+    let err = session
         .root()
         .create_dataset("original", |b| {
             b.with_i32_data(&[9]);
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "got: {err}");
+    // The same rule when the creation would change the object's kind, which a
+    // listing would otherwise report as a dataset becoming a group.
+    let err = session.root().create_group("original").unwrap_err();
+    assert!(err.to_string().contains("already exists"), "got: {err}");
+
+    // Nothing was staged, so `original` still means the object in the file and
+    // there is nothing left for the commit to refuse.
+    assert_eq!(
+        session.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    assert_eq!(
+        session.root().datasets().unwrap(),
+        vec!["original".to_string()]
+    );
+    assert!(session.root().groups().unwrap().is_empty());
+    assert!(!session.has_staged_edits());
+    session.commit().unwrap();
+    assert_eq!(
+        session.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+}
+
+#[test]
+fn a_creation_under_a_deleted_group_does_not_hide_the_files_own_child() {
+    // `delete("g")` and `create_dataset("g/other")` with nothing rebuilding `g`
+    // is a batch the commit refuses, so until it does, `g`'s own children are
+    // still what their names mean: the deletion hides nothing on its own
+    // (issue #392).
+    let path = temp_path("hdf5_pure_staged_prefix_delete.h5");
+    {
+        let mut b = FileBuilder::new();
+        let mut g = b.create_group("g");
+        g.create_dataset("inner").with_i32_data(&[1, 2]);
+        b.add_group(g.finish());
+        b.write(&path).unwrap();
+    }
+
+    let session = File::open_rw(&path).unwrap();
+    session.root().delete("g").unwrap();
+    // Deleting `g` does not hand `g/inner` over to a creation there: only a
+    // commit that builds `g` again could, and this one does not. So the name is
+    // still taken, and staging over it is the collision it looks like.
+    let err = session
+        .root()
+        .create_dataset("g/inner", |b| {
+            b.with_i32_data(&[9]);
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "got: {err}");
+    session
+        .root()
+        .create_dataset("g/other", |b| {
+            b.with_i32_data(&[9]);
+        })
+        .unwrap();
+
+    let g = session.group("g").unwrap();
+    assert_eq!(
+        g.dataset("inner").unwrap().read_i32().unwrap(),
+        vec![1, 2],
+        "a live, readable dataset must not be reported as staged"
+    );
+    assert!(
+        g.datasets().unwrap().contains(&"inner".to_string()),
+        "it must not vanish from its group's listing either"
+    );
+    // The batch itself is still the commit's to refuse.
+    assert!(session.commit().is_err());
+}
+
+#[test]
+fn the_root_group_cannot_be_deleted() {
+    let path = temp_path("hdf5_pure_staged_delete_root.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    for name in ["", "/"] {
+        let err = session.root().delete(name).unwrap_err();
+        assert!(err.to_string().contains("root group"), "got: {err}");
+    }
+    // Refused where it was asked for, so it cannot go on to make every staged
+    // creation in the session look like a replacement of a file object.
+    assert!(!session.has_staged_edits());
+    session
+        .root()
+        .create_dataset("added", |b| {
+            b.with_i32_data(&[1]);
         })
         .unwrap();
     assert_eq!(
         session.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    assert_eq!(
-        session.root().datasets().unwrap(),
-        vec!["original".to_string()],
-        "the colliding creation must not be listed beside the object it collides with"
-    );
-
-    // The same rule when the creation would change the object's kind, which a
-    // listing would otherwise report as a dataset becoming a group.
-    session.root().create_group("original").unwrap();
-    assert!(matches!(
-        session.group("original"),
-        Err(Error::NotAGroup(_))
-    ));
-    assert!(session.root().groups().unwrap().is_empty());
-    assert_eq!(
-        session.root().datasets().unwrap(),
-        vec!["original".to_string()]
-    );
-
-    // The commit refuses, and the file's object is still readable afterwards.
-    assert!(session.commit().is_err());
-    assert_eq!(
-        session.dataset("original").unwrap().read_f64().unwrap(),
-        vec![1.0, 2.0, 3.0, 4.0]
-    );
+    session.commit().unwrap();
 }
 
 #[test]
@@ -7035,16 +7166,30 @@ fn deleting_a_staged_object_withdraws_it() {
     root.delete("nested").unwrap();
     assert!(!session.has_staged_edits(), "the staging was withdrawn");
 
-    // The handles name objects the session no longer intends to create, and say
-    // so the way a handle onto anything absent does.
+    // The handles name creations the session has dropped, and say exactly that
+    // rather than reporting the path as merely absent: a handle born onto a
+    // staged creation is never quietly retargeted at what the path means now.
+    assert!(matches!(ds.read_i32(), Err(Error::StagingWithdrawn(p)) if p == "added"));
+    assert!(matches!(grp.attrs(), Err(Error::StagingWithdrawn(p)) if p == "nested"));
+    // Nor may one go on *staging* through the withdrawn path, which is how an
+    // edit would end up landing under whatever the file holds there.
     assert!(matches!(
-        ds.read_i32(),
-        Err(Error::Format(FormatError::PathNotFound(_)))
+        grp.create_dataset("late", |b| {
+            b.with_i32_data(&[1]);
+        }),
+        Err(Error::StagingWithdrawn(_))
     ));
     assert!(matches!(
-        grp.attrs(),
-        Err(Error::Format(FormatError::PathNotFound(_)))
+        grp.set_attr("kind", AttrValue::I64(2)),
+        Err(Error::StagingWithdrawn(_))
     ));
+    assert!(matches!(
+        grp.delete("leaf"),
+        Err(Error::StagingWithdrawn(_))
+    ));
+    assert!(!session.has_staged_edits(), "and none of them recorded");
+    // A fresh lookup of the same name is a different question, and answers the
+    // way a lookup of anything absent does.
     assert!(matches!(
         session.dataset("added"),
         Err(Error::Format(FormatError::PathNotFound(_)))
@@ -7077,15 +7222,44 @@ fn deleting_a_staged_replacement_leaves_the_deletion_it_replaced() {
     let session = File::open_rw(&path).unwrap();
     let root = session.root();
     root.delete("original").unwrap();
-    root.create_dataset("original", |b| {
-        b.with_i32_data(&[9]);
-    })
-    .unwrap();
+    let mut replacement = root
+        .create_dataset("original", |b| {
+            b.with_i32_data(&[9]);
+        })
+        .unwrap();
+    assert_eq!(replacement.shape().unwrap(), vec![1], "the replacement's");
     // Changing one's mind about the replacement leaves the deletion that was
     // asked for first, rather than a staged creation nothing can withdraw.
     root.delete("original").unwrap();
-    // A staged deletion hides nothing, so the path still means the object in
-    // the file until the commit removes it — the answer it gave before the
+    // The handle was made onto that creation, and the file's own `original` is
+    // the object this session is *deleting* — so the handle reports the
+    // withdrawal rather than quietly answering, reading or editing for it
+    // (issue #392).
+    assert!(
+        matches!(replacement.shape(), Err(Error::StagingWithdrawn(p)) if p == "original"),
+        "got: {:?}",
+        replacement.shape()
+    );
+    assert!(matches!(
+        replacement.read_f64(),
+        Err(Error::StagingWithdrawn(_))
+    ));
+    assert!(matches!(
+        replacement.append_staged(|a| {
+            a.append_i32(&[1]);
+        }),
+        Err(Error::StagingWithdrawn(_))
+    ));
+    assert!(matches!(
+        replacement.write(&[1i32]),
+        Err(Error::StagingWithdrawn(_))
+    ));
+    assert!(matches!(
+        replacement.set_attr("kind", AttrValue::I64(1)),
+        Err(Error::StagingWithdrawn(_))
+    ));
+    // A staged deletion hides nothing, so a fresh lookup still means the object
+    // in the file until the commit removes it — the answer it gave before the
     // replacement was staged.
     assert_eq!(
         session.dataset("original").unwrap().read_f64().unwrap(),
@@ -7094,6 +7268,7 @@ fn deleting_a_staged_replacement_leaves_the_deletion_it_replaced() {
     session.commit().unwrap();
     // Handles keep the session's exclusive lock alive, and that lock is
     // mandatory on Windows, so they go before the file is opened again.
+    drop(replacement);
     drop(root);
     drop(session);
 

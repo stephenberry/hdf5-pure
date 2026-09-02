@@ -146,6 +146,28 @@ impl Revisions {
     }
 }
 
+/// Where a [`Dataset`] or [`Group`] handle stands with respect to the staged
+/// set, worked out by [`FileInner::staged_standing`].
+///
+/// A handle names its object by path, and a path can mean an object in the
+/// file, an object this session has staged, or — for a handle *born* onto a
+/// staged creation — nothing at all, once that creation is withdrawn. The third
+/// is why the handle carries a mark of its own: without one, a withdrawal is
+/// indistinguishable from a commit, and the handle would silently start
+/// answering for whatever the file holds at the path, which in the case that
+/// produces it is the object the session is deleting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Standing {
+    /// Resolve the path against the file, as a handle opened by name does.
+    Live,
+    /// A creation this session staged owns the path and no commit has written
+    /// it: [`Error::NotCommitted`] for anything needing its bytes.
+    Pending,
+    /// This handle was made onto a staged creation that has since been
+    /// withdrawn: [`Error::StagingWithdrawn`].
+    Withdrawn,
+}
+
 /// A borrowed `Source` view over a [`File`]'s backend, used by the
 /// streaming-capable read paths so one call site serves both backends.
 pub(crate) enum SourceView<'a> {
@@ -1144,11 +1166,14 @@ impl FileInner {
     }
 
     /// [`locate`](Self::locate), reported as [`Error::NotCommitted`] when this
-    /// session has the path *staged* rather than written.
+    /// session has the path *staged* rather than written, and as
+    /// [`Error::StagingWithdrawn`] when the staging a handle was born onto is
+    /// gone.
     ///
     /// Every handle onto a staged object comes through here, so the distinction
-    /// between "there is no such object" and "there is one, and `commit` has not
-    /// written it yet" is made in one place rather than at each caller.
+    /// between "there is no such object", "there is one, and `commit` has not
+    /// written it yet" and "the one this handle names has been withdrawn" is
+    /// made in one place rather than at each caller.
     ///
     /// The staged set is consulted *before* the file for a handle that has never
     /// resolved, because a staged creation can sit on a path the file still
@@ -1156,14 +1181,24 @@ impl FileInner {
     /// (issue #305), and until that commit runs the old bytes are still
     /// perfectly readable. Answering from them would hand the caller the object
     /// their handle was explicitly not opened onto.
+    ///
+    /// `birth` is the handle's own [`Standing`] input — `None` for one opened
+    /// onto an object in the file. This question is keyed by path alone, so a
+    /// born handle whose creation was withdrawn and replaced by one of the other
+    /// kind at the same path reports `NotCommitted` here where
+    /// [`staged_dataset_view`](Self::staged_dataset_view) tells it apart; both
+    /// refuse, and neither answers from the file.
     fn locate_staged(
         &self,
         path: Option<&str>,
         memo: Option<Resolution>,
+        birth: Option<u64>,
     ) -> Result<Resolution, Error> {
         if let (None, Some(named)) = (memo, path) {
-            if self.staged_object(named).is_some() {
-                return Err(Error::NotCommitted(named.to_string()));
+            match self.staged_standing(named, birth) {
+                Standing::Pending => return Err(Error::NotCommitted(named.to_string())),
+                Standing::Withdrawn => return Err(Error::StagingWithdrawn(named.to_string())),
+                Standing::Live => {}
             }
         }
         match self.locate(path, memo) {
@@ -1193,9 +1228,74 @@ impl FileInner {
         self.query_engine(|e| e.staged_object(path)).flatten()
     }
 
-    /// What a dataset staged at `path` says about itself before it is written.
-    fn staged_dataset_meta(&self, path: &str) -> Option<StagedMeta> {
-        self.query_engine(|e| e.staged_dataset_meta(path)).flatten()
+    /// Where a handle naming `path` stands: whether the object it addresses is
+    /// one the file holds, one this session has staged, or one whose staging has
+    /// been withdrawn under it.
+    ///
+    /// `birth` is the session's [staged generation](WriteEngine::staged_generation)
+    /// as of the moment the handle was made onto a staged creation, and `None`
+    /// for every handle opened onto an object in the file. It is what separates
+    /// the two ways a staged path can stop being staged — the commit published
+    /// it, or a [`Group::delete`] withdrew it — which otherwise look identical
+    /// from here, and which a handle must not confuse: a withdrawn creation
+    /// leaves the file's own object at that path, and it is the object the
+    /// session is *deleting*.
+    ///
+    /// Both halves come from one lock, so a commit cannot land between them and
+    /// pair a generation with a staged set from the other side of it.
+    ///
+    /// A file with no write session stages nothing, so every handle onto one is
+    /// live. That includes the `birth`-carrying arm, which such a file cannot
+    /// produce: a handle holds its [`FileInner`] alive and a backend never
+    /// changes under one, so the case is unreachable rather than merely unlikely.
+    fn staged_standing(&self, path: &str, birth: Option<u64>) -> Standing {
+        let Some((generation, staged)) =
+            self.query_engine(|e| (e.staged_generation(), e.staged_object(path).is_some()))
+        else {
+            return Standing::Live;
+        };
+        match birth {
+            // A commit has taken this session's staged set since the handle was
+            // made, so what it names is in the file (or was deleted from it
+            // afterwards, which resolving the path reports).
+            Some(birth) if birth != generation => Standing::Live,
+            Some(_) if !staged => Standing::Withdrawn,
+            _ if staged => Standing::Pending,
+            _ => Standing::Live,
+        }
+    }
+
+    /// What a dataset staged at `path` says about itself before it is written,
+    /// for a handle whose staged generation at birth was `birth`.
+    ///
+    /// `Ok(None)` means the handle should read the file: either nothing is
+    /// staged there, or a commit has published what was. The
+    /// [`Error::StagingWithdrawn`] arm is [`staged_standing`](Self::staged_standing)'s,
+    /// decided under the same lock — and told apart by *kind* here, since a
+    /// dataset creation withdrawn and replaced by a group at the same path
+    /// leaves nothing for this handle to answer from either.
+    fn staged_dataset_view(
+        &self,
+        path: &str,
+        birth: Option<u64>,
+    ) -> Result<Option<StagedMeta>, Error> {
+        let Some((generation, meta)) =
+            self.query_engine(|e| (e.staged_generation(), e.staged_dataset_meta(path)))
+        else {
+            return Ok(None);
+        };
+        match birth {
+            Some(birth) if birth != generation => Ok(None),
+            Some(_) if meta.is_none() => Err(Error::StagingWithdrawn(path.to_string())),
+            _ => Ok(meta),
+        }
+    }
+
+    /// The session's staged generation now, for a handle being made onto a
+    /// creation staged in it. `None` on a file with no write session, which
+    /// stages nothing and so makes no such handle.
+    fn staged_generation(&self) -> Option<u64> {
+        self.query_engine(WriteEngine::staged_generation)
     }
 
     /// The direct children `parent` gains from this session's staged creations.
@@ -3153,6 +3253,12 @@ pub struct Group {
     /// a group reached by object reference ([`Dataset::dereference`]), which has
     /// no resolvable path.
     path: Option<String>,
+    /// The session's staged generation when this handle was made onto a staged
+    /// creation, and `None` for a handle opened onto a group in the file.
+    ///
+    /// It is what keeps such a handle from being retargeted at a different
+    /// object: see [`Standing`] and [`FileInner::staged_standing`].
+    staged_birth: Option<u64>,
 }
 
 impl Clone for Group {
@@ -3163,6 +3269,7 @@ impl Clone for Group {
             file: Arc::clone(&self.file),
             state: RwLock::new(*self.state.read().unwrap_or_else(PoisonError::into_inner)),
             path: self.path.clone(),
+            staged_birth: self.staged_birth,
         }
     }
 }
@@ -3188,6 +3295,7 @@ impl Group {
             file,
             state: RwLock::new(Some(at)),
             path,
+            staged_birth: None,
         }
     }
 
@@ -3200,8 +3308,13 @@ impl Group {
     /// [`Error::NotCommitted`](crate::Error::NotCommitted) until
     /// [`File::commit`], after which the first use resolves the path and the
     /// handle behaves as if it had been opened by name.
+    ///
+    /// The session's staged generation is taken here so that the handle can tell
+    /// that commit from a *withdrawal* of the same staging, which leaves the
+    /// path meaning whatever the file holds — see [`Standing`].
     fn pending(file: Arc<FileInner>, path: String) -> Self {
         Self {
+            staged_birth: file.staged_generation(),
             file,
             state: RwLock::new(None),
             path: Some(path),
@@ -3229,7 +3342,9 @@ impl Group {
                 return Ok(memo.address);
             }
         }
-        let at = self.file.locate_staged(self.path.as_deref(), memo)?;
+        let at = self
+            .file
+            .locate_staged(self.path.as_deref(), memo, self.staged_birth)?;
         // Checked before it is memoized. The short-circuit above does not
         // re-check, so an address installed and then refused would be the
         // answer every later call returns without looking at it again.
@@ -3734,13 +3849,25 @@ impl Group {
     /// Reading it
     /// — its attributes, or a member's data — reports
     /// [`Error::NotCommitted`](crate::Error::NotCommitted) until the commit,
-    /// after which the same handle answers for the group in the file.
+    /// after which the same handle answers for the group in the file. Deleting
+    /// it before the commit withdraws the staging, and the handle then reports
+    /// [`Error::StagingWithdrawn`](crate::Error::StagingWithdrawn) rather than
+    /// answering for whatever else the path may name.
+    ///
+    /// **The handle keeps the file's exclusive OS lock alive**, as every
+    /// [`Group`] and [`Dataset`] handle does, so `let g = root.create_group(..)?`
+    /// holds what `root.create_group(..)?;` used to drop and a reopen of the
+    /// file fails until it goes. [`File::close`] states the rule.
     ///
     /// [`create_group_with`](Self::create_group_with) builds a whole subtree in
     /// one call instead.
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
-    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly). A name the file already
+    /// links to is refused here with
+    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported) unless this
+    /// session also deletes it — a [replacement](Self::delete) — since there
+    /// would otherwise be no new object for the handle to address.
     ///
     /// ```no_run
     /// # use hdf5_pure::File;
@@ -3769,8 +3896,12 @@ impl Group {
     /// [`group`](Self::group) would give back.
     ///
     /// The closure records into a buffer rather than into the file itself, and
-    /// nothing it stages resolves until [`File::commit`], so reading the same
-    /// [`File`] from inside it sees the file as it was before this call.
+    /// what it stages is applied together when it returns — so reading the same
+    /// [`File`] from inside it sees the file as it was before this call, and
+    /// everything it staged is addressable by name from the moment it returns.
+    ///
+    /// The handle this returns keeps the file's exclusive OS lock alive, as
+    /// every [`Group`] and [`Dataset`] handle does; see [`File::close`].
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
@@ -3816,14 +3947,26 @@ impl Group {
     /// dataset's bytes — a `read_*`, its attributes, an immediate
     /// [`append`](Dataset::append) — reports
     /// [`Error::NotCommitted`](crate::Error::NotCommitted) until the commit,
-    /// after which the same handle reads the dataset in the file.
+    /// after which the same handle reads the dataset in the file. Deleting it
+    /// before the commit withdraws the staging, and the handle then reports
+    /// [`Error::StagingWithdrawn`](crate::Error::StagingWithdrawn) rather than
+    /// answering for whatever else the path may name.
+    ///
+    /// **The handle keeps the file's exclusive OS lock alive**, as every
+    /// [`Group`] and [`Dataset`] handle does, so `let ds = root.create_dataset(..)?`
+    /// holds what `root.create_dataset(..)?;` used to drop and a reopen of the
+    /// file fails until it goes. [`File::close`] states the rule.
     ///
     /// As with [`create_group_with`](Self::create_group_with), the closure
     /// configures a builder rather than the file, so it may read the same
     /// [`File`] — it will see the file as it was before this call.
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
-    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly). A name the file already
+    /// links to is refused here with
+    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported) unless this
+    /// session also deletes it — a [replacement](Self::delete) — since there
+    /// would otherwise be no new dataset for the handle to address.
     ///
     /// ```no_run
     /// # use hdf5_pure::File;
@@ -3876,7 +4019,16 @@ impl Group {
     /// withdraws that staging instead — its attributes, appends and staged
     /// children go with it — since there is no link in the file to unlink. Where
     /// the deletion was part of a replacement, the plain deletion of the file's
-    /// own object is what remains.
+    /// own object is what remains. A handle onto the withdrawn creation reports
+    /// [`Error::StagingWithdrawn`](crate::Error::StagingWithdrawn) from then on:
+    /// it names nothing, and the object the file holds at that path is the one
+    /// this session is removing.
+    ///
+    /// Deleting a group carries its whole subtree away, but only a commit that
+    /// builds that group *again* can put anything back under it: staging a
+    /// creation below a deleted path that nothing recreates is a batch `commit`
+    /// refuses, and until it does the file's own children still own their names.
+    /// The root itself cannot be deleted.
     ///
     /// ```no_run
     /// # use hdf5_pure::File;
@@ -3920,9 +4072,32 @@ impl Group {
         name: &str,
         f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
+        self.refuse_if_withdrawn()?;
         let child = self.child_path(name).ok_or(Error::ReadOnly)?;
         self.file
             .with_engine_mut(Change::Relocating, |session| f(session, &child))
+    }
+
+    /// Refuse an edit staged *through* a handle whose own staged creation has
+    /// been withdrawn.
+    ///
+    /// Every read through such a handle already reports it: they resolve the
+    /// path, and [`FileInner::locate_staged`] is where that is decided. The
+    /// staging calls resolve nothing — they address the file by path — so this
+    /// is where they ask the same question, and without it an edit staged
+    /// through a withdrawn group would land under whatever the file holds at its
+    /// path, which is the object the session is deleting.
+    ///
+    /// Costs nothing for a handle opened onto an object in the file: those carry
+    /// no birth generation, so the session is never locked to answer.
+    fn refuse_if_withdrawn(&self) -> Result<(), Error> {
+        let Some(path) = self.path.as_deref().filter(|_| self.staged_birth.is_some()) else {
+            return Ok(());
+        };
+        match self.file.staged_standing(path, self.staged_birth) {
+            Standing::Withdrawn => Err(Error::StagingWithdrawn(path.to_string())),
+            Standing::Live | Standing::Pending => Ok(()),
+        }
     }
 
     /// Validate that this group can stage an edit to child `name` and return the
@@ -3934,6 +4109,7 @@ impl Group {
     /// built (issue #200).
     fn child_edit_path(&self, name: &str) -> Result<String, Error> {
         self.file.check_staged_writable()?;
+        self.refuse_if_withdrawn()?;
         self.child_path(name).ok_or(Error::ReadOnly)
     }
 
@@ -3966,6 +4142,7 @@ impl Group {
         &self,
         f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
+        self.refuse_if_withdrawn()?;
         let path = self.path.clone().ok_or(Error::ReadOnly)?;
         self.file
             .with_engine_mut(Change::Relocating, |session| f(session, &path))
@@ -4006,8 +4183,8 @@ type StagedChildren = Vec<StagedChild>;
 /// Whether a staged creation takes `name` over from the link the file holds
 /// there — which it does only when the same commit removes that link.
 ///
-/// A creation that merely collides with a surviving link is one the commit
-/// refuses, so the file's own object is what the name lists as until then.
+/// A creation that merely collides with a surviving link is refused where it is
+/// staged, so the file's own object is what the name lists as.
 fn superseded(staged: &[StagedChild], name: &str) -> bool {
     staged.iter().any(|c| c.name == name && c.replaces_link)
 }
@@ -4081,6 +4258,12 @@ pub struct Dataset {
     /// it. `None` for a dataset reached by object reference
     /// ([`Dataset::dereference`]), which has no resolvable path.
     path: Option<String>,
+    /// The session's staged generation when this handle was made onto a staged
+    /// creation, and `None` for a handle opened onto a dataset in the file.
+    ///
+    /// It is what keeps such a handle from being retargeted at a different
+    /// object: see [`Standing`] and [`FileInner::staged_standing`].
+    staged_birth: Option<u64>,
 }
 
 impl Clone for Dataset {
@@ -4098,6 +4281,7 @@ impl Clone for Dataset {
             chunk_cache: Arc::clone(&self.chunk_cache),
             chunk_cache_config: self.chunk_cache_config,
             path: self.path.clone(),
+            staged_birth: self.staged_birth,
         }
     }
 }
@@ -4213,6 +4397,7 @@ impl Dataset {
             chunk_cache: Arc::new(ChunkCache::with_config(chunk_cache_config)),
             chunk_cache_config,
             path,
+            staged_birth: None,
         }
     }
 
@@ -4227,6 +4412,7 @@ impl Dataset {
     /// the handle behaves as if it had been opened by name.
     fn pending(file: Arc<FileInner>, chunk_cache_config: ChunkCacheConfig, path: String) -> Self {
         Self {
+            staged_birth: file.staged_generation(),
             file,
             state: RwLock::new(None),
             chunk_cache: Arc::new(ChunkCache::with_config(chunk_cache_config)),
@@ -4235,28 +4421,34 @@ impl Dataset {
         }
     }
 
-    /// What this dataset's staged creation says about itself, or `None` once it
-    /// is committed (or when it never was staged).
+    /// What this dataset's staged creation says about itself, `Ok(None)` once it
+    /// is committed (or when it never was staged), and
+    /// [`Error::StagingWithdrawn`] when the creation this handle was made onto
+    /// has been withdrawn — the one answer that is neither the staged record nor
+    /// the file, because the object at that path is one the session is deleting.
     ///
     /// Only a handle with no memo can be pending: one that has resolved a header
     /// names an object the file already holds, so this costs a lock read rather
     /// than a session lock on the common path.
-    fn staged_meta(&self) -> Option<StagedMeta> {
+    fn staged_meta(&self) -> Result<Option<StagedMeta>, Error> {
         if self
             .state
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .is_some()
         {
-            return None;
+            return Ok(None);
         }
-        self.file.staged_dataset_meta(self.path.as_deref()?)
+        let Some(path) = self.path.as_deref() else {
+            return Ok(None);
+        };
+        self.file.staged_dataset_view(path, self.staged_birth)
     }
 
     /// Refuse an operation that needs this dataset's bytes while it is still
     /// staged.
     fn refuse_if_pending(&self) -> Result<(), Error> {
-        match self.staged_meta() {
+        match self.staged_meta()? {
             // `staged_meta` answers only for a handle with a path.
             Some(_) => Err(Error::NotCommitted(self.path.clone().unwrap_or_default())),
             None => Ok(()),
@@ -4288,7 +4480,9 @@ impl Dataset {
                 None => None,
             }
         };
-        let at = self.file.locate_staged(self.path.as_deref(), memo)?;
+        let at = self
+            .file
+            .locate_staged(self.path.as_deref(), memo, self.staged_birth)?;
         let header = self.file.parse_header(at.address)?;
         // Checked *before* it is memoized. A header installed and then refused is
         // the answer every later call short-circuits on, so this handle would
@@ -4665,7 +4859,7 @@ impl Dataset {
         // The distinction is the handle's, not the path's: a handle onto the
         // object a staged creation *replaces* is not pending, and the session
         // refuses its append rather than growing the replacement under it.
-        let pending = self.staged_meta().is_some();
+        let pending = self.staged_meta()?.is_some();
         if pending {
             self.file.check_staged_writable()?;
         } else {
@@ -4807,7 +5001,7 @@ the same commit to replace it",
     /// was staged, which includes the elements
     /// [`append_staged`](Self::append_staged) has folded into it.
     pub fn shape(&self) -> Result<Vec<u64>, Error> {
-        if let Some(meta) = self.staged_meta() {
+        if let Some(meta) = self.staged_meta()? {
             return Ok(meta.dimensions);
         }
         let ds = self.dataspace()?;
@@ -4825,7 +5019,7 @@ the same commit to replace it",
     /// (which requires a chunked dataset whose first maximum dimension is
     /// `u64::MAX`) instead of relying on the append's refusal error.
     pub fn maxshape(&self) -> Result<Option<Vec<u64>>, Error> {
-        if let Some(meta) = self.staged_meta() {
+        if let Some(meta) = self.staged_meta()? {
             return Ok(meta.maxshape);
         }
         let ds = self.dataspace()?;
@@ -4842,7 +5036,7 @@ the same commit to replace it",
     /// longer be resolved. A dataset this session has staged and not yet
     /// committed answers with the storage its builder selected.
     pub fn is_chunked(&self) -> bool {
-        if let Some(meta) = self.staged_meta() {
+        if let Ok(Some(meta)) = self.staged_meta() {
             return meta.chunked;
         }
         matches!(self.data_layout(), Ok(DataLayout::Chunked { .. }))
@@ -4878,7 +5072,7 @@ the same commit to replace it",
     /// the pipeline without decoding a chunk. A dataset this session has staged
     /// and not yet committed reports the pipeline its builder asked for.
     pub fn filters(&self) -> Vec<u16> {
-        if let Some(meta) = self.staged_meta() {
+        if let Ok(Some(meta)) = self.staged_meta() {
             return meta.filters.into_iter().map(|(id, _)| id).collect();
         }
         self.filter_pipeline_parsed()
@@ -4989,7 +5183,7 @@ the same commit to replace it",
     /// are derived from the dataset being written (element size, chunk geometry,
     /// fill value) when [`File::commit`] writes it.
     pub fn filter_pipeline(&self) -> Vec<Filter> {
-        if let Some(meta) = self.staged_meta() {
+        if let Ok(Some(meta)) = self.staged_meta() {
             return meta
                 .filters
                 .into_iter()
@@ -5613,7 +5807,7 @@ the same commit to replace it",
     /// `create_dataset(..., dtype=f["t"])` — is stored as a reference to the
     /// datatype's own object header and is resolved to the type it names.
     pub fn datatype(&self) -> Result<Datatype, Error> {
-        if let Some(meta) = self.staged_meta() {
+        if let Some(meta) = self.staged_meta()? {
             return Ok(meta.datatype);
         }
         let state = self.resolved()?;

@@ -675,8 +675,8 @@ pub(crate) struct StagedObject {
     ///
     /// True makes the creation a *replacement* (issue #305). False means the
     /// file holds no link there at all — a creation colliding with one that
-    /// survives is not reported as staged, since the commit refuses it and the
-    /// file's own object is what the name means until then.
+    /// survives is refused where it is staged, and would not be reported here
+    /// either, since the file's own object is what the name means.
     pub(crate) replaces_link: bool,
 }
 
@@ -867,6 +867,28 @@ impl StagedEdits {
     /// ancestor that carries it away.
     fn deletes_cover(&self, path: &[String]) -> bool {
         self.deletes.iter().any(|d| path.starts_with(&d[..]))
+    }
+
+    /// Whether a staged deletion hands `path` over to a creation staged there —
+    /// which is what makes the pair a *replacement* rather than a collision
+    /// (issue #305).
+    ///
+    /// Stricter than [`deletes_cover`](Self::deletes_cover), and deliberately:
+    /// a deletion of an *ancestor* only carries the name over when this same
+    /// session builds that ancestor again, which is exactly what the commit
+    /// requires of everything at or under a replaced path. Deleting `g` and
+    /// creating `g/x` without recreating `g` is a batch the commit refuses, so
+    /// the file's own `g/x` is still what that name means — reporting it as a
+    /// replacement would make a live, readable dataset answer
+    /// [`Error::NotCommitted`] and vanish from its group's listing until the
+    /// refusal.
+    ///
+    /// The exact deletion is the empty case of the same rule: with `d == path`
+    /// there is no ancestor between them to have been recreated.
+    fn deletes_hand_over(&self, path: &[String]) -> bool {
+        self.deletes.iter().any(|d| {
+            path.starts_with(&d[..]) && (d.len()..path.len()).all(|n| self.has_group_at(&path[..n]))
+        })
     }
 
     /// Withdraw every edit staged at or under `path`, as though the calls that
@@ -1243,6 +1265,23 @@ pub(crate) struct WriteEngine {
     /// [`refuse_mid_batch`](Self::refuse_mid_batch) can keep
     /// [`StagedEdits::rewind`]'s truncation an exact undo.
     staging_batch: bool,
+    /// How many times this session's staged set has been *consumed* by a commit
+    /// rather than handed back to it.
+    ///
+    /// It is what tells a handle born onto a staged creation
+    /// ([`staged_generation`](Self::staged_generation)) which of two things has
+    /// happened since: the object it names was published, so it addresses the
+    /// file now — or the staging was withdrawn under it, and it names nothing.
+    /// Both leave the staged set without an entry at its path, and reading them
+    /// the same way is what let such a handle silently retarget onto whatever
+    /// the file held at that path.
+    ///
+    /// Advanced by [`commit`](Self::commit) alone, on exactly the path where the
+    /// set does not go back: a commit that succeeds, and one that fails past its
+    /// publish (whose objects are in the file). A commit refused before its
+    /// first write restores the set and leaves this alone, so the handles it
+    /// concerns stay pending and the batch can be committed again.
+    staged_generation: u64,
     /// Superblock status flags this session raised on the file and holds for its
     /// lifetime — the SWMR pair, or the page buffer's crash mark — or `0` when it
     /// holds none.
@@ -2639,6 +2678,7 @@ impl WriteEngine {
             fsm_len: len,
             publish_attempted: false,
             staging_batch: false,
+            staged_generation: 0,
             held_status_flags: 0,
             sync_policy: SyncPolicy::Always,
         };
@@ -3060,8 +3100,9 @@ impl WriteEngine {
         path: &str,
         mut builder: DatasetBuilder,
     ) -> Result<(), Error> {
-        self.refuse_if_claimed(&split_path(path))?;
         let mut comps = split_path(path);
+        self.refuse_if_claimed(&comps)?;
+        self.refuse_creation_collision(&comps)?;
         builder.name = comps.pop().unwrap_or_default();
         self.staged.push_dataset(comps, flatten_dataset(builder)?);
         Ok(())
@@ -3347,6 +3388,11 @@ impl WriteEngine {
     /// staged creation must resolve at commit time per element — a
     /// variable-length string payload, an object reference — is refused: those
     /// carry a side table indexed by element that this cannot extend.
+    ///
+    /// A provenance dataset (`with_provenance`) is grown rather than refused:
+    /// its attributes are derived from the bytes, so they are rebuilt from the
+    /// grown ones ([`FlatDataset::rebuild_provenance`]) and the digest the
+    /// commit writes is the digest of what it writes.
     fn extend_staged_dataset(
         &mut self,
         comps: &[String],
@@ -3417,6 +3463,12 @@ impl WriteEngine {
         }
         fd.raw.extend_from_slice(bytes);
         fd.ds.dimensions[0] = grown;
+        // The digest covers the bytes, so it is recomputed over the grown ones
+        // rather than left describing the shorter dataset that was staged. Doing
+        // it here, on the record the commit writes, is what keeps
+        // `verify_provenance` passing on the file this produces.
+        #[cfg(feature = "provenance")]
+        fd.rebuild_provenance();
         Ok(())
     }
 
@@ -4457,12 +4509,16 @@ impl WriteEngine {
     ///   file and still readable, and a lookup that pretended otherwise would
     ///   refuse a read the file can serve.
     /// - A creation **colliding** with a link the commit does not remove is one
-    ///   the commit refuses ("a link with this name already exists"). Reporting
-    ///   it would shadow a live, readable object with a handle that never
-    ///   becomes valid, so the file's own object stays the meaning of the name.
+    ///   [`refuse_creation_collision`](Self::refuse_creation_collision) turns
+    ///   away where it is staged, so this arm is the same rule asked a second
+    ///   time rather than a state a caller can reach. Reporting such a creation
+    ///   would shadow a live, readable object with a handle that never becomes
+    ///   valid, so the file's own object stays the meaning of the name.
     /// - The two together are a **replacement** (issue #305), and the creation
     ///   is what the path names from the moment it is staged, before the commit
-    ///   as after.
+    ///   as after. "The two together" is
+    ///   [`StagedEdits::deletes_hand_over`]'s rule: the deletion names this path,
+    ///   or an ancestor this session builds again.
     ///
     /// Only a path the session **named** answers. A commit also creates the
     /// intermediate groups on the way to an addition — `create_dataset("a/b")`
@@ -4488,7 +4544,7 @@ impl WriteEngine {
         } else {
             return None;
         };
-        let replaces_link = self.staged.deletes_cover(&comps);
+        let replaces_link = self.staged.deletes_hand_over(&comps);
         // The file is asked only about a path a creation actually names, so an
         // ordinary open of an object nothing is staged at never pays for this.
         if !replaces_link && self.path_in_file(&comps) {
@@ -4498,6 +4554,38 @@ impl WriteEngine {
             kind,
             replaces_link,
         })
+    }
+
+    /// Refuse a creation at a path the file already links to and this session
+    /// does not remove, at the call that stages it.
+    ///
+    /// The commit refuses the same batch (`a link with this name already
+    /// exists`), and this raises that refusal's own error so the two cannot
+    /// disagree about what a collision is. Refusing here is what lets
+    /// [`Group::create_dataset`](crate::Group::create_dataset) and its two
+    /// siblings hand back a handle onto the object they stage: a creation that
+    /// merely collides is not what its path names — the file's object still is
+    /// — so a handle onto it would have addressed the *old* object while
+    /// claiming to address the new one.
+    ///
+    /// Only a collision with the *file*, and only for a **creation**, is refused
+    /// here. Two creations staged at one path are still the commit's refusal to
+    /// make — nothing is being shadowed, so a handle onto either names something
+    /// this session is adding — and a [`copy`](Self::copy) destination hands
+    /// back no handle at all, so its collision is the commit's too.
+    fn refuse_creation_collision(&self, comps: &[String]) -> Result<(), Error> {
+        // An empty path names the root, which is not a link and cannot be
+        // created. Both callers already refuse it by name — with a message that
+        // says so — so this must not answer first with a collision.
+        if comps.is_empty() {
+            return Ok(());
+        }
+        if self.staged.deletes_hand_over(comps) || !self.path_in_file(comps) {
+            return Ok(());
+        }
+        Err(Error::EditUnsupported(
+            "a link with this name already exists in the target group",
+        ))
     }
 
     /// Whether the file this session is editing holds a link at `path`, as of
@@ -4528,6 +4616,14 @@ impl WriteEngine {
     /// one per call to ask a question whose answer is already known.
     fn stages_no_creations(&self) -> bool {
         self.staged.groups.is_empty() && self.staged.datasets.is_empty()
+    }
+
+    /// How many times a commit has consumed this session's staged set, rather
+    /// than handing it back to it. See the
+    /// [`staged_generation`](Self::staged_generation) field for the rule, and
+    /// [`crate::Error::StagingWithdrawn`] for what a handle does with it.
+    pub(crate) fn staged_generation(&self) -> u64 {
+        self.staged_generation
     }
 
     /// What a staged dataset at `path` says about itself, for the introspection
@@ -4580,10 +4676,14 @@ impl WriteEngine {
             return Vec::new();
         }
         let base = split_path(parent);
-        // Whether a deletion carries the whole group away, and which links
-        // directly under it are removed by name: the two ways a creation here
-        // is a replacement rather than a collision.
-        let base_deleted = self.staged.deletes_cover(&base);
+        // Whether this group is itself a replacement staged here — its on-disk
+        // links go with the object being removed, so every creation under it
+        // owns its name — and which links directly under it are removed by
+        // name: the two ways a creation here is a replacement rather than a
+        // collision. A deletion of the group that this session does *not* build
+        // again is neither: the commit refuses that batch, so the file's own
+        // children still own their names (see [`StagedEdits::deletes_hand_over`]).
+        let base_deleted = self.staged.deletes_hand_over(&base) && self.staged.has_group_at(&base);
         let deleted_here: HashSet<&str> = self
             .staged
             .deletes
@@ -4625,6 +4725,7 @@ impl WriteEngine {
     pub fn create_group(&mut self, path: &str) -> Result<(), Error> {
         let comps = split_path(path);
         self.refuse_if_claimed(&comps)?;
+        self.refuse_creation_collision(&comps)?;
         self.staged.push_group(comps);
         Ok(())
     }
@@ -4777,8 +4878,21 @@ impl WriteEngine {
     /// attributes, appends and staged children go with it. When the file *also*
     /// holds a link at the path (the creation was replacing it), the withdrawal
     /// leaves the plain deletion of the file's own object behind.
+    ///
+    /// The root itself (`""` or `"/"`) is refused with [`Error::EditUnsupported`]:
+    /// nothing links to it, so there is no link to remove.
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
         let comps = split_path(path);
+        // The root is not linked from anywhere, so there is no link to remove —
+        // and an empty path is a prefix of every other, so a deletion staged
+        // here would make every staged creation in the session look like a
+        // replacement of a file object until the commit refused the batch.
+        // Refused by name, as creating the root is.
+        if comps.is_empty() {
+            return Err(Error::EditUnsupported(
+                "cannot delete the root group; delete its members instead",
+            ));
+        }
         self.refuse_if_claimed(&comps)?;
         if self.staged.dataset_at(&comps).is_some() || self.staged.has_group_at(&comps) {
             self.refuse_mid_batch()?;
@@ -4991,6 +5105,8 @@ impl WriteEngine {
             let restored = self.undo_inplace_writes();
             self.restore_free(snapshot);
             self.staged = staged;
+            // The set is back, so nothing this session staged has been consumed
+            // and every handle onto one of those creations is still pending.
             if let Err(restore) = restored {
                 // Both are worth carrying: the refusal is what the caller has to
                 // fix, and the write failure is what proves the file changed.
@@ -5000,6 +5116,11 @@ impl WriteEngine {
                     restore: Box::new(restore),
                 });
             }
+        } else {
+            // The set is gone — published, or in the file as slack a later
+            // commit must not re-issue — so a handle onto one of its creations
+            // stops being pending and addresses the file from here on.
+            self.staged_generation += 1;
         }
         // For the paths that took no rollback — a commit that succeeded, whose
         // overwrites are now the file's values, and one that failed with the
@@ -10681,6 +10802,49 @@ struct FlatDataset {
     /// for the library default. Validated against the datatype element size in
     /// [`flatten_dataset`].
     fill: Option<Vec<u8>>,
+    /// The provenance attributes' own inputs, kept so they can be rebuilt when
+    /// `raw` changes before the commit writes it. `None` for a dataset staged
+    /// without [`DatasetBuilder::with_provenance`](crate::DatasetBuilder::with_provenance).
+    #[cfg(feature = "provenance")]
+    provenance: Option<StagedProvenance>,
+}
+
+/// A staged dataset's provenance metadata, and where in
+/// [`FlatDataset::attrs`] the attributes it produced sit.
+///
+/// The hash is over the dataset's raw bytes, so it is only correct as of the
+/// bytes it was taken from; [`FlatDataset::rebuild_provenance`] is what keeps
+/// it that way when [`WriteEngine::extend_staged_dataset`] grows them.
+#[cfg(feature = "provenance")]
+struct StagedProvenance {
+    /// What [`crate::provenance::Provenance::build_attrs`] was, and is, called
+    /// with. Held rather than re-derived from the attributes it produced, which
+    /// a caller may also have set by hand.
+    inputs: crate::provenance::Provenance,
+    /// The index in `attrs` where its attributes begin. They are appended last
+    /// and are the only ones this may replace, so everything below it — the
+    /// caller's own attributes, and the `vl_attrs` indices into them — is left
+    /// exactly as it was.
+    attrs_start: usize,
+}
+
+#[cfg(feature = "provenance")]
+impl FlatDataset {
+    /// Recompute this dataset's provenance attributes over the bytes it now
+    /// holds. A no-op for a dataset staged without provenance.
+    ///
+    /// The rebuilt set is the same attributes in the same order and of the same
+    /// serialized length — the digest is 64 hex characters whatever it hashes —
+    /// so `attrs_are_dense`, decided once in [`flatten_dataset`] over the
+    /// original set, still describes this one.
+    fn rebuild_provenance(&mut self) {
+        let Some(prov) = &self.provenance else {
+            return;
+        };
+        self.attrs.truncate(prov.attrs_start);
+        let rebuilt = prov.inputs.build_attrs(&self.raw);
+        self.attrs.extend(rebuilt);
+    }
 }
 
 /// A borrow adapter that drives the shared Extensible-Array append engine
@@ -11236,15 +11400,23 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
             vl_attrs.push((i, build_global_heap_collections(strings)));
         }
     }
+    // Appended last, and recorded as such: `raw` can still grow before the
+    // commit writes it (`WriteEngine::extend_staged_dataset`), and the digest
+    // has to follow it.
     #[cfg(feature = "provenance")]
-    if let Some(ref prov) = db.provenance {
-        let p = crate::provenance::Provenance {
+    let provenance = db.provenance.as_ref().map(|prov| {
+        let inputs = crate::provenance::Provenance {
             creator: prov.creator.clone(),
             timestamp: prov.timestamp.clone(),
             source: prov.source.clone(),
         };
-        attrs.extend(p.build_attrs(&raw));
-    }
+        let attrs_start = attrs.len();
+        attrs.extend(inputs.build_attrs(&raw));
+        StagedProvenance {
+            inputs,
+            attrs_start,
+        }
+    });
     // More attributes than an object header keeps compactly, or one whose message
     // overflows its 2-byte message-size field, sends the set to a fractal heap —
     // the same disjunction, and the same heap, the whole-file writer uses. What
@@ -11295,6 +11467,8 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         vl_string_staging: db.vl_string_staging,
         reference_targets: db.reference_targets,
         fill: db.fill,
+        #[cfg(feature = "provenance")]
+        provenance,
     })
 }
 
@@ -18547,26 +18721,129 @@ mod staged_query_tests {
     }
 
     #[test]
-    fn a_creation_colliding_with_a_surviving_link_does_not_shadow_it() {
+    fn a_creation_colliding_with_a_surviving_link_is_refused_where_it_is_staged() {
         let dir = tempdir().unwrap();
         let mut e = open_session(&dir.path().join("q.h5"));
-        // No deletion beside it, so `commit` refuses this creation for the name
-        // it collides with. Until then the file's own object is what `existing`
-        // means: reporting the creation would refuse reads the file can serve,
-        // and would go on refusing them after the commit failed.
-        e.stage_created_dataset("existing", i32_dataset(&[9]))
-            .unwrap();
+        // No deletion beside it, so this creation collides with a link the
+        // commit keeps. That is the commit's own refusal, raised where the call
+        // is made so no handle onto the creation is ever handed back: such a
+        // handle would have addressed the file's `existing` while claiming to
+        // address the new one.
+        let err = e
+            .stage_created_dataset("existing", i32_dataset(&[9]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::EditUnsupported(m) if m.contains("already exists")),
+            "got: {err}"
+        );
+        // The same rule for a group, which is also the kind change a listing
+        // would otherwise misreport as turning a dataset into a group.
+        assert!(e.create_group("existing").is_err());
+
+        // Nothing was staged, so the file's own object is still what the name
+        // means, and the session has nothing left to refuse at commit time.
         assert_eq!(kind(&e, "existing"), None);
         assert!(e.staged_dataset_meta("existing").is_none());
-        assert!(!e.staged_children("")[0].replaces_link);
+        assert!(e.staged_children("").is_empty());
+        e.commit().unwrap();
+    }
 
-        // The same rule with a kind change, which a listing would otherwise
-        // misreport as turning a dataset into a group.
-        e.create_group("existing").unwrap();
-        assert_eq!(kind(&e, "existing"), None);
+    #[test]
+    fn a_creation_under_a_deleted_group_the_session_does_not_rebuild_shadows_nothing() {
+        // `delete("g")` carries `g/inner` away with it, but only a commit that
+        // builds `g` again can put anything back under that path — and this one
+        // does not, so the commit refuses the batch. Until then the file's own
+        // `g/inner` is what the name means: calling the staged creation beside
+        // it a replacement would make a live, readable dataset answer
+        // `NotCommitted` and vanish from its group's listing (issue #392).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("prefix.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        let mut g = b.create_group("g");
+        g.create_dataset("inner").with_i32_data(&[1]);
+        b.add_group(g.finish());
+        b.write(&path).unwrap();
 
-        // And the collision is still a collision at commit time.
-        assert!(e.commit().is_err());
+        let mut e = WriteEngine::open_rw_with_strategy(
+            &path,
+            crate::source::MetadataCacheConfig::disabled(),
+            FileLocking::Enabled,
+            MemoryStrategy::Mirrored,
+        )
+        .unwrap();
+        e.delete("g").unwrap();
+        // The name `g/inner` is still taken: a deletion of `g` alone hands it
+        // over to nobody, so this is the collision it looks like rather than a
+        // replacement.
+        let err = e
+            .stage_created_dataset("g/inner", i32_dataset(&[9]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::EditUnsupported(m) if m.contains("already exists")),
+            "got: {err}"
+        );
+        assert_eq!(kind(&e, "g/inner"), None, "the file's own dataset");
+
+        // A name the file does not hold stages, and is not a replacement of
+        // anything; the commit refuses the batch for the overlap itself.
+        e.stage_created_dataset("g/other", i32_dataset(&[9]))
+            .unwrap();
+        assert!(
+            !e.staged_children("g")[0].replaces_link,
+            "nothing rebuilds `g`, so its names are not handed over"
+        );
+        assert!(e.commit().is_err(), "a deletion overlapping an addition");
+    }
+
+    #[test]
+    fn a_deleted_group_rebuilt_in_the_same_commit_hands_its_names_over() {
+        // The other side of that rule: `g` is replaced, so a creation under it
+        // owns its name from the moment it is staged and the object the commit
+        // removes is no longer what the path means.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("replaced.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        let mut g = b.create_group("g");
+        g.create_dataset("inner").with_i32_data(&[1]);
+        b.add_group(g.finish());
+        b.write(&path).unwrap();
+
+        let mut e = WriteEngine::open_rw_with_strategy(
+            &path,
+            crate::source::MetadataCacheConfig::disabled(),
+            FileLocking::Enabled,
+            MemoryStrategy::Mirrored,
+        )
+        .unwrap();
+        e.delete("g").unwrap();
+        e.create_group("g").unwrap();
+        e.stage_created_dataset("g/inner", i32_dataset(&[9]))
+            .unwrap();
+        assert_eq!(kind(&e, "g/inner"), Some(StagedKind::Dataset));
+        assert!(e.staged_object("g/inner").unwrap().replaces_link);
+        assert!(e.staged_children("g")[0].replaces_link);
+        e.commit().unwrap();
+    }
+
+    #[test]
+    fn the_root_cannot_be_deleted() {
+        // Nothing links to the root, so there is no link to remove — and an
+        // empty path is a prefix of every other, so a deletion staged there
+        // would make every creation in the session look like a replacement.
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        for path in ["", "/"] {
+            let err = e.delete(path).unwrap_err();
+            assert!(
+                matches!(&err, Error::EditUnsupported(m) if m.contains("root group")),
+                "got: {err}"
+            );
+        }
+        e.stage_created_dataset("fresh", i32_dataset(&[1])).unwrap();
+        assert!(
+            !e.staged_object("fresh").unwrap().replaces_link,
+            "no deletion was staged, so this replaces nothing"
+        );
     }
 
     #[test]

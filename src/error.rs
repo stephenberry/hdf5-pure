@@ -1158,8 +1158,8 @@ pub enum Error {
     /// name gives back — can stage further edits under it, and a staged dataset
     /// answers [`crate::Dataset::shape`], [`crate::Dataset::maxshape`],
     /// [`crate::Dataset::dtype`], [`crate::Dataset::datatype`],
-    /// [`crate::Dataset::is_chunked`] and [`crate::Dataset::filters`] from what
-    /// was staged. Everything that reads the object's bytes reports this until
+    /// [`crate::Dataset::is_chunked`], [`crate::Dataset::filters`] and
+    /// [`crate::Dataset::filter_pipeline`] from what was staged. Everything that reads the object's bytes reports this until
     /// the commit: element reads, attribute reads, and the edits that rewrite an
     /// existing object in place ([`crate::Dataset::append`],
     /// [`crate::Dataset::write`], `set_attr` on a dataset). Add the elements to
@@ -1167,6 +1167,23 @@ pub enum Error {
     /// [`crate::Dataset::append_staged`], which folds them into the pending
     /// creation.
     NotCommitted(String),
+    /// A [`crate::Dataset`] / [`crate::Group`] handle onto a staged creation was
+    /// used after that creation was **withdrawn**, so it names nothing: the path
+    /// in the payload was staged when the handle was made, and this session has
+    /// since dropped that staging without committing it.
+    ///
+    /// [`crate::Group::delete`] of an object staged in the same session is what
+    /// withdraws one — including the second `delete` of a delete-then-create
+    /// *replacement*, which leaves the deletion of the file's own object
+    /// standing and the staged replacement gone. The handle is not retargeted at
+    /// whatever the file holds at that path, because that object is precisely
+    /// the one the session is removing; it reports this instead, and a fresh
+    /// lookup by name is how to reach whatever the path means now.
+    ///
+    /// Only a handle *born* onto a staged creation can report it. One opened
+    /// onto an object in the file names that object however the staged set
+    /// changes around it.
+    StagingWithdrawn(String),
     /// A staged edit (`write` / `set_attr` / `create_*` / `delete` / `copy` /
     /// `commit`) was requested on a file opened with
     /// [`crate::File::open_swmr_writer`], which permits only immediate
@@ -1292,6 +1309,11 @@ impl fmt::Display for Error {
             Error::NotCommitted(path) => write!(
                 f,
                 "\"{path}\" is staged and not written yet; File::commit publishes it"
+            ),
+            Error::StagingWithdrawn(path) => write!(
+                f,
+                "this handle was made onto the staged creation of \"{path}\", and that staging \
+                 was withdrawn before any commit; look the path up again to reach what it means now"
             ),
             Error::FileClosed => write!(
                 f,

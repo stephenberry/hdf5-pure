@@ -2224,3 +2224,49 @@ fn a_never_written_reference_dataset_copies_beside_a_delete() {
         );
     }
 }
+
+#[test]
+fn appending_into_a_staged_contiguous_dataset_stays_c_readable() {
+    // `Dataset::append_staged` on a dataset staged in the *same* session folds
+    // the elements into the pending creation, growing its raw bytes and its
+    // leading dimension together. That pairing is reachable no other way — a
+    // builder is handed its whole shape at once — and what it produces is an
+    // ordinary fixed-shape contiguous dataset, so the reference library is what
+    // proves the two halves agree (issue #392).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("staged_append.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1]);
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let mut col = session
+            .root()
+            .create_dataset("col", |b| {
+                b.with_f64_data(&[1.0, 2.0]);
+            })
+            .unwrap();
+        col.append_staged(|a| {
+            a.append_f64(&[3.0, 4.0, 5.0]);
+        })
+        .unwrap();
+        assert_eq!(col.shape().unwrap(), vec![5]);
+        session.commit().unwrap();
+    } // drop the editor (release its exclusive lock) before reading back
+
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("col").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0]
+    );
+
+    let c = hdf5::File::open(&path).unwrap();
+    let ds = c.dataset("col").unwrap();
+    assert_eq!(ds.shape(), vec![5], "the C library reads the grown shape");
+    assert_eq!(
+        ds.read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0],
+        "and every element the fold appended"
+    );
+}
