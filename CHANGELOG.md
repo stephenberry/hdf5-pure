@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - A group or dataset staged by `Group::create_group`, `create_group_with` or `create_dataset` is addressable by name in the same session, so a nested schema is built and its handles cached without a `commit` in between. Such a handle stages further edits and answers a staged dataset's shape, maxshape, datatype and filters; anything that reads bytes reports the new `Error::NotCommitted` until the commit ([#392](https://github.com/stephenberry/hdf5-pure/issues/392)).
-- `Dataset::append_staged` on a dataset staged in the same session folds the elements into the pending creation, so it needs neither an unlimited dimension nor a chunked layout ([#392](https://github.com/stephenberry/hdf5-pure/issues/392)).
+- `Dataset::append_staged` on a dataset staged in the same session folds the elements into the pending creation, so it needs neither an unlimited dimension nor a chunked layout, and `Group::delete` of an object staged in the same session withdraws the staging rather than staging a deletion the commit would refuse ([#392](https://github.com/stephenberry/hdf5-pure/issues/392)).
 
 ### Fixed
 
