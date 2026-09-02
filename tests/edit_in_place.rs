@@ -7062,6 +7062,8 @@ fn deleting_a_staged_object_withdraws_it() {
     session.commit().unwrap();
     // Handles keep the session's exclusive lock alive, and that lock is
     // mandatory on Windows, so they go before the file is opened again.
+    drop(ds);
+    drop(grp);
     drop(root);
     drop(session);
     assert_eq!(std::fs::read(&path).unwrap(), before);
