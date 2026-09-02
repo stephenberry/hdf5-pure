@@ -6956,6 +6956,9 @@ fn appending_through_a_handle_onto_a_replaced_dataset_is_refused() {
     );
 
     session.commit().unwrap();
+    // Handles keep the session's exclusive lock alive, and that lock is
+    // mandatory on Windows, so they go before the file is opened again.
+    drop(doomed);
     drop(session);
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("x").unwrap().read_i32().unwrap(), vec![100]);
@@ -7057,6 +7060,9 @@ fn deleting_a_staged_object_withdraws_it() {
 
     // A commit of nothing leaves the file byte-identical.
     session.commit().unwrap();
+    // Handles keep the session's exclusive lock alive, and that lock is
+    // mandatory on Windows, so they go before the file is opened again.
+    drop(root);
     drop(session);
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
@@ -7084,6 +7090,9 @@ fn deleting_a_staged_replacement_leaves_the_deletion_it_replaced() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     session.commit().unwrap();
+    // Handles keep the session's exclusive lock alive, and that lock is
+    // mandatory on Windows, so they go before the file is opened again.
+    drop(root);
     drop(session);
 
     let file = File::open(&path).unwrap();
