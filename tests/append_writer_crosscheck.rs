@@ -216,18 +216,20 @@ fn reopen_across_sessions_c_reads() {
 }
 
 #[test]
-fn c_creates_writer_refuses_unaligned_filtered() {
-    // A filtered dataset whose current length is not chunk-aligned cannot be
-    // grown in place; the append refuses and leaves the file for C to read.
+fn c_creates_writer_grows_an_unaligned_filtered_tail() {
+    // A filtered dataset the C library left on a partial trailing chunk is
+    // grown in place: this crate decodes that chunk with its recorded filter
+    // mask, extends it, re-encodes it into a fresh allocation and repoints the
+    // one index element — and the C library reads the result (issue #393).
     let dir = tempdir().unwrap();
     let path = dir.path().join("d.h5");
     let base: Vec<i32> = (0..7).collect(); // 7 of chunk 5 => a partial tail
     c_create_filtered(&path, &base, 5);
-    let file = File::open_rw(&path).unwrap();
-    assert!(matches!(
-        file.dataset("d").unwrap().append(&[7, 8, 9]),
-        Err(hdf5_pure::Error::AppendInPlaceUnsupported(_))
-    ));
-    drop(file);
-    assert_eq!(read_c(&path), base);
+    {
+        let file = File::open_rw(&path).unwrap();
+        file.dataset("d").unwrap().append(&[7, 8, 9]).unwrap();
+    }
+    let expected: Vec<i32> = (0..10).collect();
+    assert_eq!(read_pure(&path), expected);
+    assert_eq!(read_c(&path), expected);
 }

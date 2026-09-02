@@ -6,8 +6,7 @@
 //! the new one. That is the right trade for a caller appending a chunk at a
 //! time, and the wrong one for a caller appending a hundred elements at a time
 //! into a chunk that holds a thousand — which pays the whole sequence ten times
-//! over to write one chunk, and cannot pay it at all when the dataset is
-//! filtered, because a filtered trailing chunk cannot be grown in place.
+//! over to write one chunk.
 //!
 //! A [`BufferedAppender`] holds appended elements in memory and writes them
 //! only when they complete a chunk, so the file sees one append per chunk
@@ -45,8 +44,8 @@ use crate::reader::Dataset;
 /// chunks are written through the immediate, crash-atomic in-place path, and
 /// the remainder stays buffered. So a caller appending `k` elements at a time
 /// into a chunk of `n` performs one file write per `n/k` calls instead of one
-/// per call, and a *filtered* dataset — which [`Dataset::append`] refuses to
-/// grow by a partial chunk at all — is appended by any length.
+/// per call. Every write it makes is the immediate in-place one, on a filtered
+/// dataset as much as an unfiltered one.
 ///
 /// # Durability
 ///
@@ -78,11 +77,12 @@ use crate::reader::Dataset;
 ///   [`Dataset::set_attr`](crate::Dataset::set_attr),
 ///   [`Group::delete`](crate::Group::delete), [`File::copy`](crate::File::copy)
 ///   and the rest;
-/// - *every* staged edit while the appender still owes the realignment described
-///   below, since that write commits and a commit will not run beside unrelated
-///   staged edits;
 /// - a second appender on the same dataset, which would interleave the two
 ///   buffers a chunk at a time.
+///
+/// An edit naming something *else* is accepted beside a live appender: every
+/// write the appender makes is immediate and stages nothing, so it has no commit
+/// of its own to protect.
 ///
 /// Each of those is reported to the caller who created the conflict, which is
 /// the only place it can be acted on. What remains outside that guarantee is
@@ -90,19 +90,26 @@ use crate::reader::Dataset;
 /// appenders — and a buffer left ending mid-element, which only
 /// [`append_raw`](Self::append_raw) can produce.
 ///
-/// # The one expensive case
+/// # A filtered dataset resumed mid-chunk
 ///
 /// A *filtered* dataset whose on-disk length is not a whole multiple of its
-/// chunk length has a partial trailing chunk, and growing that chunk in place
-/// would repoint an index element a reader can already see — a multi-field
-/// record whose overwrite is not power-loss atomic. The appender instead lands
-/// such a dataset back on a chunk boundary with one staged, index-rebuilding
-/// commit ([`Dataset::append_staged`]), and every write after that is the cheap
-/// in-place one. A log resumed across sessions therefore pays that commit once
-/// when it is opened, not once per append.
+/// chunk length — a log resumed across sessions, typically — costs nothing
+/// extra: the in-place path re-encodes that trailing chunk into a fresh
+/// allocation and repoints its one index element, and the bytes it vacates are
+/// reclaimed by [`repack`](crate::repack). The appender still chooses its write
+/// prefix so the on-disk length lands back on a chunk boundary, which keeps the
+/// re-encoding to the first write rather than one per call.
 ///
-/// Because that recovery commits, it is refused while the session holds
-/// unrelated staged edits; commit or discard those first.
+/// A **lossy** pipeline (ZFP, or float D-scale scale-offset) cannot have that
+/// chunk re-encoded at all — the values it holds would change — so an appender
+/// over a lossy dataset that already sits on a partial trailing chunk is refused
+/// when it is constructed. One over a chunk-aligned lossy dataset is fine, and
+/// stays fine as long as its writes land on boundaries. A mid-stream
+/// [`flush`](Self::flush) is what breaks that: it leaves the length unaligned,
+/// and the appender then cannot write again until the length is chunk-aligned
+/// once more — the next write reports the same refusal and poisons the appender,
+/// with its elements still in [`unwritten`](Self::unwritten). On a lossy dataset,
+/// flush only whole chunks, or flush once at the end.
 ///
 /// ```no_run
 /// # use hdf5_pure::File;
@@ -125,7 +132,11 @@ pub struct BufferedAppender<'a> {
     /// cannot leave this appender writing against a stale length.
     chunk_elems: u64,
     element_size: NonZeroUsize,
-    filtered: bool,
+    /// Whether the pipeline is lossy, and so cannot have a partial trailing
+    /// chunk re-encoded. Reported by [`Debug`] and checked at construction; the
+    /// writes themselves never regrow a tail unless a mid-stream
+    /// [`flush`](Self::flush) left one.
+    lossy_filters: bool,
     /// Elements appended but not yet written, as little-endian bytes.
     pending: AppendBuilder,
     /// Set by a failed write. Blocks further use and stops `Drop` from retrying
@@ -147,7 +158,7 @@ impl std::fmt::Debug for BufferedAppender<'_> {
         f.debug_struct("BufferedAppender")
             .field("chunk_elements", &self.chunk_elems)
             .field("buffered_elements", &self.buffered_elements())
-            .field("filtered", &self.filtered)
+            .field("lossy_filters", &self.lossy_filters)
             .field("poisoned", &self.poisoned)
             .finish()
     }
@@ -171,16 +182,26 @@ impl<'a> BufferedAppender<'a> {
             ));
         }
         let chunk_elems = g.chunk_elems.max(1);
-        // A filtered dataset sitting on a partial trailing chunk owes a staged
-        // realignment, which commits — so while that debt stands the claim has to
-        // exclude every staged edit, not merely the ones naming this dataset.
-        let needs_commit = g.filtered && g.current_dim % chunk_elems != 0;
-        let claim = dataset.claim_for_appender(needs_commit)?;
+        // A *lossy* pipeline (ZFP, float D-scale scale-offset) cannot have a
+        // partial trailing chunk grown at all — that would re-encode committed
+        // values. An appender over one that is already sitting on such a chunk
+        // could not make even its first write, so it is refused here for the same
+        // reason the SWMR case above is, rather than accepting elements it would
+        // then have to hand back.
+        if g.lossy_filters && g.current_dim % chunk_elems != 0 {
+            return Err(Error::AppendInPlaceUnsupported(
+                "this dataset's filter pipeline is lossy and its length is not a whole multiple \
+                 of the chunk length, so a buffered appender's first write would have to \
+                 re-encode already-committed values; append whole chunks from a chunk-aligned \
+                 length instead",
+            ));
+        }
+        let claim = dataset.claim_for_appender()?;
         Ok(Self {
             dataset,
             chunk_elems,
             element_size: g.element_size,
-            filtered: g.filtered,
+            lossy_filters: g.lossy_filters,
             pending: AppendBuilder::new(),
             poisoned: false,
             finished: false,
@@ -251,12 +272,19 @@ impl<'a> BufferedAppender<'a> {
     /// Write every buffered element to the file now, including a partial
     /// trailing chunk.
     ///
-    /// This is the durability point. It costs one write, plus — on a filtered
-    /// dataset whose on-disk length is already unaligned — the one staged
-    /// commit described on the type. Note that flushing a partial chunk leaves
-    /// the on-disk length unaligned, so a filtered appender that flushes after
-    /// every batch pays that commit on every batch but the first; let the
-    /// appender batch where the last few elements can wait.
+    /// This is the durability point, and under a lossless pipeline it costs one
+    /// in-place write whatever the dataset's alignment. Flushing a partial chunk
+    /// does leave the on-disk length unaligned, so the next write re-encodes that
+    /// trailing chunk; let the appender batch where the last few elements can
+    /// wait.
+    ///
+    /// Under a **lossy** pipeline (ZFP, or float D-scale scale-offset) that
+    /// trailing chunk cannot be re-encoded at all, so a flush that leaves one
+    /// makes the appender unable to write again until the length is chunk-aligned
+    /// once more: the next write fails with the lossy refusal and poisons the
+    /// appender, its elements recoverable through
+    /// [`unwritten`](Self::unwritten). On such a dataset, flush only whole
+    /// chunks — or flush once, at the end.
     pub fn flush(&mut self) -> Result<(), Error> {
         self.check_usable()?;
         let avail = self.whole_elements()?;
@@ -355,12 +383,11 @@ impl<'a> BufferedAppender<'a> {
 
     /// Write the first `take_elems` buffered elements, draining them on success.
     ///
-    /// A filtered dataset sitting on a partial trailing chunk goes through the
-    /// staged, index-rebuilding path, which is the only one that may rewrite an
-    /// index element a reader can already see; everything else goes in place.
+    /// Always the immediate in-place path: since issue #393 that path re-encodes
+    /// a filtered partial trailing chunk into a fresh allocation, so there is no
+    /// shape of dataset left for which this type has to commit.
     fn write_prefix(&mut self, take_elems: u64) -> Result<(), Error> {
         let before = self.dataset.append_geometry()?.current_dim;
-        let staged = self.filtered && before % self.chunk_elems != 0;
         // Copy the prefix rather than split it out: a failed write must leave
         // the buffer holding exactly the elements that did not land, and how
         // many those are is only known afterwards.
@@ -370,11 +397,7 @@ impl<'a> BufferedAppender<'a> {
                 .saturating_mul(self.element_size.get()),
         );
 
-        let result = if staged {
-            self.dataset.append_staged_committed(head)
-        } else {
-            self.dataset.append_prebuilt(&head)
-        };
+        let result = self.dataset.append_prebuilt(&head);
         // A multi-batch in-place append can fail with earlier batches durable, so
         // on failure ask the file how far it actually got rather than assuming
         // all or none. A success advanced the dimension by exactly the prefix.
@@ -391,16 +414,6 @@ impl<'a> BufferedAppender<'a> {
                 .unwrap_or(usize::MAX)
                 .saturating_mul(self.element_size.get()),
         );
-        // Flushing a partial tail on a filtered dataset leaves it unaligned
-        // again, so the realignment debt comes back and the claim has to widen
-        // with it. Read the length rather than deriving it from `take`: a failed
-        // write may have landed only part of the prefix.
-        let now = self
-            .dataset
-            .append_geometry()
-            .map_or(before + landed, |g| g.current_dim);
-        self.dataset
-            .set_appender_needs_commit(self.claim, self.filtered && now % self.chunk_elems != 0);
         if let Err(e) = result {
             self.poisoned = true;
             return Err(e);

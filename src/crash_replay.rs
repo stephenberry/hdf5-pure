@@ -104,11 +104,14 @@
 //! case — or below it, where address-ordered gathering already issues the
 //! content first. See [`Store::alloc_raw`](crate::chunk_index_inplace::Store::alloc_raw).
 //!
-//! Outside this engine, nothing is covered: dense attribute heaps, the
-//! Fixed-Array and v2 B-tree chunk indexes, filtered and variable-length chunk
-//! writes, and group link-table growth all publish low-address pointers to
-//! high-address content and have no sweep here. That is the remaining half of
-//! issue #309.
+//! Filtered chunk writes are covered only through this engine, by
+//! [`regrowing_a_filtered_trailing_chunk_survives_a_crash_at_every_write`],
+//! which sweeps the one write in the crate that moves an *already visible*
+//! chunk: the trailing-chunk rewrite of issue #393. Outside this engine, nothing
+//! is covered: dense attribute heaps, the Fixed-Array and v2 B-tree chunk
+//! indexes, the chunked writer's own filtered output, and group link-table
+//! growth all publish low-address pointers to high-address content and have no
+//! sweep here. That is the remaining half of issue #309.
 
 use std::path::Path;
 
@@ -606,6 +609,90 @@ fn appended_all_the_way(path: &Path, hi: i32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// [`warmed_base`], with a **shuffle** filter on the dataset.
+///
+/// Shuffle rather than a compressor because this fixture has to stay wide: the
+/// sweeps demand a file spanning [`MIN_PAGES`] gather pages, and the values here
+/// are `0..n`, which deflate takes to a small fraction of a page. Shuffle stores
+/// a chunk at its full size, so the file is as big as the unfiltered one — and
+/// it makes the element a filtered record all the same (client id 1: address +
+/// stored size + filter mask), which is what these sweeps are about.
+///
+/// It is also the most adversarial shape for the trailing-chunk rewrite of issue
+/// #393. A re-encoded shuffle chunk is exactly as long as the one it replaces,
+/// so an implementation that overwrote the old slot rather than allocating a
+/// fresh one would always "fit" — and the prefix in the middle of that overwrite
+/// is what the sweep below reads.
+fn warmed_shuffled_base(path: &Path) {
+    let mut b = FileBuilder::new();
+    b.create_dataset("d")
+        .with_i32_data(&(0..CHUNK as i32).collect::<Vec<_>>())
+        .with_shape(&[CHUNK])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[CHUNK])
+        .with_shuffle();
+    b.write(path).unwrap();
+
+    let mut s = WriteEngine::open_with_locking(path, FileLocking::Enabled).unwrap();
+    s.set_sync_policy(SyncPolicy::OnClose);
+    let mut n = ROUND;
+    while n < WARMUP {
+        append(&mut s, n, ROUND);
+        n += ROUND;
+    }
+    drop(s);
+}
+
+/// A *filtered* dataset grown by appends that leave a partial trailing chunk,
+/// which the next append then re-encodes (issue #393).
+///
+/// Each round appends 30 elements and then 34: the first opens a partial chunk,
+/// the second decodes it, extends it, re-encodes it into a fresh allocation and
+/// repoints the index element that a reader at the old dimension is still
+/// following. That repoint is the only write in this crate that changes where an
+/// *already visible* chunk lives, so every prefix of it has to read back as the
+/// old length with the old values — which is what the module's `Silent` rule
+/// says, applied to a rewrite rather than an insert.
+///
+/// Positioned like the unfiltered sweeps, so the Extensible-Array block barriers
+/// are crossed here too; a filtered array reaches them at the same element
+/// indices, since the block geometry counts elements rather than bytes. Deleting
+/// the barrier before a fresh data-block pointer reddens this sweep, which is
+/// what says it is a sweep rather than decoration.
+///
+/// One thing it cannot see, and the reason the rewrite allocates rather than
+/// overwriting: the re-encoded chunk is a single contiguous write, and this
+/// module replays whole writes atomically, so an implementation that overwrote
+/// the old slot when the new bytes happened to fit would pass here. The argument
+/// against that one is the disk's rather than the log's — a torn sector inside
+/// the old slot leaves a reader decoding a mix of two encodings, with no crash
+/// point this harness can position.
+#[test]
+fn regrowing_a_filtered_trailing_chunk_survives_a_crash_at_every_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("append_filtered.h5");
+    warmed_shuffled_base(&path);
+
+    let rec = Recording::of("append-filtered-tail", &path, |p| {
+        let mut s = WriteEngine::open_with_locking(p, FileLocking::Enabled).unwrap();
+        s.set_sync_policy(SyncPolicy::OnClose);
+        for r in 0..ROUNDS {
+            let base = WARMUP + r * ROUND;
+            append(&mut s, base, 30);
+            append(&mut s, base + 30, ROUND - 30);
+        }
+        drop(s);
+    });
+
+    rec.assert_positioned(2, 1);
+    let hi = WARMUP + ROUNDS * ROUND;
+    rec.replay_every_prefix(
+        dir.path(),
+        |p| appended_prefix_is_intact(p, WARMUP, hi),
+        |p| appended_all_the_way(p, hi),
+    );
 }
 
 /// The same sweep on a paged file, where the free-space managers are written and

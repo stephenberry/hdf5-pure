@@ -35,6 +35,7 @@ use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
+use crate::edit::{LOSSY_TAIL_REFUSAL, pipeline_lossless};
 use crate::error::{Error, FormatError};
 use crate::extensible_array::{DataBlockGeom, EaGeometry, ExtensibleArrayHeader, SuperBlockGeom};
 use crate::fill_value::FillPattern;
@@ -892,12 +893,11 @@ impl Located {
         file.alloc_raw(&buf)
     }
 
-    /// Width of a filtered element's stored-size field, checked against the record
-    /// about to go in it. Zero for an unfiltered array, whose element is a bare
-    /// address.
-    fn element_size_width(&self, os: usize, rec: ElemRecord) -> Result<usize, Error> {
+    /// Width of a filtered element's stored-size field. Zero for an unfiltered
+    /// array, whose element is a bare address.
+    fn element_size_width(&self, os: usize) -> usize {
         if self.client_id == 0 {
-            return Ok(0);
+            return 0;
         }
         // `element_size` is one byte out of the array header, so a file can name
         // a width the three fields do not fit in. `locate` is where that byte is
@@ -907,13 +907,27 @@ impl Located {
             "locate admitted an element width of {} for a {os}-byte address",
             self.ea_elem_size
         );
-        let csz = self.ea_elem_size - os - 4;
-        if csz < 8 && rec.stored_size >= (1u64 << (8 * csz)) {
+        self.ea_elem_size - os - 4
+    }
+
+    /// Refuse a stored chunk size the element's size field cannot hold.
+    ///
+    /// Separate from [`element_size_width`](Self::element_size_width) because
+    /// the two are needed at different times: the width when an element is laid
+    /// out (phase 2 of the apply), the *check* while the plan is still being
+    /// built. Re-encoding a trailing chunk is exactly the case where a stored
+    /// size can grow past the width, and a refusal raised in phase 2 would land
+    /// after phase 1 had already written the chunk bytes — a leaked blob and a
+    /// half-applied append. `plan_ea_append` calls this for every blob it is
+    /// about to hand over, so the refusal happens before anything is written.
+    fn check_stored_size(&self, os: usize, stored_size: u64) -> Result<(), Error> {
+        let csz = self.element_size_width(os);
+        if self.client_id != 0 && csz < 8 && stored_size >= (1u64 << (8 * csz)) {
             return Err(Error::AppendUnsupported(
                 "recompressed chunk size exceeds the dataset's extensible-array element width",
             ));
         }
-        Ok(csz)
+        Ok(())
     }
 
     /// Lay one Extensible-Array element into `buf`, returning the bytes used.
@@ -929,7 +943,8 @@ impl Located {
         if self.client_id == 0 {
             return Ok(os);
         }
-        let csz = self.element_size_width(os, rec)?;
+        self.check_stored_size(os, rec.stored_size)?;
+        let csz = self.element_size_width(os);
         buf[os..os + csz].copy_from_slice(&rec.stored_size.to_le_bytes()[..csz]);
         buf[os + csz..os + csz + 4].copy_from_slice(&rec.filter_mask.to_le_bytes());
         Ok(os + csz + 4)
@@ -1056,12 +1071,13 @@ pub(crate) struct AppendPlan {
 /// and the new dimension / chunk count. Shared by the general append writer and
 /// the in-place edit engine's in-place append so the read/plan logic lives in one place.
 ///
-/// A *filtered* dataset must already be a whole number of chunks long: growing
-/// its trailing partial chunk is refused here rather than repointing a
-/// multi-field element a reader can already see, whose in-place overwrite is not
-/// power-loss atomic. The appended length is unconstrained — see the refusal
-/// itself for why. Use [`Dataset::append_staged`](crate::Dataset::append_staged)
-/// or a [`BufferedAppender`](crate::BufferedAppender) for the refused case.
+/// `grow_visible_tail` says whether the caller may rewrite the trailing chunk of
+/// a *filtered* dataset — a chunk a reader at the old dimension can already see.
+/// A `File::open_rw` session holds an exclusive lock and passes `true`; the SWMR
+/// writer, whose readers are the point, passes `false`. It has no bearing on an
+/// unfiltered dataset, whose trailing chunk is raw and grows by relocation
+/// either way, and none on a *lossy* pipeline, which is refused here whatever the
+/// caller asks for.
 pub(crate) fn plan_ea_append<F: Store>(
     file: &F,
     loc: &Located,
@@ -1069,6 +1085,7 @@ pub(crate) fn plan_ea_append<F: Store>(
     spatial: &[u64],
     element_size: NonZeroUsize,
     pipeline: Option<&FilterPipeline>,
+    grow_visible_tail: bool,
     raw: &[u8],
     new_elems: u64,
     fill: FillPattern<'_>,
@@ -1083,28 +1100,61 @@ pub(crate) fn plan_ea_append<F: Store>(
     let n_full = current_dim / chunk_elems;
     let has_partial = current_dim % chunk_elems != 0;
 
-    // A filtered append must start chunk-aligned. Growing a *filtered* partial
-    // trailing chunk would repoint that chunk's existing index element in place,
-    // and a filtered element is a multi-field record (address + compressed_size +
-    // filter_mask) that is visible at the old dimension before the commit — so a
-    // power-loss crash tearing that record across a disk sector could leave the
-    // committed view unreadable. The trailing element of an *unfiltered* dataset is
-    // a single address whose overwrite is atomic, so an unfiltered append may start
-    // anywhere.
+    // Growing a partial trailing chunk is copy-on-write, filtered or not. The
+    // rewritten chunk is written to a *fresh* allocation in phase 1 and the old
+    // slot is never touched, so the only mutation of already-visible state is
+    // phase 2's repoint of element `n_full`. That element write is the same
+    // write `ea_insert` makes for a brand-new element in a block that already
+    // holds visible ones: since issue #307 every element goes out through
+    // `Store::publish_checksummed`, one write running from the changed byte
+    // through the checksum that covers it, so a filtered element's three fields
+    // and their checksum are as atomic as an unfiltered element's one address.
     //
-    // The appended *length* need not be a chunk multiple either way. An unaligned
-    // length only makes the last chunk this append writes a partial one, and that
-    // chunk's index element is a fresh insert past the old dimension — invisible
-    // until phase 4 publishes the new dimension, exactly like every whole chunk
-    // beside it. It is the rewrite of an already-visible element that is refused,
-    // not the partial chunk itself.
-    if pipeline.is_some() && has_partial {
-        return Err(Error::AppendUnsupported(
-            "a filtered dataset whose length is not a whole multiple of the chunk length \
-             cannot be appended in place: growing its trailing partial chunk would repoint \
-             an index element a reader can already see. Use Dataset::append_staged, or a \
-             BufferedAppender, which keeps the on-disk length chunk-aligned",
-        ));
+    // A crash between the phases leaves a readable prefix. After phase 1 nothing
+    // points at the new chunk. After phase 2 a reader still bounded by the old
+    // dimension decodes the new chunk instead of the old one, and
+    // `split_into_chunks` padded it to a whole chunk with the dataset's fill
+    // value, so it yields the same element count with the old live prefix
+    // byte-identical — which holds because the pipelines this admits are
+    // lossless, the condition the next paragraph enforces. Phases 3 and 4 are the
+    // ordinary in-progress states.
+    //
+    // Reusing the old slot when the re-encoded bytes happen to fit is the option
+    // this does *not* take: overwriting a chunk in place is not one atomic write,
+    // and a reader crossing it would decode a mix of two encodings.
+    //
+    // What copy-on-write does *not* buy is a lossy filter. Rewriting the tail
+    // decodes the committed chunk and encodes it again, and for ZFP fixed-rate or
+    // float D-scale scale-offset that round trip is not the identity: the chunk's
+    // new neighbours move the quantization, so values a reader has already seen
+    // come back different. Measured on a chunk of 4 f64 at ZFP rate 8, growing
+    // `[4.5, 5.5]` by two elements read the committed pair back as `[16.0, 0.0]`.
+    // Refused for every caller, `grow_visible_tail` or not.
+    //
+    // The SWMR writer passes `grow_visible_tail = false`. In production that is
+    // defence in depth rather than a reachable message: `append_inplace_gathered`
+    // refuses every filtered SWMR append before it gets here. It is stated as a
+    // parameter anyway because it is this function that knows *why* the rewrite
+    // is safe, and the reason — an exclusive lock, no reader mid-sequence — is
+    // the caller's property, not this function's.
+    //
+    // The appended *length* has never been constrained. An unaligned length only
+    // makes the last chunk this append writes a partial one, and that chunk's
+    // index element is a fresh insert past the old dimension — invisible until
+    // phase 4 publishes the new dimension, exactly like every whole chunk beside
+    // it.
+    if has_partial && let Some(pl) = pipeline {
+        if !grow_visible_tail {
+            return Err(Error::AppendUnsupported(
+                "a filtered dataset whose length is not a whole multiple of the chunk length \
+                 cannot be appended in place by this writer: growing its trailing partial chunk \
+                 would repoint an index element a concurrent reader can already see. Use \
+                 Dataset::append_staged, or append whole chunks",
+            ));
+        }
+        if !pipeline_lossless(pl) {
+            return Err(Error::AppendUnsupported(LOSSY_TAIL_REFUSAL));
+        }
     }
 
     // Build the raw tail region: the live prefix of any rewritten partial chunk,
@@ -1166,6 +1216,15 @@ pub(crate) fn plan_ea_append<F: Store>(
     } else {
         split
     };
+
+    // Every blob has to fit the element it will be recorded in. Checked here,
+    // while nothing has been written, rather than where the element is laid out
+    // in phase 2 — by then phase 1 has already placed the chunk bytes, and the
+    // refusal would leave them behind unreferenced.
+    let os = file.offset_size() as usize;
+    for blob in &new_chunk_bytes {
+        loc.check_stored_size(os, blob.len() as u64)?;
+    }
 
     let new_num_chunks = n_full + new_chunk_bytes.len() as u64;
     Ok(AppendPlan {
@@ -1764,6 +1823,7 @@ mod tests {
             &spatial,
             loc.elem_bytes,
             None,
+            true,
             &raw,
             new_elems,
             FillPattern::ZERO,

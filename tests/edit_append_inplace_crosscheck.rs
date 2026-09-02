@@ -72,6 +72,73 @@ fn append_inplace_to_c_dataset_both_read() {
     assert_eq!(read_c(&path, "d"), expected);
 }
 
+/// Create a rank-1 unlimited, shuffle+deflate i32 dataset with the C library,
+/// seeded with `0..n` and left on a partial trailing chunk when `n % chunk != 0`.
+fn c_create_filtered_unlimited(path: &std::path::Path, name: &str, n: i32, chunk: usize) {
+    let file = hdf5::File::with_options()
+        .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+        .create(path)
+        .unwrap();
+    let ds = file
+        .new_dataset::<i32>()
+        .chunk((chunk,))
+        .shuffle()
+        .deflate(4)
+        .shape((Extent::resizable(n as usize),))
+        .create(name)
+        .unwrap();
+    ds.write(&(0..n).collect::<Vec<_>>()).unwrap();
+    file.close().unwrap();
+}
+
+/// A filtered dataset this crate leaves on a partial trailing chunk, then grows
+/// again (issue #393). The re-encoded chunk is zero-padded to the full chunk
+/// size before the pipeline runs and the dataspace dimension is what bounds the
+/// live elements, so a reader that took the chunk size for the live length would
+/// read the padding back as data — which is what the C library is here to rule
+/// out.
+#[test]
+fn append_inplace_grows_a_filtered_partial_tail_both_read() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("filtered_tail.h5");
+    c_create_filtered_unlimited(&path, "d", 8, 4);
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        let mut ds = s.dataset("d").unwrap();
+        ds.append(&[8, 9]).unwrap(); // leaves a partial trailing chunk
+        ds.append(&[10, 11]).unwrap(); // grows it
+        ds.append(&[12, 13, 14]).unwrap(); // grows it again, crossing a boundary
+    }
+
+    let expected: Vec<i32> = (0..15).collect();
+    assert_eq!(read_pure(&path, "d"), expected);
+    assert_eq!(read_c(&path, "d"), expected);
+}
+
+/// The same growth onto a partial trailing chunk the **C library itself** wrote,
+/// whose stored chunk may carry a non-zero filter mask. This crate decodes it
+/// with that mask and re-encodes with none, which is what an aligned filtered
+/// append has always done.
+#[test]
+fn append_inplace_grows_a_c_written_filtered_partial_tail() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_filtered_tail.h5");
+    c_create_filtered_unlimited(&path, "d", 10, 4); // 10 % 4 != 0
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        let mut ds = s.dataset("d").unwrap();
+        ds.append(&[10, 11]).unwrap(); // completes the C-written partial chunk
+        ds.append(&[12]).unwrap(); // opens a new one
+        ds.append(&(13..20).collect::<Vec<_>>()).unwrap(); // grows across chunks
+    }
+
+    let expected: Vec<i32> = (0..20).collect();
+    assert_eq!(read_pure(&path, "d"), expected);
+    assert_eq!(read_c(&path, "d"), expected);
+}
+
 #[test]
 fn hard_link_aliasing_append_inplace_stays_coherent() {
     // Two hard links to one dataset: appending in place via either path must stay
@@ -331,20 +398,19 @@ fn combined_mixed_edits_c_readable() {
     assert_eq!(read_pure(&path, "log"), (0..10).collect::<Vec<_>>());
 }
 
-/// A refused realignment must not leave its own append staged (issue #316).
+/// The shape that used to wedge a `BufferedAppender`: a *filtered* dataset
+/// sitting on a partial trailing chunk with a second hard link (issue #316).
 ///
-/// `BufferedAppender` is the one caller that stages *on the session's behalf*:
-/// a filtered dataset sitting on a partial trailing chunk is realigned by an
-/// internal `append_staged` plus `commit`. When that commit refuses — here
-/// because the C library gave the dataset a second hard link, which the append
-/// preflight will not relocate a header for — restoring the staged set would
-/// hand the caller an append they never made. It would also be permanent: every
-/// later `commit` re-runs the same refusal, including the one `close` makes, so
-/// the session could never be sealed and its free-space managers never rehomed.
+/// The appender used to realign such a dataset with an internal
+/// `append_staged` + `commit`, and a commit relocates the object header, which
+/// the append preflight refuses for a dataset with more than one hard link — so
+/// the appender could never write and the session could never be sealed. Since
+/// issue #393 the trailing chunk is re-encoded in place instead, which moves no
+/// header, so both links keep naming the grown dataset.
 #[test]
-fn a_refused_realignment_leaves_nothing_staged() {
+fn a_filtered_partial_tail_with_two_hard_links_appends_in_place() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("wedge.h5");
+    let path = dir.path().join("aliased_tail.h5");
     {
         let mut b = hdf5_pure::FileBuilder::new();
         b.create_dataset("d")
@@ -365,28 +431,15 @@ fn a_refused_realignment_leaves_nothing_staged() {
     {
         let mut ds = session.dataset("d").unwrap();
         let mut app = ds.buffered_appender().unwrap();
-        let err = app
-            .append(&(10..30i32).collect::<Vec<_>>())
-            .expect_err("a two-hard-link dataset cannot have its header relocated");
-        assert!(
-            err.to_string().contains("single hard link"),
-            "unexpected error: {err}"
-        );
-        drop(app);
+        app.append(&(10..30i32).collect::<Vec<_>>()).unwrap();
+        app.finish().unwrap();
     }
-    assert!(
-        !session.has_staged_edits(),
-        "the refused realignment left its own append staged"
-    );
-    session
-        .commit()
-        .expect("a session that staged nothing must commit cleanly");
-    session
-        .close()
-        .expect("the session must still be sealable after a refused realignment");
+    session.close().unwrap();
 
-    // The dataset is as it was: the refusal wrote nothing.
-    assert_eq!(read_pure(&path, "d"), (0..10).collect::<Vec<i32>>());
+    let expected: Vec<i32> = (0..30).collect();
+    assert_eq!(read_pure(&path, "d"), expected);
+    assert_eq!(read_pure(&path, "alias"), expected);
+    assert_eq!(read_c(&path, "alias"), expected);
 }
 
 /// An immediate append that draws its chunks from freed space (issue #349)

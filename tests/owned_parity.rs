@@ -29,22 +29,24 @@ fn build_filtered_unlimited(path: &std::path::Path, n: i32, chunk: u64) {
     b.write(path).unwrap();
 }
 
-/// The one genuinely missing owned capability: growing a **filtered** dataset by
-/// a non-chunk-aligned length. The immediate `Dataset::append` (fast in-place
-/// path) refuses it; `Dataset::append_staged` (index-rebuild path) accepts it
-/// and applies on `commit`.
+/// Growing a **filtered** dataset that sits on a partial trailing chunk, both
+/// ways: the immediate `Dataset::append` (fast in-place path, which re-encodes
+/// that chunk since issue #393) and `Dataset::append_staged` (index-rebuild
+/// path, applied on `commit`). What separates them here is *when* the elements
+/// land, which is what the rest of this test pins.
 #[test]
 fn append_staged_grows_filtered_any_length() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("f.h5");
-    build_filtered_unlimited(&path, 5, 4); // length 5, chunk 4 -> partial tail
+    build_filtered_unlimited(&path, 3, 4); // length 3, chunk 4 -> partial tail
 
     let file = File::open_rw(&path).unwrap();
     {
         let mut ds = file.dataset("d").unwrap();
-        // Immediate in-place append refuses a filtered, non-chunk-aligned grow.
-        assert!(ds.append(&[5i32, 6, 7]).is_err());
-        // The staged rebuild path accepts it.
+        // Immediate in-place append: applied at once, nothing staged.
+        ds.append(&[3i32, 4]).unwrap();
+        assert!(!file.has_staged_edits());
+        // The staged rebuild path takes the same shape, deferred to `commit`.
         ds.append_staged(|b| {
             b.append_i32(&[5, 6, 7]);
         })

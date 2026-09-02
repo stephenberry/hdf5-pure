@@ -1,10 +1,9 @@
 //! Buffering appends into whole chunks with `Dataset::buffered_appender`.
 //!
 //! `Dataset::append` writes on every call, which is the wrong trade for a
-//! logger appending a handful of samples at a time into a chunk that holds many
-//! — and is refused outright once a *filtered* dataset is sitting on a partial
-//! trailing chunk, because growing that chunk would repoint an index element a
-//! reader can already see.
+//! logger appending a handful of samples at a time into a chunk that holds many:
+//! it pays a whole crash-atomic write sequence to add ten elements, and on a
+//! filtered dataset it re-encodes the trailing chunk each time.
 //!
 //! A `BufferedAppender` holds appended elements in memory and writes them only
 //! when they complete a chunk, so the file sees one append per chunk rather
@@ -82,8 +81,8 @@ fn main() {
 
     // ---- Resuming the log -------------------------------------------------
     // The dataset now ends mid-chunk (250 of 64). A new appender lands it back
-    // on a chunk boundary with one staged commit, then goes back to the cheap
-    // in-place path for everything after.
+    // on a chunk boundary with its first write, which re-encodes that trailing
+    // chunk, and every write after it starts on a boundary.
     {
         let session = File::open_rw(&path).expect("reopen for editing");
         let mut samples = session.dataset("samples").expect("open dataset");

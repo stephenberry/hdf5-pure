@@ -111,7 +111,7 @@ SWMR append supports the following subset, distinct from the general [editing](e
 | --- | --- |
 | Dimensionality | exactly one unlimited dimension |
 | Storage | chunked (Extensible Array index, latest format) |
-| Filters | unfiltered (no compression on the appended dataset) |
+| Filters | unfiltered (no compression on the appended dataset); `File::open_rw` takes filtered ones |
 | Append granularity | chunk-aligned appends |
 | File layout | no userblock (zero base address); latest-format v3 superblock |
 | Growth | unbounded |
@@ -120,4 +120,4 @@ SWMR append supports the following subset, distinct from the general [editing](e
 `File::open_swmr_writer` rejects files that fall outside this subset, returning `Error::SwmrAppendUnsupported` for a non-latest-format superblock or a userblock file before performing any mutating write.
 
 !!! tip "Appending without SWMR"
-    If you don't need concurrent readers, two paths append to an unlimited dataset in place with fewer restrictions than the SWMR writer — both handle **filtered** (compressed) datasets. [`Dataset::append_staged`](editing.md#appending-to-an-unlimited-dataset) is the general, composable one-off path and takes **any-length** appends on filtered and unfiltered datasets alike. [`File::open_rw` + `Dataset::append`](editing.md#streaming-appends) is the throughput path that stays open across many appends and grows the index in place at amortized `O(1)` cost; it takes any-length appends on unfiltered datasets and whole-chunk appends on filtered ones. Reach for SWMR only when a separate process must read the dataset while it grows.
+    If you don't need concurrent readers, two paths append to an unlimited dataset in place with fewer restrictions than the SWMR writer — both handle **filtered** (compressed) datasets, from any length and by any length. [`Dataset::append_staged`](editing.md#appending-to-an-unlimited-dataset) is the general, composable one-off path. [`File::open_rw` + `Dataset::append`](editing.md#streaming-appends) is the throughput path that stays open across many appends and grows the index in place at amortized `O(1)` cost. Reach for SWMR only when a separate process must read the dataset while it grows.

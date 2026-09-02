@@ -384,11 +384,6 @@ struct AppenderClaim {
     /// staged edit may move, so a path-less claim conflicts with everything —
     /// exactly the rule `append_prepare` already applies to that target.
     path: Option<PathKey>,
-    /// Whether this appender still owes a staged, index-rebuilding realignment
-    /// (a filtered dataset sitting on a partial trailing chunk). That write
-    /// commits, and a commit refuses to run beside unrelated staged edits, so
-    /// while it is outstanding the claim conflicts with everything.
-    needs_commit: bool,
 }
 
 /// Variable-length group/root attributes staged by [`apply_compact_attr_ops`],
@@ -962,10 +957,6 @@ pub(crate) struct WriteEngine {
     /// Monotonic id for the next claim, so releasing one is exact even when two
     /// appenders on different datasets are live at once.
     next_appender_token: u64,
-    /// Set while an appender is driving its own staged realignment through
-    /// `stage_dataset_append` + `commit`, so its claim does not refuse its own
-    /// write. Re-entrancy only; never observable outside that call.
-    appender_commit_in_progress: bool,
     /// Session-local free-space tracker (issue #21). Holds regions vacated by
     /// prior commits in this session — superseded object headers and the blocks
     /// of deleted objects — so later commits reuse them instead of growing the
@@ -2011,9 +2002,11 @@ pub(crate) struct AppendGeometry {
     pub(crate) element_size: NonZeroUsize,
     /// Current length along the unlimited dimension.
     pub(crate) current_dim: u64,
-    /// Whether a filter pipeline applies (an in-place append then requires a
-    /// chunk-aligned starting length).
-    pub(crate) filtered: bool,
+    /// Whether this dataset's filter pipeline is **lossy** — ZFP, or float
+    /// D-scale scale-offset. Such a dataset cannot have a partial trailing chunk
+    /// grown, because that decodes and re-encodes already-committed values (see
+    /// [`pipeline_lossless`]), so an append onto one has to start chunk-aligned.
+    pub(crate) lossy_filters: bool,
     /// Whole-chunk elements in one full batch (>= one chunk's worth), or
     /// [`u64::MAX`] when the session does not batch.
     pub(crate) full_batch_elems: u64,
@@ -2541,7 +2534,6 @@ impl WriteEngine {
             staged: StagedEdits::default(),
             appender_claims: Vec::new(),
             next_appender_token: 0,
-            appender_commit_in_progress: false,
             free: FreeList::new(),
             proved_free_of_references: false,
             persist: None,
@@ -3232,14 +3224,9 @@ impl WriteEngine {
     ///
     /// Refused when the claim could not be honored: a second appender on the
     /// same dataset would interleave the two buffers a chunk at a time, and a
-    /// staged edit already pending on that path — or any staged edit at all, when
-    /// the appender still owes a realignment — is one the appender's own flush
+    /// staged edit already pending on that path is one the appender's own flush
     /// would later refuse.
-    pub(crate) fn claim_for_appender(
-        &mut self,
-        path: Option<&str>,
-        needs_commit: bool,
-    ) -> Result<u64, Error> {
+    pub(crate) fn claim_for_appender(&mut self, path: Option<&str>) -> Result<u64, Error> {
         let path = path.map(split_path);
         if self
             .appender_claims
@@ -3251,13 +3238,9 @@ impl WriteEngine {
                  their buffers a chunk at a time",
             ));
         }
-        let blocked = if needs_commit {
-            self.has_staged_edits()
-        } else {
-            match path.as_deref() {
-                Some(p) => self.append_conflicts_with_pending(p),
-                None => self.has_staged_edits() || self.committed,
-            }
+        let blocked = match path.as_deref() {
+            Some(p) => self.append_conflicts_with_pending(p),
+            None => self.has_staged_edits() || self.committed,
         };
         if blocked {
             return Err(Error::EditUnsupported(
@@ -3267,36 +3250,13 @@ impl WriteEngine {
         }
         let token = self.next_appender_token;
         self.next_appender_token += 1;
-        self.appender_claims.push(AppenderClaim {
-            token,
-            path,
-            needs_commit,
-        });
+        self.appender_claims.push(AppenderClaim { token, path });
         Ok(token)
-    }
-
-    /// Record whether the claim still owes a staged realignment. The appender
-    /// calls this after every write, since flushing a partial trailing chunk on
-    /// a filtered dataset puts the debt back.
-    pub(crate) fn set_appender_needs_commit(&mut self, token: u64, needs_commit: bool) {
-        if let Some(c) = self.appender_claims.iter_mut().find(|c| c.token == token) {
-            c.needs_commit = needs_commit;
-        }
     }
 
     /// Drop a claim. Called from the appender's `Drop`, after its final flush.
     pub(crate) fn release_appender_claim(&mut self, token: u64) {
         self.appender_claims.retain(|c| c.token != token);
-    }
-
-    /// Run `f` with this session's claims suspended, so an appender's own staged
-    /// realignment is not refused by its own claim.
-    pub(crate) fn within_appender_commit<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        let prev = self.appender_commit_in_progress;
-        self.appender_commit_in_progress = true;
-        let out = f(self);
-        self.appender_commit_in_progress = prev;
-        out
     }
 
     /// Refuse a staged edit at `path` that a live appender could not survive.
@@ -3308,13 +3268,7 @@ impl WriteEngine {
     /// data lost silently in `Drop`. Refusing here moves the failure to the call
     /// that creates the conflict, where there is someone to report it to.
     fn refuse_if_claimed(&self, path: &[String]) -> Result<(), Error> {
-        if self.appender_commit_in_progress {
-            return Ok(());
-        }
         let conflicts = self.appender_claims.iter().any(|c| match &c.path {
-            // A claim owing a realignment needs a commit, and a commit refuses to
-            // run beside unrelated staged edits, so it conflicts with every path.
-            _ if c.needs_commit => true,
             Some(p) => paths_overlap(p, path),
             None => true,
         });
@@ -3853,7 +3807,7 @@ impl WriteEngine {
             chunk_elems,
             element_size: st.element_size,
             current_dim: st.loc.current_dim,
-            filtered: st.pipeline.is_some(),
+            lossy_filters: st.pipeline.as_ref().is_some_and(|p| !pipeline_lossless(p)),
             full_batch_elems: self.batch_elems(st.loc.chunk_bytes, chunk_elems),
         })
     }
@@ -3911,10 +3865,10 @@ impl WriteEngine {
         }
 
         // In SWMR mode, hold to the subset a concurrent reader can follow safely:
-        // unfiltered (a filtered element is a multi-field record whose in-place
-        // repoint is not power-loss atomic) and chunk-aligned (so an append only
-        // ever inserts new, not-yet-visible elements and never rewrites a visible
-        // trailing chunk out from under a reader).
+        // unfiltered and chunk-aligned, so an append only ever inserts new,
+        // not-yet-visible elements and never rewrites a visible trailing chunk
+        // out from under a reader. Outside SWMR the session's exclusive lock is
+        // what makes that rewrite safe; see `plan_ea_append`.
         if self.swmr_mode {
             let st = &self.located[&oh_addr];
             if st.pipeline.is_some() {
@@ -3934,37 +3888,27 @@ impl WriteEngine {
             }
         }
 
-        let (chunk_elems, elem_bytes, full_batch_elems, filtered, current_dim) = {
+        let (chunk_elems, elem_bytes, full_batch_elems) = {
             let st = &self.located[&oh_addr];
             (
                 st.loc.chunk_elems.max(1),
                 st.element_size.get() as u64,
                 self.batch_elems(st.loc.chunk_bytes, st.loc.chunk_elems.max(1)),
-                st.pipeline.is_some(),
-                st.loc.current_dim,
             )
         };
-        // Refuse a filtered append onto an unaligned length before ANY batch
-        // applies, so the refusal is as atomic as an unbatched one. Left to
-        // `plan_ea_append` it would surface only when the first batch was reached.
-        // The appended length is unconstrained: `batch_elems` is a whole-chunk
-        // multiple, so an unaligned remainder can only ever be the *last* batch,
-        // by which point every earlier batch has left the length chunk-aligned.
-        if filtered && current_dim % chunk_elems != 0 {
-            return Err(Error::AppendInPlaceUnsupported(
-                "a filtered dataset whose length is not a whole multiple of the chunk length \
-                 cannot be appended in place: growing its trailing partial chunk would repoint \
-                 an index element a reader can already see. Use Dataset::append_staged, or a \
-                 BufferedAppender, which keeps the on-disk length chunk-aligned",
-            ));
-        }
+        // Outside SWMR the session holds an exclusive lock, so re-encoding a
+        // filtered partial trailing chunk into a fresh allocation and repointing
+        // its index element is a change no other reader is crossing; see
+        // `plan_ea_append`, which owns that argument and keeps the refusal for
+        // the SWMR writer.
+        let grow_visible_tail = !self.swmr_mode;
 
         let mut done = 0u64;
         while done < new_elems {
             // Fill the trailing partial chunk first (so later batches start
             // chunk-aligned and never rewrite it again), then whole-chunk batches.
-            // Filtered datasets are chunk-aligned by contract, so every batch stays
-            // chunk-aligned there too.
+            // That first batch is the only one that can re-encode a filtered
+            // trailing chunk; every batch after it starts on a boundary.
             let current_dim = self.located[&oh_addr].loc.current_dim;
             let to_boundary = (chunk_elems - current_dim % chunk_elems) % chunk_elems;
             let take = (new_elems - done).min(to_boundary.saturating_add(full_batch_elems));
@@ -4003,6 +3947,7 @@ impl WriteEngine {
                     &st.spatial,
                     st.element_size,
                     st.pipeline.as_ref(),
+                    grow_visible_tail,
                     batch,
                     take,
                     st.fill.pattern(st.element_size),
@@ -7707,6 +7652,15 @@ impl WriteEngine {
             .map_err(|_| Error::AppendUnsupported("chunk count exceeds this platform"))?;
         let has_partial = current_dim0 % chunk_elems != 0;
 
+        // NOTE: this path rewrites that chunk for a *lossy* pipeline too, which is
+        // not value-preserving — the immediate path refuses exactly that, through
+        // `pipeline_lossless`. It is left alone here on purpose: seven
+        // `scaleoffset_fill_crosscheck` tests grow a float D-scale dataset from an
+        // unaligned length through this code and assert the result is byte-identical
+        // to the reference C library's own encoding, so the same predicate cannot be
+        // applied without taking a deliberately exercised, crosschecked capability
+        // away. Filed separately (issue #393's review); the demonstrated case is ZFP.
+
         let mut kept_chunks: Vec<WrittenChunk> = Vec::with_capacity(n_full);
         for ci in grid_order.iter().take(n_full) {
             kept_chunks.push(WrittenChunk {
@@ -10860,6 +10814,46 @@ pub(crate) fn pipeline_reencodable(pipeline: &FilterPipeline) -> bool {
     })
 }
 
+/// Whether re-encoding a chunk through `pipeline` reproduces the values it was
+/// decoded from — the condition for rewriting a chunk that is **already
+/// committed**, as growing a partial trailing chunk does.
+///
+/// Stricter than [`pipeline_reencodable`], and for a different question. That
+/// one asks whether this crate can *apply* the filters at all, which is what a
+/// brand-new chunk needs. This one asks whether decode-then-encode is the
+/// identity, which is what a chunk somebody has already read needs. Deflate,
+/// shuffle, fletcher32 and LZF are lossless by construction; scale-offset only
+/// in its integer mode; ZFP fixed-rate quantizes every block to a bit budget, so
+/// re-encoding it against a *different* set of neighbours in the same block
+/// re-quantizes the values that were already there.
+///
+/// This is the line [`repack`](crate::repack)'s `check_pipeline` already draws
+/// for its two re-encoding paths, stated once more here because the append
+/// engine reaches it by a different route.
+pub(crate) fn pipeline_lossless(pipeline: &FilterPipeline) -> bool {
+    pipeline.filters.iter().all(|f| match f.filter_id {
+        FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_LZF => true,
+        // The integer mode subtracts a per-chunk minimum and packs the residuals
+        // whole; float D-scale rounds to a decimal count and is documented lossy.
+        // Anything else (float E-scale) this crate neither writes nor decodes.
+        FILTER_SCALEOFFSET => matches!(
+            crate::scaleoffset::scale_offset_mode(&f.client_data),
+            Some((crate::scaleoffset::ScaleOffset::Integer(_), _))
+        ),
+        // Unknown ids included: a filter whose semantics are unknown is not one
+        // to assume round-trips.
+        _ => false,
+    })
+}
+
+/// The refusal the immediate append path raises for a lossy pipeline sitting on a
+/// partial trailing chunk. Named here beside the predicate it goes with, and used
+/// from [`chunk_index_inplace`](crate::chunk_index_inplace).
+pub(crate) const LOSSY_TAIL_REFUSAL: &str = "this dataset's filter pipeline is lossy (ZFP, or float D-scale scale-offset), and its \
+     length is not a whole multiple of the chunk length: growing that trailing chunk would \
+     decode and re-encode values that are already committed, changing them. Append whole \
+     chunks from a chunk-aligned length instead";
+
 /// Rebuild a header message `region`, replacing the single Data Layout message's
 /// record with one carrying `new_layout_body` and leaving every other message
 /// (datatype, dataspace, fill value, filter pipeline, attributes, attribute info)
@@ -13300,33 +13294,47 @@ mod tests {
     /// partial-tail append repoints the visible trailing element in place. Mirrors
     /// `Dataset::append`'s crash-consistency harness, but driven through
     /// the in-place edit engine's own mirror (disk-before-mirror ordering) to prove the shared
-    /// engine is crash-safe under both owners. Two starting layouts: the trailing
-    /// element inline in the index block (chunk 4, n 6), and in a data block
-    /// (chunk 2, n 9, slot 0).
+    /// engine is crash-safe under both owners. Three starting layouts: the trailing
+    /// element inline in the index block (chunk 4, n 6), in a data block
+    /// (chunk 2, n 9, slot 0), and a *filtered* inline one (issue #393), whose
+    /// repointed element is the three-field record rather than a bare address and
+    /// whose relocated chunk has to decode to the old prefix at every phase
+    /// before the dimension moves.
     #[test]
     fn append_inplace_crash_consistency_partial_tail_prefix() {
         use crate::reader::File as PureFile;
         use crate::writer::FileBuilder;
         use tempfile::tempdir;
 
-        let build = |path: &std::path::Path, n: i32, chunk: u64| {
+        let build = |path: &std::path::Path, n: i32, chunk: u64, deflate: bool| {
             let data: Vec<i32> = (0..n).collect();
             let mut b = FileBuilder::new();
-            b.create_dataset("d")
+            let d = b
+                .create_dataset("d")
                 .with_i32_data(&data)
                 .with_shape(&[n as u64])
                 .with_maxshape(&[u64::MAX])
                 .with_chunks(&[chunk]);
+            if deflate {
+                d.with_deflate(6);
+            }
             b.write(path).unwrap();
         };
 
-        for (n, chunk, add) in [(6i32, 4u64, 5i32), (9, 2, 6)] {
+        for (n, chunk, add, deflate) in [
+            (6i32, 4u64, 5i32, false),
+            (9, 2, 6, false),
+            (6, 4, 5, true),
+            (9, 4, 3, true),
+        ] {
             let dir = tempdir().unwrap();
             let base = dir.path().join("base.h5");
-            build(&base, n, chunk);
+            build(&base, n, chunk, deflate);
 
             for max_phase in 1u8..=4 {
-                let p = dir.path().join(format!("crash_{n}_{chunk}_{max_phase}.h5"));
+                let p = dir
+                    .path()
+                    .join(format!("crash_{n}_{chunk}_{deflate}_{max_phase}.h5"));
                 std::fs::copy(&base, &p).unwrap();
                 {
                     let mut s = WriteEngine::open_with_locking(&p, FileLocking::Enabled).unwrap();
@@ -13339,10 +13347,183 @@ mod tests {
                 assert_eq!(
                     f.dataset("d").unwrap().read_i32().unwrap(),
                     (0..expected_len).collect::<Vec<_>>(),
-                    "inconsistent view after crash at phase {max_phase} (n={n}, chunk={chunk})"
+                    "inconsistent view after crash at phase {max_phase} (n={n}, chunk={chunk}, \
+                     deflate={deflate})"
                 );
             }
         }
+    }
+
+    /// Growing a partial trailing chunk decodes and re-encodes elements that are
+    /// already committed, so a **lossy** pipeline is refused on the immediate
+    /// in-place path, with the file left exactly as it was.
+    ///
+    /// The values are the point rather than the error: measured on this fixture
+    /// before the refusal existed, the committed pair `[4.5, 5.5]` read back as
+    /// `[16.0, 0.0]` once two more elements joined their ZFP block. That is
+    /// quantization following the block's new contents, not a decode that lost
+    /// its place — a *fresh* chunk of `[99.0, 98.0, 97.0]` at this rate reads
+    /// back as `[98.0, 102.0, 90.0]` with nothing decoded anywhere, which is what
+    /// eight bits per value buys and is not this test's business.
+    #[cfg(feature = "zfp")]
+    #[test]
+    fn append_onto_a_lossy_partial_tail_is_refused() {
+        use crate::reader::File as PureFile;
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let committed: Vec<f64> = vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5];
+
+        // `d` is 6 of a chunk of 4: a partial trailing chunk holding 4.5 and 5.5.
+        let build = |path: &std::path::Path| {
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_f64_data(&committed)
+                .with_shape(&[6])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[4])
+                .with_zfp(8.0);
+            b.write(path).unwrap();
+        };
+
+        // The immediate in-place path.
+        let p = dir.path().join("inplace.h5");
+        build(&p);
+        let before = std::fs::read(&p).unwrap();
+        {
+            let f = crate::reader::File::open_rw(&p).unwrap();
+            let err = f
+                .dataset("d")
+                .unwrap()
+                .append(&[99.0f64, 98.0, 97.0])
+                .expect_err("a lossy pipeline must not have its trailing chunk re-encoded");
+            assert!(
+                matches!(&err, Error::AppendInPlaceUnsupported(m) if m.contains("lossy")),
+                "got: {err:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            before,
+            "the refusal wrote bytes"
+        );
+        assert_eq!(
+            PureFile::open(&p)
+                .unwrap()
+                .dataset("d")
+                .unwrap()
+                .read_f64()
+                .unwrap(),
+            committed
+        );
+
+        // A chunk-aligned start needs no rewrite, so it is still accepted and the
+        // committed values are still exactly what they were.
+        let p = dir.path().join("aligned.h5");
+        {
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_f64_data(&committed[..4])
+                .with_shape(&[4])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[4])
+                .with_zfp(8.0);
+            b.write(&p).unwrap();
+        }
+        {
+            let f = crate::reader::File::open_rw(&p).unwrap();
+            f.dataset("d").unwrap().append(&[9.5f64, 8.5, 7.5]).unwrap();
+        }
+        let back = PureFile::open(&p)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_f64()
+            .unwrap();
+        assert_eq!(back[..4], committed[..4], "an untouched chunk changed");
+
+        // A buffered appender over the unaligned shape is refused when it is
+        // made, since its very first write would be the rewrite above.
+        let p = dir.path().join("buffered.h5");
+        build(&p);
+        {
+            let f = crate::reader::File::open_rw(&p).unwrap();
+            let mut ds = f.dataset("d").unwrap();
+            let err = ds
+                .buffered_appender()
+                .expect_err("its first write would re-encode the committed tail");
+            assert!(
+                matches!(&err, Error::AppendInPlaceUnsupported(m) if m.contains("lossy")),
+                "got: {err:?}"
+            );
+        }
+    }
+
+    /// Float D-scale scale-offset is the other lossy mode, and is refused for the
+    /// same reason — while the **integer** mode, which is lossless, grows its
+    /// partial trailing chunk with every value intact. Both halves matter: a
+    /// predicate that refused all of scale-offset would pass the first assertion
+    /// and take a working case away.
+    #[test]
+    fn a_lossy_scale_offset_mode_is_refused_and_a_lossless_one_is_not() {
+        use crate::reader::File as PureFile;
+        use crate::scaleoffset::ScaleOffset;
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+
+        let p = dir.path().join("dscale.h5");
+        {
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_f64_data(&[0.5, 1.5, 2.5, 3.5, 4.5, 5.5])
+                .with_shape(&[6])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[4])
+                .with_scale_offset(ScaleOffset::FloatDScale(1));
+            b.write(&p).unwrap();
+        }
+        {
+            let f = crate::reader::File::open_rw(&p).unwrap();
+            let err = f
+                .dataset("d")
+                .unwrap()
+                .append(&[99.0f64, 98.0, 97.0])
+                .expect_err("float D-scale is lossy");
+            assert!(
+                matches!(&err, Error::AppendInPlaceUnsupported(m) if m.contains("lossy")),
+                "got: {err:?}"
+            );
+        }
+
+        let p = dir.path().join("int.h5");
+        {
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&(0..6).collect::<Vec<_>>())
+                .with_shape(&[6])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[4])
+                .with_scale_offset(ScaleOffset::Integer(0));
+            b.write(&p).unwrap();
+        }
+        {
+            let f = crate::reader::File::open_rw(&p).unwrap();
+            let mut ds = f.dataset("d").unwrap();
+            ds.append(&[6i32, 7, 8]).unwrap();
+            ds.append(&[9i32]).unwrap();
+        }
+        assert_eq!(
+            PureFile::open(&p)
+                .unwrap()
+                .dataset("d")
+                .unwrap()
+                .read_i32()
+                .unwrap(),
+            (0..10).collect::<Vec<_>>()
+        );
     }
 
     /// A *filtered* append whose length is not a whole number of chunks writes a
@@ -13371,9 +13552,10 @@ mod tests {
             b.write(path).unwrap();
         };
 
-        // Aligned starts (a filtered append requires one), unaligned lengths:
-        // one that stays inside a single new chunk, and one that spans several
-        // and ends partway through the last.
+        // Aligned starts, unaligned lengths: one that stays inside a single new
+        // chunk, and one that spans several and ends partway through the last.
+        // (An unaligned *start* is the sibling sweep,
+        // `append_inplace_crash_consistency_partial_tail_prefix`.)
         for (n, chunk, add) in [(8i32, 4u64, 2i32), (8, 4, 9), (0, 4, 3)] {
             let dir = tempdir().unwrap();
             let base = dir.path().join("base.h5");

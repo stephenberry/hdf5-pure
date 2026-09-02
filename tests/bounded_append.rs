@@ -106,31 +106,26 @@ fn refetched_handle_observes_appends() {
 }
 
 #[test]
-fn filtered_appends_start_on_a_chunk_boundary_only() {
+fn filtered_appends_start_and_end_at_any_length() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("filtered.h5");
     build(&p, 8, 4, true);
     {
         let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
-        // Chunk-aligned filtered append is accepted.
+        // Chunk-aligned.
         ds.append(&[8i32, 9, 10, 11]).unwrap();
         assert_eq!(ds.read_i32().unwrap(), (0..12).collect::<Vec<_>>());
-        // So is one whose length is not a chunk multiple: it only adds a new
-        // partial chunk, which no reader can see until the dimension is
-        // published.
+        // A length that is not a chunk multiple: adds a new partial chunk.
         ds.append(&[12i32]).unwrap();
         assert_eq!(ds.read_i32().unwrap(), (0..13).collect::<Vec<_>>());
-        // Now the dataset sits on a partial trailing chunk, and growing that in
-        // place would repoint a visible index element (same engine rule as
-        // open_rw).
-        let err = ds.append(&[13i32]).unwrap_err();
-        assert!(
-            matches!(err, Error::AppendInPlaceUnsupported(_)),
-            "unexpected error: {err:?}"
-        );
+        // Growing that partial chunk: the bounded engine reads and re-encodes
+        // exactly the one trailing chunk, the same rule as open_rw.
+        ds.append(&[13i32]).unwrap();
+        ds.append(&[14i32, 15, 16]).unwrap();
+        assert_eq!(ds.read_i32().unwrap(), (0..17).collect::<Vec<_>>());
     }
-    assert_eq!(read_i32(&p), (0..13).collect::<Vec<_>>());
+    assert_eq!(read_i32(&p), (0..17).collect::<Vec<_>>());
 }
 
 #[test]
@@ -547,34 +542,27 @@ fn reads_match_streaming_capabilities() {
 }
 
 #[test]
-fn unaligned_filtered_multi_batch_append_is_refused_atomically() {
-    // A filtered append onto a partial trailing chunk that is larger than the
-    // internal batch budget must be refused up front with NO batch applied —
-    // the same atomic refusal as open_rw — not partially committed before some
-    // later batch errors.
+fn unaligned_filtered_multi_batch_append_lands_every_element() {
+    // A filtered append onto a partial trailing chunk, larger than the internal
+    // batch budget. Only the first batch may re-encode the trailing chunk: it
+    // fills to the boundary, and every batch after it starts aligned. Each
+    // batch is its own crash-atomic apply, so this is also the shape where a
+    // batching mistake shows up as lost or duplicated elements.
     let dir = tempdir().unwrap();
     let p = dir.path().join("atomic.h5");
     build(&p, 257, 256, true); // one element past a chunk boundary
-    let before = std::fs::read(&p).unwrap();
+    const ADDED: i32 = 524_288; // ~2 MiB of i32, several batches
     {
         let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
-        // ~2 MiB of i32.
-        let big: Vec<i32> = (0..524_288).collect();
-        let err = ds.append(&big).unwrap_err();
-        assert!(
-            matches!(err, Error::AppendInPlaceUnsupported(_)),
-            "got: {err:?}"
-        );
-        assert_eq!(ds.shape().unwrap(), vec![257]);
+        ds.append(&(257..257 + ADDED).collect::<Vec<i32>>())
+            .unwrap();
+        assert_eq!(ds.shape().unwrap(), vec![(257 + ADDED) as u64]);
     }
-    assert_eq!(
-        std::fs::read(&p).unwrap(),
-        before,
-        "a refused append modified the file"
-    );
-    // Same atomicity for a raw append whose byte length is not a whole number
-    // of elements.
+    assert_eq!(read_i32(&p), (0..257 + ADDED).collect::<Vec<_>>());
+
+    // A raw append whose byte length is not a whole number of elements is
+    // refused before any batch applies, so the file is untouched.
     let before = std::fs::read(&p).unwrap();
     {
         let file = open_bounded(&p).unwrap();
@@ -582,8 +570,6 @@ fn unaligned_filtered_multi_batch_append_is_refused_atomically() {
         let mut bytes = vec![0u8; 2 * 1024 * 1024];
         bytes.push(0); // not a whole i32
         let err = ds.append_raw(&bytes).unwrap_err();
-        // Named, not merely typed: with an unaligned dataset both refusals
-        // carry this variant, and only the message says which one fired.
         assert!(
             matches!(&err, Error::AppendInPlaceUnsupported(m) if m.contains("whole number of elements")),
             "got: {err:?}"

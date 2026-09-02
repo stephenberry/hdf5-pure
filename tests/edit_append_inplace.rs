@@ -6,7 +6,10 @@
 //! hard-link aliasing and a combined mixed-edit file) lives in
 //! `edit_crosscheck.rs`.
 
-use hdf5_pure::{AttrValue, Error, File, FileBuilder, FileSpaceStrategy, FormatError};
+use hdf5_pure::{
+    AttrValue, Error, File, FileAccessProperties, FileBuilder, FileSpaceStrategy, FormatError,
+    ScaleOffset, SyncPolicy,
+};
 use tempfile::tempdir;
 
 /// Build a rank-1, unlimited i32 dataset at `name` with the given chunk length and
@@ -78,22 +81,155 @@ fn filtered_whole_chunk() {
     assert_eq!(read_i32(&p, "d"), (0..12).collect::<Vec<_>>());
 }
 
+/// A filtered dataset left on a partial trailing chunk grows in place (issue
+/// #393): the trailing chunk is decoded, extended, re-encoded and written to a
+/// fresh allocation, and its one index element is repointed. Before the fix the
+/// second append here was `AppendInPlaceUnsupported` and the dataset was stuck
+/// on the staged path for the rest of its life.
 #[test]
-fn filtered_onto_a_partial_trailing_chunk_refused() {
+fn filtered_onto_a_partial_trailing_chunk_grows() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("d.h5");
     build(&p, "d", 8, 4, true);
 
-    let s = File::open_rw(&p).unwrap();
-    // Not a whole chunk (2 of 4), but the dataset starts on a boundary, so this
-    // only inserts a new partial chunk no reader can see yet: allowed.
-    s.dataset("d").unwrap().append(&[8, 9]).unwrap();
-    // Now the trailing chunk is partial and visible, and growing it would
-    // repoint a filtered index element, which is not power-loss atomic.
-    let err = s.dataset("d").unwrap().append(&[10, 11]).unwrap_err();
-    assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
-    drop(s);
-    assert_eq!(read_i32(&p, "d"), (0..10).collect::<Vec<_>>());
+    {
+        let s = File::open_rw(&p).unwrap();
+        // Not a whole chunk (2 of 4): leaves the dataset on a partial tail.
+        s.dataset("d").unwrap().append(&[8, 9]).unwrap();
+        // Grows that partial tail, then crosses into a fresh chunk, then leaves
+        // another partial tail behind — three shapes in one session.
+        s.dataset("d").unwrap().append(&[10, 11]).unwrap();
+        s.dataset("d").unwrap().append(&[12, 13, 14]).unwrap();
+        s.dataset("d").unwrap().append(&[15]).unwrap();
+    }
+
+    assert_eq!(read_i32(&p, "d"), (0..16).collect::<Vec<_>>());
+}
+
+/// The filter stacks a re-encoded trailing chunk has to survive. Named rather
+/// than a boolean because the growth is filter-agnostic and the point of the
+/// test below is that all four behave the same.
+#[derive(Clone, Copy, Debug)]
+enum Filters {
+    Deflate,
+    ShuffleDeflate,
+    ScaleOffset,
+    Lzf,
+}
+
+const FILTER_STACKS: [Filters; 4] = [
+    Filters::Deflate,
+    Filters::ShuffleDeflate,
+    Filters::ScaleOffset,
+    Filters::Lzf,
+];
+
+/// A rank-1 unlimited u64 dataset under `filters`, seeded with `0..n`.
+fn build_u64_filtered(path: &std::path::Path, n: u64, chunk: u64, filters: Filters) {
+    let data: Vec<u64> = (0..n).collect();
+    let mut b = FileBuilder::new();
+    let ds = b
+        .create_dataset("d")
+        .with_u64_data(&data)
+        .with_shape(&[n])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[chunk]);
+    match filters {
+        Filters::Deflate => {
+            ds.with_deflate(6);
+        }
+        Filters::ShuffleDeflate => {
+            ds.with_shuffle().with_deflate(6);
+        }
+        Filters::ScaleOffset => {
+            ds.with_scale_offset(ScaleOffset::Integer(0));
+        }
+        Filters::Lzf => {
+            ds.with_lzf();
+        }
+    }
+    b.write(path).unwrap();
+}
+
+/// The shape issue #393 reports: chunk 1000, then appends of 1000, 100 and 100.
+/// The first lands on a boundary, the second leaves a partial tail, and the
+/// third has to grow that tail — under every filter stack this crate can
+/// re-encode.
+#[test]
+fn a_filtered_timer_flush_pattern_appends_by_any_length() {
+    let dir = tempdir().unwrap();
+    for filters in FILTER_STACKS {
+        let p = dir.path().join(format!("{filters:?}.h5"));
+        build_u64_filtered(&p, 0, 1000, filters);
+
+        {
+            let s = File::open_rw(&p).unwrap();
+            let mut ds = s.dataset("d").unwrap();
+            ds.append(&(0..1000u64).collect::<Vec<_>>()).unwrap();
+            ds.append(&(1000..1100u64).collect::<Vec<_>>()).unwrap();
+            ds.append(&(1100..1200u64).collect::<Vec<_>>()).unwrap();
+        }
+
+        let f = File::open(&p).unwrap();
+        assert_eq!(
+            f.dataset("d").unwrap().read_u64().unwrap(),
+            (0..1200u64).collect::<Vec<_>>(),
+            "{filters:?}"
+        );
+    }
+}
+
+/// A hundred short appends in a row, each one re-encoding the tail the previous
+/// one left. The values are what catch a chunk that was decoded, extended and
+/// re-encoded against the wrong live prefix.
+#[test]
+fn repeated_short_filtered_appends_keep_every_element() {
+    let dir = tempdir().unwrap();
+    for filters in FILTER_STACKS {
+        let p = dir.path().join(format!("many_{filters:?}.h5"));
+        build_u64_filtered(&p, 0, 64, filters);
+
+        {
+            // One barrier at close rather than five per append: this loop is
+            // about what the file ends up holding, not about fsync cadence.
+            let s = File::open_rw_with_options(
+                &p,
+                FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose),
+            )
+            .unwrap();
+            let mut ds = s.dataset("d").unwrap();
+            for i in 0..100u64 {
+                ds.append(&(i * 7..i * 7 + 7).collect::<Vec<_>>()).unwrap();
+            }
+        }
+
+        let f = File::open(&p).unwrap();
+        assert_eq!(
+            f.dataset("d").unwrap().read_u64().unwrap(),
+            (0..700u64).collect::<Vec<_>>(),
+            "{filters:?}"
+        );
+    }
+}
+
+/// `append_raw` reaches the same engine, so it grows a filtered partial tail too.
+#[test]
+fn filtered_raw_append_onto_a_partial_trailing_chunk() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("d.h5");
+    build(&p, "d", 8, 4, true);
+
+    {
+        let s = File::open_rw(&p).unwrap();
+        s.dataset("d").unwrap().append(&[8, 9]).unwrap();
+        let bytes: Vec<u8> = [10i32, 11, 12]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        s.dataset("d").unwrap().append_raw(&bytes).unwrap();
+    }
+
+    assert_eq!(read_i32(&p, "d"), (0..13).collect::<Vec<_>>());
 }
 
 // ---- interleave with staged tree edits --------------------------------------

@@ -4331,12 +4331,24 @@ impl Dataset {
     /// The file must have been opened for writing with [`File::open_rw`];
     /// a read-only file returns
     /// [`Error::ReadOnly`](crate::Error::ReadOnly). The target must be a chunked,
-    /// rank-1, unlimited, Extensible-Array-indexed dataset, and a filtered one
-    /// must already be a whole number of chunks long — growing a trailing chunk
-    /// a reader can see is not power-loss atomic, where an unfiltered dataset
-    /// may be any length. The *appended* length is unconstrained either way;
-    /// anything else returns
+    /// rank-1, unlimited, Extensible-Array-indexed dataset; anything else returns
     /// [`Error::AppendInPlaceUnsupported`](crate::Error::AppendInPlaceUnsupported).
+    /// Both the dataset's current length and the appended length are
+    /// unconstrained, on a filtered dataset as much as an unfiltered one: a
+    /// partial trailing chunk is rewritten into a fresh allocation — decoded,
+    /// extended and re-encoded when there is a filter pipeline — and its index
+    /// element is repointed once those bytes are on the disk. The bytes the old
+    /// chunk occupied are left for [`repack`](crate::repack).
+    ///
+    /// Two things still require a chunk-aligned starting length. A **lossy**
+    /// pipeline (ZFP, or float D-scale scale-offset) is refused, because
+    /// re-encoding the trailing chunk would change values that are already
+    /// committed rather than reproduce them. And a trailing chunk the chunk index
+    /// does not name — one a writer allocated lazily, which the reference C
+    /// library does for a chunk it has not written — cannot be read to be grown,
+    /// so it is refused too; append whole chunks, or use
+    /// [`append_staged`](Self::append_staged).
+    ///
     /// The append is immediate and crash-atomic (no `commit` needed) — under the
     /// default [`SyncPolicy::Always`]. Under
     /// [`SyncPolicy::OnClose`](crate::SyncPolicy::OnClose) the same writes are made
@@ -4344,6 +4356,11 @@ impl Dataset {
     /// append is still immediate and still crash-atomic against *this process*
     /// failing, but ordering it against power loss is the caller's, through
     /// [`File::sync`].
+    ///
+    /// A **SWMR** writer ([`File::open_swmr_writer`]) keeps the narrower rule it
+    /// always had — unfiltered, and chunk-aligned at both ends — because its
+    /// readers are concurrent by contract and a rewritten trailing chunk is one
+    /// they could be crossing.
     ///
     /// A handle reached by object reference ([`dereference`](Self::dereference))
     /// has no resolvable path, so it names its dataset by the object-header
@@ -4397,8 +4414,8 @@ impl Dataset {
     /// A [`BufferedAppender`] over this dataset: appended elements are held in
     /// memory and written a whole chunk at a time, so a caller appending less
     /// than a chunk per call writes to the file once per chunk instead of once
-    /// per call — and can append to a *filtered* dataset by any length, which
-    /// [`append`](Self::append) refuses.
+    /// per call, and a filtered dataset is never left mid-chunk for the next
+    /// write to re-encode.
     ///
     /// Every eligibility rule [`append`](Self::append) applies is applied here,
     /// so an ineligible dataset is reported now rather than on the first write.
@@ -4411,22 +4428,13 @@ impl Dataset {
     /// Register a live `BufferedAppender` on this dataset with the session, so a
     /// staged edit that would stop it from flushing is refused at the call that
     /// creates the conflict rather than in the appender's `Drop`.
-    pub(crate) fn claim_for_appender(&self, needs_commit: bool) -> Result<u64, Error> {
+    pub(crate) fn claim_for_appender(&self) -> Result<u64, Error> {
         let Backend::Edit(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
         m.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .claim_for_appender(self.path.as_deref(), needs_commit)
-    }
-
-    /// Record whether the live appender still owes a staged realignment.
-    pub(crate) fn set_appender_needs_commit(&self, token: u64, needs_commit: bool) {
-        if let Backend::Edit(m) = &self.file.backend {
-            m.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .set_appender_needs_commit(token, needs_commit);
-        }
+            .claim_for_appender(self.path.as_deref())
     }
 
     /// Release the claim taken by [`claim_for_appender`](Self::claim_for_appender).
@@ -4463,52 +4471,6 @@ impl Dataset {
         })
     }
 
-    /// Stage an append and commit it in the same lock, used by
-    /// [`BufferedAppender`] for the one case in-place growth cannot serve: a
-    /// filtered dataset whose trailing chunk is partial. Refused while the
-    /// session holds unrelated staged edits, which this commit would otherwise
-    /// publish as a side effect of an append.
-    pub(crate) fn append_staged_committed(&mut self, b: AppendBuilder) -> Result<(), Error> {
-        // A path-less handle (reached by object reference) cannot be named to the
-        // staging surface at all. Say that, rather than the `ReadOnly` that
-        // `check_staged_edit` reports for the same condition — the file is not
-        // read-only, and telling the caller to reopen it read-write is advice
-        // they have already taken.
-        let path = self.path.clone().ok_or(Error::AppendInPlaceUnsupported(
-            "this dataset handle was reached by object reference and has no path, so the \
-                 staged rewrite that grows a filtered dataset's partial trailing chunk cannot \
-                 name it; re-open the dataset by path",
-        ))?;
-        self.check_staged_edit()?;
-        self.file.with_engine_mut(Change::Relocating, |engine| {
-            if engine.has_staged_edits() {
-                // The same variant the engine's own two staged-conflict refusals
-                // use (`append_prepare`), so a caller catching that one to fall
-                // back on `append_staged` catches this one too.
-                return Err(Error::AppendInPlaceUnsupported(
-                    "a buffered append onto a filtered dataset with a partial trailing chunk \
-                     must commit, and this session holds other staged edits; commit the staged \
-                     edits before appending, or use Dataset::append_staged",
-                ));
-            }
-            // Suspend this appender's own claim: it is the reason no other
-            // edit may be staged, and it must not refuse its own realignment.
-            //
-            // Staged atomically because this is the one place that stages on the
-            // caller's behalf: a refusal from the commit below puts the staged
-            // set back (issue #316), and an append the *caller* never staged is
-            // not one to hand them. Left behind it would also be permanent —
-            // every later `commit` re-runs the same refusal, including the one
-            // `close` makes, so the session could never be sealed.
-            engine.within_appender_commit(|e| {
-                e.stage_atomically(|s| {
-                    s.stage_dataset_append(&path, b)?;
-                    s.commit()
-                })
-            })
-        })
-    }
-
     /// Fetch (locating on first use) this dataset's append geometry from the
     /// write session, which also applies every refusal that does not depend on
     /// the bytes being appended.
@@ -4531,28 +4493,18 @@ impl Dataset {
     /// resident reports one unbounded batch, so the call stays a single
     /// crash-atomic apply there.
     ///
-    /// Every predictable refusal (wrong datatype, ineligible dataset,
-    /// non-chunk-aligned filtered append) is raised before the first batch is
-    /// applied. The cached header and chunk cache are then refreshed so later
-    /// reads on this handle observe the new length.
+    /// Every predictable refusal (wrong datatype, ineligible dataset) is raised
+    /// before the first batch is applied. The cached header and chunk cache are
+    /// then refreshed so later reads on this handle observe the new length. A
+    /// filtered dataset sitting on a partial trailing chunk is grown by the
+    /// first batch, which re-encodes that chunk into a fresh allocation and
+    /// leaves every later batch starting on a boundary.
     fn append_batches(
         &mut self,
         g: AppendGeometry,
         total_elems: u64,
         fill: impl Fn(&mut AppendBuilder, std::ops::Range<usize>),
     ) -> Result<(), Error> {
-        // Atomic refusal before any batch: a filtered append must start
-        // chunk-aligned (the engine re-checks per batch as a backstop). The
-        // appended length is unconstrained — an unaligned remainder is always the
-        // last batch, and its chunk is a fresh element no reader can see yet.
-        if g.filtered && g.current_dim % g.chunk_elems != 0 {
-            return Err(Error::AppendInPlaceUnsupported(
-                "a filtered dataset whose length is not a whole multiple of the chunk length \
-                 cannot be appended in place: growing its trailing partial chunk would repoint \
-                 an index element a reader can already see. Use Dataset::append_staged, or a \
-                 BufferedAppender, which keeps the on-disk length chunk-aligned",
-            ));
-        }
         // Worked out once for the whole call: every batch names the same
         // dataset, and an in-place append does not move it.
         let target = self.append_target()?;
@@ -4665,13 +4617,13 @@ impl Dataset {
     /// index-rebuilding counterpart of the immediate [`append`](Self::append).
     ///
     /// Unlike [`append`](Self::append) (immediate, amortized `O(1)`,
-    /// Extensible-Array only, and refused on a filtered dataset whose length is
-    /// not already a whole number of chunks), this rebuilds the chunk index on
-    /// commit and so also grows **filtered** datasets from any length (the
-    /// trailing partial chunk is rewritten) and datasets whose
-    /// Extensible-Array index is not yet allocated. Configure the appended
-    /// elements through `build` on the [`AppendBuilder`]; repeated calls within
-    /// the builder concatenate in order. The dataset must be chunked, unlimited
+    /// Extensible-Array only), this rebuilds the chunk index on commit and so
+    /// also grows datasets whose Extensible-Array index is not yet allocated,
+    /// and — unlike it — rewrites a partial trailing chunk under a lossy filter
+    /// pipeline as well.
+    /// Configure the appended elements through `build` on the
+    /// [`AppendBuilder`]; repeated calls within the builder concatenate in
+    /// order. The dataset must be chunked, unlimited
     /// along axis 0, Extensible-Array indexed, rank 1, use a re-encodable filter
     /// pipeline, and have a single hard link, otherwise
     /// [`Error::AppendUnsupported`](crate::Error::AppendUnsupported) is returned

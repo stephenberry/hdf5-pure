@@ -156,21 +156,22 @@ fn scale_offset_f64_chunk_aligned() {
 }
 
 #[test]
-fn refuse_filtered_onto_a_partial_trailing_chunk() {
-    // What a filtered dataset cannot do in place is grow a trailing chunk a
-    // reader can already see: that repoints a multi-field index element, which
-    // is not power-loss atomic. It is the dataset's *current* length that
-    // decides this, not the appended length — see
-    // `filtered_unaligned_length_onto_an_aligned_dataset` for the other half.
+fn filtered_onto_a_partial_trailing_chunk() {
+    // A filtered dataset whose on-disk length is not a chunk multiple grows like
+    // any other: the trailing chunk is decoded, extended, re-encoded into a
+    // fresh allocation, and its index element repointed (issue #393). Across
+    // separate sessions, so each append starts from what the last one left.
     let dir = tempdir().unwrap();
-
-    // Non-aligned current length (6 of a chunk of 4 = a partial tail on disk).
     let p = dir.path().join("b.h5");
-    create_i32(&p, 6, 4, true, true, false);
+    create_i32(&p, 6, 4, true, true, false); // 6 of a chunk of 4
     with_writer(&p, |w| {
-        assert_unsupported(w.dataset("d").unwrap().append(&[6, 7, 8, 9]))
+        w.dataset("d").unwrap().append(&[6, 7, 8, 9]).unwrap();
     });
-    assert_eq!(read_i32(&p), (0..6).collect::<Vec<_>>());
+    assert_eq!(read_i32(&p), (0..10).collect::<Vec<_>>());
+    with_writer(&p, |w| {
+        w.dataset("d").unwrap().append(&[10]).unwrap();
+    });
+    assert_eq!(read_i32(&p), (0..11).collect::<Vec<_>>());
 }
 
 #[test]
@@ -178,8 +179,8 @@ fn filtered_unaligned_length_onto_an_aligned_dataset() {
     // An unaligned appended *length* only makes the last chunk this append
     // writes a partial one, and that chunk's index element is a fresh insert
     // past the old dimension — invisible until the dimension is published, like
-    // every whole chunk beside it. So it is allowed, and it leaves the dataset
-    // unaligned, which is what the refusal above then catches.
+    // every whole chunk beside it. The next append then grows that partial
+    // chunk, which is the other half of the pair.
     let dir = tempdir().unwrap();
     let p = dir.path().join("a.h5");
     create_i32(&p, 8, 4, true, true, false);
@@ -188,11 +189,10 @@ fn filtered_unaligned_length_onto_an_aligned_dataset() {
     });
     assert_eq!(read_i32(&p), (0..13).collect::<Vec<_>>());
 
-    // ...and now the dataset sits on a partial chunk, so the next one is not.
     with_writer(&p, |w| {
-        assert_unsupported(w.dataset("d").unwrap().append(&[13, 14, 15]))
+        w.dataset("d").unwrap().append(&[13, 14, 15]).unwrap();
     });
-    assert_eq!(read_i32(&p), (0..13).collect::<Vec<_>>());
+    assert_eq!(read_i32(&p), (0..16).collect::<Vec<_>>());
 }
 
 // ---- streaming: many appends in one session ---------------------------------

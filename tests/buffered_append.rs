@@ -1,8 +1,8 @@
 //! `Dataset::buffered_appender` (issue #262): appended elements are held in
 //! memory and written a whole chunk at a time, so a caller appending less than
-//! a chunk per call writes once per chunk rather than once per call — and can
-//! append to a *filtered* dataset by any length, which the immediate
-//! `Dataset::append` refuses.
+//! a chunk per call writes once per chunk rather than once per call. Since
+//! issue #393 every write it makes is the immediate in-place one, filtered or
+//! not, so the type buys write *frequency* and nothing else.
 
 use hdf5_pure::{AttrValue, Error, File, FileBuilder};
 use tempfile::tempdir;
@@ -123,23 +123,22 @@ fn the_on_disk_length_stays_chunk_aligned_after_every_call() {
     }
 }
 
-/// The realignment happens *once*, not on every write. A second one would need
-/// to commit, and this session has an edit staged after the first write, so a
-/// second attempt is refused — which is the observable that separates "realigned
-/// once" from "realigns every time".
+/// No write the appender makes commits, on a filtered dataset resumed mid-chunk
+/// least of all (issue #393). The observable is an unrelated edit staged before
+/// the writes: if any of them committed, that edit would have been published as
+/// a side effect and `has_staged_edits` would have gone false.
 #[test]
-fn an_unaligned_filtered_log_is_realigned_once_not_per_call() {
+fn an_unaligned_filtered_flush_never_commits() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("d.h5");
-    build(&p, 10, 8, true); // unaligned: the first write must realign
+    build(&p, 10, 8, true); // filtered, and sitting on a partial trailing chunk
 
     let session = File::open_rw(&p).unwrap();
     let mut ds = session.dataset("d").unwrap();
     let mut app = ds.buffered_appender().unwrap();
-    app.append(&(10..30i32).collect::<Vec<_>>()).unwrap(); // realigns to 30...
-    assert_eq!(session.dataset("d").unwrap().shape().unwrap(), vec![24]);
 
-    // Stage something unrelated. Any further realignment attempt now fails.
+    // Staged beside a live appender on an unaligned filtered dataset: accepted,
+    // because the appender has no commit of its own left to protect.
     session
         .root()
         .create_dataset("other", |b| {
@@ -147,12 +146,22 @@ fn an_unaligned_filtered_log_is_realigned_once_not_per_call() {
         })
         .unwrap();
 
-    // These writes must all take the in-place path, so they must all succeed.
+    // The first write grows the partial trailing chunk; the flush leaves a new
+    // partial tail for the next write to grow again.
+    app.append(&(10..30i32).collect::<Vec<_>>()).unwrap();
+    assert_eq!(session.dataset("d").unwrap().shape().unwrap(), vec![24]);
+    app.flush().unwrap();
+    assert_eq!(session.dataset("d").unwrap().shape().unwrap(), vec![30]);
     for i in 0..6i32 {
         app.append(&(30 + i * 8..38 + i * 8).collect::<Vec<_>>())
             .unwrap();
     }
     app.flush().unwrap();
+    assert!(
+        session.has_staged_edits(),
+        "a buffered write published the caller's staged edit"
+    );
+
     drop(app);
     drop(ds);
     session.commit().unwrap();
@@ -200,9 +209,9 @@ fn every_shape_round_trips() {
     }
 }
 
-/// A filtered dataset appended by a length that is not a chunk multiple: the
-/// case `Dataset::append` refuses outright and `append_staged` charges an index
-/// rebuild for.
+/// A filtered dataset appended by a length that is not a chunk multiple, over
+/// and over: the buffer keeps the on-disk length chunk-aligned so no write has
+/// to re-encode a trailing chunk.
 #[test]
 fn a_filtered_dataset_takes_any_append_length() {
     let dir = tempdir().unwrap();
@@ -295,13 +304,11 @@ fn dropping_the_appender_flushes_its_buffer() {
 
 // ---- resuming an unaligned log ----------------------------------------------
 
-/// The case the appender exists to make cheap across sessions: a filtered log
-/// left on a partial trailing chunk. The appender lands it back on a chunk
-/// boundary once, and everything after that is the in-place path — which the
-/// file proves by accepting an immediate `Dataset::append` afterwards, since
-/// that call is refused on an unaligned filtered dataset.
+/// Resuming a filtered log left on a partial trailing chunk: the appender lands
+/// it back on a chunk boundary with its first write, and an immediate
+/// `Dataset::append` afterwards picks it up from there.
 #[test]
-fn resuming_an_unaligned_filtered_log_realigns_it_once() {
+fn resuming_an_unaligned_filtered_log_lands_back_on_a_boundary() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("d.h5");
     build(&p, 10, 8, true); // 10 of 8 = a partial trailing chunk
@@ -333,15 +340,13 @@ fn resuming_an_unaligned_filtered_log_realigns_it_once() {
     assert_eq!(read_i32(&p), (0..48).collect::<Vec<_>>());
 }
 
-/// The realignment commits, and a commit relocates object headers — so the
-/// dataset handle the appender borrowed must come back usable, not pointing at
-/// the address its header vacated. Every other write path in this crate leaves
-/// the header where it is, so this handle refresh has no precedent to inherit.
+/// The borrowed handle keeps working across the writes, and reads the length
+/// and values they published.
 #[test]
-fn the_handle_survives_the_realignment_commit() {
+fn the_handle_reads_what_the_appender_wrote() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("d.h5");
-    build(&p, 10, 8, true); // unaligned: the first write realigns
+    build(&p, 10, 8, true); // filtered, sitting on a partial trailing chunk
 
     let session = File::open_rw(&p).unwrap();
     let mut ds = session.dataset("d").unwrap();
@@ -350,20 +355,19 @@ fn the_handle_survives_the_realignment_commit() {
         app.append(&(10..30i32).collect::<Vec<_>>()).unwrap();
         app.finish().unwrap();
     }
-    // The same handle, after the commit moved its header.
     assert_eq!(ds.shape().unwrap(), vec![30]);
     assert_eq!(ds.read_i32().unwrap(), (0..30).collect::<Vec<_>>());
     assert_eq!(ds.chunk_shape().unwrap(), Some(vec![8]));
 }
 
-/// The realignment commits, so it must not silently publish edits the caller
-/// staged for a commit of their own — reported when the appender is made, since
-/// the conflict already exists by then.
+/// An appender over a filtered dataset with a partial trailing chunk is made
+/// while unrelated edits are staged, and both go through: it has no commit of
+/// its own, so there is nothing for the staged set to collide with (issue #393).
 #[test]
-fn an_appender_owing_a_realignment_is_refused_while_edits_are_staged() {
+fn an_appender_on_an_unaligned_filtered_dataset_is_made_beside_staged_edits() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("d.h5");
-    build(&p, 10, 8, true); // unaligned: the first write must realign
+    build(&p, 10, 8, true);
 
     let session = File::open_rw(&p).unwrap();
     session
@@ -374,18 +378,26 @@ fn an_appender_owing_a_realignment_is_refused_while_edits_are_staged() {
         .unwrap();
 
     let mut ds = session.dataset("d").unwrap();
-    let err = ds
-        .buffered_appender()
-        .expect_err("the realignment commit must not publish the staged dataset");
-    assert!(
-        matches!(&err, Error::EditUnsupported(m) if m.contains("staged edits")),
-        "got: {err:?}"
-    );
-    // Nothing was published: the staged dataset is still staged.
+    {
+        let mut app = ds.buffered_appender().unwrap();
+        app.append(&(10..30i32).collect::<Vec<_>>()).unwrap();
+        app.finish().unwrap();
+    }
+    // The staged dataset is still staged: no write published it.
     assert!(session.has_staged_edits());
     drop(ds);
+    session.commit().unwrap();
     drop(session);
-    assert_eq!(read_i32(&p), (0..10).collect::<Vec<_>>());
+    assert_eq!(read_i32(&p), (0..30).collect::<Vec<_>>());
+    assert_eq!(
+        File::open(&p)
+            .unwrap()
+            .dataset("other")
+            .unwrap()
+            .read_i32()
+            .unwrap(),
+        vec![1, 2, 3]
+    );
 }
 
 // ---- refusals ----------------------------------------------------------------
@@ -521,39 +533,27 @@ fn an_unrelated_staged_edit_is_allowed_beside_a_live_appender() {
     );
 }
 
-/// While an appender still owes its staged realignment, *any* staged edit is
-/// refused — that write commits, and a commit will not run beside unrelated
-/// staged edits, so a non-overlapping one would break it just as surely.
+/// An unrelated staged edit is accepted beside a live appender on a filtered,
+/// unaligned dataset — the shape that used to block *every* staged edit while a
+/// realignment commit was owed (issue #393).
 #[test]
-fn an_appender_owing_a_realignment_blocks_every_staged_edit() {
+fn an_unrelated_staged_edit_is_allowed_beside_an_unaligned_filtered_appender() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("d.h5");
-    build(&p, 10, 8, true); // filtered and unaligned: a realignment is owed
+    build(&p, 10, 8, true); // filtered and unaligned
 
     let session = File::open_rw(&p).unwrap();
     let mut ds = session.dataset("d").unwrap();
     let mut app = ds.buffered_appender().unwrap();
 
-    let err = session
-        .root()
-        .create_dataset("unrelated", |b| {
-            b.with_i32_data(&[1]);
-        })
-        .expect_err("an owed realignment must block even an unrelated edit");
-    assert!(
-        matches!(&err, Error::EditUnsupported(m) if m.contains("live buffered appender")),
-        "got: {err:?}"
-    );
-
-    // Once the realignment has happened the debt is gone and unrelated edits
-    // are allowed again.
-    app.append(&(10..30i32).collect::<Vec<_>>()).unwrap();
     session
         .root()
         .create_dataset("unrelated", |b| {
             b.with_i32_data(&[1]);
         })
         .unwrap();
+
+    app.append(&(10..30i32).collect::<Vec<_>>()).unwrap();
     app.finish().unwrap();
     drop(ds);
     session.commit().unwrap();
