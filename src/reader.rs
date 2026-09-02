@@ -1535,7 +1535,12 @@ impl FileInner {
             self.superblock.offset_size,
         )
         .unwrap_or_default();
-        sections.sort_by_key(|s| s.addr);
+        // Distinct sections have distinct addresses in any well-formed file, so
+        // the tie-break never arises; only a malformed manager can advertise one
+        // address twice, and which of the pair is reported first is already
+        // unspecified. No `debug_assert` here: this parses untrusted bytes, which
+        // must not panic a debug build.
+        sections.sort_unstable_by_key(|s| s.addr);
         sections.into_iter().map(|s| (s.addr, s.size)).collect()
     }
 
