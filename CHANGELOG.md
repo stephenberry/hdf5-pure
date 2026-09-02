@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-09-02
+
+Staged edits are addressable while they are still staged. `Group::create_group`, `create_group_with` and `create_dataset` hand back a handle onto the object they stage, so a nested schema is built and its handles kept without a `commit` in between; such a handle stages further edits and answers a staged dataset's shape, maxshape, datatype and filters, reports the new `Error::NotCommitted` for anything that reads bytes, and reports the new `Error::StagingWithdrawn` once `Group::delete` withdraws the staging rather than answering for another object ([#392](https://github.com/stephenberry/hdf5-pure/issues/392)). Appends improved on three fronts: `Dataset::append_staged` folds elements into a pending creation, which needs neither an unlimited dimension nor a chunked layout; a filtered dataset grows from a length that is not chunk-aligned by re-encoding its trailing chunk, except under a lossy pipeline where that would change committed values ([#393](https://github.com/stephenberry/hdf5-pure/issues/393), [#407](https://github.com/stephenberry/hdf5-pure/issues/407)); and `Dataset::append` reuses space an earlier commit freed instead of always extending end-of-file ([#387](https://github.com/stephenberry/hdf5-pure/issues/387)). A `FileSpaceStrategy::Page` file also stops growing under delete-and-recreate churn ([#388](https://github.com/stephenberry/hdf5-pure/issues/388)), and `with_libver_bounds` and `with_page_buffer_size` accept bounds and budgets they used to refuse ([#390](https://github.com/stephenberry/hdf5-pure/issues/390), [#391](https://github.com/stephenberry/hdf5-pure/issues/391)). **Breaking:** the three `create_*` methods return a handle instead of `()`, and a handle kept alive holds the file's exclusive lock like any other.
+
 ### Added
 
 - A group or dataset staged by `Group::create_group`, `create_group_with` or `create_dataset` is addressable by name in the same session, so a nested schema is built and its handles cached without a `commit` in between. Such a handle stages further edits and answers a staged dataset's shape, maxshape, datatype and filters; anything that reads bytes reports the new `Error::NotCommitted` until the commit, and a handle whose staging `Group::delete` later withdraws reports the new `Error::StagingWithdrawn` rather than answering for another object ([#392](https://github.com/stephenberry/hdf5-pure/issues/392)).
@@ -855,7 +859,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.42.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.43.0...HEAD
+[0.43.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.40.0...v0.41.0
 [0.40.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.39.0...v0.40.0
