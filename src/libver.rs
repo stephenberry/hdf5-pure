@@ -102,6 +102,11 @@ impl LibVer {
     /// 1.12 or 1.14. The value returned is the format actually written, so an
     /// error naming it stays true.
     ///
+    /// That licence is not a licence to ignore `high`: an inverted range is
+    /// refused, as `H5Pset_libver_bounds` refuses one, and the check has to come
+    /// before the clamp that implements the licence — clamping first would turn
+    /// `(LATEST, V110)` into a bound the 1.10 format satisfies.
+    ///
     /// One function so the whole-file writer and an editing session's fapl
     /// answer the same bounds the same way; a second copy of this rule is how
     /// the two would come to disagree about which format a caller asked for.
@@ -111,6 +116,13 @@ impl LibVer {
         let Some((low, high)) = bounds else {
             return Ok(LibVer::WRITER_DEFAULT);
         };
+        if low > high {
+            return Err(crate::error::FormatError::LibverBoundsUnsatisfiable {
+                writes: LibVer::WRITER_DEFAULT.name(),
+                requested_low: low.name(),
+                requested_high: high.name(),
+            });
+        }
         let effective_low = low.min(LibVer::WRITER_DEFAULT);
         for candidate in [LibVer::WRITER_DEFAULT, LibVer::WRITER_OLDEST] {
             if candidate >= effective_low && candidate <= high {
@@ -182,8 +194,9 @@ mod tests {
         }
     }
 
-    /// An upper bound of 1.8 selects the older format whatever the lower bound
-    /// admits, since `high` is what picks between the two.
+    /// An upper bound of 1.8 selects the older format, since `high` is what picks
+    /// between the two. Only a lower bound the 1.8 format satisfies gets there:
+    /// `(V110, V18)` is inverted and refused.
     #[test]
     fn an_upper_bound_of_1_8_selects_the_older_format() {
         for (low, high) in [(LibVer::Earliest, LibVer::V18), (LibVer::V18, LibVer::V18)] {
@@ -199,11 +212,21 @@ mod tests {
 
     /// What is left unsatisfiable: an upper bound older than the 1.8 format, and
     /// an inverted range whose upper bound sits below the lower one.
+    ///
+    /// The inverted pairs here all carry a `high` of 1.10 or newer, so the only
+    /// thing that can refuse them is the inversion itself. `(LATEST, V18)` would
+    /// pass this test with the inversion check gone, since a `high` of 1.8 is
+    /// below the format the writer defaults to and is refused on that ground
+    /// alone.
     #[test]
     fn bounds_admitting_no_format_this_crate_writes_are_refused() {
         for (low, high) in [
             (LibVer::Earliest, LibVer::Earliest),
             (LibVer::LATEST, LibVer::V18),
+            (LibVer::V114, LibVer::V110),
+            (LibVer::LATEST, LibVer::V112),
+            (LibVer::V112, LibVer::V110),
+            (LibVer::V110, LibVer::V18),
         ] {
             let err = LibVer::resolve_writable(Some((low, high))).unwrap_err();
             assert!(

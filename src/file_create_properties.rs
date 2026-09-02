@@ -101,7 +101,9 @@ impl FileCreateProperties {
     ///
     /// `low` only rules formats out, licensing newer encodings without requiring
     /// them, so a lower bound of `V112`, `V114` or `LATEST` writes the 1.10
-    /// format rather than being refused.
+    /// format rather than being refused — provided `high` reaches it. An
+    /// inverted range such as `V114..=V110` is refused with
+    /// [`FormatError::LibverBoundsUnsatisfiable`](crate::FormatError::LibverBoundsUnsatisfiable).
     ///
     /// HDF5 classes `H5Pset_libver_bounds` as a *file access* property; it sits
     /// here because this crate resolves the bound at write time.

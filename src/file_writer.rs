@@ -1005,7 +1005,10 @@ impl FileWriter {
     /// this writes a version 3 one. Leaving the bounds unset is the same as
     /// leaving `high` at `Latest`. `low` only rules formats out, licensing newer
     /// encodings without requiring them, so a lower bound of `V112`, `V114` or
-    /// `LATEST` is satisfied by the 1.10 format rather than refused.
+    /// `LATEST` is satisfied by the 1.10 format rather than refused — provided
+    /// `high` reaches it. An inverted range such as `V114..=V110` is refused with
+    /// [`FormatError::LibverBoundsUnsatisfiable`], as `H5Pset_libver_bounds`
+    /// refuses one.
     ///
     /// Some content cannot be written in the 1.8 format at all, and asking for
     /// both is an error rather than a silent upgrade: a chunked (or resizable,
@@ -4825,12 +4828,16 @@ mod tests {
     }
 
     /// An upper bound older than the 1.8 format, and one below the lower bound,
-    /// are what is left unsatisfiable.
+    /// are what is left unsatisfiable — and the inverted pairs keep a `high` of
+    /// 1.10 or newer, so nothing but the inversion can be what refuses them.
     #[test]
     fn bounds_admitting_no_format_this_crate_writes_are_refused() {
         for (low, high) in [
             (LibVer::Earliest, LibVer::Earliest),
             (LibVer::LATEST, LibVer::V18),
+            (LibVer::V114, LibVer::V110),
+            (LibVer::LATEST, LibVer::V112),
+            (LibVer::V112, LibVer::V110),
         ] {
             let err = write_bounded(Some((low, high))).unwrap_err();
             assert!(

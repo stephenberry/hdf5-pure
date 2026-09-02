@@ -200,7 +200,11 @@ impl FileBuilder {
     ///
     /// `low` only rules formats out: as in the C library it licenses newer
     /// encodings without requiring them, so a lower bound of `V112`, `V114` or
-    /// `LATEST` is satisfied by the 1.10 format rather than refused.
+    /// `LATEST` is satisfied by the 1.10 format rather than refused. It does not
+    /// license `high` away — an inverted range such as `V114..=V110` is refused
+    /// with
+    /// [`FormatError::LibverBoundsUnsatisfiable`](crate::FormatError::LibverBoundsUnsatisfiable),
+    /// as `H5Pset_libver_bounds` refuses one.
     ///
     /// Content the 1.8 format cannot express is refused rather than silently
     /// upgraded, with

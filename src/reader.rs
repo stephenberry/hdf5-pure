@@ -321,7 +321,9 @@ impl FileAccessProperties {
     /// `low` only rules formats out — as in the C library it licenses newer
     /// encodings without requiring them — so a lower bound of [`LibVer::V112`],
     /// [`LibVer::V114`] or [`LibVer::LATEST`] leaves the session writing the 1.10
-    /// format rather than failing.
+    /// format rather than failing, provided `high` reaches it. An inverted range
+    /// such as `V114..=V110` is refused with
+    /// [`FormatError::LibverBoundsUnsatisfiable`](crate::FormatError::LibverBoundsUnsatisfiable).
     ///
     /// The read-only opens ignore this: they write nothing. [`File::open_swmr_writer`]
     /// requires a version 3 superblock, so it refuses a `high` below
