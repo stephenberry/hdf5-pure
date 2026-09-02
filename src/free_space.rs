@@ -198,6 +198,47 @@ impl FreeList {
         Some(addr)
     }
 
+    /// Remove whatever part of `[addr, addr + len)` this list holds, leaving the
+    /// parts of each overlapped region that fall outside it free.
+    ///
+    /// Unlike [`alloc`](Self::alloc) this reserves a *stated* range rather than
+    /// asking for one, and unlike a failed `alloc` it is not an error for the
+    /// range to be free only in part (or not at all): it is how a caller that has
+    /// decided a range's fate elsewhere makes the list agree. The paged editor
+    /// uses it to lift a whole free page out of the per-page-type lists before
+    /// re-filing it as one typeless free page (`PagedEdit::promote_whole_free_pages`).
+    ///
+    /// A zero-length range is a no-op.
+    pub(crate) fn take_range(&mut self, addr: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let end = addr + len;
+        let mut out = Vec::with_capacity(self.regions.len() + 1);
+        for r in self.regions.drain(..) {
+            // Disjoint from the range: keep the region whole.
+            if r.end() <= addr || r.addr >= end {
+                out.push(r);
+                continue;
+            }
+            // Overlapping: keep whatever lies below and above the range. Either
+            // side may be empty, and both are when the range covers the region.
+            if r.addr < addr {
+                out.push(FreeRegion {
+                    addr: r.addr,
+                    len: addr - r.addr,
+                });
+            }
+            if r.end() > end {
+                out.push(FreeRegion {
+                    addr: end,
+                    len: r.end() - end,
+                });
+            }
+        }
+        self.regions = out;
+    }
+
     /// The free regions as `(addr, len)` pairs, sorted ascending by address and
     /// fully coalesced. Used to persist the free list to disk (issue #21) and to
     /// report the session's live reusable free space (issue #150).
@@ -367,5 +408,33 @@ mod tests {
     fn take_trailing_empty_list() {
         let mut fl = FreeList::new();
         assert_eq!(fl.take_trailing(0), None);
+    }
+
+    #[test]
+    fn take_range_splits_the_region_around_it() {
+        let mut fl = FreeList::new();
+        fl.free(100, 100); // [100, 200)
+        fl.take_range(120, 30); // [120, 150)
+        assert_eq!(regions(&fl), [(100, 20), (150, 50)]);
+    }
+
+    #[test]
+    fn take_range_spanning_several_regions_keeps_only_the_edges() {
+        let mut fl = FreeList::new();
+        fl.free(100, 50); // [100, 150)
+        fl.free(200, 50); // [200, 250)
+        fl.free(300, 50); // [300, 350)
+        fl.take_range(120, 200); // [120, 320)
+        assert_eq!(regions(&fl), [(100, 20), (320, 30)]);
+    }
+
+    #[test]
+    fn take_range_tolerates_a_range_that_is_not_free() {
+        let mut fl = FreeList::new();
+        fl.free(100, 50);
+        fl.take_range(300, 50); // wholly outside the list
+        fl.take_range(140, 20); // half inside it
+        fl.take_range(0, 0); // empty
+        assert_eq!(regions(&fl), [(100, 40)]);
     }
 }
