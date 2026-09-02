@@ -434,6 +434,9 @@ impl ExplicitCompoundTypeBuilder {
             }
         }
 
+        // Stable on purpose: two fields at one offset are rejected as an overlap
+        // just below, and stability is what makes that error name them in
+        // declaration order rather than an arbitrary one.
         self.fields.sort_by_key(|field| field.byte_offset);
         for fields in self.fields.windows(2) {
             let first_end = fields[0].byte_offset + u64::from(fields[0].datatype.type_size());

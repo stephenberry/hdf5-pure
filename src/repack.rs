@@ -450,7 +450,7 @@ fn populate<S: GroupSink>(
 
     // Datasets, sorted by name.
     let mut dataset_names = src.datasets()?;
-    dataset_names.sort();
+    dataset_names.sort_unstable();
     for name in dataset_names {
         let child_path = join(path, &name);
         if drop.contains(&child_path) {
@@ -470,7 +470,7 @@ fn populate<S: GroupSink>(
 
     // Subgroups, sorted by name; built depth-first into a FinishedGroup.
     let mut group_names = src.groups()?;
-    group_names.sort();
+    group_names.sort_unstable();
     for name in group_names {
         let child_path = join(path, &name);
         if drop.contains(&child_path) {
@@ -1235,7 +1235,10 @@ where
     S: AttrSink + ?Sized,
     F: FnOnce() -> Result<std::collections::HashMap<String, AttrValue>, Error>,
 {
-    messages.sort_by(|a, b| a.name.cmp(&b.name));
+    // Attribute names are unique within an object header, so the tie-break never
+    // arises; a duplicate would mean a malformed source header, and the two would
+    // be copied in one arbitrary order either way.
+    messages.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     // An attribute naming a committed (`H5Tcommit`) datatype is re-pointed at the
     // same type in the output, exactly as a dataset's committed element type is.
     // The source address is what says *which* committed object, so two attributes

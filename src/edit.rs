@@ -1923,7 +1923,12 @@ impl PagedEdit {
     fn reusable_sections(&self) -> Vec<(u64, u64)> {
         let mut out = self.meta.sections();
         out.extend(self.raw.sections());
-        out.sort_by_key(|&(addr, _)| addr);
+        out.sort_unstable_by_key(|&(addr, _)| addr);
+        debug_assert!(
+            out.windows(2).all(|w| w[0].0 < w[1].0),
+            "the same address is free in both the metadata and the raw list, so \
+             the two page-type lists have stopped being disjoint"
+        );
         out
     }
 }
@@ -2899,7 +2904,12 @@ impl WriteEngine {
                     tagged.push((s, ty));
                 }
             }
-            tagged.sort_by_key(|(s, _)| s.addr);
+            // Distinct sections have distinct addresses in any well-formed file,
+            // so the tie-break never arises; only a malformed manager can
+            // advertise one address twice, and the overlap guard below already
+            // discards the second of any such pair. No `debug_assert` here: this
+            // parses untrusted bytes, which must not panic a debug build.
+            tagged.sort_unstable_by_key(|(s, _)| s.addr);
             let mut prev_end = 0u64;
             for (s, ty) in tagged {
                 let Some(end) = s.addr.checked_add(s.size) else {
@@ -2943,7 +2953,9 @@ impl WriteEngine {
         )
         .map(|(sections, _)| sections)
         {
-            sections.sort_by_key(|s| s.addr);
+            // Unique addresses in any well-formed file; see the paged branch
+            // above for why a duplicate is harmless and unasserted here.
+            sections.sort_unstable_by_key(|s| s.addr);
             let mut prev_end = 0u64;
             for s in sections {
                 let Some(end) = s.addr.checked_add(s.size) else {
@@ -3593,7 +3605,12 @@ impl WriteEngine {
                 }
                 let mut out = pg.meta.sections();
                 out.extend(raw.sections());
-                out.sort_by_key(|&(addr, _)| addr);
+                out.sort_unstable_by_key(|&(addr, _)| addr);
+                debug_assert!(
+                    out.windows(2).all(|w| w[0].0 < w[1].0),
+                    "the same address is free in both the metadata and the raw \
+                     list, so the two page-type lists have stopped being disjoint"
+                );
                 out
             }
             (None, false) => {
@@ -6005,6 +6022,10 @@ impl WriteEngine {
         // group's new address is known.
         let mut relocations: BTreeMap<u64, u64> = BTreeMap::new();
         let mut by_depth = keys.clone();
+        // Stable on purpose: `keys` comes from a `BTreeMap`, so equal-depth
+        // groups arrive in path order, and this order is the order they are
+        // placed in — which fixes every address the commit writes. An unstable
+        // sort may permute a depth group, and the file's layout with it.
         by_depth.sort_by_key(|k| std::cmp::Reverse(k.len())); // deepest first
         for key in &by_depth {
             let (mut region, deletes, copies, writes, attrs) = {
@@ -6055,6 +6076,8 @@ impl WriteEngine {
             // caught up front by `preflight_reference_targets`.
             let mut group_datasets: Vec<FlatDataset> =
                 flat.remove(key).into_iter().flatten().collect();
+            // Stable on purpose: this is a partition, and the relative order
+            // within each half is what the paragraph above promises.
             group_datasets.sort_by_key(|fd| fd.reference_targets.is_some());
             for mut fd in group_datasets {
                 // Place each variable-length attribute's global heap collection
@@ -9500,6 +9523,8 @@ impl WriteEngine {
         superblock: &Superblock,
     ) -> Result<(), Error> {
         let mut by_depth = keys.to_vec();
+        // Stable on purpose, for the same reason as the apply loop's copy: this
+        // simulation is only faithful if it walks the groups in that same order.
         by_depth.sort_by_key(|k| std::cmp::Reverse(k.len()));
         let mut sim_addr: BTreeMap<PathKey, u64> = BTreeMap::new();
         for key in &by_depth {
@@ -9509,6 +9534,7 @@ impl WriteEngine {
                 // placed (and so become resolvable) before any reference
                 // dataset in the same group.
                 let mut ordered: Vec<&FlatDataset> = datasets.to_vec();
+                // Stable on purpose, like the loop it mirrors.
                 ordered.sort_by_key(|fd| fd.reference_targets.is_some());
                 for fd in ordered {
                     if let Some(patches) = &fd.reference_targets {

@@ -217,6 +217,8 @@ pub(crate) fn serialize_file_fsm(
             None => by_size.push((s.size, vec![s.addr])),
         }
     }
+    // The loop above keeps one entry per distinct size, so there is no tie to
+    // break and stability is not load-bearing here.
     by_size.sort_by_key(|(size, _)| *size);
     for (size, mut offsets) in by_size {
         offsets.sort_unstable();
@@ -552,7 +554,12 @@ pub(crate) fn plan_paged_managers(
         }
     }
     slot6.extend(unclassified.iter().copied());
-    slot6.sort_by_key(|s| s.addr);
+    slot6.sort_unstable_by_key(|s| s.addr);
+    debug_assert!(
+        slot6.windows(2).all(|w| w[0].addr < w[1].addr),
+        "one address is free in more than one of the metadata, raw, and \
+         unclassified lists, so they have stopped being disjoint"
+    );
 
     let mut slots = [u64::MAX; NUM_FILE_FSM_MANAGERS];
     let mut blocks = Vec::new();
