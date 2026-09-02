@@ -5370,6 +5370,9 @@ fn a_staged_edit_to_a_replaced_object_is_refused() {
     // path under it name the new object, and there is no new group here to
     // carry the attribute.
     let session = File::open_rw(&path).unwrap();
+    // Taken before the replacement is staged: once it is, `g` names the staged
+    // dataset, so this is the only way to hold the group being removed.
+    let doomed = session.group("g").unwrap();
     session.root().delete("g").unwrap();
     session
         .root()
@@ -5377,11 +5380,11 @@ fn a_staged_edit_to_a_replaced_object_is_refused() {
             b.with_i32_data(&[1]);
         })
         .unwrap();
-    session
-        .group("g")
-        .unwrap()
-        .set_attr("generation", AttrValue::I64(1))
-        .unwrap();
+    assert!(
+        matches!(session.group("g"), Err(Error::NotAGroup(_))),
+        "`g` names the staged dataset before the commit, not the group it replaces"
+    );
+    doomed.set_attr("generation", AttrValue::I64(1)).unwrap();
     let err = session.commit().unwrap_err();
     assert!(
         matches!(&err, Error::EditUnsupported(m) if m.contains("at or under a replaced path")),
@@ -6576,4 +6579,334 @@ fn a_raw_bytes_overwrite_stops_a_vlen_overwrite_from_reclaiming_its_collection()
         "the aliased strings were freed out from under the overwritten dataset \
          and written over: {alias:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Staged objects are addressable before the commit (issue #392)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_staged_subtree_is_addressable_before_the_commit() {
+    let path = temp_path("hdf5_pure_staged_visible_subtree.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    // The issue's reproducer: describe a nested schema, then bind handles to it
+    // without a commit in between.
+    let epoch = session
+        .root()
+        .create_group_with("epoch", |g| {
+            g.create_dataset("sys_time", |b| {
+                b.with_u64_data(&[])
+                    .with_shape(&[0])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[4]);
+            });
+        })
+        .unwrap();
+
+    // Reachable by name from the file, from the root, and from the returned
+    // handle — all before the commit.
+    assert!(session.group("epoch").is_ok());
+    assert!(session.dataset("epoch/sys_time").is_ok());
+    assert!(session.root().group("epoch").is_ok());
+    let mut col = epoch.dataset("sys_time").unwrap();
+
+    // What the builder settled is answered from the staged record.
+    assert_eq!(col.shape().unwrap(), vec![0]);
+    assert_eq!(col.maxshape().unwrap(), Some(vec![u64::MAX]));
+    assert_eq!(col.dtype().unwrap(), DType::U64);
+    assert!(col.is_chunked());
+    assert!(col.filters().is_empty());
+
+    // An append onto a dataset that is not written yet folds into the pending
+    // creation, and the shape follows.
+    col.append_staged(|a| {
+        a.append_u64(&[1, 2, 3]);
+    })
+    .unwrap();
+    assert_eq!(col.shape().unwrap(), vec![3]);
+
+    session.commit().unwrap();
+
+    // The same handles now read the objects in the file.
+    assert_eq!(col.read_u64().unwrap(), vec![1, 2, 3]);
+    assert_eq!(epoch.datasets().unwrap(), vec!["sys_time".to_string()]);
+    drop(session);
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("epoch/sys_time").unwrap().read_u64().unwrap(),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn a_staged_dataset_handle_is_an_ordinary_dataset_handle() {
+    // The composability the issue asks for: code that takes `&Dataset` accepts
+    // one onto a dataset that is not committed yet.
+    fn width(ds: &hdf5_pure::Dataset) -> u64 {
+        ds.shape().unwrap().first().copied().unwrap_or(0)
+    }
+    fn count(group: &hdf5_pure::Group) -> usize {
+        group.datasets().unwrap().len()
+    }
+
+    let path = temp_path("hdf5_pure_staged_visible_borrowed.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    let grp = session.root().create_group("run").unwrap();
+    let ds = grp
+        .create_dataset("col", |b| {
+            b.with_i32_data(&[1, 2, 3, 4]);
+        })
+        .unwrap();
+    assert_eq!(width(&ds), 4);
+    assert_eq!(count(&grp), 1);
+    session.commit().unwrap();
+    assert_eq!(width(&ds), 4);
+    assert_eq!(count(&grp), 1);
+}
+
+#[test]
+fn reading_a_staged_object_reports_that_it_is_not_committed() {
+    let path = temp_path("hdf5_pure_staged_visible_reads.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    let grp = session.root().create_group("run").unwrap();
+    let mut col = grp
+        .create_dataset("col", |b| {
+            b.with_i32_data(&[7, 8])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[2]);
+        })
+        .unwrap();
+
+    // A whole-dataset read must not answer fill values for elements that are
+    // only staged.
+    assert!(
+        matches!(col.read_i32(), Err(Error::NotCommitted(p)) if p == "run/col"),
+        "a staged dataset must not read as fill values"
+    );
+    assert!(matches!(col.read_raw(), Err(Error::NotCommitted(_))));
+    assert!(matches!(col.attrs(), Err(Error::NotCommitted(_))));
+    assert!(matches!(grp.attrs(), Err(Error::NotCommitted(_))));
+
+    // In-place growth has no bytes to grow.
+    assert!(matches!(col.append(&[9i32]), Err(Error::NotCommitted(_))));
+    assert!(matches!(
+        col.append_raw(&[0u8; 4]),
+        Err(Error::NotCommitted(_))
+    ));
+    assert!(matches!(
+        col.buffered_appender().map(|_| ()),
+        Err(Error::NotCommitted(_))
+    ));
+
+    // So do the staged edits that rewrite an object the file already holds.
+    assert!(matches!(col.write(&[1i32, 2]), Err(Error::NotCommitted(_))));
+    assert!(matches!(
+        col.write_staged(|b| {
+            b.with_i32_data(&[1, 2]);
+        }),
+        Err(Error::NotCommitted(_))
+    ));
+    assert!(matches!(
+        col.set_attr("units", AttrValue::I64(1)),
+        Err(Error::NotCommitted(_))
+    ));
+
+    // A staged group takes attributes, which is what `create_group_with`'s
+    // closure was the only way to do.
+    grp.set_attr("kind", AttrValue::I64(3)).unwrap();
+    session.commit().unwrap();
+    assert_eq!(col.read_i32().unwrap(), vec![7, 8]);
+    assert_eq!(grp.attrs().unwrap()["kind"], AttrValue::I64(3));
+}
+
+#[test]
+fn a_replaced_path_resolves_to_the_object_replacing_it() {
+    let path = temp_path("hdf5_pure_staged_visible_replace.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    session.root().delete("original").unwrap();
+    session
+        .root()
+        .create_dataset("original", |b| {
+            b.with_i32_data(&[5, 6]);
+        })
+        .unwrap();
+
+    // Before the commit the path already names the replacement, not the object
+    // being removed — and reading it says so rather than answering with the old
+    // dataset's values.
+    let replacement = session.dataset("original").unwrap();
+    assert_eq!(replacement.dtype().unwrap(), DType::I32);
+    assert_eq!(replacement.shape().unwrap(), vec![2]);
+    assert!(matches!(
+        replacement.read_i32(),
+        Err(Error::NotCommitted(_))
+    ));
+    // Listed once, not twice.
+    assert_eq!(
+        session.root().datasets().unwrap(),
+        vec!["original".to_string()]
+    );
+
+    session.commit().unwrap();
+    assert_eq!(replacement.read_i32().unwrap(), vec![5, 6]);
+}
+
+#[test]
+fn listings_merge_staged_children_without_duplicating_them() {
+    let path = temp_path("hdf5_pure_staged_visible_listings.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("kept").with_i32_data(&[1]);
+    let mut shed = b.create_group("shed");
+    shed.create_dataset("x").with_i32_data(&[2]);
+    b.add_group(shed.finish());
+    b.write(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    let root = session.root();
+    root.create_dataset("added", |b| {
+        b.with_i32_data(&[3]);
+    })
+    .unwrap();
+    root.create_group_with("nested", |g| {
+        g.create_dataset("leaf", |b| {
+            b.with_i32_data(&[4]);
+        });
+    })
+    .unwrap();
+    // A replacement: the name is on disk and staged at once.
+    root.delete("kept").unwrap();
+    root.create_dataset("kept", |b| {
+        b.with_i32_data(&[5]);
+    })
+    .unwrap();
+
+    let mut datasets = root.datasets().unwrap();
+    datasets.sort();
+    assert_eq!(datasets, vec!["added".to_string(), "kept".to_string()]);
+    let mut groups = root.groups().unwrap();
+    groups.sort();
+    assert_eq!(groups, vec!["nested".to_string(), "shed".to_string()]);
+
+    // The iterating forms agree, and hand back usable handles.
+    let mut walked: Vec<String> = root.iter_datasets().unwrap().map(|(n, _)| n).collect();
+    walked.sort();
+    assert_eq!(walked, datasets);
+    let mut walked_groups: Vec<String> = root.iter_groups().unwrap().map(|(n, _)| n).collect();
+    walked_groups.sort();
+    assert_eq!(walked_groups, groups);
+
+    // A staged group lists its staged members, having no on-disk links at all.
+    let nested = root.group("nested").unwrap();
+    assert_eq!(nested.datasets().unwrap(), vec!["leaf".to_string()]);
+    assert!(nested.groups().unwrap().is_empty());
+
+    session.commit().unwrap();
+    let mut after = root.datasets().unwrap();
+    after.sort();
+    assert_eq!(after, datasets);
+    assert_eq!(
+        session.dataset("kept").unwrap().read_i32().unwrap(),
+        vec![5]
+    );
+}
+
+#[test]
+fn a_refused_commit_leaves_the_staged_handle_pending() {
+    let path = temp_path("hdf5_pure_staged_visible_refused.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    let ds = session
+        .root()
+        .create_dataset("added", |b| {
+            b.with_i32_data(&[1, 2]);
+        })
+        .unwrap();
+    // A deletion of a path that does not exist refuses the whole commit, so the
+    // addition beside it stays staged (issue #316).
+    session.root().delete("no_such_object").unwrap();
+    assert!(session.commit().is_err());
+    assert!(
+        matches!(ds.read_i32(), Err(Error::NotCommitted(p)) if p == "added"),
+        "a refused commit leaves the object staged"
+    );
+    assert_eq!(ds.shape().unwrap(), vec![2]);
+
+    // Dropping the `File` does not end the session while a handle onto it is
+    // alive, so the object stays staged and the handle keeps saying so. The
+    // file itself never received it.
+    drop(session);
+    assert!(matches!(ds.read_i32(), Err(Error::NotCommitted(_))));
+    drop(ds);
+    let reopened = File::open(&path).unwrap();
+    assert!(matches!(
+        reopened.dataset("added"),
+        Err(Error::Format(FormatError::PathNotFound(_)))
+    ));
+}
+
+#[test]
+fn a_lookup_of_a_staged_object_of_the_other_kind_is_refused() {
+    let path = temp_path("hdf5_pure_staged_visible_kinds.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    session.root().create_group("grp").unwrap();
+    session
+        .root()
+        .create_dataset("set", |b| {
+            b.with_i32_data(&[1]);
+        })
+        .unwrap();
+
+    assert!(matches!(session.dataset("grp"), Err(Error::NotADataset(_))));
+    assert!(matches!(session.group("set"), Err(Error::NotAGroup(_))));
+    assert!(matches!(
+        session.root().dataset("grp"),
+        Err(Error::NotADataset(_))
+    ));
+    assert!(matches!(
+        session.root().group("set"),
+        Err(Error::NotAGroup(_))
+    ));
+}
+
+#[test]
+fn appending_to_a_staged_dataset_of_the_wrong_type_is_refused() {
+    let path = temp_path("hdf5_pure_staged_visible_append_type.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    let mut col = session
+        .root()
+        .create_dataset("col", |b| {
+            b.with_i32_data(&[1, 2]);
+        })
+        .unwrap();
+    assert!(matches!(
+        col.append_staged(|a| {
+            a.append_f64(&[1.0]);
+        }),
+        Err(Error::AppendUnsupported(_))
+    ));
+    // The refusal staged nothing: the dataset is the one the builder described.
+    assert_eq!(col.shape().unwrap(), vec![2]);
+
+    // A contiguous staged dataset grows all the same — this is the builder's
+    // data being extended, not a dataset in the file being appended to.
+    col.append_staged(|a| {
+        a.append_i32(&[3]);
+    })
+    .unwrap();
+    session.commit().unwrap();
+    assert_eq!(col.read_i32().unwrap(), vec![1, 2, 3]);
 }

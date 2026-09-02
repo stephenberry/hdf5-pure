@@ -115,8 +115,8 @@ use hdf5_pure::File;
 let file = File::open_rw("output.h5").unwrap();
 let root = file.root();
 
-root.create_group("run2").unwrap();
-root.create_dataset("run2/signal", |b| { b.with_f64_data(&[1.0, 2.0, 3.0]); }).unwrap();
+let run2 = root.create_group("run2").unwrap();   // a handle to the staged group
+run2.create_dataset("signal", |b| { b.with_f64_data(&[1.0, 2.0, 3.0]); }).unwrap();
 file.copy("temperature", "temperature_backup").unwrap();  // H5Ocopy
 root.delete("sensors/pressure").unwrap();                 // H5Ldelete
 

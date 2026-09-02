@@ -1147,6 +1147,26 @@ pub enum Error {
     /// and does not end such a handle; a commit does, as does staging one,
     /// [`crate::File::sync`], and [`crate::File::close`].
     StaleHandle,
+    /// The object named by the payload has been *staged* by this read-write
+    /// session and not yet published by [`crate::File::commit`], so the
+    /// operation asked for would have had to read bytes that are not in the
+    /// file.
+    ///
+    /// A staged creation is addressable as soon as it is staged: the handle
+    /// [`crate::Group::create_group`] / [`crate::Group::create_group_with`] /
+    /// [`crate::Group::create_dataset`] returns — and the one a lookup for that
+    /// name gives back — can stage further edits under it, and a staged dataset
+    /// answers [`crate::Dataset::shape`], [`crate::Dataset::maxshape`],
+    /// [`crate::Dataset::dtype`], [`crate::Dataset::datatype`],
+    /// [`crate::Dataset::is_chunked`] and [`crate::Dataset::filters`] from what
+    /// was staged. Everything that reads the object's bytes reports this until
+    /// the commit: element reads, attribute reads, and the edits that rewrite an
+    /// existing object in place ([`crate::Dataset::append`],
+    /// [`crate::Dataset::write`], `set_attr` on a dataset). Add the elements to
+    /// the builder that stages the dataset instead — or, for a dataset,
+    /// [`crate::Dataset::append_staged`], which folds them into the pending
+    /// creation.
+    NotCommitted(String),
     /// A staged edit (`write` / `set_attr` / `create_*` / `delete` / `copy` /
     /// `commit`) was requested on a file opened with
     /// [`crate::File::open_swmr_writer`], which permits only immediate
@@ -1268,6 +1288,10 @@ impl fmt::Display for Error {
                 f,
                 "this handle was reached by object reference and the file has changed since; \
                  it has no path to re-resolve, so dereference again"
+            ),
+            Error::NotCommitted(path) => write!(
+                f,
+                "\"{path}\" is staged and not written yet; File::commit publishes it"
             ),
             Error::FileClosed => write!(
                 f,

@@ -87,7 +87,7 @@ impl FilterKind {
     /// two `Deflate`s at different levels are one filter appearing twice, not
     /// two filters, which is what makes [`ChunkOptions::set_filter`] replace
     /// rather than accumulate.
-    fn filter_id(self) -> u16 {
+    pub(crate) fn filter_id(self) -> u16 {
         match self {
             #[cfg(feature = "zfp")]
             Self::Zfp(_) => FILTER_ZFP,

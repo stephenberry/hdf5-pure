@@ -84,19 +84,20 @@ file.commit().unwrap();
 assert!(signal.attrs().unwrap().contains_key("units")); // same handle, new file
 ```
 
-Two cases report rather than answer:
+Three cases report rather than answer:
 
 - **Reading** through a handle onto an object the commit **deleted** fails the way opening it by name would (`FormatError::PathNotFound`); onto one the commit **replaced with an object of a different kind**, it is `Error::NotADataset` or `Error::NotAGroup`. The bytes a deleted object leaves behind still parse as the object that left them, so reading them would answer with data no longer in the file. Its write methods address the file by path as they always did, so they still stage, and the commit refuses them.
 - A handle reached by **object reference** (`Dataset::dereference`) knows only an object-header address and has no path to look up, so it returns `Error::StaleHandle` once anything that could have moved that header has run — a commit, a staged edit, a `sync`, a `close`. Dereference again from a fresh read. An immediate `append` moves no header, so such a handle keeps reading and appending across one.
+- A handle onto an object the session has **staged** and not yet committed returns `Error::NotCommitted` for anything that reads bytes, and answers everything else; the commit is what turns it into an ordinary handle. See [Staged objects are addressable straight away](#staged-objects-are-addressable-straight-away).
 
 ## Operations
 
 | Method | Effect | HDF5 analog |
 | --- | --- | --- |
 | `File::open_rw(path)` | Open an existing file for reading and writing | — |
-| `Group::create_group(name)` | Stage a new empty group | — |
-| `Group::create_group_with(name, build)` | Stage a new group, configured through `build` (attributes, nested objects) | — |
-| `Group::create_dataset(name, build)` | Stage a new dataset, configured through a `DatasetBuilder` | — |
+| `Group::create_group(name)` | Stage a new empty group, returning a `Group` handle onto it | `H5Gcreate` |
+| `Group::create_group_with(name, build)` | Stage a new group, configured through `build` (attributes, nested objects), returning a `Group` handle onto it | `H5Gcreate` |
+| `Group::create_dataset(name, build)` | Stage a new dataset, configured through a `DatasetBuilder`, returning a `Dataset` handle onto it | `H5Dcreate` |
 | `Dataset::append_staged(build)` | Stage appending elements along axis 0 of an existing chunked, unlimited dataset, via an `AppendBuilder` | `H5Dset_extent` + write |
 | `Dataset::append(data)` | Append immediately and durably, no `commit` needed | `H5Dset_extent` + write |
 | `Dataset::buffered_appender()` | Buffer appended elements and write them a whole chunk at a time | `H5Pset_chunk_cache` (write side) |
@@ -131,9 +132,7 @@ root.create_dataset("col", |b| {
 
 The chunk dimensions have to be given: auto-chunking derives them from the shape, and a zero-element shape has none to derive from.
 
-`set_attr` needs a group that already resolves, so a group staged in this same batch is not reachable through it — stage those attributes with `create_group_with` instead. A staged object is not resolvable by name until `commit`, so `File::group`/`File::dataset` will not find it before then.
-
-The `create_group_with`/`create_dataset`/`write_staged`/`append_staged` closures configure a builder rather than the file itself, so a closure may read the same `File` — staging a dataset whose contents depend on one already there works. What it reads is the file as it was before the call, since nothing staged resolves until `commit`.
+The `create_group_with`/`create_dataset`/`write_staged`/`append_staged` closures configure a builder rather than the file itself, so a closure may read the same `File` — staging a dataset whose contents depend on one already there works. What it reads is the file as it was before the call, since the closure runs before its edits are recorded.
 
 `set_attr` takes an `AttrValue`, fixed-size or variable-length. `File::root()` names the root group. Attributes go in the rebuilt header while they fit it compactly; past that — more than eight of them, or one too large for an object-header message — the whole set moves to a fractal heap, and an object already storing its attributes in one is rebuilt the same way ([#102](https://github.com/stephenberry/hdf5-pure/issues/102)). An object stays dense once it is dense, and the heap goes away only when its last attribute is removed. A rebuilt heap re-encodes the attributes it carries over: name, datatype, dataspace and value survive (the name's declared character set is rewritten as ASCII), attribute creation order does not, and the heap the edit replaces is left as dead bytes for `repack` to recover. A dataset or group *created* in place may carry a dense set the same way.
 
@@ -179,6 +178,54 @@ Everything the commit adds *below* a replaced path lands in the replacement, wha
 A source that is deleted but *not* replaced is unambiguous — that is a move — and stays allowed.
 
 The new object's storage is appended rather than laid over the original's: the original stays live until the superblock is repointed, which is what makes a crash mid-rotation land on one side or the other. The space the deletion released is therefore what a *later* commit draws on, by the two mechanisms [Space reuse and truncation](#space-reuse-and-truncation) describes — reuse for an interior region, truncation for one that reaches the end of the file. A rotation loop in one session reaches a steady file size rather than growing.
+
+## Staged objects are addressable straight away
+
+`create_group`, `create_group_with` and `create_dataset` each return a handle onto the object they stage, and `File::group` / `File::dataset` / `Group::group` / `Group::dataset` find it by name from the same session. A nested schema is therefore built and its handles cached in one pass, with no commit in the middle:
+
+```rust,no_run
+use hdf5_pure::File;
+
+let file = File::open_rw("runs.h5").unwrap();
+let epoch = file.root().create_group_with("epoch", |g| {
+    g.create_dataset("sys_time", |b| {
+        b.with_u64_data(&[])
+            .with_shape(&[0])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[512]);
+    });
+})
+.unwrap();
+
+let mut sys_time = epoch.dataset("sys_time").unwrap(); // before the commit
+assert_eq!(sys_time.shape().unwrap(), vec![0]);
+sys_time.append_staged(|a| { a.append_u64(&[1, 2, 3]); }).unwrap();
+
+file.commit().unwrap();
+assert_eq!(sys_time.read_u64().unwrap(), vec![1, 2, 3]); // the same handle
+```
+
+Such a handle *addresses* the object; it cannot read bytes the file does not hold yet. What it does before the commit:
+
+| Through a handle onto a staged object | Before `commit` |
+| --- | --- |
+| `Group::create_group` / `create_group_with` / `create_dataset` / `delete` / `set_attr` / `remove_attr` | stages, exactly as on a committed group |
+| `Group::group` / `dataset`, `groups()` / `datasets()` / `iter_groups()` / `iter_datasets()` | the staged members |
+| `Dataset::shape` / `maxshape` / `dtype` / `datatype` / `is_chunked` / `filters` | what the builder settled |
+| `Dataset::append_staged` | the elements join the pending creation |
+| `Dataset` reads (`read_*`, `attrs`), `Group::attrs` | `Error::NotCommitted` |
+| `Dataset::append` / `append_raw` / `buffered_appender` | `Error::NotCommitted` — no bytes to grow in place |
+| `Dataset::write` / `write_staged` / `set_attr` / `remove_attr` | `Error::NotCommitted` |
+
+`append_staged` on a staged dataset is the same edit as having handed the elements to its builder, so it needs neither an unlimited dimension nor a chunked layout — the two an append onto a *committed* dataset does need. A variable-length-string or object-reference dataset is the exception: its per-element side table is built with the dataset, so supply every element through the builder.
+
+After `commit` the same handles read and write the objects in the file. A refused commit leaves them staged and still answering `NotCommitted`, and the same batch can be committed again.
+
+Only a path the session **named** is addressable this way. A commit also creates the intermediate groups on the way to an addition — `create_dataset("a/b")` gets an `a` whether or not one was asked for — and those are not, because the staged set alone does not say whether such a group is being added or is already in the file, and a not-yet-committed handle onto a group you can read today would be the worse answer. Stage the group by name (`create_group("a")`) to hold a handle on it before the commit.
+
+[Replacing an object](#replacing-an-object) reads the same before the commit as after: the path names the replacement, not the object being removed. A deletion on its own hides nothing — the object is in the file until the commit runs, and reads through it keep working.
+
+`StagedGroup` — what `create_group_with`'s closure receives — is a convenience for describing a whole subtree in one call rather than the only way to reach a group that is not committed. Its methods return `&mut Self` for chaining and hand back no handles; look the object up by name once the closure has returned.
 
 ## Appending to an unlimited dataset
 

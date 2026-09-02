@@ -6,11 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- A group or dataset staged by `Group::create_group`, `create_group_with` or `create_dataset` is addressable by name in the same session, so a nested schema is built and its handles cached without a `commit` in between. Such a handle stages further edits and answers a staged dataset's shape, maxshape, datatype and filters; anything that reads bytes reports the new `Error::NotCommitted` until the commit ([#392](https://github.com/stephenberry/hdf5-pure/issues/392)).
+- `Dataset::append_staged` on a dataset staged in the same session folds the elements into the pending creation, so it needs neither an unlimited dimension nor a chunked layout ([#392](https://github.com/stephenberry/hdf5-pure/issues/392)).
+
 ### Fixed
 
 - `FileBuilder::with_libver_bounds` and `FileCreateProperties::with_libver_bounds` accept a lower bound of `LibVer::V112`, `V114` or `LATEST` and write the 1.10 format, matching `H5Pset_libver_bounds`, where those bounds were refused as unsatisfiable ([#390](https://github.com/stephenberry/hdf5-pure/issues/390)).
 - `FileAccessProperties::with_page_buffer_size` accepts any budget of at least the file's page size, where it refused one below 1 MiB. A smaller buffer holds less resident memory in exchange for more writes on long contiguous runs; `0` still turns it off ([#391](https://github.com/stephenberry/hdf5-pure/issues/391)).
 - A `FileSpaceStrategy::Page` file stops growing under delete-and-recreate churn: deleting a group of empty resizable datasets, and repeatedly flushing `Dataset::append_staged`, now return the chunk indexes involved instead of stranding one per cycle. Space whose page type cannot be established is still held back until the whole page around it is free, so `space_accounting().reusable_free_bytes` can lag a delete by up to a page ([#388](https://github.com/stephenberry/hdf5-pure/issues/388)).
+
+### Changed
+
+- **Breaking:** `Group::create_group`, `create_group_with` and `create_dataset` return a handle to the object they stage instead of `()` ([#392](https://github.com/stephenberry/hdf5-pure/issues/392)).
 
 ## [0.42.0] - 2026-08-29
 
