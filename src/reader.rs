@@ -318,6 +318,11 @@ impl FileAccessProperties {
     /// gives when writing a whole file, so a `.mat` bounded to 1.8 for MATLAB
     /// stays loadable by MATLAB after an edit.
     ///
+    /// `low` only rules formats out — as in the C library it licenses newer
+    /// encodings without requiring them — so a lower bound of [`LibVer::V112`],
+    /// [`LibVer::V114`] or [`LibVer::LATEST`] leaves the session writing the 1.10
+    /// format rather than failing.
+    ///
     /// The read-only opens ignore this: they write nothing. [`File::open_swmr_writer`]
     /// requires a version 3 superblock, so it refuses a `high` below
     /// [`LibVer::V110`] up front rather than accepting a bound it cannot honor.

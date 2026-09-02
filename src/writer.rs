@@ -198,6 +198,10 @@ impl FileBuilder {
     /// older reader wants: MATLAB's MAT v7.3 loader, for instance, is HDF5
     /// 1.8.12 before R2021b, which does not understand a version 3 superblock.
     ///
+    /// `low` only rules formats out: as in the C library it licenses newer
+    /// encodings without requiring them, so a lower bound of `V112`, `V114` or
+    /// `LATEST` is satisfied by the 1.10 format rather than refused.
+    ///
     /// Content the 1.8 format cannot express is refused rather than silently
     /// upgraded, with
     /// [`FormatError::LibverTooOldForContent`](crate::FormatError::LibverTooOldForContent):

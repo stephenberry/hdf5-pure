@@ -244,7 +244,9 @@ An open `File` reports its size and the format version it requires:
 | `LibVer::V18` | 1.8 (version 2 superblock, new-style object headers) |
 | `LibVer::V110` | 1.10 (version 3 superblock, SWMR, extensible/fixed array indices) |
 | `LibVer::V112` | 1.12 |
-| `LibVer::V114` | 1.14 |
+| `LibVer::V114` | 1.14, the value of `LibVer::LATEST` |
+
+`libver_bound()` never returns `V112` or `V114`: it derives from the superblock version, whose newest value is the version 3 of HDF5 1.10, so it caps at `V110`. Both are still meaningful to `with_libver_bounds`, where a lower bound of `V112`, `V114` or `LATEST` selects the 1.10 format — the low bound licenses newer encodings rather than demanding them.
 
 ```rust
 use hdf5_pure::{File, LibVer};

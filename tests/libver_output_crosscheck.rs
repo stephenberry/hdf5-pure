@@ -30,8 +30,12 @@
 //! the file. It cannot open it at all — which is exactly the reported symptom of
 //! `h5disp` working while `load` fails, since those reach different HDF5
 //! versions inside MATLAB.
+//!
+//! The last test covers the other end of the bound rather than the 1.8 format: a
+//! *lower* bound of `LibVer::LATEST`, which selects the same 1.10 format the
+//! writer emits by default and must produce a file the C library reads.
 
-use hdf5_pure::{AttrValue, File, FileBuilder, LibVer};
+use hdf5_pure::{AttrValue, File, FileAccessProperties, FileBuilder, FileCreateProperties, LibVer};
 use tempfile::tempdir;
 
 /// A file exercising everything the 1.8 format still carries: contiguous
@@ -203,4 +207,70 @@ fn an_edit_session_keeps_a_1_8_file_in_the_1_8_format() {
     let d = f.dataset("values").unwrap();
     assert_eq!(d.read_raw::<f64>().unwrap(), vec![1.0, 2.0, 3.0]);
     assert_eq!(d.loc_info().unwrap().num_attrs, 2);
+}
+
+/// A *lower* bound of `LibVer::LATEST` licenses newer encodings without
+/// requiring any, so both entry points write the 1.10 format under it — the
+/// reading `H5Pset_libver_bounds` has, where the low bound is a floor and the
+/// library is free to stay below the ceiling. The C library reading the result
+/// is what says the file is a real one and not merely one this crate accepted.
+#[test]
+fn c_reads_a_file_written_at_a_lower_bound_of_latest() {
+    let dir = tempdir().unwrap();
+
+    let via_builder = dir.path().join("latest_builder.h5");
+    let mut b = FileBuilder::new();
+    b.with_libver_bounds(LibVer::LATEST, LibVer::LATEST);
+    b.set_attr("root_attr", AttrValue::AsciiString("r".into()));
+    b.create_dataset("values").with_f64_data(&[1.0, 2.0, 3.0]);
+    b.write(&via_builder).unwrap();
+
+    let via_properties = dir.path().join("latest_created.h5");
+    {
+        let f = File::create_with_options(
+            &via_properties,
+            FileCreateProperties::new().with_libver_bounds(LibVer::LATEST, LibVer::LATEST),
+            FileAccessProperties::new(),
+        )
+        .expect("a lower bound of LATEST is satisfied by the 1.10 format");
+        f.root()
+            .create_dataset("values", |d| {
+                d.with_f64_data(&[1.0, 2.0, 3.0]);
+            })
+            .unwrap();
+        f.root()
+            .set_attr("root_attr", AttrValue::AsciiString("r".into()))
+            .unwrap();
+        f.commit().unwrap();
+    }
+
+    for path in [via_builder, via_properties] {
+        let bytes = std::fs::read(&path).unwrap();
+        let sig = bytes
+            .windows(8)
+            .position(|w| w == b"\x89HDF\r\n\x1a\n")
+            .expect("the file carries an HDF5 signature");
+        assert_eq!(
+            bytes[sig + 8],
+            3,
+            "{}: the 1.10 format, not one 1.12 or 1.14 would have named",
+            path.display()
+        );
+
+        // Released before the C library opens the same file: Windows OS locks
+        // are mandatory.
+        let f = File::open(&path).unwrap();
+        assert_eq!(f.libver_bound(), LibVer::V110);
+        assert_eq!(f.libver_bound(), LibVer::WRITER_DEFAULT);
+        drop(f);
+
+        let f = hdf5::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("values").unwrap().read_raw::<f64>().unwrap(),
+            vec![1.0, 2.0, 3.0],
+            "{}",
+            path.display()
+        );
+        assert_eq!(f.attr_names().unwrap(), vec!["root_attr".to_string()]);
+    }
 }

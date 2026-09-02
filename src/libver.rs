@@ -47,6 +47,13 @@ pub enum LibVer {
 impl LibVer {
     /// The newest boundary this enum knows about — the meaning of
     /// `H5F_LIBVER_LATEST`. Tracks the highest concrete variant.
+    ///
+    /// Usable as either bound. As a *lower* bound it is a licence to use newer
+    /// encodings, not a requirement to: `H5Pset_libver_bounds` lets the library
+    /// pick anything from the low bound upward, and what this crate writes at
+    /// [`WRITER_DEFAULT`](Self::WRITER_DEFAULT) is already no newer than the
+    /// reference library emits under a low bound of 1.12 or 1.14, so a lower
+    /// bound above `WRITER_DEFAULT` is satisfied by it rather than refused.
     pub const LATEST: LibVer = LibVer::V114;
 
     /// The on-disk format this crate's [`FileBuilder`](crate::FileBuilder)
@@ -87,6 +94,14 @@ impl LibVer {
     /// nothing. Bounds admitting no such format give
     /// [`FormatError::LibverBoundsUnsatisfiable`].
     ///
+    /// A lower bound above [`WRITER_DEFAULT`](Self::WRITER_DEFAULT) is satisfied
+    /// by it, so `(LATEST, LATEST)` resolves to the 1.10 format rather than
+    /// failing. HDF5's low bound is a licence to use newer encodings, not a
+    /// requirement to use them, and every message this crate writes is already
+    /// at or below the version the reference library emits under a low bound of
+    /// 1.12 or 1.14. The value returned is the format actually written, so an
+    /// error naming it stays true.
+    ///
     /// One function so the whole-file writer and an editing session's fapl
     /// answer the same bounds the same way; a second copy of this rule is how
     /// the two would come to disagree about which format a caller asked for.
@@ -96,8 +111,9 @@ impl LibVer {
         let Some((low, high)) = bounds else {
             return Ok(LibVer::WRITER_DEFAULT);
         };
+        let effective_low = low.min(LibVer::WRITER_DEFAULT);
         for candidate in [LibVer::WRITER_DEFAULT, LibVer::WRITER_OLDEST] {
-            if candidate >= low && candidate <= high {
+            if candidate >= effective_low && candidate <= high {
                 return Ok(candidate);
             }
         }
@@ -116,6 +132,92 @@ impl LibVer {
             LibVer::V110 => "v1.10",
             LibVer::V112 => "v1.12",
             LibVer::V114 => "v1.14",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LibVer;
+    use crate::error::FormatError;
+
+    /// Unbounded, and any bound admitting the 1.10 format, resolve to it.
+    #[test]
+    fn bounds_admitting_the_default_format_resolve_to_it() {
+        assert_eq!(LibVer::resolve_writable(None).unwrap(), LibVer::V110);
+        for (low, high) in [
+            (LibVer::Earliest, LibVer::LATEST),
+            (LibVer::Earliest, LibVer::V110),
+            (LibVer::V110, LibVer::V110),
+        ] {
+            assert_eq!(
+                LibVer::resolve_writable(Some((low, high))).unwrap(),
+                LibVer::V110,
+                "bounds [{}, {}]",
+                low.name(),
+                high.name()
+            );
+        }
+    }
+
+    /// A lower bound newer than the 1.10 format this crate writes is a licence to
+    /// use newer encodings, not a requirement to, so it is satisfied by that
+    /// format — and resolves to the format written rather than the bound asked
+    /// for.
+    #[test]
+    fn a_lower_bound_above_the_default_format_is_satisfied_by_it() {
+        for (low, high) in [
+            (LibVer::LATEST, LibVer::LATEST),
+            (LibVer::V112, LibVer::LATEST),
+            (LibVer::V112, LibVer::V112),
+            (LibVer::V114, LibVer::V114),
+        ] {
+            assert_eq!(
+                LibVer::resolve_writable(Some((low, high))).unwrap(),
+                LibVer::V110,
+                "bounds [{}, {}]",
+                low.name(),
+                high.name()
+            );
+        }
+    }
+
+    /// An upper bound of 1.8 selects the older format whatever the lower bound
+    /// admits, since `high` is what picks between the two.
+    #[test]
+    fn an_upper_bound_of_1_8_selects_the_older_format() {
+        for (low, high) in [(LibVer::Earliest, LibVer::V18), (LibVer::V18, LibVer::V18)] {
+            assert_eq!(
+                LibVer::resolve_writable(Some((low, high))).unwrap(),
+                LibVer::V18,
+                "bounds [{}, {}]",
+                low.name(),
+                high.name()
+            );
+        }
+    }
+
+    /// What is left unsatisfiable: an upper bound older than the 1.8 format, and
+    /// an inverted range whose upper bound sits below the lower one.
+    #[test]
+    fn bounds_admitting_no_format_this_crate_writes_are_refused() {
+        for (low, high) in [
+            (LibVer::Earliest, LibVer::Earliest),
+            (LibVer::LATEST, LibVer::V18),
+        ] {
+            let err = LibVer::resolve_writable(Some((low, high))).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    FormatError::LibverBoundsUnsatisfiable {
+                        writes: "v1.10",
+                        ..
+                    }
+                ),
+                "bounds [{}, {}] gave {err:?}",
+                low.name(),
+                high.name()
+            );
         }
     }
 }

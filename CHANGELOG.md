@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- `FileBuilder::with_libver_bounds` and `FileCreateProperties::with_libver_bounds` accept a lower bound of `LibVer::V112`, `V114` or `LATEST` and write the 1.10 format, matching `H5Pset_libver_bounds`, where those bounds were refused as unsatisfiable ([#390](https://github.com/stephenberry/hdf5-pure/issues/390)).
+
 ## [0.42.0] - 2026-08-29
 
 Reading a file no longer needs a filesystem path. `File::from_source` and `File::from_source_with_options` open a file for streaming reads over anything implementing `Source`, exported now along with `ReadSeekSource` — an object store addressed by range request, a WebAssembly guest handed byte ranges by its host, a decrypting layer over a file — with the same on-demand metadata and chunk reads `File::open_streaming` gives a path, so peak memory tracks what a read touches rather than the size of the file ([#27](https://github.com/stephenberry/hdf5-pure/issues/27)). A file the superblock marks as held by a writer is refused here as it is by the path opens, naming the recovery a caller without a path can actually reach, and a source that answers a read short is refused rather than followed into a parser. Additive minor bump.

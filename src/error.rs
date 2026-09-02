@@ -380,7 +380,9 @@ pub enum FormatError {
     /// admit no format this crate writes. It writes the 1.8 and 1.10 formats
     /// ([`LibVer::WRITER_OLDEST`](crate::LibVer::WRITER_OLDEST) through
     /// [`LibVer::WRITER_DEFAULT`](crate::LibVer::WRITER_DEFAULT)), so an upper
-    /// bound older than 1.8, or a lower bound newer than 1.10, is unsatisfiable.
+    /// bound older than 1.8, or one below the lower bound, is unsatisfiable. A
+    /// *lower* bound newer than 1.10 is not: it licenses newer encodings without
+    /// requiring them, and the 1.10 format satisfies it.
     /// The fields carry the default format and the bounds asked for, as
     /// [`LibVer::name`](crate::LibVer::name) labels.
     LibverBoundsUnsatisfiable {

@@ -1003,7 +1003,9 @@ impl FileWriter {
     /// needs and treats `low` as the floor; the difference shows on
     /// `Earliest..=Latest`, where `H5Fcreate` writes a version 0 superblock and
     /// this writes a version 3 one. Leaving the bounds unset is the same as
-    /// leaving `high` at `Latest`.
+    /// leaving `high` at `Latest`. `low` only rules formats out, licensing newer
+    /// encodings without requiring them, so a lower bound of `V112`, `V114` or
+    /// `LATEST` is satisfied by the 1.10 format rather than refused.
     ///
     /// Some content cannot be written in the 1.8 format at all, and asking for
     /// both is an error rather than a silent upgrade: a chunked (or resizable,
@@ -4758,6 +4760,10 @@ mod tests {
             (Some((LibVer::Earliest, LibVer::LATEST)), 3, 4),
             (Some((LibVer::Earliest, LibVer::V110)), 3, 4),
             (Some((LibVer::V110, LibVer::LATEST)), 3, 4),
+            // A lower bound above the newest format this crate writes licenses
+            // newer encodings without requiring any, so it writes the 1.10 one.
+            (Some((LibVer::LATEST, LibVer::LATEST)), 3, 4),
+            (Some((LibVer::V112, LibVer::V112)), 3, 4),
             (Some((LibVer::Earliest, LibVer::V18)), 2, 3),
             (Some((LibVer::V18, LibVer::V18)), 2, 3),
         ] {
@@ -4818,11 +4824,13 @@ mod tests {
         );
     }
 
+    /// An upper bound older than the 1.8 format, and one below the lower bound,
+    /// are what is left unsatisfiable.
     #[test]
     fn bounds_admitting_no_format_this_crate_writes_are_refused() {
         for (low, high) in [
             (LibVer::Earliest, LibVer::Earliest),
-            (LibVer::V112, LibVer::LATEST),
+            (LibVer::LATEST, LibVer::V18),
         ] {
             let err = write_bounded(Some((low, high))).unwrap_err();
             assert!(
