@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - `FileBuilder::with_libver_bounds` and `FileCreateProperties::with_libver_bounds` accept a lower bound of `LibVer::V112`, `V114` or `LATEST` and write the 1.10 format, matching `H5Pset_libver_bounds`, where those bounds were refused as unsatisfiable ([#390](https://github.com/stephenberry/hdf5-pure/issues/390)).
+- `FileAccessProperties::with_page_buffer_size` accepts any budget of at least the file's page size, where it refused one below 1 MiB. A smaller buffer holds less resident memory in exchange for more writes on long contiguous runs; `0` still turns it off ([#391](https://github.com/stephenberry/hdf5-pure/issues/391)).
 
 ## [0.42.0] - 2026-08-29
 

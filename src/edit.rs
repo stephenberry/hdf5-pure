@@ -1287,27 +1287,24 @@ pub(crate) fn create_would_refuse_reopen(
         }
         // An unpaged file has no page size of its own and merges within
         // `DEFAULT_GATHER_PAGE`, which is the same figure the format defaults
-        // `H5Pset_file_space_page_size` to. It cannot decide anything today —
-        // 4 KiB is below the floor checked alongside it, so a budget that clears
-        // the floor clears this too, and mutating this arm fails no test. It is
-        // written out rather than folded into the paged arm's `unwrap_or` because
-        // the two constants are free to move apart, and because a reader
-        // comparing this function against `set_page_buffer_size` should find the
-        // same rule in both.
+        // `H5Pset_file_space_page_size` to. This arm decides on its own now that
+        // a budget below the session's own gather budget is honored rather than
+        // refused (issue #391): a 2 KiB buffer on an unpaged create clears every
+        // other check and is caught only here. It is written out rather than
+        // folded into the paged arm's `unwrap_or` because the two constants are
+        // free to move apart, and because a reader comparing this function
+        // against `set_page_buffer_size` should find the same rule in both.
         let page_size = match create.file_space_strategy() {
             Some((FileSpaceStrategy::Page, _, _)) => create
                 .file_space_page_size()
                 .unwrap_or(crate::file_space_info::DEFAULT_PAGE_SIZE),
             _ => DEFAULT_GATHER_PAGE,
         };
-        if (access.page_buffer_size() as u64) < page_size
-            || access.page_buffer_size() < WRITE_GATHER_BYTES
-        {
+        if (access.page_buffer_size() as u64) < page_size {
             return Some(
-                "a page buffer smaller than the file's file-space page size, or than the \
-                 1 MiB a session already gathers under, would be refused at open — so \
-                 creating one this way would write the file and then fail to open it; raise \
-                 with_page_buffer_size",
+                "a page buffer smaller than the file's file-space page size would be refused \
+                 at open — so creating one this way would write the file and then fail to \
+                 open it; raise with_page_buffer_size",
             );
         }
     }
@@ -1597,8 +1594,8 @@ fn barrier_data(image: &mut dyn FileImage, sync_policy: SyncPolicy) -> Result<()
 }
 
 /// Byte budget for the writes one operation may gather before they are issued
-/// (see [`WriteBuffering::Operation`]), and the floor under an explicit
-/// [`page buffer`](crate::FileAccessProperties::with_page_buffer_size).
+/// (see [`WriteBuffering::Operation`]): the default every exclusively locked
+/// read-write session opens under.
 ///
 /// A megabyte, the same figure as [`APPEND_BATCH_BYTES`] and for a related
 /// reason: that is already what a bounded session spends holding one batch of
@@ -1607,14 +1604,27 @@ fn barrier_data(image: &mut dyn FileImage, sync_policy: SyncPolicy) -> Result<()
 /// alone. An operation larger than this is flushed part-way, which costs it
 /// little — its writes are long and contiguous by then.
 ///
-/// It is also the floor under an explicit
-/// [page buffer](crate::FileAccessProperties::with_page_buffer_size), because a
-/// page buffer *replaces* this budget rather than adding to it, so a smaller one
-/// is also where a long contiguous run is flushed and restarted — a 4 MiB append
-/// costs 10 writes at this budget and 1,094 at 4 KiB. No smaller budget has
-/// measured better on either direction of workload;
-/// [`set_page_buffer_size`](WriteEngine::set_page_buffer_size) carries the table
-/// and `no_budget_below_the_floor_beats_the_floor` asserts the ordering.
+/// # Choosing a page-buffer budget
+///
+/// An explicit [page buffer](crate::FileAccessProperties::with_page_buffer_size)
+/// *replaces* this budget rather than adding to it, and holds what it gathers
+/// across operations rather than releasing it at every ordering barrier. The two
+/// figures are therefore not comparable as memory: this one is a per-operation
+/// peak, a page buffer's is continuous residency. A budget below it asks for less
+/// of that residency and pays in writes, wherever one long contiguous run has to
+/// be flushed and restarted. Writes issued on a 4 KiB-paged file:
+///
+/// ```text
+/// workload                          unset   4 KiB   64 KiB   1 MiB
+/// 32 chunk appends into 8 + commit    188      25        4       4
+/// one 4 MiB append                    131    1094       74      10
+/// ```
+///
+/// Nothing here bypasses the gatherer the way `H5PB_write` bypasses the C page
+/// buffer for any I/O of a page or more (issue #357), so the second row is what
+/// a small budget actually costs; `a_smaller_budget_issues_more_writes` asserts
+/// that ordering rather than these counts. Which side of it to want is the
+/// caller's trade, not this crate's (issue #391).
 const WRITE_GATHER_BYTES: usize = 1 << 20;
 
 /// Page the write gatherer merges within on a file that is not paged.
@@ -2234,6 +2244,10 @@ impl WriteEngine {
     /// reaches the same conclusion and acts on it *silently*, rounding the budget
     /// up at `H5Fopen`, which is the one part of its behavior not worth copying.
     ///
+    /// Every larger budget is honored, including one below the
+    /// [`WRITE_GATHER_BYTES`] this session was already gathering under. That was
+    /// refused until issue #391; see the constant for what a small one costs.
+    ///
     /// It does **not** require a paged file, where `H5Pset_page_buffer_size`
     /// does. The C page buffer is a page *cache*, and `H5PB_create` rejects an
     /// unpaged file because its `min_meta_perc`/`min_raw_perc` reservations are
@@ -2264,40 +2278,31 @@ impl WriteEngine {
                  become visible in",
             ));
         }
+        // One page is the whole of the size rule, and a buffer that cannot hold
+        // one drains on every page it touches.
+        //
+        // A budget below `WRITE_GATHER_BYTES` was refused alongside it until
+        // issue #391, on the grounds that a page buffer *replaces* the byte
+        // budget the session was already gathering under rather than adding to
+        // it, so a smaller one is also the point at which one long run is flushed
+        // and restarted. That cost is real — nothing here bypasses the gatherer
+        // the way `H5PB_write` bypasses the C page buffer for I/O of a page or
+        // more (issue #357) — but it is not this crate's trade to make. The
+        // budget it replaces is a per-operation peak released at every barrier,
+        // while this one is held across operations, so a smaller number lowers
+        // both the peak and the residency, and a writer inside a tight memory cap
+        // is entitled to spend the writes for that. See `WRITE_GATHER_BYTES` for
+        // the measurement.
         let page_size = self.gather_page_size();
         if (max_bytes as u64) < page_size {
             return Err(Error::EditUnsupported(
                 "a page buffer must be at least the file's file-space page size",
             ));
         }
-        // A page buffer *replaces* the byte budget the session was already
-        // gathering under rather than adding to it, so a smaller one is also the
-        // point at which one long run is flushed and restarted. The C library
-        // needs no floor because `H5PB_write` bypasses its buffer for any I/O of
-        // a page or more; nothing bypasses this gatherer, so the floor is what
-        // stands in for that (issues #288, #308, #357).
-        //
-        // Measured on a 4 KiB-paged file, both directions, writes issued:
-        //
-        //     workload                          unset   4 KiB   64 KiB   1 MiB
-        //     32 chunk appends into 8 + commit    188      25        4       4
-        //     one 4 MiB append                    131    1094       74      10
-        //
-        // The floor is not a worst-case trade: on the scattered workload this
-        // property is sold for, 64 KiB buys nothing the floor does not, and on
-        // the long run it is 7x worse. `no_budget_below_the_floor_beats_the_floor`
-        // asserts that ordering rather than these counts.
-        if max_bytes < WRITE_GATHER_BYTES {
-            return Err(Error::EditUnsupported(
-                "a page buffer must be at least the byte budget a session already gathers \
-                 under (1 MiB); a smaller one replaces that budget and issues more writes \
-                 than leaving it unset",
-            ));
-        }
         // A page buffer holds dirty pages across ordering barriers, and under
         // `Always` every barrier is an `fsync` that flushes it — so it would hold
         // nothing, and the caller would have paid the mark below for nothing in
-        // return. It lives here with its four siblings rather than at the fapl,
+        // return. It lives here with its three siblings rather than at the fapl,
         // because a refusal kept apart from the others is one
         // `create_would_refuse_reopen` forgets to restate, which is how this one
         // came to write the file before refusing it.
@@ -15224,28 +15229,28 @@ mod tests {
         );
     }
 
-    /// No budget below the 1 MiB floor issues fewer writes than the floor does —
-    /// on the workload a page buffer is *sold* for, or on the one it is worst at.
+    /// A page-buffer budget below the 1 MiB a session already gathers under
+    /// issues *more* writes — on the workload a page buffer is sold for, and on
+    /// the one it is worst at.
     ///
-    /// This is the measurement the floor rests on, so it belongs in the suite
-    /// rather than in a comment: someone relaxing
-    /// [`WRITE_GATHER_BYTES`](super::WRITE_GATHER_BYTES) to honor a caller's
-    /// smaller number is exactly who needs to see it fail. The refusal is
-    /// deliberately bypassed here — `set_write_buffering` is driven directly —
-    /// because the point is what the smaller budgets *would* cost, which the
-    /// public path cannot ask for.
+    /// This is the price the public property quotes for a small budget, so it
+    /// belongs in the suite rather than in a comment. Such a budget was refused
+    /// outright until issue #391, on the strength of exactly this measurement;
+    /// what changed is who decides, not what it costs. A claim about a cost that
+    /// nothing checks is one that quietly stops being true, and a caller sizing a
+    /// buffer against a memory cap is who pays for that.
     ///
-    /// The C library needs no such floor: `H5PB_write` sends any I/O of a page or
-    /// more straight to the driver, so a small `page_buf_size` there caps memory
-    /// without throttling a long write. Nothing bypasses this gatherer, so the
-    /// budget is also the point at which a long run is flushed and restarted.
+    /// The C library charges nothing for a small buffer: `H5PB_write` sends any
+    /// I/O of a page or more straight to the driver. Nothing bypasses this
+    /// gatherer, so the budget is also the point at which a long run is flushed
+    /// and restarted — which is why the second workload is one long run.
     ///
     /// Asserted as an **ordering** rather than as counts. The counts are
     /// deterministic on one target and are quoted on the public property, but how
     /// many writes a commit needs is free to fall; what must not change is which
-    /// budget wins (issue #357).
+    /// budget issues fewer (issues #357, #391).
     #[test]
-    fn no_budget_below_the_floor_beats_the_floor() {
+    fn a_smaller_budget_issues_more_writes() {
         use tempfile::tempdir;
 
         let dir = tempdir().unwrap();
@@ -15264,19 +15269,13 @@ mod tests {
             b.write(path).unwrap();
         };
 
-        // `set_page_buffer_size` without its floor: everything else that property
-        // does, so the arms differ in the budget and nothing else.
+        // The public path, which now accepts every budget down to this fixture's
+        // 4 KiB page — so the arms differ in the budget a caller asked for and in
+        // nothing else.
         let run = |path: &std::path::Path, budget: usize, workload: &dyn Fn(&mut WriteEngine)| {
             let mut s = WriteEngine::open_with_locking(path, FileLocking::Enabled).unwrap();
             s.set_sync_policy(SyncPolicy::OnClose);
-            let page_size = s.gather_page_size();
-            s.raise_crash_mark().unwrap();
-            s.image
-                .set_write_buffering(WriteBuffering::Session {
-                    page_size,
-                    max_bytes: budget,
-                })
-                .unwrap();
+            s.set_page_buffer_size(budget).unwrap();
             let before = s.image.issued_writes();
             workload(&mut s);
             s.force_sync().unwrap();
@@ -15313,26 +15312,26 @@ mod tests {
                 fixture(&path, tables);
                 run(&path, budget, &workload)
             };
-            let floor = at(WRITE_GATHER_BYTES);
+            let ample = at(WRITE_GATHER_BYTES);
             let smallest = at(4096);
             for smaller in [4096, 64 * 1024] {
                 let below = at(smaller);
                 assert!(
-                    floor <= below,
+                    ample <= below,
                     "{label}: a {smaller}-byte budget issued {below} writes against \
-                     {floor} at the {WRITE_GATHER_BYTES}-byte floor, so the floor is \
-                     refusing a budget that would have been better"
+                     {ample} at {WRITE_GATHER_BYTES}, so a smaller budget is not the \
+                     trade the property documents"
                 );
             }
             // Not vacuous: a gatherer that ignored `max_bytes` outright would
             // report the same count at every budget and satisfy the ordering
             // above without honoring any of them. One page is a quarter of the
-            // floor's smallest step, so a workload that does not separate there
-            // is one this assertion cannot speak for.
+            // smallest step measured here, so a workload that does not separate
+            // there is one this assertion cannot speak for.
             assert!(
-                smallest > floor,
+                smallest > ample,
                 "{label}: the budget changed nothing — {smallest} writes at 4 KiB \
-                 against {floor} at the floor — so this workload cannot say which \
+                 against {ample} at 1 MiB — so this workload cannot say which \
                  budget is better"
             );
         }
@@ -15483,6 +15482,89 @@ mod tests {
                 "{label}: a page buffer changed the file it produced"
             );
         }
+    }
+
+    /// A budget below the 1 MiB a session already gathers under is honored end
+    /// to end, and leaves the same file 1 MiB leaves (issue #391).
+    ///
+    /// The floor this replaces was a write-count argument with no correctness
+    /// claim behind it, so the assertion that carries the weight is the byte
+    /// comparison rather than the read-back: a buffer that flushes and restarts
+    /// more often must produce the *same* file, not merely a readable one.
+    ///
+    /// Run through the public API — create, append, commit, close, reopen —
+    /// because `File::create_with_options` is where the refusal used to fire, on
+    /// a pair it had already decided it could not reopen with. A 16 KiB-paged
+    /// file at 256 KiB is the case the issue reported.
+    #[test]
+    fn a_page_buffer_below_the_gather_budget_writes_the_same_file() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let run = |path: &std::path::Path, budget: usize| -> Vec<i32> {
+            let file = crate::reader::File::create_with_options(
+                path,
+                crate::FileCreateProperties::new()
+                    .with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
+                    .with_file_space_page_size(16 * 1024),
+                crate::FileAccessProperties::new()
+                    .with_sync_policy(SyncPolicy::OnClose)
+                    .with_page_buffer_size(budget),
+            )
+            .unwrap();
+            file.root()
+                .create_dataset("d", |b| {
+                    b.with_i32_data(&(0..64).collect::<Vec<i32>>())
+                        .with_shape(&[64])
+                        .with_maxshape(&[u64::MAX])
+                        .with_chunks(&[64]);
+                })
+                .unwrap();
+            file.commit().unwrap();
+            for round in 0..8i32 {
+                let mut ds = file.dataset("d").unwrap();
+                ds.append(&vec![round; 64]).unwrap();
+            }
+            file.root()
+                .create_dataset("added", |b| {
+                    b.with_f64_data(&[2.5f64; 32]).with_shape(&[32]);
+                })
+                .unwrap();
+            file.commit().unwrap();
+            file.close().unwrap();
+
+            let reopened = crate::reader::File::open(path).unwrap();
+            assert_eq!(
+                reopened.dataset("added").unwrap().read_f64().unwrap(),
+                vec![2.5f64; 32],
+                "the dataset committed through the buffer must read back"
+            );
+            reopened.dataset("d").unwrap().read_i32().unwrap()
+        };
+
+        let small = dir.path().join("small_budget.h5");
+        let ample = dir.path().join("ample_budget.h5");
+        let from_small = run(&small, 256 * 1024);
+        let from_ample = run(&ample, 1 << 20);
+
+        let mut expected: Vec<i32> = (0..64).collect();
+        for round in 0..8i32 {
+            expected.extend(std::iter::repeat_n(round, 64));
+        }
+        assert_eq!(
+            from_small, expected,
+            "a 256 KiB page buffer did not append what it was given"
+        );
+        assert_eq!(
+            from_ample, expected,
+            "and neither did the 1 MiB one, so the file comparison below would be \
+             two arms agreeing on the wrong answer"
+        );
+        assert_eq!(
+            std::fs::read(&small).unwrap(),
+            std::fs::read(&ample).unwrap(),
+            "a 256 KiB page buffer produced a different file from a 1 MiB one"
+        );
     }
 
     /// A barrier issues what has been gathered under **every** policy, so the
