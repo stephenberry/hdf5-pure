@@ -4360,7 +4360,18 @@ impl Dataset {
     /// A **SWMR** writer ([`File::open_swmr_writer`]) keeps the narrower rule it
     /// always had — unfiltered, and chunk-aligned at both ends — because its
     /// readers are concurrent by contract and a rewritten trailing chunk is one
-    /// they could be crossing.
+    /// they could be crossing. It allocates at end-of-file for that same reason:
+    /// a region this session freed is one a reader may still be inside.
+    ///
+    /// Where the new chunks land otherwise depends on how the file records its
+    /// free space. A default-strategy file spends a hole an earlier commit in
+    /// this session left; a file that **persists** its free-space managers
+    /// (including every paged file) spends only space the session has first taken
+    /// *out* of them, in a rewrite of its own, so no byte an append writes is one
+    /// a durable manager advertises — a crash can strand the unspent remainder of
+    /// such a batch, but nothing can be handed out twice. That batch is a
+    /// megabyte, so a file whose largest hole is smaller than one keeps growing at
+    /// end-of-file, where the rewrite would cost more than it saves.
     ///
     /// A handle reached by object reference ([`dereference`](Self::dereference))
     /// has no resolvable path, so it names its dataset by the object-header

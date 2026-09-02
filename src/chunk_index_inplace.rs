@@ -157,8 +157,11 @@ pub(crate) trait Store: Source {
     /// superblock holds and this trait exposes no accessor for. Phase 1 gets
     /// there in two steps rather than from this contract: an appended region is
     /// covered by the patch it then issues, and a reused region is covered
-    /// because a free list is populated only by a commit, and a commit leaves the
-    /// recorded end-of-file at the file's length.
+    /// because a list this may draw from is populated only by a commit — a
+    /// staged one, or the manager rewrite a persisting session makes before an
+    /// append may reuse at all (`WriteEngine::reserve_for_immediate_append`,
+    /// issue #387) — and every commit leaves the recorded end-of-file at the
+    /// file's length.
     ///
     /// The bytes do **not** necessarily reach the disk here: a session gathers
     /// its writes and issues them at the next ordering barrier (issue #288).

@@ -246,6 +246,20 @@ impl FreeList {
         self.regions.iter().map(|r| (r.addr, r.len)).collect()
     }
 
+    /// Whether this list holds no free space at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    /// The largest single run this list could satisfy an allocation from, or `0`
+    /// when it is empty. Allocation is best-fit over *contiguous* regions, so a
+    /// list holding plenty of bytes in small pieces can still refuse a large
+    /// request — which is the question an in-place append's reserve has to ask
+    /// before it decides whether to draw more (issue #387).
+    pub(crate) fn largest(&self) -> u64 {
+        self.regions.iter().map(|r| r.len).max().unwrap_or(0)
+    }
+
     /// If a free region ends exactly at `eof` (the current end-of-file), remove
     /// it from the list and return its start address — the file can be truncated
     /// to that address. Returns `None` if the highest free region does not reach
@@ -375,6 +389,21 @@ mod tests {
         let a = fl.alloc(40).unwrap();
         fl.free(a, 40); // give it back
         assert_eq!(regions(&fl), [(0, 100)]); // coalesced back to whole
+    }
+
+    #[test]
+    fn is_empty_and_largest_report_the_list() {
+        let mut fl = FreeList::new();
+        assert!(fl.is_empty());
+        assert_eq!(fl.largest(), 0);
+        fl.free(100, 10);
+        fl.free(200, 40);
+        fl.free(400, 25);
+        assert!(!fl.is_empty());
+        assert_eq!(fl.largest(), 40);
+        // Coalescing is what `largest` reports over, not the frees as issued.
+        fl.free(240, 40);
+        assert_eq!(fl.largest(), 80);
     }
 
     #[test]

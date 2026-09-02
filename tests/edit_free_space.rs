@@ -15,6 +15,12 @@ use hdf5_pure::{
 mod temp_fixture;
 use temp_fixture::temp_path;
 
+// Shared with `tests/paged_staged_commit.rs`, which holds the staged commit to
+// the same invariant this holds the in-place append's reserve to (issue #387).
+#[path = "common/paged.rs"]
+mod paged;
+use paged::assert_pages_homogeneous;
+
 /// The superblock's end-of-file must equal the actual file length after every
 /// commit, including ones that truncate.
 fn assert_eof_matches_file(path: &std::path::Path) {
@@ -1814,27 +1820,31 @@ fn immediate_append_reuses_a_freed_hole() {
     );
 }
 
-/// A file that **persists** its free-space managers is the one case an immediate
-/// append must keep extending end-of-file (issue #349).
+/// An immediate append onto a file that **persists** its free-space managers may
+/// spend only space it has first taken *out* of them (issue #387).
 ///
-/// Its holes are recorded on disk, and only a commit or the close-time rewrite
-/// updates that record. An append has neither: it publishes through its own four
-/// phases and never repoints the superblock, so an append that consumed a
-/// persisted hole and then lost its process would leave a manager offering space
-/// a live chunk occupies, and the next session would allocate over the top of it.
-/// The staged `append_staged` + `commit` remains the way to reuse here.
+/// The managers are a durable record, and an append has no superblock repoint of
+/// its own to update that record with. So the bytes it writes must already be
+/// ones no manager advertises: the session draws a batch, republishes the
+/// managers without it, and spends only from there. What it must never do is
+/// write into a hole the published managers still offer — through a clean close
+/// as much as a crash, that would leave the next session (this crate or the C
+/// library) allocating over a live chunk.
 ///
-/// Asserted as "the persisted free space is still there afterwards" rather than
-/// as a file-size comparison, because it is the *manager* staying truthful that
-/// the carve-out is about.
+/// The hole here is far smaller than one reserve batch, so nothing is drawn at
+/// all and the append extends end-of-file. That is what makes this the "no
+/// unreserved hole is spent" case rather than a size comparison: the persisted
+/// free space has to be exactly as large afterwards as it was before.
 #[test]
-fn a_persisting_file_appends_at_end_of_file() {
+fn a_persisting_file_spends_no_unreserved_hole() {
     let payload: Vec<i32> = (0..16384).collect();
     let path = temp_path("hdf5_pure_fs_immediate_append_persisting.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
     // Comfortably larger than the payload, so the hole still holds the whole
-    // append after the commits below have placed their own tails inside it.
+    // append after the commits below have placed their own tails inside it —
+    // and still well under the batch an append reserves, so the append is
+    // offered a hole it must decline rather than one it never sees.
     b.create_dataset("scratch")
         .with_i32_data(&vec![7; payload.len() + 1024]);
     b.create_dataset("ceiling").with_i32_data(&[9, 9, 9]);
@@ -1866,6 +1876,271 @@ fn a_persisting_file_appends_at_end_of_file() {
         persisted >= freed,
         "the managers must still describe the untouched hole ({persisted} of {freed})"
     );
+    assert_no_persisted_free_space_holds_live_chunks(&path, &["log"]);
+}
+
+/// Elements the persisting-reuse tests churn: 2 MiB of `i32`.
+///
+/// Sized against the batch an append reserves out of the on-disk managers, which
+/// is a megabyte: the payload has to be several of those, or the test would be
+/// measuring a single draw rather than a session that keeps drawing as it
+/// appends. It is also what makes the hole the delete leaves worth drawing from
+/// at all.
+const REUSE_ELEMS: i32 = 512 * 1024;
+/// Elements per chunk in those tests: 64 KiB chunks, four pages of the paged
+/// fixture's 16 KiB page.
+const REUSE_CHUNK: u64 = 16384;
+
+/// No region the on-disk free-space managers advertise may overlap a live chunk
+/// of any of `datasets`.
+///
+/// This is the half of issue #387 that is about safety rather than size. A
+/// manager offering space a chunk occupies is not a stale number: the next
+/// session — this crate or the reference C library — allocates straight out of
+/// those managers and would write over the top of live data.
+fn assert_no_persisted_free_space_holds_live_chunks(path: &std::path::Path, datasets: &[&str]) {
+    let file = File::open(path).unwrap();
+    let free = file.persisted_free_space();
+    for name in datasets {
+        for chunk in file.dataset(name).unwrap().chunks().unwrap() {
+            let (lo, hi) = (chunk.address, chunk.address + chunk.storage_size);
+            for &(addr, len) in &free {
+                assert!(
+                    addr >= hi || lo >= addr + len,
+                    "the managers advertise [{addr}, {}) as free, which overlaps a live \
+                     chunk of `{name}` at [{lo}, {hi})",
+                    addr + len
+                );
+            }
+        }
+    }
+}
+
+/// Stage an empty unlimited chunked dataset and commit it.
+fn create_reuse_log(session: &File, name: &str) {
+    session
+        .root()
+        .create_dataset(name, |b| {
+            b.with_i32_data(&[])
+                .with_shape(&[0])
+                .with_chunks(&[REUSE_CHUNK])
+                .with_maxshape(&[u64::MAX]);
+        })
+        .unwrap();
+    session.commit().unwrap();
+}
+
+/// The reporter's scenario for issue #387: append a large payload in place,
+/// delete the dataset, commit, and append the same volume onto a replacement.
+///
+/// Returns the file size after each wave and the reusable free space before and
+/// after the second one.
+fn append_churn_on_a_persisting_file(
+    strategy: FileSpaceStrategy,
+    name: &str,
+) -> (u64, u64, u64, u64) {
+    let payload: Vec<i32> = (0..REUSE_ELEMS).collect();
+    let path = temp_path(name);
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(strategy, true, 1);
+    if strategy == FileSpaceStrategy::Page {
+        b.with_file_space_page_size(RECLAIM_PAGE);
+    }
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.write(&path).unwrap();
+
+    let session = open_rw_on_close(&path);
+    create_reuse_log(&session, "log");
+    session.dataset("log").unwrap().append(&payload).unwrap();
+    // A live object above the churned region, so the delete below leaves an
+    // interior hole rather than a run reaching end-of-file that the commit would
+    // simply truncate away — which would let this pass on truncation rather than
+    // on reuse.
+    session
+        .root()
+        .create_dataset("ceiling", |b| {
+            b.with_i32_data(&[9, 9, 9]);
+        })
+        .unwrap();
+    session.commit().unwrap();
+    let after_first = std::fs::metadata(&path).unwrap().len();
+
+    session.root().delete("log").unwrap();
+    session.commit().unwrap();
+    let freed_before = session.space_accounting().unwrap().reusable_free_bytes;
+
+    create_reuse_log(&session, "log2");
+    session.dataset("log2").unwrap().append(&payload).unwrap();
+    let freed_after = session.space_accounting().unwrap().reusable_free_bytes;
+    session.close().unwrap();
+    let after_second = std::fs::metadata(&path).unwrap().len();
+
+    assert_eof_matches_file(&path);
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("log2").unwrap().read_i32().unwrap(), payload);
+    assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), [1, 2, 3]);
+    assert_eq!(
+        file.dataset("ceiling").unwrap().read_i32().unwrap(),
+        [9, 9, 9]
+    );
+    drop(file);
+    assert_no_persisted_free_space_holds_live_chunks(&path, &["log2"]);
+
+    (after_first, after_second, freed_before, freed_after)
+}
+
+/// Hold one run of [`append_churn_on_a_persisting_file`] to the reuse issue #387
+/// asks for: the second wave lands inside the hole the first one left rather than
+/// past it, and the reusable free space falls as it is spent.
+fn assert_the_second_wave_reused_the_hole(first: u64, second: u64, before: u64, after: u64) {
+    let payload_bytes = REUSE_ELEMS as u64 * 4;
+    assert!(
+        before >= payload_bytes,
+        "the deleted dataset's chunks should be reusable (only {before} bytes are)"
+    );
+    assert!(
+        second < first + payload_bytes / 2,
+        "the second wave should have moved into the {before}-byte hole, not extended \
+         the file (was {first}, now {second})"
+    );
+    assert!(
+        after < before / 2,
+        "the reusable free space should have fallen as the append spent it (was \
+         {before}, now {after})"
+    );
+}
+
+/// A file that persists its free-space managers reuses the hole a delete left,
+/// through the in-place `Dataset::append` path (issue #387).
+///
+/// Before this the append always extended end-of-file on such a file, so the
+/// second wave cost a whole extra copy of the payload while `reusable_free_bytes`
+/// went on reporting the first copy's space as available.
+#[test]
+fn a_persisting_file_reuses_a_hole_it_has_taken_out_of_the_managers() {
+    let (first, second, before, after) = append_churn_on_a_persisting_file(
+        FileSpaceStrategy::FsmAggr,
+        "hdf5_pure_fs_persisting_append_reuse.h5",
+    );
+    assert_the_second_wave_reused_the_hole(first, second, before, after);
+}
+
+/// The same on a paged file, where the reserve is drawn as raw-typed space so an
+/// append spending it cannot put raw bytes in a metadata page (issue #387).
+#[test]
+fn a_paged_file_reuses_a_hole_it_has_taken_out_of_the_managers() {
+    let (first, second, before, after) = append_churn_on_a_persisting_file(
+        FileSpaceStrategy::Page,
+        "hdf5_pure_fs_paged_append_reuse.h5",
+    );
+    assert_the_second_wave_reused_the_hole(first, second, before, after);
+}
+
+/// An append spending a reserve on a paged file leaves every page holding one
+/// kind of byte (issue #387).
+///
+/// Page homogeneity is the invariant paging exists for and the one thing the
+/// reference C library cannot report on — it reads a mixed file happily — so the
+/// test above cannot stand in for this: reading every value back and finding the
+/// managers truthful both hold perfectly well on a file whose pages have been
+/// mixed. It is why the reserve is drawn through `PagedEdit::alloc_typed` rather
+/// than out of the flat list.
+///
+/// Many chunk-sized appends rather than one large one, so the session exhausts a
+/// reserve and draws again several times over, at a chunk width that is not a
+/// divisor of the page — every allocation out of the reserve then starts and ends
+/// mid-page, where a page-sized one would stay aligned and hide any misfiling by
+/// construction. A staged commit follows, so a *metadata* allocation is made
+/// while those partly-spent pages are in the lists.
+///
+/// What this does **not** discriminate, stated plainly rather than left to be
+/// discovered: no mutation of the reserve's page typing has been found that fails
+/// it. Drawing the batch as metadata instead of raw does not, because a
+/// batch-sized draw is a whole number of pages at any power-of-two page size, so
+/// `alloc_typed`'s cross-type path can only take *wholly free* pages — which
+/// belong to neither type and mix nothing. Returning the unspent remainder to the
+/// metadata list does not either, because placement is best-fit and a large
+/// misfiled run is the last fragment a small metadata allocation would choose.
+/// So this is a net for the mixing class — a raw append packing into a live
+/// metadata page, a metadata allocation landing in a raw one — and not a proof of
+/// the `PageType::Raw` argument, which rests on the reasoning at
+/// `WriteEngine::take_raw_span` instead.
+#[test]
+fn a_paged_append_reserve_keeps_pages_homogeneous() {
+    // Deliberately *not* a divisor of the page: 6,000 bytes of chunk against a
+    // 16,384-byte page, so the reserve is spent in pieces that leave its unspent
+    // remainder starting mid-page. A page-sized chunk would keep every allocation
+    // page-aligned and no misfiling of that remainder could ever show.
+    const CHUNK: u64 = 1500;
+    // Comfortably more than two reserve batches once appended, so the run crosses
+    // several draws.
+    const ROUNDS: usize = 400;
+
+    let path = temp_path("hdf5_pure_fs_paged_reserve_homogeneous.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1);
+    b.with_file_space_page_size(RECLAIM_PAGE);
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    // The hole the appends draw from: four megabytes of raw chunk data an earlier
+    // commit gives back.
+    b.create_dataset("victim")
+        .with_i32_data(&vec![7i32; 1024 * 1024])
+        .with_chunks(&[CHUNK]);
+    b.create_dataset("ceiling").with_i32_data(&[9, 9, 9]);
+    b.write(&path).unwrap();
+
+    let session = open_rw_on_close(&path);
+    session.root().delete("victim").unwrap();
+    session.commit().unwrap();
+    let freed = session.space_accounting().unwrap().reusable_free_bytes;
+    assert!(
+        freed > 2 * 1024 * 1024,
+        "the fixture must leave more than two reserve batches to draw from, not {freed}"
+    );
+
+    create_reuse_log(&session, "log");
+    let batch: Vec<i32> = (0..CHUNK as i32).collect();
+    {
+        let mut ds = session.dataset("log").unwrap();
+        for _ in 0..ROUNDS {
+            ds.append(&batch).unwrap();
+        }
+    }
+    let spent = freed - session.space_accounting().unwrap().reusable_free_bytes;
+
+    // A staged commit after the appends: it allocates metadata (an object header,
+    // the rewritten managers) and raw data of its own, so it is the write that
+    // would take up a page-alignment remainder the draws left misfiled.
+    session
+        .root()
+        .create_dataset("after", |b| {
+            b.with_i32_data(&vec![5i32; 4096]);
+        })
+        .unwrap();
+    session.commit().unwrap();
+    session.close().unwrap();
+
+    // The run has to have *spent* the reserve, or a session that quietly appended
+    // at end-of-file would satisfy the homogeneity check trivially.
+    assert!(
+        spent >= ROUNDS as u64 * CHUNK * 4 / 2,
+        "the appends should have come out of the hole, but reusable free space \
+         fell by only {spent}"
+    );
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("log").unwrap().read_i32().unwrap().len(),
+        ROUNDS * CHUNK as usize
+    );
+    assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), [1, 2, 3]);
+    assert_eq!(
+        file.dataset("after").unwrap().read_i32().unwrap(),
+        vec![5i32; 4096]
+    );
+    drop(file);
+    assert_no_persisted_free_space_holds_live_chunks(&path, &["log"]);
+    assert_pages_homogeneous(&path, RECLAIM_PAGE, &["log", "keep", "ceiling", "after"]);
 }
 
 /// The page size the paged reclaim tests below create their files with. Large
