@@ -382,17 +382,9 @@ let file = File::open_rw_with_options(
 
 Dirty pages then survive across barriers, commits and appends until the budget is spent, an `fsync` is issued, or the session closes. Measured on a paged file, 32 chunk appends into eight datasets followed by a commit: **188 writes with the default gathering, 5 with a page buffer** — two of which are the mark below going up and coming down. The appends issue nothing at all until the session ends. The file it produces is byte-identical either way.
 
-Five things are required, each refused rather than quietly ignored:
+Four things are required, each refused rather than quietly ignored:
 
 - **A budget of at least the page the session merges within**: the file's own page size when it was created with `FileSpaceStrategy::Page`, and the format's 4 KiB default otherwise. A buffer that cannot hold one page drains on every page it touches.
-- **A budget of at least 1 MiB**, which is what a session already gathers between barriers. A smaller page buffer *replaces* that budget rather than extending it, so it is also the point at which one long contiguous run is flushed and restarted. Writes issued, measured on a 4 KiB-paged file:
-
-  | workload | unset | 4 KiB | 64 KiB | 1 MiB |
-  | --- | --- | --- | --- | --- |
-  | 32 chunk appends into 8 datasets, then a commit | 188 | 25 | 4 | 4 |
-  | one 4 MiB append | 131 | 1,094 | 74 | 10 |
-
-  On the scattered workload a page buffer exists for, 64 KiB buys nothing 1 MiB does not; on the long run it is 7x worse. The floor is also not memory a session was not already spending, since the gather budget it replaces is the same figure.
 - **Persisted free space, on a paged file**, which without it can neither be committed to nor appended to — the buffer would hold nothing while its mark blocked every reader. An unpaged file has no such constraint.
 - **A version-3 superblock**, because the session marks the file while it holds it and nothing reads that byte back on an older one. See below.
 - **`SyncPolicy::OnClose`.** Under the default `Always` every barrier is an `fsync` that flushes the buffer, so it would hold nothing while still costing the mark.
@@ -401,11 +393,24 @@ There is also **a session long enough to pay for the mark**, which is a trade ra
 
 `File::create_with_options` refuses a creation/access pair it could not reopen with, rather than writing the file first, and the SWMR writer refuses a page buffer outright: its readers observe the order its writes become visible in, which is exactly what a buffer coalesces away.
 
+### Choosing a budget
+
+Any budget of at least one page is accepted, and one below 1 MiB is a request for less resident memory rather than a mistake — a writer inside a tight memory cap can ask for 256 KiB and get it. What it buys that memory with is writes: the budget is the point at which everything held is flushed, so a long contiguous run is flushed and restarted once per budget's worth of it. Writes issued, measured on a 4 KiB-paged file:
+
+| workload | unset | 4 KiB | 64 KiB | 1 MiB |
+| --- | --- | --- | --- | --- |
+| 32 chunk appends into 8 datasets, then a commit | 188 | 25 | 4 | 4 |
+| one 4 MiB append | 131 | 1,094 | 74 | 10 |
+
+On the scattered workload a page buffer exists for, a small budget costs little; on the long run 64 KiB is seven times the writes of 1 MiB.
+
+The memory comparison against leaving the property unset is not the one that table suggests. A session that sets nothing already gathers up to 1 MiB of dirty bytes **per operation** and releases it at every barrier; a page buffer holds its budget **across** operations, until the budget is spent, an `fsync`, or `close`. So 1 MiB here trades a per-operation peak for a continuous residency of the same size, and a budget below 1 MiB lowers both.
+
 ### Where this differs from `H5Pset_page_buffer_size`
 
 **A paged file is not required.** `H5PB_create` refuses one, because the C page buffer is a page *cache* whose `min_meta_perc` / `min_raw_perc` reservations count pages the paged allocator keeps segregated by kind. This is a write gatherer instead: it merges runs within a page-sized window and flushes whole, so a window is all it needs, and an unpaged file gets the same 4 KiB one every read-write session already gathers under. Since unpaged is the default strategy, requiring `Page` put the property out of reach of most files for no reason this implementation had.
 
-**The 1 MiB floor has no C counterpart**, because `H5PB_write` bypasses the C buffer for any I/O of a page or more — capping memory there does not throttle a long write. Nothing bypasses this gatherer, so the floor stands in for that.
+**A small budget costs writes here, where it costs none in C**, because `H5PB_write` bypasses the C buffer for any I/O of a page or more — capping memory there does not throttle a long write. Nothing bypasses this gatherer, so a small budget is also where a long run is flushed and restarted. Both libraries accept the budget; only this one charges for it.
 
 **A sub-page budget is refused rather than rounded.** `H5Fcreate` refuses it too; `H5Fopen` rounds it up to one page silently, and on an unpaged file silently zeroes the budget outright. A property quietly ignored is worse than one refused.
 

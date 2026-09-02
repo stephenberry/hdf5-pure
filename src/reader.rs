@@ -403,7 +403,7 @@ impl FileAccessProperties {
     ///
     /// # Refusals
     ///
-    /// Five, each refused with
+    /// Four, each refused with
     /// [`Error::EditUnsupported`](crate::Error::EditUnsupported) rather than
     /// quietly ignored:
     ///
@@ -412,11 +412,6 @@ impl FileAccessProperties {
     ///   [`FileSpaceStrategy::Page`](crate::FileSpaceStrategy::Page), and the
     ///   format's 4 KiB default otherwise. A buffer that cannot hold one page
     ///   drains on every page it touches;
-    /// - a budget below the 1 MiB a session already gathers under, since a page
-    ///   buffer *replaces* that budget rather than adding to it, so a smaller one
-    ///   is also where a long contiguous run is flushed and restarted (one 4 MiB
-    ///   append: 10 writes at 1 MiB, 1,094 at 4 KiB). See below for why this
-    ///   floor has no counterpart in the C library;
     /// - a **paged** file whose free space is not persisted, which can be neither
     ///   committed to nor appended to, so the buffer would hold nothing while its
     ///   mark blocked every reader;
@@ -433,6 +428,31 @@ impl FileAccessProperties {
     /// observe the order its writes become visible in, which is exactly what a
     /// buffer coalesces away.
     ///
+    /// # Choosing a budget
+    ///
+    /// Any budget of at least one page is honored. One below 1 MiB is an explicit
+    /// request for less resident memory, not a mistake — a writer inside a tight
+    /// memory cap can ask for 256 KiB and get it — and what it buys that memory
+    /// with is writes: the budget is the point at which everything held is
+    /// flushed, so a long contiguous run is flushed and restarted once per
+    /// budget's worth of it. Writes issued on a 4 KiB-paged file:
+    ///
+    /// | workload | unset | 4 KiB | 64 KiB | 1 MiB |
+    /// | --- | --- | --- | --- | --- |
+    /// | 32 chunk appends into 8 datasets, then a commit | 188 | 25 | 4 | 4 |
+    /// | one 4 MiB append | 131 | 1,094 | 74 | 10 |
+    ///
+    /// On the scattered workload this property exists for, a small budget costs
+    /// little; on the long run 64 KiB is seven times the writes of 1 MiB.
+    ///
+    /// The memory comparison against leaving this unset is not the one the table
+    /// suggests. A session that sets nothing already gathers up to 1 MiB of dirty
+    /// bytes **per operation**, and releases it at every ordering barrier; a page
+    /// buffer holds its budget **across** operations, until the budget is spent,
+    /// an `fsync`, or [`File::close`]. So 1 MiB here trades a per-operation peak
+    /// for a continuous residency of the same size, and a budget below 1 MiB
+    /// lowers both.
+    ///
     /// # How this differs from `H5Pset_page_buffer_size`
     ///
     /// **A paged file is not required, where the C library requires one.**
@@ -445,23 +465,13 @@ impl FileAccessProperties {
     /// unpaged is the default strategy, requiring `Page` put this property out of
     /// reach of most files for no reason this implementation had.
     ///
-    /// **The 1 MiB floor has no C counterpart, because the C buffer bypasses
-    /// itself.** `H5PB_write` sends any I/O of a page or more straight to the
-    /// driver, so a small `page_buf_size` there caps memory without throttling a
-    /// long write. Nothing bypasses here — the budget is the point at which
-    /// everything held is flushed — so a small one turns a single long run into
-    /// repeated flushes. The floor is what stands in for that bypass, and it
-    /// costs nothing measurable to give up. Writes issued on a 4 KiB-paged file:
-    ///
-    /// | workload | unset | 4 KiB | 64 KiB | 1 MiB |
-    /// | --- | --- | --- | --- | --- |
-    /// | 32 chunk appends into 8 datasets, then a commit | 188 | 25 | 4 | 4 |
-    /// | one 4 MiB append | 131 | 1,094 | 74 | 10 |
-    ///
-    /// On the scattered workload this property exists for, 64 KiB buys nothing
-    /// 1 MiB does not; on the long run it is 7x worse. Nor is the floor memory a
-    /// session was not already spending — the gather budget it replaces is the
-    /// same figure.
+    /// **A small budget costs writes here, where it costs none in C.**
+    /// `H5PB_write` sends any I/O of a page or more straight to the driver, so a
+    /// small `page_buf_size` there caps memory without throttling a long write.
+    /// Nothing bypasses this buffer — the budget is the point at which everything
+    /// held is flushed — so a small one turns a single long run into repeated
+    /// flushes. Both libraries accept the budget; only this one charges for it.
+    /// See [Choosing a budget](#choosing-a-budget) for what it charges.
     ///
     /// **A sub-page budget is refused rather than rounded.** `H5Fopen` rounds it
     /// up to one page silently, and `H5Fcreate` refuses it. A property quietly
@@ -8242,20 +8252,20 @@ mod tests {
     ///
     /// Each refusal has a different reason and none stands in for the others: a
     /// budget under one page is a buffer that drains on every page it touches, a
-    /// budget under the session's own gather budget replaces it with something
-    /// that can be far worse, a *paged* file that persists no free space can
-    /// neither commit nor append, a pre-version-3 superblock carries a
-    /// status-flags byte no library reads back so the crash mark would announce
-    /// nothing, and the SWMR writer's readers observe the order its writes become
-    /// visible in. The first is where the C library refuses
-    /// `H5Pset_page_buffer_size` too; the rest are this crate's.
+    /// *paged* file that persists no free space can neither commit nor append, a
+    /// pre-version-3 superblock carries a status-flags byte no library reads back
+    /// so the crash mark would announce nothing, and the SWMR writer's readers
+    /// observe the order its writes become visible in. The first is where the C
+    /// library refuses `H5Pset_page_buffer_size` too; the rest are this crate's.
     ///
-    /// An unpaged file is **not** among them, which is what the first case here
-    /// pins: `H5PB_create` requires the paged allocator because the C page buffer
-    /// is a page cache with per-kind reservations, and this gatherer has neither
-    /// (issue #357).
+    /// Two shapes are **not** among them, and the accepted cases here are what
+    /// pin that. An unpaged file: `H5PB_create` requires the paged allocator
+    /// because the C page buffer is a page cache with per-kind reservations, and
+    /// this gatherer has neither (issue #357). And a budget below the 1 MiB a
+    /// session already gathers under, which is a request for less resident
+    /// memory paid for in writes rather than an unhonorable pair (issue #391).
     ///
-    /// Every case also asserts the file is left byte-identical. Each refusal
+    /// Every refusal also asserts the file is left byte-identical. Each one
     /// fires with a read-write session already open, and the version-3 one fires
     /// from the same function that raises the mark — so a refusal ordered after
     /// the raise would leave a file marked in use by a session that never
@@ -8298,14 +8308,25 @@ mod tests {
             );
         };
 
-        // The one that is *accepted*, kept here beside its former siblings so
-        // reinstating the refusal fails this test rather than only the behavior
-        // test one module over.
+        // The two that are *accepted*, kept here beside their former siblings so
+        // reinstating either refusal fails this test rather than only the
+        // behavior tests one module over.
         let unpaged = fixture("unpaged.h5", false);
         let accepted = File::open_rw_with_options(&unpaged, buffered(1 << 20));
         assert!(
             accepted.is_ok(),
             "a page buffer on an unpaged file must be accepted, got {accepted:?}"
+        );
+        accepted.unwrap().close().unwrap();
+
+        // 256 KiB on a 16 KiB-paged file: a budget the session would not have
+        // gathered under, which is the point of asking for it.
+        let small_budget = fixture("small_budget.h5", true);
+        let accepted = File::open_rw_with_options(&small_budget, buffered(256 * 1024));
+        assert!(
+            accepted.is_ok(),
+            "a page buffer below the byte budget a session gathers under must be \
+             accepted, got {accepted:?}"
         );
         accepted.unwrap().close().unwrap();
 
@@ -8317,17 +8338,6 @@ mod tests {
             "a budget below one page must be refused, got {refused:?}"
         );
         untouched("budget under one page", &paged, &before);
-
-        // A budget that clears the page size but not the byte budget a session
-        // already gathers under. This is the sharpest of the three: such a buffer
-        // looks reasonable and would replace a 1 MiB gather budget with a smaller
-        // one, issuing *more* writes than leaving the property unset.
-        let refused = File::open_rw_with_options(&paged, buffered(64 * 1024));
-        assert!(
-            matches!(&refused, Err(Error::EditUnsupported(m)) if m.contains("already gathers")),
-            "a budget under the session gather budget must be refused, got {refused:?}"
-        );
-        untouched("budget under the gather budget", &paged, &before);
 
         // And the pairing a caller reaches by doing nothing, since Always is the
         // default: every barrier there is an fsync that flushes the buffer.
@@ -8462,11 +8472,11 @@ mod tests {
         // rather than with its siblings, so this function did not restate it and
         // the file was written before the open failed.
         let cases: [(&str, crate::FileCreateProperties, usize, SyncPolicy); 5] = [
-            // A page larger than the 1 MiB floor, which is the only shape in
-            // which the page-size half of the check below decides anything: for
-            // every smaller page the floor already refuses whatever it would.
+            // A page larger than the budget, on a file that does not exist yet:
+            // the page size has to come from the creation properties, which is
+            // what this pins.
             (
-                "page larger than the floor",
+                "page larger than the budget",
                 paged(2 << 20),
                 1 << 20,
                 SyncPolicy::OnClose,
@@ -8484,10 +8494,14 @@ mod tests {
                 8192,
                 SyncPolicy::OnClose,
             ),
+            // The unpaged arm of the same check, which decides on its own now
+            // that a budget below the session's gather budget is honored (issue
+            // #391): an unpaged file has no page size, so it is held to the
+            // format's 4 KiB default and 2 KiB falls short of it.
             (
-                "budget under the gather budget",
-                paged(16 * 1024),
-                64 * 1024,
+                "unpaged budget under the default page",
+                crate::FileCreateProperties::new(),
+                2048,
                 SyncPolicy::OnClose,
             ),
             (
@@ -8521,21 +8535,23 @@ mod tests {
 
         // The honorable pairs still create — including the unpaged one, which is
         // the default creation properties and so the pair a caller reaches by
-        // asking for nothing but the buffer.
-        for (label, create) in [
-            ("paged", paged(16 * 1024)),
-            ("unpaged", crate::FileCreateProperties::new()),
+        // asking for nothing but the buffer, and the 256 KiB one, which is below
+        // the byte budget a session gathers under (issue #391).
+        for (label, create, budget) in [
+            ("paged", paged(16 * 1024), 1 << 20),
+            ("unpaged", crate::FileCreateProperties::new(), 1 << 20),
+            ("paged_small_budget", paged(16 * 1024), 256 * 1024),
         ] {
             let ok = File::create_with_options(
                 dir.path().join(std::format!("ok_{label}.h5")),
                 create,
                 FileAccessProperties::new()
                     .with_sync_policy(SyncPolicy::OnClose)
-                    .with_page_buffer_size(1 << 20),
+                    .with_page_buffer_size(budget),
             );
             assert!(
                 ok.is_ok(),
-                "{label}: a file with an ample budget must create: {ok:?}"
+                "{label}: an honorable budget must create: {ok:?}"
             );
             ok.unwrap().close().unwrap();
         }
