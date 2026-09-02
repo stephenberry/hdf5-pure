@@ -5390,6 +5390,10 @@ fn a_staged_edit_to_a_replaced_object_is_refused() {
         matches!(&err, Error::EditUnsupported(m) if m.contains("at or under a replaced path")),
         "unexpected error: {err:?}"
     );
+    // A handle keeps the session (and its exclusive lock) alive until it is
+    // dropped; on Windows that lock is mandatory, so the reopen below needs
+    // both gone.
+    drop(doomed);
     drop(session);
     let file = File::open(&path).unwrap();
     assert_eq!(
@@ -6632,6 +6636,10 @@ fn a_staged_subtree_is_addressable_before_the_commit() {
     // The same handles now read the objects in the file.
     assert_eq!(col.read_u64().unwrap(), vec![1, 2, 3]);
     assert_eq!(epoch.datasets().unwrap(), vec!["sys_time".to_string()]);
+    // The handles keep the session's exclusive lock alive; drop them before
+    // reopening, since that lock is mandatory on Windows.
+    drop(col);
+    drop(epoch);
     drop(session);
 
     let file = File::open(&path).unwrap();
@@ -6948,6 +6956,9 @@ fn appending_through_a_handle_onto_a_replaced_dataset_is_refused() {
     );
 
     session.commit().unwrap();
+    // Handles keep the session's exclusive lock alive, and that lock is
+    // mandatory on Windows, so they go before the file is opened again.
+    drop(doomed);
     drop(session);
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("x").unwrap().read_i32().unwrap(), vec![100]);
@@ -7049,6 +7060,11 @@ fn deleting_a_staged_object_withdraws_it() {
 
     // A commit of nothing leaves the file byte-identical.
     session.commit().unwrap();
+    // Handles keep the session's exclusive lock alive, and that lock is
+    // mandatory on Windows, so they go before the file is opened again.
+    drop(ds);
+    drop(grp);
+    drop(root);
     drop(session);
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
@@ -7076,6 +7092,9 @@ fn deleting_a_staged_replacement_leaves_the_deletion_it_replaced() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
     session.commit().unwrap();
+    // Handles keep the session's exclusive lock alive, and that lock is
+    // mandatory on Windows, so they go before the file is opened again.
+    drop(root);
     drop(session);
 
     let file = File::open(&path).unwrap();
