@@ -91,18 +91,24 @@
 //! reader follows, which is defined in terms of the header counts rather than the
 //! dimension.
 //!
-//! Inside the engine there is one shape these sweeps cannot reach: an append
-//! that allocates out of *freed* space rather than at end-of-file (issue #349).
-//! A session's free list is populated only by its own commits, and
-//! [`Recording::of`] reads the base file before the window and requires the
-//! session to open inside it — so reaching that branch means bringing a whole
-//! `commit` into the recorded window, which would undo the positioning this
-//! module's own [`WARMUP_ROUNDS`] and [`Recording::assert_positioned`] exist to
-//! guarantee. What the sweeps would be looking for is closed by argument
-//! instead: the barriers are there because an *appended* region sits above the
-//! pointer naming it, and a reused region either sits above it too — the same
-//! case — or below it, where address-ordered gathering already issues the
-//! content first. See [`Store::alloc_raw`](crate::chunk_index_inplace::Store::alloc_raw).
+//! An append that allocates out of *freed* space rather than at end-of-file
+//! (issue #349) is swept by [`appending_into_a_reserved_hole_survives_a_crash_at_every_write`],
+//! which reaches the branch through a file that **persists** its free space: such
+//! a session seeds its free list from the on-disk managers at open, so the hole
+//! is there before the recorded window rather than made by a commit inside it.
+//! That sweep is also the only one that crosses a *reservation* — the manager
+//! rewrite an append on such a file makes before it may spend a hole (issue
+//! #387) — which is a superblock repoint in the middle of an append sequence.
+//!
+//! On a *non*-persisting file the same branch stays out of reach, and is closed
+//! by argument instead: a session's free list is populated only by its own
+//! commits, so reaching it would mean bringing a whole `commit` into the recorded
+//! window and undoing the positioning [`WARMUP_ROUNDS`] and
+//! [`Recording::assert_positioned`] exist to guarantee. The barriers are there
+//! because an *appended* region sits above the pointer naming it, and a reused
+//! region either sits above it too — the same case — or below it, where
+//! address-ordered gathering already issues the content first. See
+//! [`Store::alloc_raw`](crate::chunk_index_inplace::Store::alloc_raw).
 //!
 //! Filtered chunk writes are covered only through this engine, by
 //! [`regrowing_a_filtered_trailing_chunk_survives_a_crash_at_every_write`],
@@ -818,6 +824,158 @@ fn a_crashed_append_can_be_reopened_and_appended_to() {
         }
         appended_prefix_is_intact(p, before + RECOVER_APPEND, before + RECOVER_APPEND)
         },
+        |p| appended_all_the_way(p, hi),
+    );
+}
+
+/// Bytes of hole the reserved-append sweep leaves on the disk for the recorded
+/// session to draw on.
+///
+/// It has to exceed one reserve batch, or the session declines to draw at all
+/// and the sweep is back to covering an ordinary end-of-file append. Twice the
+/// batch, so the draw leaves a remainder and the close-time rewrite that hands it
+/// back is inside the window too.
+const RESERVE_HOLE: usize = 2 << 20;
+
+/// Recorded rounds for that sweep. Fewer than [`ROUNDS`], because every prefix
+/// writes out a file that carries the hole above.
+const RESERVE_ROUNDS: i32 = 20;
+
+/// [`warmed_base`] on a file that persists its free space, with a hole of
+/// [`RESERVE_HOLE`] bytes already recorded in the on-disk managers when the
+/// recorded window opens.
+///
+/// The delete that makes the hole runs in *this* session, which closes before the
+/// recording starts. That is what lets the sweep reach the reuse branch without a
+/// commit inside the window: a persisting session seeds its free list from the
+/// managers at open, so the recorded session finds the hole rather than making
+/// it.
+fn warmed_base_with_a_persisted_hole(path: &Path) {
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.create_dataset("d")
+        .with_i32_data(&[0i32])
+        .with_shape(&[1])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[CHUNK]);
+    b.create_dataset("victim")
+        .with_i32_data(&vec![7i32; RESERVE_HOLE / 4]);
+    // Above the hole, so deleting the victim leaves an interior region rather
+    // than a run reaching end-of-file that the commit would truncate away.
+    b.create_dataset("ceiling").with_i32_data(&[9i32, 9, 9]);
+    b.write(path).unwrap();
+
+    let mut s = WriteEngine::open_with_locking(path, FileLocking::Enabled).unwrap();
+    s.set_sync_policy(SyncPolicy::OnClose);
+    let mut n = 1i32;
+    while n < WARMUP {
+        let take = ROUND.min(WARMUP - n);
+        append(&mut s, n, take);
+        n += take;
+    }
+    s.delete("victim").unwrap();
+    s.commit().unwrap();
+    drop(s);
+}
+
+/// No region the on-disk free-space managers advertise may overlap a chunk of
+/// `d`, or the survivor beside it.
+///
+/// This is what a reservation buys, stated as the thing a crash must not be able
+/// to break: the managers are a durable record that the *next* session allocates
+/// out of, so one offering space a live chunk occupies is not a stale number but
+/// a file the next writer corrupts. A prefix caught between the reservation's
+/// repoint and the bytes it lets the append write must still satisfy it, and so
+/// must one caught before the reservation at all.
+fn persisted_free_space_holds_nothing_live(path: &Path) -> Result<(), String> {
+    let Ok(f) = crate::reader::File::open(path) else {
+        // A prefix whose file does not open at all is the read's business, not
+        // this one's; it is classified there.
+        return Ok(());
+    };
+    let free = f.persisted_free_space();
+    let Ok(chunks) = f.dataset("d").and_then(|d| d.chunks()) else {
+        return Ok(());
+    };
+    for c in chunks {
+        let (lo, hi) = (c.address, c.address + c.storage_size);
+        for &(addr, len) in &free {
+            if addr < hi && lo < addr + len {
+                return Err(std::format!(
+                    "the managers advertise [{addr}, {}) as free, which overlaps a live \
+                     chunk of `d` at [{lo}, {hi})",
+                    addr + len
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One prefix of the reserved-append sweep: the dataset reads as a prefix of
+/// itself, and the managers describe nothing live.
+fn reserved_append_prefix_is_sound(path: &Path, lo: i32, hi: i32) -> Verdict {
+    match appended_prefix_is_intact(path, lo, hi) {
+        Verdict::Clean => {}
+        other => return other,
+    }
+    // The survivor above the hole, which a reservation that handed out the wrong
+    // bytes would be written over.
+    let ceiling = crate::reader::File::open(path).and_then(|f| f.dataset("ceiling")?.read_i32());
+    match ceiling {
+        Ok(v) if v == vec![9, 9, 9] => {}
+        Ok(v) => return Verdict::Silent(std::format!("`ceiling` reads as {v:?}")),
+        Err(e) => return Verdict::Loud(std::format!("{e:?}")),
+    }
+    match persisted_free_space_holds_nothing_live(path) {
+        Ok(()) => Verdict::Clean,
+        Err(why) => Verdict::Silent(why),
+    }
+}
+
+/// An in-place append on a file that persists its free space takes the space it
+/// spends *out* of the on-disk managers first, with a superblock repoint of its
+/// own, and only then writes into it (issue #387). A crash at any instant of that
+/// sequence must leave a file whose managers describe nothing live.
+///
+/// The reservation is a commit in the middle of an append run, so it is the one
+/// publish point in this module that is neither an append's own phase nor a
+/// session's teardown. The states it can be caught between are the interesting
+/// ones: after the draw and before the repoint, where the managers still list the
+/// batch and nothing has been written into it, and after the repoint and before
+/// the append, where they do not and it has not.
+#[test]
+fn appending_into_a_reserved_hole_survives_a_crash_at_every_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reserved.h5");
+    warmed_base_with_a_persisted_hole(&path);
+    let before = std::fs::metadata(&path).unwrap().len();
+
+    let rec = Recording::of("reserved", &path, |p| {
+        let mut s = WriteEngine::open_with_locking(p, FileLocking::Enabled).unwrap();
+        s.set_sync_policy(SyncPolicy::OnClose);
+        for r in 0..RESERVE_ROUNDS {
+            append(&mut s, WARMUP + r * ROUND, ROUND);
+        }
+        drop(s);
+    });
+
+    // The window has to have *reused* the hole, or this sweeps the ordinary
+    // end-of-file append under a longer file. Every appended byte landing inside
+    // the file is what says the reservation ran.
+    let after = std::fs::metadata(&path).unwrap().len();
+    let appended = (RESERVE_ROUNDS * ROUND) as u64 * 4;
+    assert!(
+        after < before + appended / 2,
+        "the recorded session grew the file from {before} to {after} while appending \
+         {appended} bytes, so it appended at end-of-file and no reservation was swept"
+    );
+    rec.assert_positioned(1, 0);
+
+    let hi = WARMUP + RESERVE_ROUNDS * ROUND;
+    rec.replay_every_prefix(
+        dir.path(),
+        |p| reserved_append_prefix_is_sound(p, WARMUP, hi),
         |p| appended_all_the_way(p, hi),
     );
 }

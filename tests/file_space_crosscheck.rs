@@ -1159,3 +1159,140 @@ fn c_library_reads_our_paged_file_after_group_churn() {
         vec![7, 8, 9]
     );
 }
+
+/// An in-place `Dataset::append` on a persisting file spends holes an earlier
+/// commit left, and it does so by taking them out of the on-disk managers first
+/// (issue #387). The reference library is the reader that has to agree with the
+/// result: it re-parses those rewritten managers, reads every appended value
+/// back, and reports exactly the free space we record.
+///
+/// Both strategies, because the reserve is drawn from one list on a flat file and
+/// from the raw-typed one on a paged file, and only the C library's own accounting
+/// says the paged managers still segregate what they should.
+#[test]
+fn c_library_reads_our_file_after_an_append_reused_free_space() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+
+    // Comfortably more than one reserve batch, so the append draws from the hole
+    // rather than declining it.
+    let payload: Vec<i32> = (0..768 * 1024).collect();
+
+    for (label, strategy, paged) in [
+        ("flat", FileSpaceStrategy::FsmAggr, false),
+        ("paged", FileSpaceStrategy::Page, true),
+    ] {
+        let path = dir.path().join(format!("ours_append_reuse_{label}.h5"));
+        let mut b = FileBuilder::new();
+        b.with_file_space_strategy(strategy, true, 1);
+        if paged {
+            b.with_file_space_page_size(16384);
+        }
+        b.create_dataset("keep").with_i32_data(&[1, 2, 3, 4]);
+        b.write(&path).unwrap();
+
+        let make_log = |file: &File, name: &str| {
+            file.root()
+                .create_dataset(name, |b| {
+                    b.with_i32_data(&[])
+                        .with_shape(&[0])
+                        .with_chunks(&[16384])
+                        .with_maxshape(&[u64::MAX]);
+                })
+                .unwrap();
+            file.commit().unwrap();
+        };
+
+        {
+            let file = File::open_rw_with_options(
+                &path,
+                FileAccessProperties::new().with_sync_policy(hdf5_pure::SyncPolicy::OnClose),
+            )
+            .unwrap();
+            make_log(&file, "log");
+            file.dataset("log").unwrap().append(&payload).unwrap();
+            // A live object above the churn, so the delete leaves an interior hole
+            // rather than a run the commit simply truncates away.
+            file.root()
+                .create_dataset("ceiling", |b| {
+                    b.with_i32_data(&[9, 9, 9]);
+                })
+                .unwrap();
+            file.commit().unwrap();
+            let after_first = std::fs::metadata(&path).unwrap().len();
+
+            file.root().delete("log").unwrap();
+            file.commit().unwrap();
+
+            make_log(&file, "log2");
+            file.dataset("log2").unwrap().append(&payload).unwrap();
+            file.close().unwrap();
+
+            let after_second = std::fs::metadata(&path).unwrap().len();
+            assert!(
+                after_second < after_first + payload.len() as u64 * 2,
+                "{label}: the second append should have reused the hole (was \
+                 {after_first}, now {after_second})"
+            );
+        }
+
+        let ours = File::open(&path).unwrap();
+        assert_eq!(ours.dataset("log2").unwrap().read_i32().unwrap(), payload);
+        let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+        drop(ours);
+
+        let f = hdf5::File::open(&path).unwrap();
+        assert_eq!(
+            f.create_plist().unwrap().get_file_space_strategy().unwrap(),
+            CStrategy::FreeSpaceManager {
+                paged,
+                persist: true,
+                threshold: 1,
+            },
+            "{label}: C library recovers our strategy after an append reused free space"
+        );
+        assert_eq!(
+            f.dataset("log2").unwrap().read_raw::<i32>().unwrap(),
+            payload,
+            "{label}: the C library reads every value the reusing append wrote"
+        );
+        assert_eq!(
+            f.dataset("keep").unwrap().read_raw::<i32>().unwrap(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            f.dataset("ceiling").unwrap().read_raw::<i32>().unwrap(),
+            vec![9, 9, 9]
+        );
+        let free_c = unsafe { H5Fget_freespace(f.id()) };
+        assert_eq!(
+            free_c as u64, total_ours,
+            "{label}: C free-space total matches the managers the reservation rewrote"
+        );
+        drop(f);
+
+        // And the C library reopens the file read-write and allocates out of those
+        // managers itself — the session that would have written over live data had
+        // the append spent a hole the managers still advertised.
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            f.new_dataset::<f64>()
+                .shape((4096,))
+                .create("c_added")
+                .unwrap()
+                .write(&vec![2.5f64; 4096])
+                .unwrap();
+            f.close().unwrap();
+        }
+        let ours = File::open(&path).unwrap();
+        assert_eq!(
+            ours.dataset("log2").unwrap().read_i32().unwrap(),
+            payload,
+            "{label}: the C library's own allocation must not have landed on live chunks"
+        );
+        assert_eq!(
+            ours.dataset("c_added").unwrap().read_f64().unwrap(),
+            vec![2.5f64; 4096]
+        );
+    }
+}

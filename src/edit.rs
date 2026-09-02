@@ -152,8 +152,17 @@
 //! index blocks through [`Store::alloc_raw`], which
 //! [`WriteEngine::immediate_reuse_allowed`] gates: an append has no superblock
 //! repoint to publish its allocations with, so it reuses only where the space it
-//! overwrites is dead on the disk as it stands, which excludes a file that
-//! persists its free-space managers and the SWMR writer (issue #349). Everything
+//! overwrites is dead on the disk as it stands (issue #349). On a file that
+//! **persists** its managers a hole in the list is one the disk still advertises,
+//! so the append does not spend it directly: it takes a batch out of the
+//! published managers first
+//! ([`WriteEngine::reserve_for_immediate_append`], issue #387) and spends only
+//! that, which makes the on-disk record true of every byte it writes at every
+//! instant. What the session does not spend goes back before the managers are
+//! next rewritten; a session that dies in between strands the remainder, which is
+//! accounted to nobody and so can never be handed out twice. The SWMR writer
+//! reuses nothing at all, for a reason publication does not reach: its readers
+//! may still be inside the region. Everything
 //! a *commit* places goes through the other allocator
 //! ([`WriteEngine::reserve`] and [`WriteEngine::place`]), including a chunked
 //! dataset's data region and a dense attribute heap. Those carry addresses of
@@ -277,6 +286,23 @@ use crate::type_builders::{
 
 /// An undefined on-disk address (all bits set), HDF5's "no address" sentinel.
 const UNDEF: u64 = u64::MAX;
+
+/// How much free space an immediate in-place append takes out of a persisting
+/// file's on-disk managers at once, when the allocation in front of it needs
+/// less (issue #387).
+///
+/// Every draw costs a manager rewrite and a superblock repoint — a few kilobytes
+/// and two ordering barriers — so drawing per allocation would put a commit
+/// between every pair of chunks and make reuse cost more than the growth it
+/// avoids. A megabyte covers sixteen chunks at the 64 KiB scale the C library's
+/// own chunk-cache default is sized for, which puts the rewrite well outside the
+/// per-chunk path.
+///
+/// It is also the bound on what a crash can strand: the unspent remainder of one
+/// draw, plus whatever a single allocation took past it. Larger would amortize
+/// further and strand more; this is the point where the rewrite is already rare
+/// enough that making it rarer buys little.
+const APPEND_RESERVE_BYTES: u64 = 1 << 20;
 
 /// The refusal both address-side reference screens report: an object reference
 /// this commit writes names an object the same commit removes.
@@ -966,6 +992,34 @@ pub(crate) struct WriteEngine {
     /// persists its free space (`persist` is `Some`), `open` instead seeds it
     /// from the on-disk free-space managers, so reuse spans sessions.
     free: FreeList,
+    /// Space this session has taken *out* of the on-disk free-space managers so
+    /// that an immediate in-place append may spend it (issue #387).
+    ///
+    /// Only a file that persists its free space uses this. Such a file records
+    /// its holes on disk, and an append has no superblock repoint of its own to
+    /// publish an allocation with — so an append that simply drew from
+    /// [`free`](Self::free) would leave a manager advertising bytes a live chunk
+    /// now occupies, through a clean close as much as a crash. The reserve is
+    /// the answer: [`reserve_for_immediate_append`](Self::reserve_for_immediate_append)
+    /// moves a batch of bytes out of `free` (or, on a paged file, out of
+    /// [`PagedEdit`]'s raw list) and rewrites the managers *without* them, under
+    /// the same crash-atomic superblock repoint every persisting commit uses.
+    /// Only then may an append write there, because by then no durable record
+    /// calls those bytes free.
+    ///
+    /// What is left unspent goes back — into `free` or `PagedEdit` — before the
+    /// managers are next rewritten, which is [`release_reserve`](Self::release_reserve)
+    /// at the next commit and at close. A session that dies in between strands
+    /// the unspent remainder: it is accounted to nobody, so it is never handed
+    /// out twice, and a later `H5repack` or whole-file rewrite recovers it. That
+    /// is the same trade the module header records for
+    /// [`finalize_persist`](Self::finalize_persist), on a bounded surface — at
+    /// most [`APPEND_RESERVE_BYTES`] plus one allocation.
+    ///
+    /// Empty for a non-persisting session, which reuses out of `free` directly:
+    /// its list is in memory alone, so nothing on the disk claims those bytes
+    /// are free and nothing has to be published before they are spent.
+    reserved: FreeList,
     /// Whether this file has been *proved* to hold no object reference at all —
     /// the one thing that lets a commit skip the walk that repoints them
     /// (issue #324).
@@ -1228,6 +1282,12 @@ pub(crate) struct WriteEngine {
 /// [`WriteEngine::publish_attempted`] gates it.
 struct FreeSnapshot {
     free: FreeList,
+    /// The append reserve, which the persisting commit tail drains back into the
+    /// lists above before it rewrites the managers. A commit that then fails
+    /// before publishing leaves those managers as they were — still not listing
+    /// the reserve — so restoring it is what keeps the session's picture of the
+    /// disk exact (issue #387).
+    reserved: FreeList,
     paged: Option<(FreeList, FreeList)>,
     /// The heap-collection provenance, rolled back with the free lists.
     ///
@@ -2083,8 +2143,8 @@ pub struct SpaceAccounting {
     /// trailing bytes (the same slack [`File::file_size`](crate::File::file_size)
     /// surfaces), since opening does not rewrite that address.
     pub logical_size: u64,
-    /// Total reusable free bytes the next allocation or [`commit`](crate::File::commit)
-    /// can draw from before the file has to grow — the summed length of
+    /// Total reusable free bytes this session can draw from before the file has to
+    /// grow — the summed length of
     /// [`reusable_free_space`](Self::reusable_free_space).
     ///
     /// Counts holes left inside [`logical_size`](Self::logical_size) by this
@@ -2098,6 +2158,22 @@ pub struct SpaceAccounting {
     /// shrinkage: a region counted here may be truncated away at commit — rather
     /// than reused — if adjacent space is later freed and the coalesced run
     /// reaches end-of-file.
+    ///
+    /// **Which write can spend it is not uniform on a persisting file.** Such a
+    /// session may write into a hole only once it has taken that hole *out* of
+    /// the on-disk managers, so an in-place [`append`](crate::Dataset::append)
+    /// holds a reserve of up to a megabyte that this figure counts and the next
+    /// [`commit`](crate::File::commit) cannot place into: the commit gives the
+    /// unspent part back in the same tail that rewrites the managers, which runs
+    /// *after* it has placed everything. The commit after that one can. So on a
+    /// persisting file read this as "space this session will reuse rather than
+    /// grow for", not as "space the very next commit can fill".
+    ///
+    /// It is also not the on-disk view. That reserve is deliberately absent from
+    /// the free-space managers for as long as the session holds it, so
+    /// [`File::persisted_free_space`](crate::File::persisted_free_space) — which
+    /// reads those managers — reports less than this by whatever is reserved,
+    /// and is the figure to compare against what another tool would find.
     pub reusable_free_bytes: u64,
     /// The reusable free regions as `(offset, length)` pairs, sorted ascending by
     /// offset and fully coalesced (no two regions touch or overlap).
@@ -2535,6 +2611,7 @@ impl WriteEngine {
             appender_claims: Vec::new(),
             next_appender_token: 0,
             free: FreeList::new(),
+            reserved: FreeList::new(),
             proved_free_of_references: false,
             persist: None,
             located: HashMap::new(),
@@ -3480,11 +3557,52 @@ impl WriteEngine {
     /// ```
     #[must_use]
     pub fn space_accounting(&self) -> SpaceAccounting {
-        // A paged file tracks its free space per page type; report the union, since
-        // the caller wants one total rather than a per-manager breakdown.
-        let reusable_free_space = match &self.paged {
-            Some(pg) => pg.reusable_sections(),
-            None => self.free.sections(),
+        // The append reserve is free space this session can still spend — it is
+        // out of the on-disk managers, not out of the file — so leaving it out
+        // would make an in-place append look like it had consumed bytes it has
+        // not yet placed anything in (issue #387).
+        //
+        // It is folded back through `FreeList::free` rather than appended and
+        // sorted, because a reserve span very often *abuts* what is left of the
+        // hole it was drawn from — and the spent end of the reserve walks toward
+        // that remainder until the two touch exactly. Reported as two regions
+        // they would break the field's documented contract in the one way that
+        // misleads: a caller sizing an allocation against the largest region
+        // would be told nothing that big fits when it does.
+        //
+        // It goes back into the list it came from and no other. On a paged file
+        // that is the raw list, which is what `take_raw_span` drew it out of;
+        // the two page-type lists stay reported side by side as they always
+        // were, because a caller cannot allocate across a page-type boundary and
+        // merging them would claim it could. `FreeList::free`'s debug assertion
+        // comes along and is welcome: the reserve is drawn out of exactly this
+        // list, so an overlap here would mean that invariant had already broken.
+        //
+        // A paged file tracks its free space per page type; report the union of
+        // the two, since the caller wants one total rather than a per-manager
+        // breakdown.
+        let reusable_free_space = match (&self.paged, self.reserved.is_empty()) {
+            // The common case, and every non-persisting session: no reserve to
+            // fold, so nothing is cloned.
+            (Some(pg), true) => pg.reusable_sections(),
+            (None, true) => self.free.sections(),
+            (Some(pg), false) => {
+                let mut raw = pg.raw.clone();
+                for (addr, len) in self.reserved.sections() {
+                    raw.free(addr, len);
+                }
+                let mut out = pg.meta.sections();
+                out.extend(raw.sections());
+                out.sort_by_key(|&(addr, _)| addr);
+                out
+            }
+            (None, false) => {
+                let mut free = self.free.clone();
+                for (addr, len) in self.reserved.sections() {
+                    free.free(addr, len);
+                }
+                free.sections()
+            }
         };
         let reusable_free_bytes = reusable_free_space.iter().map(|(_, len)| len).sum();
         SpaceAccounting {
@@ -3512,42 +3630,50 @@ impl WriteEngine {
         }
     }
 
-    /// Whether an immediate in-place append may allocate out of
-    /// [`free`](Self::free) instead of growing the file (issue #349).
+    /// Whether an immediate in-place append may allocate out of already-free
+    /// space instead of growing the file (issue #349, issue #387).
     ///
     /// The staged [`commit`](Self::commit) always may: it publishes its
     /// allocations with the superblock repoint, so a crash before that leaves a
     /// file whose root never named them. An immediate append has no repoint, so
     /// what has to hold instead is that the bytes it overwrites are dead *on the
-    /// disk as it stands* — and for two kinds of session they are not:
+    /// disk as it stands*. Which list satisfies that depends on the session:
     ///
+    /// - An ordinary [`File::open_rw`](crate::File::open_rw) session on a
+    ///   default-strategy file holds its free space in memory alone. A region in
+    ///   [`free`](Self::free) was freed by a commit this session already
+    ///   published, so nothing on the disk points at it and nothing on the disk
+    ///   claims it is free; a crash at any point of the append leaves it as dead
+    ///   as it was. It is spent directly.
+    /// - A file that **persists** its free-space managers records its holes on
+    ///   disk, so a hole in `free` is one a durable manager still advertises and
+    ///   spending it would leave that manager describing bytes a live chunk
+    ///   occupies — through a clean close as much as a crash, since only a commit
+    ///   or [`finalize_persist`](Self::finalize_persist) rewrites the record.
+    ///   Such a session therefore spends [`reserved`](Self::reserved) instead:
+    ///   space [`reserve_for_immediate_append`](Self::reserve_for_immediate_append)
+    ///   has already taken *out* of the published managers.
     /// - A **paged** file keeps its free space per page type in [`PagedEdit`]
     ///   rather than in [`free`](Self::free), so drawing from that list would be
-    ///   drawing from the wrong one. Named as its own term rather than left to
-    ///   the argument that the persist term already covers it (`open_rw` refuses
-    ///   a paged file that does not persist): a page-type invariant proved from
-    ///   another file's refusal is exactly the shape that has gone wrong here
-    ///   before (issue #261).
-    /// - A file that **persists** its free-space managers records its holes on
-    ///   disk, and only a commit or [`finalize_persist`](Self::finalize_persist)
-    ///   at close rewrites that record — and `finalize_persist` triggers on the
-    ///   file having *grown*, which an append that spent a hole need not have
-    ///   done. So such an append could leave a manager advertising space a live
-    ///   chunk occupies, through a clean close as much as a crash, and the next
-    ///   session would hand it out over the top.
-    /// - The **SWMR** writer's readers may still be reading a region this session
-    ///   freed; the format forbids reusing it while they are, which is why the C
-    ///   library's own SWMR writer allocates append-only. No test can reach this
-    ///   term today, because a SWMR session refuses every staged edit
-    ///   ([`Error::SwmrStagedUnsupported`]) and so never frees anything. It is
-    ///   here so that lifting that refusal cannot silently enable reuse.
+    ///   drawing from the wrong one and would put a byte of one kind in a page of
+    ///   the other. It draws its reserve through [`PagedEdit::alloc_typed`] with
+    ///   [`PageType::Raw`] instead, which is what keeps a page holding one kind.
+    ///   Named as its own term at the call site rather than left to the argument
+    ///   that the persist term already covers it (`append_prepare` refuses a
+    ///   paged file that does not persist): a page-type invariant proved from
+    ///   another function's refusal is exactly the shape that has gone wrong here
+    ///   before (issue #261). It costs nothing to name, because `reserved` is
+    ///   empty on a session that never reserved — the term declines reuse rather
+    ///   than misdirecting it.
     ///
-    /// Everything else — the ordinary [`File::open_rw`](crate::File::open_rw)
-    /// session on a default-strategy file — holds its free space in memory alone.
-    /// A region in that list was freed by a commit this session already
-    /// published, so nothing on the disk points at it and nothing on the disk
-    /// claims it is free; a crash at any point of the append leaves it as dead as
-    /// it was.
+    /// The **SWMR** writer is the one absolute bar, and it is not about
+    /// publication at all: its concurrent readers may still be inside a region
+    /// this session freed, and the format forbids reusing one while they are,
+    /// which is why the C library's own SWMR writer allocates append-only. No
+    /// test can reach this term today, because a SWMR session refuses every
+    /// staged edit ([`Error::SwmrStagedUnsupported`]) and so never frees
+    /// anything. It is here so that lifting that refusal cannot silently enable
+    /// reuse.
     ///
     /// One window is inherited rather than introduced. A commit whose superblock
     /// write itself fails leaves [`publish_attempted`](Self::publish_attempted)
@@ -3557,7 +3683,131 @@ impl WriteEngine {
     /// before. That is the same trade, on a larger surface: doing nothing is
     /// still the only answer that is never actively wrong.
     fn immediate_reuse_allowed(&self) -> bool {
-        self.paged.is_none() && self.persist.is_none() && !self.swmr_mode
+        !self.swmr_mode
+    }
+
+    /// Take a batch of free space out of the on-disk free-space managers so an
+    /// immediate in-place append may spend it, for a session that persists them
+    /// (issue #387). Returns whether [`reserved`](Self::reserved) can now serve a
+    /// contiguous `want` bytes.
+    ///
+    /// The draw and the publication are one step and in that order: the bytes
+    /// leave [`free`](Self::free) (or [`PagedEdit`]'s raw list) first, and the
+    /// managers are then rewritten through the ordinary persisting commit tail
+    /// with nothing to free and the root unchanged — the same call
+    /// [`finalize_persist`](Self::finalize_persist) makes, whose superblock
+    /// repoint is the crash-atomic linearization point. Before that repoint the
+    /// old managers stand and still list the batch, which is correct because
+    /// nothing has been written into it; after it, no durable record calls those
+    /// bytes free and the append may have them.
+    ///
+    /// Nothing here moves a live object: `to_free` is empty and the new root is
+    /// the old one, so the tail places only itself, in a hole or past the live
+    /// data. The [`located`](Self::located) append-geometry cache is therefore
+    /// still valid across this call, which is what lets it run between an
+    /// append's plan and its apply.
+    ///
+    /// Returns `Ok(false)` — not an error — when the session persists nothing to
+    /// draw from, or when no hole as large as a whole batch is left; the caller
+    /// simply grows the file, as it always did. An error means the manager rewrite
+    /// itself failed, and the batch is handed back so the session's lists agree
+    /// with whatever the disk now holds: if the rewrite never published, they
+    /// match it exactly, and if it did, they over-report free space that is
+    /// genuinely free (nothing was written into it) and the next commit records
+    /// it again.
+    fn reserve_for_immediate_append(&mut self, want: u64) -> Result<bool, Error> {
+        if want == 0 || self.persist.is_none() || self.swmr_mode {
+            return Ok(false);
+        }
+        if self.reserved.largest() >= want {
+            return Ok(true);
+        }
+        // One draw covers many appends: each costs a manager rewrite and a
+        // superblock repoint, so drawing per allocation would put a commit
+        // between every pair of chunks — which is why the batch size is a floor
+        // rather than a preference. A file whose largest hole is under it keeps
+        // appending at end-of-file, and gives up nothing worth the rewrite: a
+        // hole that small is not a file growing without bound.
+        if !self.take_raw_span(want.max(APPEND_RESERVE_BYTES)) {
+            return Ok(false);
+        }
+        match self.commit_persisting(self.superblock.root_group_address, Vec::new()) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                self.release_reserve();
+                Err(e)
+            }
+        }
+    }
+
+    /// Move `len` bytes of raw-appendable free space into
+    /// [`reserved`](Self::reserved), reporting whether a contiguous run that
+    /// large was available.
+    ///
+    /// A paged file draws through [`PagedEdit::alloc_typed`] with
+    /// [`PageType::Raw`], the same call the staged commit makes for a dataset's
+    /// data, so the reserve is raw-typed space and an append spending it cannot
+    /// mix a page. A flat file has one list and draws from it.
+    fn take_raw_span(&mut self, len: u64) -> bool {
+        let addr = match self.paged.as_mut() {
+            Some(pg) => pg.alloc_typed(len, PageType::Raw),
+            None => self.free.alloc(len),
+        };
+        match addr {
+            Some(addr) => {
+                self.reserved.free(addr, len);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Give the unspent append reserve back to the lists the managers are written
+    /// from, so the next rewrite records it as the free space it is.
+    ///
+    /// Called immediately before every rewrite of the on-disk managers — the
+    /// persisting commit tail and [`finalize_persist`](Self::finalize_persist) —
+    /// and nowhere else, so a commit that does *not* rewrite them (the
+    /// same-length-overwrite fast path) leaves the reserve intact for the appends
+    /// that follow it.
+    ///
+    /// The reserve is raw-typed on a paged file, so it goes back to the raw list.
+    /// A run that was claimed whole from the metadata list is raw space now, and
+    /// a page of it that is wholly free can be claimed back by either type
+    /// through [`PagedEdit::alloc_typed`], exactly as any other free page can.
+    fn release_reserve(&mut self) {
+        if self.reserved.is_empty() {
+            return;
+        }
+        let spans = std::mem::replace(&mut self.reserved, FreeList::new()).sections();
+        match self.paged.as_mut() {
+            Some(pg) => {
+                for (addr, len) in spans {
+                    pg.raw.free(addr, len);
+                }
+            }
+            None => {
+                for (addr, len) in spans {
+                    self.free.free(addr, len);
+                }
+            }
+        }
+    }
+
+    /// Rewrite the on-disk free-space managers for a persisting commit, giving
+    /// the unspent append reserve back first so the managers record it.
+    ///
+    /// Every caller that publishes a *tree* takes this rather than
+    /// [`commit_persisting`](Self::commit_persisting) directly. The one caller
+    /// that does not is [`reserve_for_immediate_append`](Self::reserve_for_immediate_append),
+    /// whose whole purpose is to publish managers that leave the reserve out.
+    fn commit_persisting_releasing_reserve(
+        &mut self,
+        new_root: u64,
+        to_free: Vec<(u64, u64, FreeClass)>,
+    ) -> Result<(), Error> {
+        self.release_reserve();
+        self.commit_persisting(new_root, to_free)
     }
 
     /// Adopt the fapl's `fsync` cadence. Called once, on the funnel every
@@ -3658,7 +3908,8 @@ impl WriteEngine {
     /// this session left them stale.
     ///
     /// Immediate in-place appends grow the file past the managers, leaving them
-    /// describing a length the file no longer has. A staged
+    /// describing a length the file no longer has, or spend a reserve those
+    /// managers no longer list. A staged
     /// [`commit`](Self::commit) rewrites them as part of its tail, but a session
     /// that only appends never runs one, so [`File::close`](crate::File::close)
     /// and `FileInner::drop` call this instead. It is the same tail the commit
@@ -3674,19 +3925,25 @@ impl WriteEngine {
     /// this call's own writes the last the session issues.
     ///
     /// A no-op for a non-persisting file, and skipped when the file has not grown
-    /// past the managers since they were last written, so an unchanged session
-    /// never grows the file.
+    /// past the managers since they were last written *and* the session holds no
+    /// unspent append reserve, so an unchanged session never grows the file. The
+    /// reserve is the second condition because an append that spent a hole rather
+    /// than the end of the file leaves the length alone, and what it did not
+    /// spend is space the managers must be told about again (issue #387).
     ///
     /// If a session that grew the file ends without `close` or `drop` running (a
     /// true crash — `SIGKILL`, power loss), the managers are left describing the
-    /// shorter file. Every append was durable and crash-atomic, so no data is lost,
-    /// and both this crate and the reference C library reopen the file and read it
-    /// correctly; the managers simply under-report until a clean rewrite.
+    /// shorter file, and an unspent reserve is left out of them altogether. Every
+    /// append was durable and crash-atomic, so no data is lost, and both this
+    /// crate and the reference C library reopen the file and read it correctly;
+    /// the managers simply under-report until a clean rewrite, which wastes those
+    /// bytes and never hands them out twice.
     pub(crate) fn finalize_persist(&mut self) -> Result<(), Error> {
-        if self.persist.is_none() || self.image.len() == self.fsm_len {
+        if self.persist.is_none() || (self.image.len() == self.fsm_len && self.reserved.is_empty())
+        {
             return Ok(());
         }
-        self.commit_persisting(self.superblock.root_group_address, Vec::new())
+        self.commit_persisting_releasing_reserve(self.superblock.root_group_address, Vec::new())
     }
 
     /// Resolve and locate an in-place append target, applying every rule that
@@ -3954,8 +4211,37 @@ impl WriteEngine {
                 )
             };
             let plan = plan_result.map_err(as_inplace_error)?;
+            // A persisting file's holes are advertised on disk, so this batch's
+            // bytes have to be taken out of the published managers before any of
+            // them is written into. Sized on the largest single blob, since the
+            // allocator serves each one from a contiguous run: a reserve that
+            // cannot hold the biggest is a reserve the biggest goes past. A
+            // refusal here (nothing left to draw, or nothing to draw from) is not
+            // an error — the append grows the file, as it always did. Placed
+            // between the plan and the apply because the manager rewrite it makes
+            // publishes a superblock, and nothing may be half-applied across that.
+            let largest_blob = plan
+                .new_chunk_bytes
+                .iter()
+                .map(|b| b.len() as u64)
+                .max()
+                .unwrap_or(0);
+            self.reserve_for_immediate_append(largest_blob)?;
             {
                 let reuse = self.immediate_reuse_allowed();
+                // Two terms, not one. A **paged** session must never be handed
+                // `free`: it keeps its space per page type in `PagedEdit`, so
+                // that list is the wrong one to draw from and placing a byte out
+                // of it would mix a page. Every paged session is a persisting one
+                // (`append_prepare` refuses a paged file without persistence), so
+                // the first term alone would pick `reserved` for it anyway — and
+                // that is exactly the shape issue #261 was: a page-type invariant
+                // proved from a refusal in another function. Named here so the
+                // safety is by construction, and so deleting that refusal cannot
+                // silently turn a paged append loose on the flat list. `reserved`
+                // is empty on any session that never reserved, which makes the
+                // extra term cost nothing but the reuse it correctly declines.
+                let from_reserve = self.persist.is_some() || self.paged.is_some();
                 let Self {
                     image,
                     superblock,
@@ -3963,6 +4249,7 @@ impl WriteEngine {
                     paged,
                     located,
                     free,
+                    reserved,
                     sync_policy,
                     ..
                 } = self;
@@ -3972,7 +4259,10 @@ impl WriteEngine {
                     superblock,
                     sb_sig_off: *sb_sig_off,
                     paged: paged.as_mut(),
-                    free: reuse.then_some(free),
+                    // A persisting or paged session spends only what the reserve
+                    // took out of the managers; every other session spends its
+                    // in-memory list directly. See `immediate_reuse_allowed`.
+                    free: reuse.then_some(if from_reserve { reserved } else { free }),
                     sync_policy: *sync_policy,
                 };
                 apply_ea_append(&mut store, &mut st.loc, &plan, max_phase)
@@ -4594,6 +4884,7 @@ impl WriteEngine {
     fn snapshot_free(&self) -> FreeSnapshot {
         FreeSnapshot {
             free: self.free.clone(),
+            reserved: self.reserved.clone(),
             paged: self
                 .paged
                 .as_ref()
@@ -4621,6 +4912,7 @@ impl WriteEngine {
     fn restore_free(&mut self, snapshot: FreeSnapshot) {
         self.vl_overwrite_heaps = snapshot.vl_overwrite_heaps;
         self.free = snapshot.free;
+        self.reserved = snapshot.reserved;
         if let (Some(pg), Some((meta, raw))) = (self.paged.as_mut(), snapshot.paged) {
             pg.meta = meta;
             pg.raw = raw;
@@ -5947,7 +6239,7 @@ impl WriteEngine {
         // truncating it away, so its commit takes a different tail: one that
         // rewrites the on-disk managers rather than only repointing the superblock.
         if self.persist.is_some() {
-            self.commit_persisting(new_root, to_free)?;
+            self.commit_persisting_releasing_reserve(new_root, to_free)?;
             return self.repoint_stored_references(&relocations);
         }
 
@@ -10205,9 +10497,11 @@ struct EditStore<'a> {
     /// borrow rather than a copy: padding recorded here has to reach the manager
     /// rewrite at the next commit or at close.
     paged: Option<&'a mut PagedEdit>,
-    /// The session's reusable free space, when an immediate append may draw from
-    /// it, and `None` when it may not — the gate is
-    /// [`WriteEngine::immediate_reuse_allowed`], which states the two cases.
+    /// The list an immediate append may draw from, and `None` when it may draw
+    /// from none — [`WriteEngine::immediate_reuse_allowed`] states which. It is
+    /// the session's own free list on a file that forgets its holes at close, and
+    /// [`WriteEngine::reserved`] — space already taken out of the on-disk
+    /// managers — on one that persists them.
     free: Option<&'a mut FreeList>,
     /// The session's `fsync` cadence, carried by value: the append engine's own
     /// ordered barriers ([`apply_ea_append`]) are durability points like the
@@ -16976,6 +17270,170 @@ mod tests {
             after,
             "finalize_persist returned with writes still gathered"
         );
+    }
+
+    /// [`SpaceAccounting::reusable_free_space`] stays coalesced once an in-place
+    /// append holds a reserve (issue #387).
+    ///
+    /// The reserve is drawn *out of* the session's free list, so what is left of
+    /// the hole it came from sits immediately beside it — and as the append
+    /// spends the reserve down, the spent end walks toward that remainder until
+    /// the two abut exactly. Reporting them as two regions would break the
+    /// field's documented contract ("no two regions touch or overlap") in the one
+    /// way that misleads: a caller sizing an allocation against the largest
+    /// region would be told nothing that big fits when it does.
+    ///
+    /// Sixteen chunk-sized appends, checked after every one, because the abutment
+    /// appears only at a particular point in spending a batch rather than at the
+    /// first append.
+    #[test]
+    fn the_append_reserve_is_reported_as_one_coalesced_free_list() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        /// Elements of the dataset the delete vacates: three reserve batches, so
+        /// the hole outlives several draws.
+        const VICTIM: usize = (APPEND_RESERVE_BYTES as usize * 3) / 4;
+        /// Elements per chunk: 64 KiB, so sixteen appends spend a whole batch.
+        const CHUNK: u64 = 16384;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reserve_coalesced.h5");
+        let mut b = FileBuilder::new();
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+        b.create_dataset("t0")
+            .with_i32_data(&[0i32])
+            .with_shape(&[1])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[CHUNK]);
+        b.create_dataset("victim")
+            .with_i32_data(&vec![7i32; VICTIM]);
+        b.create_dataset("ceiling").with_i32_data(&[9i32, 9, 9]);
+        b.write(&path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        s.set_sync_policy(SyncPolicy::OnClose);
+        s.delete("victim").unwrap();
+        s.commit().unwrap();
+
+        let batch: Vec<i32> = (0..CHUNK as i32).collect();
+        let mut reserved_ever = false;
+        for round in 0..16 {
+            s.append_inplace_i32_phased("t0", &batch, 4).unwrap();
+            reserved_ever |= !s.reserved.is_empty();
+            let acct = s.space_accounting();
+            let regions = &acct.reusable_free_space;
+            for w in regions.windows(2) {
+                let ((a_addr, a_len), (b_addr, _)) = (w[0], w[1]);
+                assert!(
+                    a_addr + a_len < b_addr,
+                    "round {round}: [{a_addr}, {}) and [{b_addr}, ..) touch or overlap, \
+                     though reusable_free_space is documented as fully coalesced: {regions:?}",
+                    a_addr + a_len
+                );
+            }
+            assert_eq!(
+                acct.reusable_free_bytes,
+                regions.iter().map(|&(_, len)| len).sum::<u64>(),
+                "round {round}: the total must be the summed length of the regions"
+            );
+        }
+        assert!(
+            reserved_ever,
+            "no reserve was ever held, so this measured the plain free list"
+        );
+    }
+
+    /// A persisting session gives its **unspent** append reserve back to the
+    /// on-disk managers before it closes (issue #387).
+    ///
+    /// An append on such a file takes a batch out of the managers before it may
+    /// spend any of it, and takes a whole batch however little the append needs.
+    /// What is left over is space nothing occupies, so leaving it out of the
+    /// managers would turn every appending session into a leak of up to
+    /// [`APPEND_RESERVE_BYTES`] — invisible from inside the session, since its own
+    /// accounting still counts the reserve as reusable.
+    ///
+    /// Measured from outside the session for that reason: the persisted free
+    /// space after the close, against what it was before the append.
+    #[test]
+    fn an_unspent_append_reserve_goes_back_to_the_managers() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        /// Elements of the dataset the delete below vacates. Its blocks are the
+        /// hole the append draws from, so it has to exceed one reserve batch or
+        /// nothing is drawn and this measures the old behaviour.
+        const VICTIM: usize = (APPEND_RESERVE_BYTES as usize * 2) / 4;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reserve_return.h5");
+        let mut b = FileBuilder::new();
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+        b.create_dataset("t0")
+            .with_i32_data(&(0..256).collect::<Vec<_>>())
+            .with_shape(&[256])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[64]);
+        b.create_dataset("victim")
+            .with_i32_data(&vec![7i32; VICTIM]);
+        // Above the hole, so the delete leaves an interior region rather than a
+        // run reaching end-of-file that the commit truncates away.
+        b.create_dataset("ceiling").with_i32_data(&[9i32, 9, 9]);
+        b.write(&path).unwrap();
+
+        let persisted = |p: &std::path::Path| -> u64 {
+            crate::reader::File::open(p)
+                .unwrap()
+                .persisted_free_space()
+                .iter()
+                .map(|&(_, len)| len)
+                .sum()
+        };
+
+        {
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+            s.set_sync_policy(SyncPolicy::OnClose);
+            s.delete("victim").unwrap();
+            s.commit().unwrap();
+        }
+        let before = persisted(&path);
+        assert!(
+            before > APPEND_RESERVE_BYTES,
+            "the fixture must leave more than one reserve batch on disk, not {before} bytes"
+        );
+
+        // A few kilobytes of append against a megabyte of reserve.
+        let appended: Vec<i32> = (0..1024).collect();
+        {
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+            s.set_sync_policy(SyncPolicy::OnClose);
+            s.append_inplace_i32_phased("t0", &appended, 4).unwrap();
+            s.finalize_persist().unwrap();
+        }
+
+        let after = persisted(&path);
+        // What the append actually placed: its chunks and the index blocks beside
+        // them, plus the manager rewrite's own churn. Generous, and still an order
+        // of magnitude under the batch that would go missing.
+        let spent = 64 * 1024;
+        assert!(
+            after + spent >= before,
+            "the session reserved {APPEND_RESERVE_BYTES} bytes and spent a few of them, \
+             so the managers should still describe nearly all of the {before} they did \
+             before — they describe {after}"
+        );
+        assert!(
+            after < before,
+            "the append placed bytes inside the hole, so the managers must describe \
+             less than the {before} they did (they describe {after})"
+        );
+
+        let f = crate::reader::File::open(&path).unwrap();
+        let mut want = (0..256).collect::<Vec<i32>>();
+        want.extend_from_slice(&appended);
+        assert_eq!(f.dataset("t0").unwrap().read_i32().unwrap(), want);
+        assert_eq!(f.dataset("ceiling").unwrap().read_i32().unwrap(), [9, 9, 9]);
     }
 
     /// One in-place append costs a small constant number of writes even where
