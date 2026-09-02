@@ -108,11 +108,29 @@ fn libver_bounds_of_1_8_select_the_older_format() {
     );
 }
 
+/// A lower bound newer than the 1.10 format this crate writes licenses newer
+/// encodings without requiring them — the meaning it has in
+/// `H5Pset_libver_bounds` — so it writes the 1.10 format rather than failing.
 #[test]
-fn libver_bounds_reject_too_new_lower_bound() {
-    let mut builder = FileBuilder::new();
-    builder.with_libver_bounds(LibVer::V112, LibVer::LATEST);
-    builder.create_dataset("data").with_i32_data(&[1, 2, 3]);
-    // Lower bound 1.12 demands a format newer than the 1.10 this crate emits.
-    assert!(builder.finish().is_err());
+fn libver_bounds_above_the_written_format_still_write_it() {
+    for (low, high) in [
+        (LibVer::V112, LibVer::LATEST),
+        (LibVer::LATEST, LibVer::LATEST),
+    ] {
+        let mut builder = FileBuilder::new();
+        builder.with_libver_bounds(low, high);
+        builder.create_dataset("data").with_i32_data(&[1, 2, 3]);
+        let bytes = builder
+            .finish()
+            .expect("a lower bound above 1.10 is satisfied by the 1.10 format");
+        assert_eq!(bytes[8], 3, "version 3 superblock");
+
+        let file = File::from_bytes(bytes).unwrap();
+        assert_eq!(file.libver_bound(), LibVer::V110);
+        assert_eq!(file.libver_bound(), LibVer::WRITER_DEFAULT);
+        assert_eq!(
+            file.dataset("data").unwrap().read_i32().unwrap(),
+            vec![1, 2, 3]
+        );
+    }
 }
