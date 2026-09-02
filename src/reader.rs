@@ -4640,7 +4640,9 @@ impl Dataset {
     /// Like it, a dataset under a **lossy** pipeline (ZFP, or float D-scale
     /// scale-offset) whose length is not a whole multiple of its chunk length
     /// is refused: growing that trailing chunk would decode and re-encode
-    /// values that are already committed, changing them.
+    /// values that are already committed, changing them. That one is refused
+    /// *here*, by this call, rather than at the commit — nothing is staged, and
+    /// edits staged beside it are unaffected.
     /// Configure the appended elements through `build` on the
     /// [`AppendBuilder`]; repeated calls within the builder concatenate in
     /// order. The dataset must be chunked, unlimited

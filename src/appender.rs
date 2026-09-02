@@ -105,11 +105,12 @@ use crate::reader::Dataset;
 /// over a lossy dataset that already sits on a partial trailing chunk is refused
 /// when it is constructed. One over a chunk-aligned lossy dataset is fine, and
 /// stays fine as long as its writes land on boundaries. A mid-stream
-/// [`flush`](Self::flush) is what breaks that: it leaves the length unaligned,
-/// and the appender then cannot write again until the length is chunk-aligned
-/// once more — the next write reports the same refusal and poisons the appender,
-/// with its elements still in [`unwritten`](Self::unwritten). On a lossy dataset,
-/// flush only whole chunks, or flush once at the end.
+/// [`flush`](Self::flush) is what would break that, so on a lossy dataset a
+/// flush that would leave the length unaligned is refused at the call, with the
+/// buffer untouched: [`finish`](Self::finish) (and the flush a drop makes) writes
+/// the partial tail, because it is the last write the appender will make and
+/// there is no later one for the unaligned length to refuse. Buffer until a whole
+/// chunk, or finish.
 ///
 /// ```no_run
 /// # use hdf5_pure::File;
@@ -133,9 +134,9 @@ pub struct BufferedAppender<'a> {
     chunk_elems: u64,
     element_size: NonZeroUsize,
     /// Whether the pipeline is lossy, and so cannot have a partial trailing
-    /// chunk re-encoded. Reported by [`Debug`] and checked at construction; the
-    /// writes themselves never regrow a tail unless a mid-stream
-    /// [`flush`](Self::flush) left one.
+    /// chunk re-encoded. Checked at construction, again by every non-terminal
+    /// [`flush`](BufferedAppender::flush) — which is the only way this type could
+    /// leave a tail for a later write to regrow — and reported by [`Debug`].
     lossy_filters: bool,
     /// Elements appended but not yet written, as little-endian bytes.
     pending: AppendBuilder,
@@ -162,6 +163,17 @@ impl std::fmt::Debug for BufferedAppender<'_> {
             .field("poisoned", &self.poisoned)
             .finish()
     }
+}
+
+/// Whether a flush is the last write an appender will make, which is what
+/// decides if it may leave a lossy dataset's length off a chunk boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Terminal {
+    /// [`BufferedAppender::flush`]: the appender lives on, and a later write
+    /// would have to regrow whatever tail this one leaves.
+    No,
+    /// [`BufferedAppender::finish`] and the flush a drop makes: nothing follows.
+    Yes,
 }
 
 impl<'a> BufferedAppender<'a> {
@@ -279,17 +291,42 @@ impl<'a> BufferedAppender<'a> {
     /// wait.
     ///
     /// Under a **lossy** pipeline (ZFP, or float D-scale scale-offset) that
-    /// trailing chunk cannot be re-encoded at all, so a flush that leaves one
-    /// makes the appender unable to write again until the length is chunk-aligned
-    /// once more: the next write fails with the lossy refusal and poisons the
-    /// appender, its elements recoverable through
-    /// [`unwritten`](Self::unwritten). On such a dataset, flush only whole
-    /// chunks — or flush once, at the end.
+    /// trailing chunk cannot be re-encoded at all, so a flush that would leave the
+    /// on-disk length unaligned is refused here, before anything is written and
+    /// with every buffered element still buffered. Left to happen, it would strand
+    /// the appender one call later: the *next* write is the one that has to regrow
+    /// the tail, and it fails with the lossy refusal and poisons the appender —
+    /// reporting a loss of the caller's elements at a call that did nothing wrong.
+    /// Keep buffering until the elements complete a chunk, or end the appender
+    /// with [`finish`](Self::finish), which writes the partial tail because no
+    /// write follows it.
     pub fn flush(&mut self) -> Result<(), Error> {
+        self.flush_prefix(Terminal::No)
+    }
+
+    /// [`flush`](Self::flush)'s body, parameterized by whether a write may follow.
+    ///
+    /// The partial tail a lossy dataset cannot regrow is refused only while the
+    /// appender lives on: `finish` and the flush a drop makes are the last write
+    /// there will be, and refusing them would discard the elements instead of
+    /// landing them — the opposite of what the refusal is for.
+    fn flush_prefix(&mut self, terminal: Terminal) -> Result<(), Error> {
         self.check_usable()?;
         let avail = self.whole_elements()?;
         if avail == 0 {
             return Ok(());
+        }
+        if self.lossy_filters && terminal == Terminal::No {
+            let current = self.dataset.append_geometry()?.current_dim;
+            if current.saturating_add(avail) % self.chunk_elems != 0 {
+                return Err(Error::AppendInPlaceUnsupported(
+                    "this dataset's filter pipeline is lossy, and flushing these elements would \
+                     leave its length short of a chunk boundary — a later write would then have \
+                     to re-encode already-committed values; buffer until the elements complete \
+                     a chunk, or end the appender with BufferedAppender::finish, which writes \
+                     the partial tail",
+                ));
+            }
         }
         self.write_prefix(avail)
     }
@@ -313,9 +350,13 @@ impl<'a> BufferedAppender<'a> {
     /// this returns `Err`, the elements that did not land are gone with it. Use
     /// [`flush`](Self::flush) instead when you mean to recover them through
     /// [`unwritten`](Self::unwritten), and `finish` once it has succeeded.
+    ///
+    /// This is also the one flush that writes a partial trailing chunk onto a
+    /// **lossy** dataset. [`flush`](Self::flush) refuses that, because the write
+    /// after it could not regrow the tail; here there is no write after it.
     pub fn finish(mut self) -> Result<(), Error> {
         self.finished = true;
-        self.flush()
+        self.flush_prefix(Terminal::Yes)
     }
 
     /// Write out whatever chunks the just-appended bytes completed, rolling the
@@ -429,7 +470,7 @@ impl Drop for BufferedAppender<'_> {
             // to see it, which is what that method's documentation says. The
             // claim held until now is what keeps the reachable causes of a
             // refusal here from arising in the first place.
-            let _ = self.flush();
+            let _ = self.flush_prefix(Terminal::Yes);
         }
         self.dataset.release_appender_claim(self.claim);
     }

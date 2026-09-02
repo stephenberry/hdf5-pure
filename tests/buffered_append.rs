@@ -4,7 +4,7 @@
 //! issue #393 every write it makes is the immediate in-place one, filtered or
 //! not, so the type buys write *frequency* and nothing else.
 
-use hdf5_pure::{AttrValue, Error, File, FileBuilder};
+use hdf5_pure::{AttrValue, Error, File, FileBuilder, ScaleOffset};
 use tempfile::tempdir;
 
 /// A rank-1 unlimited chunked i32 dataset `d` seeded with `0..n`.
@@ -756,4 +756,114 @@ fn a_buffered_appender_writes_into_freed_space() {
             .unwrap(),
         [9, 9, 9]
     );
+}
+
+// ---- a lossy pipeline -------------------------------------------------------
+
+/// A chunk-aligned, lossy (float D-scale scale-offset) dataset of `n` elements,
+/// chunked four at a time. The values are clear of the default fill value's
+/// tolerance window, so each is stored as itself.
+fn build_lossy(path: &std::path::Path, n: usize) {
+    let data: Vec<f64> = (0..n).map(|i| 1.05 + i as f64 * 0.1).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("d")
+        .with_f64_data(&data)
+        .with_shape(&[n as u64])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[4])
+        .with_scale_offset(ScaleOffset::FloatDScale(1));
+    b.write(path).unwrap();
+}
+
+fn read_f64(path: &std::path::Path) -> Vec<f64> {
+    File::open(path)
+        .unwrap()
+        .dataset("d")
+        .unwrap()
+        .read_f64()
+        .unwrap()
+}
+
+/// A mid-stream `flush` on a lossy dataset is refused rather than left to strand
+/// the appender one call later.
+///
+/// Writing a partial tail is legal — it costs no re-encoding, since the length
+/// was chunk-aligned — but the *next* write has to grow that tail, and a lossy
+/// pipeline cannot: it fails, poisons the appender, and the caller loses elements
+/// at a call that did nothing wrong. So the refusal is moved to the flush, which
+/// is where the caller can still act on it, and the buffer is left whole.
+#[test]
+fn a_partial_flush_on_a_lossy_dataset_is_refused_with_the_buffer_intact() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("d.h5");
+    build_lossy(&p, 4);
+    let committed = read_f64(&p);
+
+    let session = File::open_rw(&p).unwrap();
+    let mut ds = session.dataset("d").unwrap();
+    let mut app = ds.buffered_appender().unwrap();
+    app.append(&[9.05f64, 9.15]).unwrap();
+    let err = app
+        .flush()
+        .expect_err("a lossy dataset must not be left off a chunk boundary mid-stream");
+    assert!(
+        matches!(&err, Error::AppendInPlaceUnsupported(m) if m.contains("lossy")),
+        "got: {err:?}"
+    );
+    // Refused before any write, so nothing landed and nothing was lost.
+    assert_eq!(app.buffered_elements(), 2);
+    assert_eq!(app.unwritten().len(), 16);
+    assert_eq!(
+        session.dataset("d").unwrap().read_f64().unwrap().len(),
+        4,
+        "the refused flush wrote elements"
+    );
+
+    // The appender is usable: completing the chunk writes it, and a flush that
+    // lands on a boundary is accepted.
+    app.append(&[9.25f64, 9.35]).unwrap();
+    app.flush().unwrap();
+    assert_eq!(app.buffered_elements(), 0);
+
+    // `finish` is the one flush that may leave a partial tail: no write follows
+    // it, so there is nothing left to refuse.
+    app.append(&[9.45f64]).unwrap();
+    app.finish().unwrap();
+    drop(ds);
+    session.close().unwrap();
+
+    let back = read_f64(&p);
+    assert_eq!(back.len(), 9);
+    assert_eq!(
+        back[..4],
+        committed[..],
+        "an already-committed chunk was re-encoded"
+    );
+    for (got, want) in back[4..]
+        .iter()
+        .zip([9.05f64, 9.15, 9.25, 9.35, 9.45].iter())
+    {
+        assert!((got - want).abs() < 0.06, "{got} != {want}");
+    }
+}
+
+/// Dropping without `finish` writes the partial tail, as it always has: a drop is
+/// terminal, so the refusal a live `flush` raises does not apply to it — and
+/// applying it would discard the elements instead of landing them.
+#[test]
+fn dropping_a_lossy_appender_still_writes_its_partial_tail() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("d.h5");
+    build_lossy(&p, 4);
+    {
+        let session = File::open_rw(&p).unwrap();
+        let mut ds = session.dataset("d").unwrap();
+        let mut app = ds.buffered_appender().unwrap();
+        app.append(&[9.05f64, 9.15]).unwrap();
+        // no finish()
+        drop(app);
+        drop(ds);
+        session.close().unwrap();
+    }
+    assert_eq!(read_f64(&p).len(), 6);
 }

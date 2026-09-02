@@ -481,9 +481,12 @@ fn c_create_typed<T: hdf5::H5Type + Copy>(
     file.close().unwrap();
 }
 
-/// Both files end up holding the same elements in one chunk. In the first the
-/// C library encoded that chunk; in the second this crate re-encoded it on
-/// append. The compressed bytes must match exactly.
+/// Both files end up holding the same elements in one chunk. In the first the C
+/// library encoded it. In the second this crate did, appending to a dataset the
+/// C library created — onto a C-written partial chunk under the lossless integer
+/// mode, and onto an empty dataset under the lossy float ones, which seed no
+/// elements at all (see [`seed_len`]). Either way the compressed bytes must match
+/// exactly.
 ///
 /// This is the load-bearing check for everything the encoder decides that a
 /// round trip cannot see. Both decoders tolerate a `minbits` a code point too

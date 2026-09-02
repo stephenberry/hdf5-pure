@@ -3,7 +3,7 @@
 //! filtered and unfiltered, chunk-aligned and not — and read the result back
 //! with this crate. C-library interop lives in `append_crosscheck.rs`.
 
-use hdf5_pure::{AppendBuilder, Error, File, FileBuilder, FormatError, ScaleOffset};
+use hdf5_pure::{AppendBuilder, AttrValue, Error, File, FileBuilder, FormatError, ScaleOffset};
 use tempfile::tempdir;
 
 /// Create a rank-1, unlimited i32 dataset with the given chunk length and
@@ -148,9 +148,15 @@ fn append_scale_offset_f64() {
 /// and a smaller appended value moves that minimum, so a committed value is
 /// rounded again from a different origin. Measured on this fixture before the
 /// refusal existed: the committed `1.45` and `1.55` read back as `1.5` and `1.6`
-/// once `1.0` joined their chunk. So the rewrite is refused at `commit`, the
-/// file is left as it was, and the same dataset grows from a chunk-aligned
-/// length (issue #407).
+/// once `1.0` joined their chunk. So the rewrite is refused at
+/// `append_staged` — nothing is staged, the file is left as it was, and the same
+/// dataset grows from a chunk-aligned length (issue #407).
+///
+/// The refusal is at the call rather than at the commit because a preflight
+/// refusal is permanent for the session: `commit` puts the staged set back, so
+/// the append is still there at the next one, and `close` runs a commit and
+/// returns its `Err` — taking every edit staged beside it out with it. The last
+/// part of this test is that other edits survive.
 #[test]
 fn a_staged_append_onto_a_lossy_partial_tail_is_refused() {
     let dir = tempdir().unwrap();
@@ -179,8 +185,46 @@ fn a_staged_append_onto_a_lossy_partial_tail_is_refused() {
     // Six of a chunk of four: 1.45 and 1.55 sit in a partial trailing chunk.
     let path = dir.path().join("unaligned.h5");
     build(&path, &written);
-    let before = std::fs::read(&path).unwrap();
     let committed = read(&path);
+    {
+        let s = File::open_rw(&path).unwrap();
+        // An unrelated edit staged first, to show the refusal costs it nothing.
+        s.dataset("d")
+            .unwrap()
+            .set_attr("note", AttrValue::I64(7))
+            .unwrap();
+        let err = s
+            .dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_f64(&[1.0, 2.0]);
+            })
+            .expect_err("a lossy pipeline must not have its trailing chunk re-encoded");
+        assert!(
+            matches!(&err, Error::AppendUnsupported(m) if m.contains("lossy")),
+            "got: {err:?}"
+        );
+        // Nothing was staged by the refused call, so the session still commits —
+        // and closes, which is what a commit-time refusal took away.
+        s.close().unwrap();
+    }
+    let reopened = File::open(&path).unwrap();
+    assert_eq!(
+        reopened.dataset("d").unwrap().attrs().unwrap().get("note"),
+        Some(&AttrValue::I64(7)),
+        "the refused append discarded an edit staged beside it"
+    );
+    drop(reopened);
+    assert_eq!(
+        read(&path),
+        committed,
+        "the refusal changed committed values"
+    );
+
+    // The same refusal, with nothing else staged: not one byte moves.
+    let path = dir.path().join("unaligned_only.h5");
+    build(&path, &written);
+    let before = std::fs::read(&path).unwrap();
     {
         let s = File::open_rw(&path).unwrap();
         s.dataset("d")
@@ -188,14 +232,8 @@ fn a_staged_append_onto_a_lossy_partial_tail_is_refused() {
             .append_staged(|b| {
                 b.append_f64(&[1.0, 2.0]);
             })
-            .unwrap();
-        let err = s
-            .commit()
             .expect_err("a lossy pipeline must not have its trailing chunk re-encoded");
-        assert!(
-            matches!(&err, Error::AppendUnsupported(m) if m.contains("lossy")),
-            "got: {err:?}"
-        );
+        s.close().unwrap();
     }
     assert_eq!(
         std::fs::read(&path).unwrap(),

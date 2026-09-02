@@ -2405,6 +2405,13 @@ fn paged_staged_append_churn_does_not_leak_the_old_index() {
     assert_eq!(f.dataset("d").unwrap().read_i32().unwrap(), want);
     drop(f);
     assert_eof_matches_file(&path);
+    // Reclaiming the superseded index is only worth doing if it is reclaimed
+    // under the page type it actually sits in: filing a metadata region as raw
+    // mixes a page (issue #261), and offering a live chunk as free hands the next
+    // session the bytes the dataset is stored in (issue #387). Neither shows up
+    // in the size ceiling above, which a wrong answer satisfies best of all.
+    assert_pages_homogeneous(&path, RECLAIM_PAGE, &["d"]);
+    assert_no_persisted_free_space_holds_live_chunks(&path, &["d"]);
 }
 
 /// A staged append that adds several chunks fills the chunk-sized holes an
@@ -2497,6 +2504,13 @@ fn a_multi_chunk_staged_append_fills_chunk_sized_holes() {
         );
 
         f.close().unwrap();
+        // The paged half places the appended chunks and the rebuilt index into
+        // holes; both must land in raw pages, and neither may leave a live chunk
+        // inside a region the managers advertise.
+        if page > 0 {
+            assert_pages_homogeneous(&path, page, &["d"]);
+        }
+        assert_no_persisted_free_space_holds_live_chunks(&path, &["d"]);
         let f = File::open(&path).unwrap();
         assert_eq!(
             f.dataset("d").unwrap().read_i32().unwrap(),

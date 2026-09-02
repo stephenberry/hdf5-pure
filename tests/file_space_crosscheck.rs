@@ -1229,10 +1229,16 @@ fn c_library_reads_our_file_after_an_append_reused_free_space() {
             file.close().unwrap();
 
             let after_second = std::fs::metadata(&path).unwrap().len();
+            // The delete left a hole one payload wide. An append that reuses it
+            // grows the file barely at all; one that goes past the end grows it by
+            // the whole payload. Half of that, in bytes, is the line — the same
+            // figure the elements-times-two form above it worked out to, said in
+            // the unit the file size is in.
+            let payload_bytes = std::mem::size_of_val(&payload[..]) as u64;
             assert!(
-                after_second < after_first + payload.len() as u64 * 2,
+                after_second < after_first + payload_bytes / 2,
                 "{label}: the second append should have reused the hole (was \
-                 {after_first}, now {after_second})"
+                 {after_first}, now {after_second}, payload {payload_bytes} bytes)"
             );
         }
 

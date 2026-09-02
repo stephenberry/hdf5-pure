@@ -298,10 +298,13 @@ const UNDEF: u64 = u64::MAX;
 /// own chunk-cache default is sized for, which puts the rewrite well outside the
 /// per-chunk path.
 ///
-/// It is also the bound on what a crash can strand: the unspent remainder of one
-/// draw, plus whatever a single allocation took past it. Larger would amortize
-/// further and strand more; this is the point where the rewrite is already rare
-/// enough that making it rarer buys little.
+/// It bounds one draw, not a session's total. A fresh draw is made whenever the
+/// largest reserved region is smaller than the allocation in hand, and the
+/// remainders of earlier draws are kept and still handed out, so what an abrupt
+/// end strands is the sum of every remainder still held: each one smaller than
+/// the allocation that forced the next draw, and one more of them possible per
+/// draw. Larger would amortize further and strand more; this is the point where
+/// the rewrite is already rare enough that making it rarer buys little.
 const APPEND_RESERVE_BYTES: u64 = 1 << 20;
 
 /// The refusal both address-side reference screens report: an object reference
@@ -1013,8 +1016,10 @@ pub(crate) struct WriteEngine {
     /// the unspent remainder: it is accounted to nobody, so it is never handed
     /// out twice, and a later `H5repack` or whole-file rewrite recovers it. That
     /// is the same trade the module header records for
-    /// [`finalize_persist`](Self::finalize_persist), on a bounded surface — at
-    /// most [`APPEND_RESERVE_BYTES`] plus one allocation.
+    /// [`finalize_persist`](Self::finalize_persist), on a surface bounded per
+    /// draw — see [`APPEND_RESERVE_BYTES`], which is what one draw is worth,
+    /// and note that this list holds the unspent remainder of every draw the
+    /// session has made, not just the last.
     ///
     /// Empty for a non-persisting session, which reuses out of `free` directly:
     /// its list is in memory alone, so nothing on the disk claims those bytes
@@ -1925,9 +1930,10 @@ impl PagedEdit {
         out.extend(self.raw.sections());
         out.sort_unstable_by_key(|&(addr, _)| addr);
         debug_assert!(
-            out.windows(2).all(|w| w[0].0 < w[1].0),
-            "the same address is free in both the metadata and the raw list, so \
-             the two page-type lists have stopped being disjoint"
+            out.windows(2)
+                .all(|w| w[0].0.saturating_add(w[0].1) <= w[1].0),
+            "a region is free in both the metadata and the raw list, so the two \
+             page-type lists have stopped being disjoint"
         );
         out
     }
@@ -3173,8 +3179,110 @@ impl WriteEngine {
                  replaced; append through the handle that staged the creation, or commit first",
             ));
         }
+        self.refuse_lossy_partial_tail(path, &builder)?;
         self.staged.appends.push((comps, builder));
         Ok(())
+    }
+
+    /// Refuse, at the call that stages an append, a dataset whose lossy pipeline
+    /// sits on a partial trailing chunk — the refusal
+    /// [`prepare_append`](Self::prepare_append) raises during the commit's
+    /// preflight, brought forward to where the caller can act on it (issue #407).
+    ///
+    /// Waiting for the commit makes that refusal permanent for the session and
+    /// costs every edit staged beside it: a preflight failure restores the staged
+    /// set, so the offending append is still there at the next
+    /// [`commit`](crate::File::commit), and [`File::close`](crate::File::close)
+    /// runs one and returns its `Err` — discarding the whole staged set on the way
+    /// out. `BufferedAppender::new` refuses the same dataset eagerly for the same
+    /// reason; this puts the staged path on the same footing.
+    ///
+    /// **Positive proof only.** Every reason the geometry cannot be read here — a
+    /// path that does not resolve, a header this engine does not parse, a layout
+    /// that is not chunked, a rank this release does not append to — leaves the
+    /// answer to the preflight, which names each of them. Nothing about the bytes
+    /// being appended enters into it: the on-disk length is what decides whether a
+    /// trailing chunk has to be re-encoded, and staged appends never change that
+    /// before the commit reads it. The commit-time check stays as the backstop,
+    /// and is the only one that runs for an append staged through some other
+    /// entry point.
+    fn refuse_lossy_partial_tail(&self, path: &str, builder: &AppendBuilder) -> Result<(), Error> {
+        // A zero-length append is dropped by the preflight before it ever reaches
+        // `prepare_append`, so it stays a no-op here rather than becoming the one
+        // append this refusal would newly reject.
+        if builder.raw().is_empty() {
+            return Ok(());
+        }
+        if self.appends_onto_a_lossy_partial_tail(path) {
+            return Err(Error::AppendUnsupported(LOSSY_TAIL_REFUSAL));
+        }
+        Ok(())
+    }
+
+    /// The geometry question behind [`refuse_lossy_partial_tail`](Self::refuse_lossy_partial_tail):
+    /// does the file hold, at `path`, a rank-1 chunked dataset under a lossy
+    /// filter pipeline whose length is not a whole multiple of its chunk length?
+    /// `false` whenever that cannot be established, for whatever reason.
+    fn appends_onto_a_lossy_partial_tail(&self, path: &str) -> bool {
+        let Ok(addr) =
+            crate::group_v2::resolve_path_any_from_source(&self.image(), &self.superblock, path)
+        else {
+            return false;
+        };
+        let Ok(region) =
+            Self::gather_oh_messages(&self.image(), addr, self.superblock.base_address)
+        else {
+            return false;
+        };
+        let mut datatype: Option<(usize, usize)> = None;
+        let mut dataspace: Option<(usize, usize)> = None;
+        let mut layout: Option<(usize, usize)> = None;
+        let mut filter: Option<(usize, usize)> = None;
+        let mut p = 0;
+        while let Ok(Some((msg_type, body, body_end))) = next_message(&region, p) {
+            match msg_type {
+                MessageType::Datatype => datatype = Some((body, body_end)),
+                MessageType::Dataspace => dataspace = Some((body, body_end)),
+                MessageType::DataLayout => layout = Some((body, body_end)),
+                MessageType::FilterPipeline => filter = Some((body, body_end)),
+                _ => {}
+            }
+            p = body_end;
+        }
+        // No pipeline at all is nothing to re-encode, and an unparseable one is
+        // refused by the preflight on its own terms.
+        let (Some((fb, fe)), Some((dt_b, dt_e)), Some((ds_b, ds_e)), Some((lb, le))) =
+            (filter, datatype, dataspace, layout)
+        else {
+            return false;
+        };
+        let Ok(pipeline) = FilterPipeline::parse(&region[fb..fe]) else {
+            return false;
+        };
+        if pipeline_lossless(&pipeline) {
+            return false;
+        }
+        let Ok((disk_dt, _)) = Datatype::parse(&region[dt_b..dt_e]) else {
+            return false;
+        };
+        let Ok(disk_ds) = Dataspace::parse(&region[ds_b..ds_e], LENGTH_SIZE) else {
+            return false;
+        };
+        let Ok(dl) = DataLayout::parse(&region[lb..le], OFFSET_SIZE, LENGTH_SIZE) else {
+            return false;
+        };
+        // Rank 1 is the shape the preflight's `current_dim0 % chunk_elems`
+        // arithmetic is about; anything else it refuses before reaching that test.
+        if disk_ds.dimensions.len() != 1 {
+            return false;
+        }
+        let Ok(geometry) = chunked_geometry(&disk_dt, &disk_ds, &dl) else {
+            return false;
+        };
+        match (geometry.spatial.first(), disk_ds.dimensions.first()) {
+            (Some(&chunk_elems), Some(&dim0)) if chunk_elems != 0 => dim0 % chunk_elems != 0,
+            _ => false,
+        }
     }
 
     /// Stage an append made through a handle onto a dataset **this session
@@ -3195,6 +3303,11 @@ impl WriteEngine {
         let comps = split_path(path);
         self.refuse_if_claimed(&comps)?;
         if self.staged.dataset_at(&comps).is_none() {
+            // Nothing staged here after all, so these elements grow the object the
+            // file holds — including its trailing chunk, which the same eager
+            // refusal applies to. The fold below reaches no on-disk chunk at all
+            // and is untouched by it.
+            self.refuse_lossy_partial_tail(path, &builder)?;
             self.staged.appends.push((comps, builder));
             return Ok(());
         }
@@ -8955,10 +9068,11 @@ impl WriteEngine {
         // freed region big enough for the lot, where the chunks placed one at a
         // time fill several smaller ones. So the blob form is taken only when a
         // single region already holds it, and otherwise each chunk is placed on its
-        // own and the index after them. That fallback is not the same as the
-        // separate placement this replaced: chunks that find no region append, and
-        // an index appended behind them abuts the last of them just as the blob
-        // would.
+        // own and the index after them. That fallback keeps the proof only where
+        // the last chunk placed ends up immediately below the index — which is what
+        // happens when both append at end-of-file, and not what happens when the
+        // chunks find holes to sit in. An index left abutting nothing is recorded
+        // as dead rather than free, which costs space and never correctness.
         //
         // Sizing runs at a provisional base, exactly as `write_chunked_relocatable`
         // sizes its blob: an Extensible Array's length follows the slot layout and
@@ -9020,25 +9134,38 @@ impl WriteEngine {
         };
         let ea_stored = match blob {
             Some(addr) => {
-                let blob_stored = base.relative(addr)?;
-                let combined = placed_chunks(blob_stored);
-                let mut buf =
-                    Vec::with_capacity(usize::try_from(chunk_total + ea_len).unwrap_or(0));
-                for cb in new_chunk_bytes {
-                    buf.extend_from_slice(cb);
+                // The region is out of the free lists from here, so every way the
+                // build can fail has to put it back: a `?` straight out of this arm
+                // would leave it neither free nor written for the rest of the
+                // session. Collected into a `Result` and handed back on the way out.
+                let placed = (|| -> Result<u64, Error> {
+                    let blob_stored = base.relative(addr)?;
+                    let combined = placed_chunks(blob_stored);
+                    let mut buf =
+                        Vec::with_capacity(usize::try_from(chunk_total + ea_len).unwrap_or(0));
+                    for cb in new_chunk_bytes {
+                        buf.extend_from_slice(cb);
+                    }
+                    buf.extend_from_slice(&ea(
+                        &crate::chunked_write::IndexSlots::dense(&combined),
+                        blob_stored + chunk_total,
+                    )?);
+                    self.place(
+                        Placement::Reused {
+                            addr,
+                            len: chunk_total + ea_len,
+                        },
+                        &buf,
+                    )?;
+                    Ok(blob_stored + chunk_total)
+                })();
+                match placed {
+                    Ok(ea_stored) => ea_stored,
+                    Err(e) => {
+                        self.release_raw_alloc(addr, chunk_total + ea_len);
+                        return Err(e);
+                    }
                 }
-                buf.extend_from_slice(&ea(
-                    &crate::chunked_write::IndexSlots::dense(&combined),
-                    blob_stored + chunk_total,
-                )?);
-                self.place(
-                    Placement::Reused {
-                        addr,
-                        len: chunk_total + ea_len,
-                    },
-                    &buf,
-                )?;
-                blob_stored + chunk_total
             }
             None => {
                 // A chunk embeds no addresses of its own, so it can go anywhere and
@@ -9172,6 +9299,25 @@ impl WriteEngine {
             return self.free.alloc(len);
         };
         pg.alloc_typed(len, ty)
+    }
+
+    /// Hand `[addr, addr + len)`, drawn from
+    /// [`alloc_free`](Self::alloc_free) with [`PageType::Raw`], back to the list
+    /// it came from — for a placement refused *after* the draw, which would
+    /// otherwise hold the region for the rest of the session without writing
+    /// anything into it.
+    ///
+    /// A paged file takes it back into the raw list whichever list served it: a
+    /// whole page [`PagedEdit::alloc_typed`] claimed from the metadata side for
+    /// raw data is raw from the moment it is claimed, and that call already
+    /// returns its alignment tail there. A page that ends up wholly free is
+    /// promoted out of either list by
+    /// [`promote_whole_free_pages`](PagedEdit::promote_whole_free_pages) as usual.
+    fn release_raw_alloc(&mut self, addr: u64, len: u64) {
+        match self.paged.as_mut() {
+            Some(pg) => pg.raw.free(addr, len),
+            None => self.free.free(addr, len),
+        }
     }
 
     /// Write `bytes` at the address [`reserve`](Self::reserve) handed out,
@@ -9947,16 +10093,46 @@ impl WriteEngine {
     /// sits in, since that decides what a later allocation may overwrite there.
     ///
     /// Nothing in the file says which writer produced it, so the index is placed
-    /// from the layout itself: some chunk-data span must **abut** it, ending
-    /// exactly where the index begins or beginning exactly where it ends. That is
-    /// this crate's single blob and is not a layout the reference library
-    /// produces. A chunk index is metadata to that library, allocated out of
-    /// metadata pages — and those are allocated from the bottom of the file, while
-    /// large raw data goes above, so its index lands far below the chunk data it
-    /// indexes rather than against it. Measured across seven files it wrote
-    /// (Extensible and Fixed Array indexes, page sizes 512/4096/8192, 8 to 16
-    /// chunks): the index began in page 0 every time, with the chunk data starting
-    /// at page 9 or higher, so neither join address was within reach of it.
+    /// from the layout itself, by two tests it must pass together: some chunk-data
+    /// span must **abut** it — ending exactly where the index begins, or beginning
+    /// exactly where it ends — and no byte of it may lie in **page 0**.
+    ///
+    /// The abutment is this crate's single blob, and is not a layout the reference
+    /// library sets out to produce. A chunk index is metadata to that library,
+    /// allocated out of metadata pages — and those are allocated from the bottom
+    /// of the file, while large raw data goes above, so its index lands far below
+    /// the chunk data it indexes rather than against it. Measured across seven
+    /// files it wrote (Extensible and Fixed Array indexes, page sizes
+    /// 512/4096/8192, 8 to 16 chunks): the index began in page 0 every time, with
+    /// the chunk data starting at page 9 or higher, so neither join address was
+    /// within reach of it.
+    ///
+    /// The page-0 screen closes the one way that measured layout can nonetheless
+    /// satisfy the abutment. An index block that ends exactly on a page boundary
+    /// with a raw page after it — a Fixed Array data block that exactly fills its
+    /// page, say — is abutted by the first chunk in that raw page, and the whole
+    /// index run would then be filed as raw, its header included, *even though
+    /// that header sits in page 0 beside the superblock*. A later raw allocation
+    /// would land inside a metadata page, which is the page-mixing defect of
+    /// issue #261. Page 0 of a paged file always begins with the superblock, so it
+    /// is a metadata page by construction and an index with a byte in it cannot be
+    /// raw whatever abuts it. The screen costs this crate nothing: it allocates
+    /// chunk data and the indexes beside it out of raw pages, and page 0 — never
+    /// wholly free, since the superblock lives there — is never one of them.
+    ///
+    /// The tighter rule considered instead was to require the join address to fall
+    /// *strictly inside* a page, which proves rawness outright: the byte before
+    /// the join and the byte after it are then in one page, and a page holding
+    /// chunk data is raw. It is sound, and a paged file the reference library
+    /// wrote cannot satisfy it at all, since such a file never puts raw and
+    /// metadata bytes in one page and so can only ever join them on a boundary.
+    /// It was rejected because it also refuses layouts *this* crate produces:
+    /// whenever a blob's chunk bytes total a page multiple from a page-aligned
+    /// start, its index begins on a boundary too. Measured over 100
+    /// `append_staged` commits at a 4096-byte page with 2048-byte chunks, that
+    /// stranded about 500 bytes per commit — 62 KB against the 10 KB the abutment
+    /// rule left — because the two writers produce the same geometry there and
+    /// nothing in the file distinguishes them.
     ///
     /// Both sides have to be admitted, not just the index that follows its data.
     /// A staged append keeps the existing chunks where they are and places the new
@@ -9975,7 +10151,13 @@ impl WriteEngine {
     /// A non-paged file has no page types to keep apart, so everything is
     /// reclaimable there; the tag is ignored by its commit tail entirely.
     fn index_is_provably_raw(&self, data: &[(u64, u64)], index: &[(u64, u64)]) -> bool {
-        self.paged.is_none() || index_abuts_chunk_data(data, index)
+        match &self.paged {
+            None => true,
+            Some(paged) => {
+                index_abuts_chunk_data(data, index)
+                    && !index_touches_page_zero(index, paged.page_size)
+            }
+        }
     }
 
     /// Every on-disk byte span of a chunked dataset's *index structure only* (not
@@ -10825,8 +11007,25 @@ fn index_abuts_chunk_data(data: &[(u64, u64)], index: &[(u64, u64)]) -> bool {
     ) else {
         return false;
     };
-    data.iter()
-        .any(|&(addr, len)| addr.checked_add(len) == Some(index_start) || addr == index_end)
+    // A zero-length span touches an address without occupying a byte beside it,
+    // so it places nothing.
+    data.iter().any(|&(addr, len)| {
+        len > 0 && (addr.checked_add(len) == Some(index_start) || addr == index_end)
+    })
+}
+
+/// Whether any byte of the `index` run lies in page 0 of a paged file, whose
+/// first bytes are the superblock and which is therefore a metadata page. The
+/// screening half of [`WriteEngine::index_is_provably_raw`], where the reasoning
+/// lives.
+///
+/// A page size of zero is not a paged file's; it cannot be reasoned about, so it
+/// screens everything out.
+fn index_touches_page_zero(index: &[(u64, u64)], page_size: u64) -> bool {
+    if page_size == 0 {
+        return !index.is_empty();
+    }
+    index.iter().any(|&(addr, len)| len > 0 && addr < page_size)
 }
 
 /// Tag object-header chunk spans as file metadata. Every span
@@ -13139,6 +13338,37 @@ mod tests {
         assert!(!index_abuts_chunk_data(&[], &[(160, 40)]));
         // Nothing to place.
         assert!(index_abuts_chunk_data(&[], &[]));
+        // A zero-length data span touches the index without occupying a byte
+        // beside it.
+        assert!(!index_abuts_chunk_data(&[(160, 0)], &[(160, 40)]));
+    }
+
+    /// The screen that keeps the abutment from admitting a reference-library
+    /// layout: an index with a byte in page 0 sits beside the superblock, so it is
+    /// in a metadata page however its far end lines up with chunk data.
+    #[test]
+    fn a_chunk_index_in_page_zero_is_never_raw() {
+        const PAGE: u64 = 512;
+        // The C-written shape this exists to refuse: the index header sits in
+        // page 0 behind the superblock, its last block fills page 1 exactly, and
+        // the first raw page begins where that block ends. The abutment alone
+        // called the whole run raw.
+        let c_written = [(48u64, 80u64), (512, 512)];
+        assert!(index_abuts_chunk_data(&[(1024, 512)], &c_written));
+        assert!(index_touches_page_zero(&c_written, PAGE));
+        // An index wholly above page 0 — every one this crate writes, since it
+        // places chunk data and the index beside it out of raw pages — is not
+        // screened out.
+        assert!(!index_touches_page_zero(&[(1024, 200)], PAGE));
+        // The boundary: the last byte of page 0 is still page 0.
+        assert!(index_touches_page_zero(&[(511, 200)], PAGE));
+        assert!(!index_touches_page_zero(&[(512, 200)], PAGE));
+        // A zero-length span occupies nothing, in page 0 as anywhere else.
+        assert!(!index_touches_page_zero(&[(0, 0)], PAGE));
+        // Nothing to screen.
+        assert!(!index_touches_page_zero(&[], PAGE));
+        // A page size a paged file never has cannot place anything.
+        assert!(index_touches_page_zero(&[(1024, 200)], 0));
     }
 
     /// A page every byte of which is free or dead belongs to no page type, so it
@@ -13767,26 +13997,26 @@ mod tests {
             .unwrap();
         assert_eq!(back[..4], committed[..4], "an untouched chunk changed");
 
-        // The staged path rebuilds the index at commit and rewrote the same
-        // chunk on the way; it refuses at commit and leaves the file alone.
+        // The staged path rebuilds the index at commit and rewrote the same chunk
+        // on the way; it refuses at the call that stages the append, so nothing is
+        // staged and the file is left alone.
         let p = dir.path().join("staged.h5");
         build(&p);
         let before = std::fs::read(&p).unwrap();
         {
             let f = crate::reader::File::open_rw(&p).unwrap();
-            f.dataset("d")
+            let err = f
+                .dataset("d")
                 .unwrap()
                 .append_staged(|b| {
                     b.append_f64(&[99.0, 98.0, 97.0]);
                 })
-                .unwrap();
-            let err = f
-                .commit()
                 .expect_err("a staged append must not re-encode the committed tail either");
             assert!(
                 matches!(&err, Error::AppendUnsupported(m) if m.contains("lossy")),
                 "got: {err:?}"
             );
+            f.close().unwrap();
         }
         assert_eq!(
             std::fs::read(&p).unwrap(),

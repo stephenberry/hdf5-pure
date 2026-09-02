@@ -1235,10 +1235,10 @@ where
     S: AttrSink + ?Sized,
     F: FnOnce() -> Result<std::collections::HashMap<String, AttrValue>, Error>,
 {
-    // Attribute names are unique within an object header, so the tie-break never
-    // arises; a duplicate would mean a malformed source header, and the two would
-    // be copied in one arbitrary order either way.
-    messages.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    // Stable, because equal keys here are not interchangeable: a malformed source
+    // header carrying one name twice carries two different payloads under it, and
+    // an unstable sort would pick between them arbitrarily. Header order decides.
+    messages.sort_by(|a, b| a.name.cmp(&b.name));
     // An attribute naming a committed (`H5Tcommit`) datatype is re-pointed at the
     // same type in the output, exactly as a dataset's committed element type is.
     // The source address is what says *which* committed object, so two attributes
