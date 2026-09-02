@@ -7,8 +7,9 @@
 //! does. Every append is crash-atomic (the dataspace dimension is published
 //! last), and the result reads back in the reference C library and h5py.
 //!
-//! An unfiltered dataset (this example) accepts **any-length** appends; a
-//! filtered dataset must be appended in whole chunks (see the guide).
+//! Appends are **any-length** and may start at any length, on filtered and
+//! unfiltered datasets alike: a partial trailing chunk is rewritten into a fresh
+//! allocation, re-encoded through the filter pipeline when there is one.
 //!
 //! Run with:
 //!
@@ -39,9 +40,10 @@ fn main() {
     // ---- Stream appends through one open, read-write file ---------------
     // The dataset starts at length 6 with a chunk length of 4, so its trailing
     // chunk is partial (2 of 4). Each append below is an arbitrary length: the
-    // partial chunk is rewritten, its index element (a single chunk address) is
-    // repointed with one atomic write, then any further whole chunks are
-    // inserted. `File::open_rw` holds an exclusive lock for the file's lifetime.
+    // partial chunk is rewritten into a fresh allocation, its index element is
+    // repointed once those bytes are on the disk, then any further whole chunks
+    // are inserted. `File::open_rw` holds an exclusive lock for the file's
+    // lifetime.
     {
         let file = File::open_rw(&path).expect("open for appending");
         let mut samples = file.dataset("samples").expect("open dataset handle");

@@ -13,8 +13,9 @@
 //!    full chunk size before the filter pipeline runs, and the dataspace
 //!    dimension is what bounds the live elements — a reader that took the chunk
 //!    size for the live length instead would read the padding back as data.
-//! 2. A dataset grown by a `BufferedAppender`, whose writes interleave the
-//!    in-place path with (on an unaligned start) one staged rebuild.
+//! 2. A dataset grown by a `BufferedAppender`, every write of which is the
+//!    in-place one — including, since issue #393, the first write onto a
+//!    filtered dataset that starts on a partial trailing chunk.
 
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
@@ -98,9 +99,9 @@ fn c_library_reads_a_buffered_appended_dataset() {
     let _c = c_lib_guard();
     let dir = tempdir().unwrap();
     let path = dir.path().join("buffered.h5");
-    // Start unaligned (10 of a chunk of 8), so the appender's first write is the
-    // staged realignment and its later ones are in place — both shapes in one
-    // file.
+    // Start unaligned (10 of a chunk of 8), so the appender's first write
+    // re-encodes the partial trailing chunk and its later ones extend from a
+    // boundary — both shapes in one file.
     pure_create(&path, 10, 8);
 
     {

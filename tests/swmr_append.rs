@@ -462,3 +462,53 @@ fn rejects_filtered_pure_dataset() {
         "C read after rejected append"
     );
 }
+
+/// The refusal above holds for a filtered dataset sitting on a *partial*
+/// trailing chunk too. `File::open_rw` grows that shape in place since issue
+/// #393 by re-encoding the trailing chunk and repointing its index element; a
+/// SWMR writer must not, because its readers follow the header counts rather
+/// than the dataspace dimension and would cross the repoint.
+#[test]
+fn rejects_filtered_pure_dataset_with_a_partial_trailing_chunk() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("filtered_partial.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..105).collect::<Vec<_>>())
+            .with_shape(&[105]) // 105 % 10 != 0: a partial trailing chunk
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[10])
+            .with_deflate(4);
+        b.write(&path).unwrap();
+    }
+
+    {
+        let w = File::open_swmr_writer(&path).unwrap();
+        let err = w
+            .dataset("d")
+            .unwrap()
+            .append(&(105..115).collect::<Vec<_>>())
+            .expect_err("a SWMR writer must not re-encode a visible filtered chunk");
+        match err {
+            Error::SwmrAppendUnsupported(reason) => {
+                assert!(reason.contains("filtered"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected SwmrAppendUnsupported, got {other:?}"),
+        }
+    }
+
+    assert_eq!(read_pure(&path), (0..105).collect::<Vec<_>>());
+    assert_eq!(read_c(&path), (0..105).collect::<Vec<_>>());
+
+    // The same file, the same shape, through `File::open_rw`: accepted.
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .append(&(105..115).collect::<Vec<_>>())
+            .unwrap();
+    }
+    assert_eq!(read_pure(&path), (0..115).collect::<Vec<_>>());
+    assert_eq!(read_c(&path), (0..115).collect::<Vec<_>>());
+}
