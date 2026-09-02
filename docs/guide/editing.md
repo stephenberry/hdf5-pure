@@ -11,7 +11,7 @@
 
 ## Choosing a write path
 
-`File::open_rw` is the read-write open, and it picks how to hold the file's bytes from the file itself rather than making you pick a function. A latest-format file with no userblock is edited **bounded**: no whole-file copy is ever built, so memory stays at the [configured caches](streaming.md) plus whatever an edit is building. Anything else — a pre-v2 superblock, or a userblock — falls back to a whole-file **mirror**, `O(file size)`, which is what makes such a file editable at all. Either backing mutates the file the same way: new bytes are appended and a small, fixed set of locations is patched, never a rewrite on commit; see [write paths](../about/architecture.md#write-paths) for the mechanics.
+`File::open_rw` is the read-write open, and it picks how to hold the file's bytes from the file itself rather than making you pick a function. A latest-format file with no userblock is edited **bounded**: no whole-file copy is ever built, so memory stays at the [configured caches](streaming.md) plus whatever an edit is building. Anything else — a pre-v2 superblock, or a userblock — falls back to a whole-file **mirror**, `O(file size)`, which is what makes such a file editable at all. Those two are the whole fallback set: neither the file's size nor its [file-space strategy](file-space.md) enters into it, so a persisting `FsmAggr` file of any size is edited bounded. Either backing mutates the file the same way: new bytes are appended and a small, fixed set of locations is patched, never a rewrite on commit; see [write paths](../about/architecture.md#write-paths) for the mechanics.
 
 Ask a file which backing it got with `File::edit_backing()`, and demand one with `FileAccessProperties::with_memory_strategy`:
 
@@ -288,6 +288,8 @@ file.close().unwrap();
 ```
 
 Bounded editing **does** grow a file that persists its free space — including a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`) — seeding the on-disk free-space managers on open and rewriting them at `File::close`, with paged appends kept page-homogeneous (raw and metadata in separate pages). See [File-Space Strategy](file-space.md) for the paged details. Memory budgets are set with the same `FileAccessProperties` as the streaming reader; cached metadata windows touched by an append are invalidated automatically, so reads through the same file never observe stale bytes.
+
+The metadata cache is **off** by default, which is why a bounded session's resident memory starts near zero rather than near the file's size. `FileAccessProperties::with_metadata_cache(MetadataCacheConfig::new(bytes))` turns it on to pin the metadata a long append loop keeps re-reading, against a byte budget you choose and that never scales with the file's length; `File::metadata_cache_stats` reports the hit rate and occupancy that say whether the budget was the right one.
 
 ## How it works
 

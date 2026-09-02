@@ -20,7 +20,10 @@
 //! else. That last part is also how a test here could go quiet, which is why each
 //! one asserts a floor as well as a ceiling — see [`allocation::Measured`].
 
-use hdf5_pure::{File, FileBuilder};
+use hdf5_pure::{
+    EditBacking, File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy,
+    SyncPolicy,
+};
 
 #[global_allocator]
 static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
@@ -946,5 +949,114 @@ fn a_write_larger_than_the_gather_budget_is_not_copied_into_it() {
         measured.bytes < DATASET_BYTES * 3 / 2,
         "a staged commit must not copy its data into the gather buffer as well: \
          measured {measured} against a {DATASET_BYTES}-byte dataset"
+    );
+}
+
+/// A bounded read-write open holds a metadata-sized amount of the file, not a
+/// copy of it — and the mirror beside it is what makes that a measurement rather
+/// than a hope (issue #389).
+///
+/// This is the rule behind `MemoryStrategy::Auto` preferring the bounded engine:
+/// the choice is only worth making if the two backings really differ by the size
+/// of the file. The contrast is measured on the same file through the same
+/// appends, so nothing but the strategy separates the two figures.
+#[test]
+fn open_rw_of_a_persisting_fsm_file_does_not_allocate_the_file() {
+    // 16 MiB in 32 KiB chunks, persisting its free-space managers under the
+    // default FsmAggr strategy: the ordinary growing file of issue #389.
+    const CHUNK_ELEMS: usize = 4096;
+    const CHUNKS: usize = 512;
+    const APPENDS: usize = 4;
+    const BATCH_BYTES: u64 = (CHUNK_ELEMS * 8) as u64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fsm.h5");
+    let data: Vec<u64> = (0..(CHUNK_ELEMS * CHUNKS) as u64).collect();
+    let mut builder = FileBuilder::new();
+    builder.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+    builder
+        .create_dataset("samples")
+        .with_u64_data(&data)
+        .with_shape(&[data.len() as u64])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[CHUNK_ELEMS as u64]);
+    builder.write(&path).unwrap();
+    drop(data);
+
+    let file_len = std::fs::metadata(&path).unwrap().len();
+    let batch: Vec<u64> = (0..CHUNK_ELEMS as u64).collect();
+
+    // One barrier at close rather than one per append; this test measures
+    // allocations, not `fsync` cadence.
+    let access = |strategy| {
+        FileAccessProperties::new()
+            .with_sync_policy(SyncPolicy::OnClose)
+            .with_memory_strategy(strategy)
+    };
+
+    let open_and_append = |name: &'static str, strategy| {
+        let (file, measured) = measure(name, || {
+            let file = File::open_rw_with_options(&path, access(strategy)).unwrap();
+            let mut ds = file.dataset("samples").unwrap();
+            for _ in 0..APPENDS {
+                ds.append(&batch).unwrap();
+            }
+            drop(ds);
+            file
+        });
+        let backing = file.edit_backing();
+        file.close().unwrap();
+        (backing, measured)
+    };
+
+    let (backing, bounded) =
+        open_and_append("bounded_open_rw_of_a_large_file", MemoryStrategy::Auto);
+    assert_eq!(
+        backing,
+        Some(EditBacking::Bounded),
+        "Auto must reach the bounded engine on this file, or the bounds below are \
+         measuring the mirror"
+    );
+
+    // The appended batches are staged inside this measurement, so their bytes are
+    // a floor a measurement of nothing cannot reach — and the session itself is
+    // returned from the region, so its retained allocations are in `live_bytes`.
+    assert!(
+        bounded.bytes >= BATCH_BYTES * APPENDS as u64,
+        "the appended batches are not in this measurement, so the ceilings below \
+         are bounding something other than the session: {bounded}"
+    );
+    assert!(
+        bounded.blocks > 0,
+        "no allocation was recorded for the open at all, so this region saw none \
+         of the work it names: {bounded}"
+    );
+
+    // What a bounded session keeps is the metadata it is holding plus whatever an
+    // append is building — a figure with no term in the file's length. Measured
+    // at 3.9 KiB live and 101 KiB at peak against a 16 MiB file, where the mirror
+    // below holds 32 MiB live, so a sixteenth of the file is orders above the one
+    // and orders below the other.
+    assert!(
+        bounded.live_bytes < file_len / 16,
+        "a bounded session must not retain a copy of the {file_len}-byte file: \
+         {bounded}"
+    );
+    assert!(
+        bounded.peak_bytes < file_len / 8,
+        "a bounded session must not build a copy of the {file_len}-byte file even \
+         transiently: {bounded}"
+    );
+
+    // The contrast that makes the ceilings above mean something: the same file,
+    // the same appends, one strategy apart.
+    let (backing, mirrored) =
+        open_and_append("mirrored_open_rw_of_a_large_file", MemoryStrategy::Mirrored);
+    assert_eq!(backing, Some(EditBacking::Mirrored));
+    assert!(
+        mirrored.live_bytes > file_len,
+        "the mirror is supposed to hold the whole {file_len}-byte file, so a \
+         measurement below that is not measuring the mirror and the bounded \
+         bounds above are not a contrast with anything: {mirrored}"
     );
 }

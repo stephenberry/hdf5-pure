@@ -1041,6 +1041,16 @@ pub enum MemoryStrategy {
     /// file it cannot edit, rather than refusing. Memory then scales with the
     /// file, which is the cost of the file opening at all. What
     /// [`File::open_rw`](crate::File::open_rw) uses when nothing is asked for.
+    ///
+    /// Two files reach that fallback, and no others: one with a pre-v2
+    /// (non-latest-format) superblock, and one with a userblock (a non-zero base
+    /// address). Every other file a read-write open accepts is edited bounded,
+    /// whatever its [`FileSpaceStrategy`](crate::FileSpaceStrategy), whether or
+    /// not it persists its free space, and however large it is. A paged file with
+    /// no persisted free space is refused by *both* backings rather than
+    /// mirrored, so it is not a third case. The list being exhaustive is what
+    /// makes "prefer bounded" a guarantee to budget against: wherever
+    /// [`Bounded`](Self::Bounded) opens a file, `Auto` gives the same backing.
     Auto,
     /// Always build the whole-file mirror, whatever the file looks like. What
     /// [`File::open_rw`](crate::File::open_rw) did before it learned to dispatch.

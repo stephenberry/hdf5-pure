@@ -8,10 +8,16 @@
 //! falls back, an explicit `Bounded` refuses, and either way the resulting `File`
 //! says which one it is, because "bounded" is a memory guarantee and a caller who
 //! was quietly given the mirror instead has no other way to notice.
+//!
+//! The other half is that the fallback set stays *small*, since every file added
+//! to it is a caller who silently pays `O(file size)` for a file the bounded
+//! engine could have edited (issue #389). The matrix at the end of this file
+//! pins it as a biconditional over the creation properties rather than as a list
+//! of examples: `Auto` mirrors a file if and only if `Bounded` refuses it.
 
 use hdf5_pure::{
     EditBacking, File, FileAccessProperties, FileBuilder, FileCreateProperties, FileSpaceStrategy,
-    MemoryStrategy,
+    LibVer, MemoryStrategy, SyncPolicy,
 };
 
 fn with_strategy(strategy: MemoryStrategy) -> FileAccessProperties {
@@ -402,4 +408,296 @@ fn create_refuses_a_pair_it_could_not_reopen_before_writing_anything() {
     )
     .unwrap();
     assert_eq!(file.edit_backing(), Some(EditBacking::Mirrored));
+}
+
+/// A file that persists its free-space managers under the default `FsmAggr`
+/// strategy — an ordinary growing file, and the one issue #389 reported as
+/// mirrored. Nothing about it is bounded-ineligible: version 3 superblock, no
+/// userblock.
+fn fsm_persisting_file(path: &std::path::Path) {
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+    b.create_dataset("samples")
+        .with_u64_data(&[0, 1, 2, 3])
+        .with_shape(&[4])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[4]);
+    b.write(path).unwrap();
+}
+
+/// Persisting free space is not a bounded-only limitation, so `open_rw` must
+/// edit such a file through the bounded engine rather than the whole-file mirror
+/// (issue #389). The mirror is for a pre-v2 superblock or a userblock, and this
+/// file is neither.
+#[test]
+fn open_rw_edits_a_persisting_fsm_file_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fsm.h5");
+    fsm_persisting_file(&path);
+
+    let file = File::open_rw(&path).unwrap();
+    assert_eq!(
+        file.edit_backing(),
+        Some(EditBacking::Bounded),
+        "a persisting FsmAggr file is bounded-eligible; mirroring it would spend \
+         O(file size) memory on a file the bounded engine edits"
+    );
+
+    let mut ds = file.dataset("samples").unwrap();
+    ds.append(&[4u64, 5, 6, 7]).unwrap();
+    drop(ds);
+    // A staged edit as well as the immediate append, so the commit this session
+    // performs is a real one rather than an empty transaction.
+    file.root()
+        .create_dataset("second", |b| {
+            b.with_u64_data(&[10, 11]);
+        })
+        .unwrap();
+    file.commit().unwrap();
+    file.close().unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    assert_eq!(
+        reopened.dataset("samples").unwrap().read_u64().unwrap(),
+        vec![0, 1, 2, 3, 4, 5, 6, 7]
+    );
+    assert_eq!(
+        reopened.dataset("second").unwrap().read_u64().unwrap(),
+        vec![10, 11]
+    );
+    assert_eq!(
+        reopened.file_space_strategy(),
+        Some(FileSpaceStrategy::FsmAggr),
+        "the bounded session must leave the file's recorded strategy alone"
+    );
+}
+
+/// The reporter's exact call in issue #389: create a persisting `FsmAggr` file
+/// with a default access list, then append to an unlimited chunked dataset. The
+/// backing is decided once at open and does not drift as the file grows, so the
+/// second assertion is the one that pins "RSS tracks file length" as impossible
+/// rather than merely unmeasured.
+#[test]
+fn create_with_options_of_a_persisting_fsm_file_opens_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("created.h5");
+
+    let file = File::create_with_options(
+        &path,
+        FileCreateProperties::new().with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0),
+        FileAccessProperties::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        file.edit_backing(),
+        Some(EditBacking::Bounded),
+        "a default access list means MemoryStrategy::Auto, which must prefer the \
+         bounded engine on a file it can edit"
+    );
+
+    file.root()
+        .create_dataset("samples", |b| {
+            b.with_u64_data(&[0u64; 256])
+                .with_shape(&[256])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[256]);
+        })
+        .unwrap();
+    file.commit().unwrap();
+
+    let batch: Vec<u64> = (0..256).collect();
+    let mut ds = file.dataset("samples").unwrap();
+    for _ in 0..64 {
+        ds.append(&batch).unwrap();
+    }
+    drop(ds);
+
+    assert_eq!(
+        file.edit_backing(),
+        Some(EditBacking::Bounded),
+        "the backing is fixed at open, so a file grown by appends stays bounded"
+    );
+    file.close().unwrap();
+
+    let reopened = File::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .dataset("samples")
+            .unwrap()
+            .read_u64()
+            .unwrap()
+            .len(),
+        256 + 64 * 256
+    );
+}
+
+/// The invariant behind `Auto`, stated over the property space rather than over
+/// one file: `Auto` mirrors only where `Bounded` refuses.
+///
+/// One direction alone would not pin it. "Bounded succeeds implies Auto is
+/// bounded" is satisfied by an engine that never mirrors anything, and "Auto
+/// mirrored implies Bounded refuses" by one that always mirrors; together they
+/// say the fallback set is exactly the bounded-ineligible set, which is what
+/// makes the fallback list in `MemoryStrategy::Auto`'s documentation exhaustive
+/// rather than illustrative.
+#[test]
+fn auto_matches_bounded_on_every_pair_bounded_accepts() {
+    let fcpls = [
+        ("default", FileCreateProperties::new()),
+        (
+            "fsm_aggr-persisting",
+            FileCreateProperties::new().with_file_space_strategy(
+                FileSpaceStrategy::FsmAggr,
+                true,
+                0,
+            ),
+        ),
+        (
+            "fsm_aggr-transient",
+            FileCreateProperties::new().with_file_space_strategy(
+                FileSpaceStrategy::FsmAggr,
+                false,
+                0,
+            ),
+        ),
+        (
+            "aggr-persisting",
+            FileCreateProperties::new().with_file_space_strategy(FileSpaceStrategy::Aggr, true, 0),
+        ),
+        (
+            "aggr-transient",
+            FileCreateProperties::new().with_file_space_strategy(FileSpaceStrategy::Aggr, false, 0),
+        ),
+        (
+            "none-persisting",
+            FileCreateProperties::new().with_file_space_strategy(FileSpaceStrategy::None, true, 0),
+        ),
+        (
+            "none-transient",
+            FileCreateProperties::new().with_file_space_strategy(FileSpaceStrategy::None, false, 0),
+        ),
+        (
+            "page-persisting",
+            FileCreateProperties::new()
+                .with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+                .with_file_space_page_size(4096),
+        ),
+        (
+            "page-transient",
+            FileCreateProperties::new()
+                .with_file_space_strategy(FileSpaceStrategy::Page, false, 0)
+                .with_file_space_page_size(4096),
+        ),
+        ("userblock", FileCreateProperties::new().with_userblock(512)),
+        (
+            "libver-1.8",
+            FileCreateProperties::new().with_libver_bounds(LibVer::Earliest, LibVer::V18),
+        ),
+    ];
+
+    // One barrier per close rather than one per operation: this matrix creates
+    // and reopens two files per row, and measures none of it.
+    let access = |strategy| {
+        FileAccessProperties::new()
+            .with_sync_policy(SyncPolicy::OnClose)
+            .with_memory_strategy(strategy)
+    };
+    let backing_of = |file: File| -> Option<EditBacking> {
+        let backing = file.edit_backing();
+        file.close().unwrap();
+        backing
+    };
+
+    // A biconditional both of whose branches are unreachable holds vacuously, so
+    // the rows that took each one are counted and the counts are asserted below.
+    let (mut checked, mut mirrored) = (0, 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    for (label, create) in fcpls {
+        let path = dir.path().join(format!("{label}.h5"));
+        let bounded_path = dir.path().join(format!("{label}-bounded.h5"));
+
+        // A pair no strategy can create says nothing about the fallback, and is
+        // pinned by `create_refuses_a_pair_it_could_not_reopen_before_writing_anything`.
+        let Ok(auto) =
+            File::create_with_options(&path, create, access(MemoryStrategy::Auto)).map(backing_of)
+        else {
+            continue;
+        };
+        let bounded =
+            File::create_with_options(&bounded_path, create, access(MemoryStrategy::Bounded))
+                .map(backing_of);
+        assert_matches_bounded(label, "create_with_options", auto, &bounded);
+
+        // Create and open share one dispatch, and this is what says so: the same
+        // file, reopened, resolves the same way.
+        let auto_reopened = File::open_rw_with_options(&path, access(MemoryStrategy::Auto))
+            .map(backing_of)
+            .unwrap_or_else(|e| panic!("{label}: Auto created this file and must reopen it: {e}"));
+        assert_eq!(
+            auto_reopened, auto,
+            "{label}: reopening must resolve to the backing the create resolved to"
+        );
+        let bounded_reopened =
+            File::open_rw_with_options(&path, access(MemoryStrategy::Bounded)).map(backing_of);
+        assert_matches_bounded(
+            label,
+            "open_rw_with_options",
+            auto_reopened,
+            &bounded_reopened,
+        );
+
+        checked += 1;
+        mirrored += usize::from(auto == Some(EditBacking::Mirrored));
+    }
+
+    assert_eq!(
+        mirrored, 1,
+        "the userblock is the only creatable property here the bounded engine \
+         refuses; another row reaching the mirror is a fallback set that grew"
+    );
+    assert!(
+        checked >= 9,
+        "only {checked} of the property rows were creatable at all, so this \
+         matrix is no longer covering the space it names"
+    );
+}
+
+/// The biconditional shared by both halves of the matrix above: `Auto` is
+/// bounded wherever `Bounded` is accepted, and mirrors only where it is refused.
+#[track_caller]
+fn assert_matches_bounded(
+    label: &str,
+    entry_point: &str,
+    auto: Option<EditBacking>,
+    bounded: &Result<Option<EditBacking>, hdf5_pure::Error>,
+) {
+    match bounded {
+        Ok(backing) => {
+            assert_eq!(
+                *backing,
+                Some(EditBacking::Bounded),
+                "{label}: an explicit Bounded that opens must report the bounded backing"
+            );
+            assert_eq!(
+                auto,
+                Some(EditBacking::Bounded),
+                "{label}: {entry_point} under Auto mirrored a file Bounded edits, which \
+                 is the O(file size) memory tax of issue #389"
+            );
+        }
+        Err(e) => {
+            assert_eq!(
+                auto,
+                Some(EditBacking::Mirrored),
+                "{label}: {entry_point} under Bounded refused ({e}), so Auto's only way \
+                 to open this file is the mirror"
+            );
+            assert!(
+                matches!(e, hdf5_pure::Error::EditUnsupported(_)),
+                "{label}: a bounded-only limitation must be reported as EditUnsupported, \
+                 got: {e:?}"
+            );
+        }
+    }
 }
