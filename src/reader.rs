@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use crate::address::BaseAddress;
 use crate::edit::{
     AppendBuilder, AppendGeometry, AppendTarget, EditBacking, MemoryStrategy, SpaceAccounting,
-    StagedKind, StagedMeta, SyncPolicy, WriteEngine,
+    StagedChild, StagedKind, StagedMeta, StagedObject, SyncPolicy, WriteEngine,
 };
 use crate::element::H5Element;
 use crate::type_builders::{DatasetBuilder, VL_REF_SIZE};
@@ -1160,14 +1160,14 @@ impl FileInner {
         memo: Option<Resolution>,
     ) -> Result<Resolution, Error> {
         if let (None, Some(named)) = (memo, path) {
-            if self.staged_kind(named).is_some() {
+            if self.staged_object(named).is_some() {
                 return Err(Error::NotCommitted(named.to_string()));
             }
         }
         match self.locate(path, memo) {
             Err(Error::Format(FormatError::PathNotFound(missing))) => {
                 let named = path.unwrap_or_default();
-                match self.staged_kind(named) {
+                match self.staged_object(named) {
                     Some(_) => Err(Error::NotCommitted(named.to_string())),
                     None => Err(Error::Format(FormatError::PathNotFound(missing))),
                 }
@@ -1186,9 +1186,9 @@ impl FileInner {
     }
 
     /// What this session has staged at `path`, if anything. See
-    /// [`WriteEngine::staged_kind`] for the rule.
-    fn staged_kind(&self, path: &str) -> Option<StagedKind> {
-        self.query_engine(|e| e.staged_kind(path)).flatten()
+    /// [`WriteEngine::staged_object`] for the rule.
+    fn staged_object(&self, path: &str) -> Option<StagedObject> {
+        self.query_engine(|e| e.staged_object(path)).flatten()
     }
 
     /// What a dataset staged at `path` says about itself before it is written.
@@ -1197,7 +1197,7 @@ impl FileInner {
     }
 
     /// The direct children `parent` gains from this session's staged creations.
-    fn staged_children(&self, parent: &str) -> Vec<(String, StagedKind)> {
+    fn staged_children(&self, parent: &str) -> StagedChildren {
         self.query_engine(|e| e.staged_children(parent))
             .unwrap_or_default()
     }
@@ -2757,7 +2757,7 @@ impl File {
     ) -> Result<Dataset, Error> {
         let chunk_cache = properties.resolved_chunk_cache(self.inner.access_properties.chunk_cache);
         let normalized = normalize_path(path);
-        match self.inner.staged_kind(&normalized) {
+        match self.inner.staged_object(&normalized).map(|o| o.kind) {
             Some(StagedKind::Dataset) => {
                 return Ok(Dataset::pending(
                     self.inner.clone(),
@@ -2795,7 +2795,7 @@ impl File {
     /// stopped by a dataset at `a/b` reports `NotAGroup("a/b")` (issue #365).
     pub fn group(&self, path: &str) -> Result<Group, Error> {
         let normalized = normalize_path(path);
-        match self.inner.staged_kind(&normalized) {
+        match self.inner.staged_object(&normalized).map(|o| o.kind) {
             Some(StagedKind::Group) => {
                 return Ok(Group::pending(self.inner.clone(), normalized));
             }
@@ -3256,6 +3256,7 @@ impl Group {
     /// #305, and the staged object is what that name already resolves to.
     pub fn datasets(&self) -> Result<Vec<String>, Error> {
         let (entries, staged) = self.children_and_staged()?;
+        let members = staged_members(&staged, StagedKind::Dataset, &entries);
         let mut names = Vec::new();
         for entry in &entries {
             if superseded(&staged, &entry.name) {
@@ -3266,7 +3267,7 @@ impl Group {
                 names.push(entry.name.clone());
             }
         }
-        names.extend(staged_named(&staged, StagedKind::Dataset));
+        names.extend(members);
         Ok(names)
     }
 
@@ -3320,6 +3321,9 @@ impl Group {
     ) -> Result<impl ExactSizeIterator<Item = (String, Dataset)> + use<>, Error> {
         let revisions = self.file.revisions();
         let (entries, staged) = self.children_and_staged()?;
+        // Taken before the entries are consumed below, since which staged
+        // members survive depends on the names the file already holds.
+        let staged_members = staged_members(&staged, StagedKind::Dataset, &entries);
         // A member is either an on-disk header this walk read, or a staged
         // creation with no header to read yet.
         let mut members: Vec<(String, Option<(u64, ObjectHeader)>)> = Vec::new();
@@ -3332,7 +3336,7 @@ impl Group {
                 members.push((entry.name, Some((entry.object_header_address, hdr))));
             }
         }
-        members.extend(staged_named(&staged, StagedKind::Dataset).map(|name| (name, None)));
+        members.extend(staged_members.into_iter().map(|name| (name, None)));
         let file = Arc::clone(&self.file);
         let parent = self.path.clone();
         let chunk_cache = DatasetAccessProperties::new()
@@ -3457,6 +3461,7 @@ impl Group {
     /// the terms [`datasets`](Self::datasets) sets out.
     pub fn groups(&self) -> Result<Vec<String>, Error> {
         let (entries, staged) = self.children_and_staged()?;
+        let members = staged_members(&staged, StagedKind::Group, &entries);
         let mut names = Vec::new();
         for entry in &entries {
             if superseded(&staged, &entry.name) {
@@ -3467,7 +3472,7 @@ impl Group {
                 names.push(entry.name.clone());
             }
         }
-        names.extend(staged_named(&staged, StagedKind::Group));
+        names.extend(members);
         Ok(names)
     }
 
@@ -3503,6 +3508,8 @@ impl Group {
     ) -> Result<impl ExactSizeIterator<Item = (String, Group)> + use<>, Error> {
         let revisions = self.file.revisions();
         let (entries, staged) = self.children_and_staged()?;
+        // Taken before the entries are consumed, as in `iter_datasets`.
+        let staged_members = staged_members(&staged, StagedKind::Group, &entries);
         // `None` for a staged member, which has no address to resolve until the
         // commit places its header.
         let mut members: Vec<(String, Option<u64>)> = Vec::new();
@@ -3517,7 +3524,7 @@ impl Group {
                 members.push((entry.name, Some(entry.object_header_address)));
             }
         }
-        members.extend(staged_named(&staged, StagedKind::Group).map(|name| (name, None)));
+        members.extend(staged_members.into_iter().map(|name| (name, None)));
         let file = Arc::clone(&self.file);
         let parent = self.path.clone();
         Ok(members.into_iter().map(move |(name, address)| {
@@ -3628,7 +3635,7 @@ impl Group {
     ) -> Result<Dataset, Error> {
         let chunk_cache = properties.resolved_chunk_cache(self.file.access_properties.chunk_cache);
         if let Some(child) = self.child_path(name) {
-            match self.file.staged_kind(&child) {
+            match self.file.staged_object(&child).map(|o| o.kind) {
                 Some(StagedKind::Dataset) => {
                     return Ok(Dataset::pending(self.file.clone(), chunk_cache, child));
                 }
@@ -3660,7 +3667,7 @@ impl Group {
     /// case, and [`FormatError::PathNotFound`] if there is no such child.
     pub fn group(&self, name: &str) -> Result<Group, Error> {
         if let Some(child) = self.child_path(name) {
-            match self.file.staged_kind(&child) {
+            match self.file.staged_object(&child).map(|o| o.kind) {
                 Some(StagedKind::Group) => {
                     return Ok(Group::pending(self.file.clone(), child));
                 }
@@ -3858,6 +3865,12 @@ impl Group {
     /// publishes both, so a rotation costs one commit and the path is never
     /// momentarily absent.
     ///
+    /// Deleting an object this session **staged** and has not committed
+    /// withdraws that staging instead — its attributes, appends and staged
+    /// children go with it — since there is no link in the file to unlink. Where
+    /// the deletion was part of a replacement, the plain deletion of the file's
+    /// own object is what remains.
+    ///
     /// ```no_run
     /// # use hdf5_pure::File;
     /// # fn main() -> Result<(), hdf5_pure::Error> {
@@ -3980,23 +3993,28 @@ impl Group {
     }
 }
 
-/// The children of one group this session has staged, as (name, kind) pairs.
-type StagedChildren = Vec<(String, StagedKind)>;
+/// The children of one group this session has staged.
+type StagedChildren = Vec<StagedChild>;
 
-/// Whether a staged creation takes over `name` from an on-disk link.
-fn superseded(staged: &[(String, StagedKind)], name: &str) -> bool {
-    staged.iter().any(|(n, _)| n == name)
+/// Whether a staged creation takes `name` over from the link the file holds
+/// there — which it does only when the same commit removes that link.
+///
+/// A creation that merely collides with a surviving link is one the commit
+/// refuses, so the file's own object is what the name lists as until then.
+fn superseded(staged: &[StagedChild], name: &str) -> bool {
+    staged.iter().any(|c| c.name == name && c.replaces_link)
 }
 
-/// The names among `staged` of the given kind, in the order they were staged.
-fn staged_named(
-    staged: &[(String, StagedKind)],
-    kind: StagedKind,
-) -> impl Iterator<Item = String> + '_ {
+/// The staged children of `kind` that own their names, given the on-disk links
+/// they sit beside, in the order they were staged.
+fn staged_members(staged: &[StagedChild], kind: StagedKind, entries: &[GroupEntry]) -> Vec<String> {
     staged
         .iter()
-        .filter(move |(_, k)| *k == kind)
-        .map(|(n, _)| n.clone())
+        .filter(|c| c.kind == kind)
+        // Either the file has no link of this name, or the commit removes it.
+        .filter(|c| c.replaces_link || !entries.iter().any(|e| e.name == c.name))
+        .map(|c| c.name.clone())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -4664,18 +4682,30 @@ impl Dataset {
     /// The closure configures a standalone builder, not the file, so it may read
     /// the same [`File`]; nothing it stages resolves until [`File::commit`].
     pub fn append_staged(&mut self, build: impl FnOnce(&mut AppendBuilder)) -> Result<(), Error> {
-        // A dataset staged in this session has no bytes to grow, so the elements
-        // are folded into the pending creation instead (see the note above).
-        // `check_staged_edit` refuses that dataset, so ask it only about one the
-        // file already holds; the file-mode and path gates apply either way.
-        if self.staged_meta().is_none() {
-            self.check_staged_edit()?;
-        } else {
+        // A dataset *this handle* names and this session has not written has no
+        // bytes to grow, so the elements are folded into the pending creation
+        // instead (see the note above). `check_staged_edit` refuses that dataset,
+        // so ask it only about one the file already holds; the file-mode and path
+        // gates apply either way.
+        //
+        // The distinction is the handle's, not the path's: a handle onto the
+        // object a staged creation *replaces* is not pending, and the session
+        // refuses its append rather than growing the replacement under it.
+        let pending = self.staged_meta().is_some();
+        if pending {
             self.file.check_staged_writable()?;
+        } else {
+            self.check_staged_edit()?;
         }
         let mut builder = AppendBuilder::new();
         build(&mut builder);
-        self.with_session_mut(|session, path| session.stage_dataset_append(path, builder))
+        self.with_session_mut(|session, path| {
+            if pending {
+                session.stage_dataset_append_pending(path, builder)
+            } else {
+                session.stage_dataset_append(path, builder)
+            }
+        })
     }
 
     /// Add or update an attribute on this dataset, staged until

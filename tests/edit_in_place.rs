@@ -6910,3 +6910,174 @@ fn appending_to_a_staged_dataset_of_the_wrong_type_is_refused() {
     session.commit().unwrap();
     assert_eq!(col.read_i32().unwrap(), vec![1, 2, 3]);
 }
+
+#[test]
+fn appending_through_a_handle_onto_a_replaced_dataset_is_refused() {
+    let path = temp_path("hdf5_pure_staged_visible_replace_append.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("x")
+        .with_i32_data(&[1, 2, 3])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[4]);
+    b.write(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    // A handle onto the object in the file, taken before it is replaced.
+    let mut doomed = session.dataset("x").unwrap();
+    session.root().delete("x").unwrap();
+    session
+        .root()
+        .create_dataset("x", |b| {
+            b.with_i32_data(&[100])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[4]);
+        })
+        .unwrap();
+
+    // The elements were meant for the dataset this handle names, which the
+    // commit is removing. Growing the replacement under it would move them to
+    // another object without saying so.
+    let err = doomed
+        .append_staged(|a| {
+            a.append_i32(&[200]);
+        })
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("could only grow the object being replaced")),
+        "unexpected error: {err:?}"
+    );
+
+    session.commit().unwrap();
+    drop(session);
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("x").unwrap().read_i32().unwrap(), vec![100]);
+}
+
+#[test]
+fn a_creation_colliding_with_a_surviving_link_does_not_shadow_it() {
+    let path = temp_path("hdf5_pure_staged_visible_collision.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    // No `delete` beside it, so `commit` refuses this for the name it collides
+    // with. Until then `original` still means the object in the file.
+    session
+        .root()
+        .create_dataset("original", |b| {
+            b.with_i32_data(&[9]);
+        })
+        .unwrap();
+    assert_eq!(
+        session.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    assert_eq!(
+        session.root().datasets().unwrap(),
+        vec!["original".to_string()],
+        "the colliding creation must not be listed beside the object it collides with"
+    );
+
+    // The same rule when the creation would change the object's kind, which a
+    // listing would otherwise report as a dataset becoming a group.
+    session.root().create_group("original").unwrap();
+    assert!(matches!(
+        session.group("original"),
+        Err(Error::NotAGroup(_))
+    ));
+    assert!(session.root().groups().unwrap().is_empty());
+    assert_eq!(
+        session.root().datasets().unwrap(),
+        vec!["original".to_string()]
+    );
+
+    // The commit refuses, and the file's object is still readable afterwards.
+    assert!(session.commit().is_err());
+    assert_eq!(
+        session.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+}
+
+#[test]
+fn deleting_a_staged_object_withdraws_it() {
+    let path = temp_path("hdf5_pure_staged_visible_withdraw.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    let session = File::open_rw(&path).unwrap();
+    let root = session.root();
+    let ds = root
+        .create_dataset("added", |b| {
+            b.with_i32_data(&[1, 2]);
+        })
+        .unwrap();
+    let grp = root
+        .create_group_with("nested", |g| {
+            g.create_dataset("leaf", |b| {
+                b.with_i32_data(&[3]);
+            });
+        })
+        .unwrap();
+    grp.set_attr("kind", AttrValue::I64(1)).unwrap();
+
+    root.delete("added").unwrap();
+    root.delete("nested").unwrap();
+    assert!(!session.has_staged_edits(), "the staging was withdrawn");
+
+    // The handles name objects the session no longer intends to create, and say
+    // so the way a handle onto anything absent does.
+    assert!(matches!(
+        ds.read_i32(),
+        Err(Error::Format(FormatError::PathNotFound(_)))
+    ));
+    assert!(matches!(
+        grp.attrs(),
+        Err(Error::Format(FormatError::PathNotFound(_)))
+    ));
+    assert!(matches!(
+        session.dataset("added"),
+        Err(Error::Format(FormatError::PathNotFound(_)))
+    ));
+    assert!(matches!(
+        session.group("nested"),
+        Err(Error::Format(FormatError::PathNotFound(_)))
+    ));
+    assert_eq!(
+        session.root().datasets().unwrap(),
+        vec!["original".to_string()]
+    );
+
+    // A commit of nothing leaves the file byte-identical.
+    session.commit().unwrap();
+    drop(session);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn deleting_a_staged_replacement_leaves_the_deletion_it_replaced() {
+    let path = temp_path("hdf5_pure_staged_visible_withdraw_replacement.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    let root = session.root();
+    root.delete("original").unwrap();
+    root.create_dataset("original", |b| {
+        b.with_i32_data(&[9]);
+    })
+    .unwrap();
+    // Changing one's mind about the replacement leaves the deletion that was
+    // asked for first, rather than a staged creation nothing can withdraw.
+    root.delete("original").unwrap();
+    // A staged deletion hides nothing, so the path still means the object in
+    // the file until the commit removes it — the answer it gave before the
+    // replacement was staged.
+    assert_eq!(
+        session.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    session.commit().unwrap();
+    drop(session);
+
+    let file = File::open(&path).unwrap();
+    assert!(file.root().datasets().unwrap().is_empty());
+}
