@@ -1046,3 +1046,116 @@ fn pure_bounded_mutates_c_created_paged_file() {
         "C free-space matches our managers"
     );
 }
+
+#[test]
+fn c_library_reads_our_paged_file_after_group_churn() {
+    let _c = c_lib_guard();
+    // The reclaim a paged file performs under delete-and-recreate churn is a claim
+    // about which bytes are free, and the reference library is the reader that has
+    // to agree with it (issue #388). hdf5-pure creates a paged persisting file,
+    // then repeatedly creates and deletes a scratch group of empty resizable
+    // chunked datasets — the shape whose chunk index the reclaim used to drop,
+    // leaving the page it sat in unaccountable. The C library must recover the
+    // strategy, read the surviving objects, and report exactly the free space our
+    // managers record, which it can only do by parsing the FSHD/FSSE blocks the
+    // churn rewrote.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ours_paged_churn.h5");
+
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+        .with_file_space_page_size(16384);
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3, 4]);
+    b.write(&path).unwrap();
+
+    {
+        let file = File::open_rw_with_options(
+            &path,
+            FileAccessProperties::new().with_sync_policy(hdf5_pure::SyncPolicy::OnClose),
+        )
+        .unwrap();
+        for cycle in 0..20 {
+            let name = format!("scratch_{cycle}");
+            file.root()
+                .create_group_with(&name, |g| {
+                    for i in 0..3 {
+                        g.create_dataset(&format!("log{i}"), |b| {
+                            b.with_i32_data(&[])
+                                .with_shape(&[0])
+                                .with_chunks(&[64])
+                                .with_maxshape(&[u64::MAX]);
+                        });
+                    }
+                })
+                .unwrap();
+            file.commit().unwrap();
+            file.root().delete(&name).unwrap();
+            file.commit().unwrap();
+        }
+        // One scratch group survives, so the file is not merely back to its
+        // original shape when the C library reads it.
+        file.root()
+            .create_group_with("live", |g| {
+                g.create_dataset("log", |b| {
+                    b.with_i32_data(&[7i32, 8, 9])
+                        .with_shape(&[3])
+                        .with_chunks(&[2])
+                        .with_maxshape(&[u64::MAX]);
+                });
+            })
+            .unwrap();
+        file.commit().unwrap();
+        file.close().unwrap();
+    }
+
+    let ours = File::open(&path).unwrap();
+    let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+    assert!(total_ours > 0, "the churn left free space to account for");
+    drop(ours);
+
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.create_plist().unwrap().get_file_space_strategy().unwrap(),
+        CStrategy::FreeSpaceManager {
+            paged: true,
+            persist: true,
+            threshold: 0,
+        },
+        "C library recovers our paged strategy after the churn"
+    );
+    assert_eq!(
+        f.dataset("keep").unwrap().read_raw::<i32>().unwrap(),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(
+        f.dataset("live/log").unwrap().read_raw::<i32>().unwrap(),
+        vec![7, 8, 9]
+    );
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert_eq!(
+        free_c as u64, total_ours,
+        "C free-space total matches the managers the churn rewrote"
+    );
+    drop(f);
+
+    // And the C library reopens the churned file read-write and writes into it.
+    {
+        let f = hdf5::File::open_rw(&path).unwrap();
+        f.new_dataset::<f64>()
+            .shape((4,))
+            .create("extra")
+            .unwrap()
+            .write(&[1.0f64, 2.0, 3.0, 4.0])
+            .unwrap();
+        f.close().unwrap();
+    }
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("extra").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    assert_eq!(
+        f.dataset("live/log").unwrap().read_raw::<i32>().unwrap(),
+        vec![7, 8, 9]
+    );
+}

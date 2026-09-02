@@ -1867,3 +1867,378 @@ fn a_persisting_file_appends_at_end_of_file() {
         "the managers must still describe the untouched hole ({persisted} of {freed})"
     );
 }
+
+/// The page size the paged reclaim tests below create their files with. Large
+/// enough that a page holds several objects, which is what makes the reclaim
+/// question interesting rather than trivially per-object.
+const RECLAIM_PAGE: u64 = 16384;
+
+/// Open `path` for editing without an `fsync` per write: every loop below closes
+/// its session, and `SyncPolicy::OnClose` writes byte-identical files.
+fn open_rw_on_close(path: &std::path::Path) -> File {
+    File::open_rw_with_options(
+        path,
+        FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose),
+    )
+    .unwrap()
+}
+
+/// Create a paged (or flat) persisting file holding one long-lived group, and
+/// return the session editing it.
+fn churn_fixture(path: &std::path::Path, strategy: FileSpaceStrategy) -> File {
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(strategy, true, 0);
+    if strategy == FileSpaceStrategy::Page {
+        b.with_file_space_page_size(RECLAIM_PAGE);
+    }
+    // Metadata only: a group carrying an attribute. It keeps the space each cycle
+    // vacates interior rather than trailing without putting raw data in the pages
+    // the scratch datasets' chunk indexes go into, which is what a real workload's
+    // long-lived *metadata* looks like to the allocator.
+    let mut keep = b.create_group("keep");
+    keep.set_attr("kind", AttrValue::I64(1));
+    b.add_group(keep.finish());
+    b.write(path).unwrap();
+    open_rw_on_close(path)
+}
+
+/// Stage a scratch group holding one empty chunked dataset, `resizable` or of
+/// fixed shape, and return how much free space deleting it gives back.
+fn scratch_delete_releases(
+    strategy: FileSpaceStrategy,
+    resizable: bool,
+    name: &str,
+) -> (File, u64) {
+    let path = temp_path(name);
+    let f = churn_fixture(&path, strategy);
+    f.root()
+        .create_group_with("scratch", |g| {
+            g.create_dataset("log", |b| {
+                b.with_i32_data(&[]).with_shape(&[0]).with_chunks(&[64]);
+                if resizable {
+                    b.with_maxshape(&[u64::MAX]);
+                }
+            });
+        })
+        .unwrap();
+    f.commit().unwrap();
+    let before = f.space_accounting().unwrap().reusable_free_bytes;
+    f.root().delete("scratch").unwrap();
+    f.commit().unwrap();
+    let after = f.space_accounting().unwrap().reusable_free_bytes;
+    (f, after - before)
+}
+
+/// How many whole, page-aligned free pages the session is offering back.
+fn whole_free_pages(f: &File) -> usize {
+    f.space_accounting()
+        .unwrap()
+        .reusable_free_space
+        .iter()
+        .filter(|&&(addr, len)| addr % RECLAIM_PAGE == 0 && len >= RECLAIM_PAGE)
+        .count()
+}
+
+/// Deleting an empty *resizable* chunked dataset on a paged file returns its
+/// chunk index, not only its object header (issue #388).
+///
+/// Such a dataset has no chunk data at all and still carries an index: this crate
+/// builds an Extensible Array eagerly for every empty resizable dataset, because
+/// an in-place append needs the index to exist before the first chunk arrives.
+/// The paged reclaim proved an index raw only where chunk data abutted it, so
+/// this shape — the one shape with no chunk data to abut — was dropped on every
+/// delete, and the raw page it sat in could never be shown to be empty.
+///
+/// The index's size is not written down anywhere, so the flat strategy measures
+/// it: the extra space its delete gives back when the deleted dataset is
+/// resizable (an index) rather than fixed-shape (no index at all, just the
+/// undefined address). That difference cancels the two object headers and the
+/// commit tail, which are the same either way.
+#[test]
+fn paged_delete_of_an_empty_extensible_dataset_reclaims_its_index() {
+    // The control: a flat persisting file has no page types to keep apart, so it
+    // reclaims every index and this difference is the index itself.
+    let (flat, with_index) = scratch_delete_releases(
+        FileSpaceStrategy::FsmAggr,
+        true,
+        "hdf5_pure_fs_ea_flat_ext.h5",
+    );
+    flat.close().unwrap();
+    let (flat, without_index) = scratch_delete_releases(
+        FileSpaceStrategy::FsmAggr,
+        false,
+        "hdf5_pure_fs_ea_flat_fixed.h5",
+    );
+    flat.close().unwrap();
+    let index_bytes = with_index - without_index;
+    assert!(
+        index_bytes >= 256,
+        "the control must measure a real Extensible Array, not {index_bytes} bytes"
+    );
+
+    let path = temp_path("hdf5_pure_fs_ea_paged.h5");
+    let f = churn_fixture(&path, FileSpaceStrategy::Page);
+    f.root()
+        .create_group_with("scratch", |g| {
+            g.create_dataset("log", |b| {
+                b.with_i32_data(&[])
+                    .with_shape(&[0])
+                    .with_chunks(&[64])
+                    .with_maxshape(&[u64::MAX]);
+            });
+        })
+        .unwrap();
+    f.commit().unwrap();
+    // The index is the only thing in its raw page, so while it is live that page
+    // is not on offer — which is what makes the assertion after the delete about
+    // the index and not about a page that was already free.
+    assert_eq!(
+        whole_free_pages(&f),
+        0,
+        "the live index must hold its page back"
+    );
+    let before = f.space_accounting().unwrap().reusable_free_bytes;
+    f.root().delete("scratch").unwrap();
+    f.commit().unwrap();
+    let released = f.space_accounting().unwrap().reusable_free_bytes - before;
+    assert!(
+        released >= index_bytes,
+        "a paged delete must give back the chunk index too ({released} bytes for \
+         a subtree whose index alone is {index_bytes})"
+    );
+    assert!(
+        whole_free_pages(&f) >= 1,
+        "the raw page the index had to itself must come back whole"
+    );
+    f.close().unwrap();
+    assert_eof_matches_file(&path);
+}
+
+/// The reporter's loop (issue #388): a paged persisting file that creates a
+/// scratch group of empty resizable datasets, commits, deletes it, and commits
+/// again reaches a steady size instead of growing a kilobyte per cycle.
+///
+/// A long-lived `keep` group goes in first so the space each cycle vacates is
+/// interior rather than trailing, which is what makes reuse — not truncation —
+/// the only way the file can stop growing.
+#[test]
+fn paged_group_churn_with_empty_datasets_reaches_a_steady_size() {
+    const CYCLES: usize = 40;
+    const SETTLED: usize = 25;
+
+    let path = temp_path("hdf5_pure_fs_paged_empty_churn.h5");
+    let f = churn_fixture(&path, FileSpaceStrategy::Page);
+    let mut sizes = Vec::with_capacity(CYCLES);
+    let mut used = Vec::with_capacity(CYCLES);
+    for cycle in 0..CYCLES {
+        let name = format!("scratch_{cycle}");
+        f.root()
+            .create_group_with(&name, |g| {
+                for i in 0..3 {
+                    g.create_dataset(&format!("log{i}"), |b| {
+                        b.with_i32_data(&[])
+                            .with_shape(&[0])
+                            .with_chunks(&[64])
+                            .with_maxshape(&[u64::MAX]);
+                    });
+                }
+            })
+            .unwrap();
+        f.commit().unwrap();
+        f.root().delete(&name).unwrap();
+        f.commit().unwrap();
+        let acct = f.space_accounting().unwrap();
+        sizes.push(f.file_size());
+        used.push(f.file_size() - acct.reusable_free_bytes);
+    }
+    assert_eq!(
+        sizes[CYCLES - 1],
+        sizes[SETTLED],
+        "the file must stop growing once the churn is in its steady state \
+         (sizes: {sizes:?})"
+    );
+    assert_eq!(
+        used[CYCLES - 1],
+        used[SETTLED],
+        "space that is neither live nor reusable must stop accumulating \
+         (used: {used:?})"
+    );
+
+    f.close().unwrap();
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.group("keep").unwrap().attrs().unwrap().get("kind"),
+        Some(&AttrValue::I64(1))
+    );
+    assert!(f.group("scratch_0").is_err(), "every scratch group is gone");
+    drop(f);
+    assert_eof_matches_file(&path);
+}
+
+/// Repeated `Dataset::append_staged` + `commit` on a paged file does not strand
+/// the index each flush supersedes (issue #388).
+///
+/// Each flush rebuilds the dataset's Extensible Array and frees the old one. The
+/// appended chunks and the rebuilt index go down as one blob, which is what lets
+/// the *next* flush prove that the index it supersedes sits in a raw page;
+/// placing them separately let reuse drop a chunk into the hole a previous index
+/// left and strand the new index against nothing, and the file then accumulated
+/// one dead index per flush.
+#[test]
+fn paged_staged_append_churn_does_not_leak_the_old_index() {
+    const FLUSHES: usize = 200;
+    const ROWS: usize = 16;
+
+    let path = temp_path("hdf5_pure_fs_paged_append_churn.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+        .with_file_space_page_size(RECLAIM_PAGE);
+    b.create_dataset("d")
+        .with_i32_data(&[0i32; ROWS])
+        .with_shape(&[ROWS as u64])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[ROWS as u64]);
+    b.write(&path).unwrap();
+
+    let f = open_rw_on_close(&path);
+    for flush in 0..FLUSHES {
+        f.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_i32(&[flush as i32; ROWS]);
+            })
+            .unwrap();
+        f.commit().unwrap();
+    }
+    let acct = f.space_accounting().unwrap();
+    let used = f.file_size() - acct.reusable_free_bytes;
+    // What the file legitimately holds: the live rows, plus the one live index
+    // over them and the headers around it, which two pages cover comfortably.
+    let payload = ((FLUSHES + 1) * ROWS * 4) as u64;
+    let ceiling = payload + 2 * RECLAIM_PAGE;
+    assert!(
+        used <= ceiling,
+        "{FLUSHES} staged appends left {used} bytes neither live nor reusable, \
+         over the {ceiling} that {payload} bytes of rows plus two pages allow"
+    );
+
+    f.close().unwrap();
+    let f = File::open(&path).unwrap();
+    let want: Vec<i32> = std::iter::repeat_n(0, ROWS)
+        .chain((0..FLUSHES).flat_map(|n| std::iter::repeat_n(n as i32, ROWS)))
+        .collect();
+    assert_eq!(f.dataset("d").unwrap().read_i32().unwrap(), want);
+    drop(f);
+    assert_eof_matches_file(&path);
+}
+
+/// A staged append that adds several chunks fills the chunk-sized holes an
+/// earlier commit left, rather than appending the lot at end-of-file.
+///
+/// The appended chunks and the rebuilt index are laid down as one blob where a
+/// single freed region holds them, since that contiguity is what lets the *next*
+/// commit place the index it supersedes on a paged file. It must not be bought
+/// with reuse: a run of chunks placed one at a time fills several small holes
+/// that no single-hole reservation can reach, and requiring one region for the
+/// whole blob sent every such append past the end of the file instead.
+///
+/// The fixture leaves four holes just wider than one chunk, kept apart by live
+/// spacers so they cannot coalesce into a region the blob would fit, and appends
+/// four chunks into them.
+#[test]
+fn a_multi_chunk_staged_append_fills_chunk_sized_holes() {
+    const CHUNK: usize = 64; // elements, so 256 bytes of i32 per chunk
+    const APPENDED: usize = 4;
+    let payload = (APPENDED * CHUNK * 4) as u64;
+
+    for (strategy, page, name) in [
+        (
+            FileSpaceStrategy::FsmAggr,
+            0,
+            "hdf5_pure_fs_append_holes_flat.h5",
+        ),
+        (
+            FileSpaceStrategy::Page,
+            4096,
+            "hdf5_pure_fs_append_holes_paged.h5",
+        ),
+    ] {
+        let path = temp_path(name);
+        let mut b = FileBuilder::new();
+        b.with_file_space_strategy(strategy, true, 0);
+        if page > 0 {
+            b.with_file_space_page_size(page);
+        }
+        b.create_dataset("d")
+            .with_i32_data(&(0..CHUNK as i32).collect::<Vec<i32>>())
+            .with_shape(&[CHUNK as u64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[CHUNK as u64]);
+        // Scratch and spacer alternate, so deleting the scratch datasets leaves
+        // four separated holes rather than one run.
+        for i in 0..APPENDED {
+            for role in ["scratch", "spacer"] {
+                b.create_dataset(&format!("{role}{i}"))
+                    .with_i32_data(&(0..72).collect::<Vec<i32>>());
+            }
+        }
+        b.write(&path).unwrap();
+
+        let f = open_rw_on_close(&path);
+        for i in 0..APPENDED {
+            f.root().delete(&format!("scratch{i}")).unwrap();
+        }
+        f.commit().unwrap();
+        let (size_before, free_before) = (
+            f.file_size(),
+            f.space_accounting().unwrap().reusable_free_bytes,
+        );
+        assert!(
+            free_before >= payload,
+            "{name}: the fixture must free at least the bytes the append will place"
+        );
+
+        f.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_i32(&(0..(APPENDED * CHUNK) as i32).collect::<Vec<i32>>());
+            })
+            .unwrap();
+        f.commit().unwrap();
+        let (size_after, free_after) = (
+            f.file_size(),
+            f.space_accounting().unwrap().reusable_free_bytes,
+        );
+        assert!(
+            size_after - size_before < payload,
+            "{name}: an append of {payload} bytes of chunks into holes that fit them \
+             must not grow the file by that much (grew {})",
+            size_after - size_before
+        );
+        assert!(
+            free_after < free_before,
+            "{name}: the holes must be spent, not left untouched \
+             ({free_before} before, {free_after} after)"
+        );
+
+        f.close().unwrap();
+        let f = File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("d").unwrap().read_i32().unwrap(),
+            (0..CHUNK as i32)
+                .chain(0..(APPENDED * CHUNK) as i32)
+                .collect::<Vec<i32>>()
+        );
+        for i in 0..APPENDED {
+            assert_eq!(
+                f.dataset(&format!("spacer{i}"))
+                    .unwrap()
+                    .read_i32()
+                    .unwrap(),
+                (0..72).collect::<Vec<i32>>()
+            );
+        }
+        drop(f);
+        assert_eof_matches_file(&path);
+    }
+}

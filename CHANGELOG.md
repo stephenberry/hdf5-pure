@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `FileBuilder::with_libver_bounds` and `FileCreateProperties::with_libver_bounds` accept a lower bound of `LibVer::V112`, `V114` or `LATEST` and write the 1.10 format, matching `H5Pset_libver_bounds`, where those bounds were refused as unsatisfiable ([#390](https://github.com/stephenberry/hdf5-pure/issues/390)).
 - `FileAccessProperties::with_page_buffer_size` accepts any budget of at least the file's page size, where it refused one below 1 MiB. A smaller buffer holds less resident memory in exchange for more writes on long contiguous runs; `0` still turns it off ([#391](https://github.com/stephenberry/hdf5-pure/issues/391)).
+- A `FileSpaceStrategy::Page` file stops growing under delete-and-recreate churn: deleting a group of empty resizable datasets, and repeatedly flushing `Dataset::append_staged`, now return the chunk indexes involved instead of stranding one per cycle. Space whose page type cannot be established is still held back until the whole page around it is free, so `space_accounting().reusable_free_bytes` can lag a delete by up to a page ([#388](https://github.com/stephenberry/hdf5-pure/issues/388)).
 
 ## [0.42.0] - 2026-08-29
 
