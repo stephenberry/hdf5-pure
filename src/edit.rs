@@ -3102,7 +3102,7 @@ impl WriteEngine {
     ) -> Result<(), Error> {
         let mut comps = split_path(path);
         self.refuse_if_claimed(&comps)?;
-        self.refuse_creation_collision(&comps)?;
+        self.refuse_creation_collision(&comps, StagedKind::Dataset)?;
         builder.name = comps.pop().unwrap_or_default();
         self.staged.push_dataset(comps, flatten_dataset(builder)?);
         Ok(())
@@ -4556,29 +4556,53 @@ impl WriteEngine {
         })
     }
 
-    /// Refuse a creation at a path the file already links to and this session
-    /// does not remove, at the call that stages it.
+    /// Refuse a creation at a path something already owns — a link the file
+    /// holds and this session does not remove, or a creation this session
+    /// already staged — at the call that stages it.
     ///
     /// The commit refuses the same batch (`a link with this name already
-    /// exists`), and this raises that refusal's own error so the two cannot
-    /// disagree about what a collision is. Refusing here is what lets
+    /// exists`), and the file arm raises that refusal's own error so the two
+    /// cannot disagree about what a collision is. Refusing here is what lets
     /// [`Group::create_dataset`](crate::Group::create_dataset) and its two
     /// siblings hand back a handle onto the object they stage: a creation that
     /// merely collides is not what its path names — the file's object still is
     /// — so a handle onto it would have addressed the *old* object while
     /// claiming to address the new one.
     ///
-    /// Only a collision with the *file*, and only for a **creation**, is refused
-    /// here. Two creations staged at one path are still the commit's refusal to
-    /// make — nothing is being shadowed, so a handle onto either names something
-    /// this session is adding — and a [`copy`](Self::copy) destination hands
-    /// back no handle at all, so its collision is the commit's too.
-    fn refuse_creation_collision(&self, comps: &[String]) -> Result<(), Error> {
+    /// A creation this session already stages at the path is refused for the
+    /// same reason, one the commit's own refusal cannot stand in for. The staged
+    /// set is indexed by path and the index keeps the *first* record at each one
+    /// (`or_insert`), so a second creation is staged behind the first and every
+    /// handle onto that path — the one this call would hand back included —
+    /// answers `shape`, `dtype`, `filters` and `append_staged` from the record
+    /// the caller did not just describe. No committed object is misaddressed,
+    /// since the commit refuses the batch, but the window between the two is one
+    /// where a handle reports another object's geometry as its own.
+    ///
+    /// Two *group* creations at one path are the exception and stay allowed:
+    /// they name one node, the commit builds one group from them, and a handle
+    /// onto either addresses that group. Re-staging a group is how a caller adds
+    /// attributes or children to one it already staged.
+    ///
+    /// A [`copy`](Self::copy) destination is still the commit's collision to
+    /// refuse: it hands back no handle, so nothing can be misaddressed by it.
+    fn refuse_creation_collision(&self, comps: &[String], kind: StagedKind) -> Result<(), Error> {
         // An empty path names the root, which is not a link and cannot be
         // created. Both callers already refuse it by name — with a message that
         // says so — so this must not answer first with a collision.
         if comps.is_empty() {
             return Ok(());
+        }
+        // Asked before the file, so that staging twice over a link this session
+        // deletes — a replacement, which the file arm below lets through — is
+        // caught by the same rule as staging twice over nothing.
+        if self.staged.dataset_at(comps).is_some()
+            || (kind == StagedKind::Dataset && self.staged.has_group_at(comps))
+        {
+            return Err(Error::EditUnsupported(
+                "this session already stages an object with this name in the target group; \
+                 delete it to withdraw that staging before staging another in its place",
+            ));
         }
         if self.staged.deletes_hand_over(comps) || !self.path_in_file(comps) {
             return Ok(());
@@ -4725,7 +4749,7 @@ impl WriteEngine {
     pub fn create_group(&mut self, path: &str) -> Result<(), Error> {
         let comps = split_path(path);
         self.refuse_if_claimed(&comps)?;
-        self.refuse_creation_collision(&comps)?;
+        self.refuse_creation_collision(&comps, StagedKind::Group)?;
         self.staged.push_group(comps);
         Ok(())
     }
@@ -18745,6 +18769,93 @@ mod staged_query_tests {
         assert_eq!(kind(&e, "existing"), None);
         assert!(e.staged_dataset_meta("existing").is_none());
         assert!(e.staged_children("").is_empty());
+        e.commit().unwrap();
+    }
+
+    #[test]
+    fn a_second_creation_at_a_staged_path_is_refused_where_it_is_staged() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.stage_created_dataset("fresh", i32_dataset(&[1, 2, 3]))
+            .unwrap();
+
+        // The staged set is indexed by path and keeps the first record there, so
+        // a second creation would be staged behind the first and the handle this
+        // call hands back would answer for the first one's shape and datatype.
+        let err = e
+            .stage_created_dataset("fresh", i32_dataset(&[9]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::EditUnsupported(m) if m.contains("already stages")),
+            "got: {err}"
+        );
+        // Refused, not replaced: the first creation is exactly as it was, and it
+        // is still the only thing staged at that name.
+        assert_eq!(e.staged_dataset_meta("fresh").unwrap().dimensions, vec![3]);
+        assert_eq!(
+            child_names(&e, ""),
+            vec![("fresh".to_string(), StagedKind::Dataset)]
+        );
+
+        // The two kinds collide with each other for the same reason: one path
+        // cannot name both, and whichever the index found first is what every
+        // handle onto it would report.
+        assert!(e.create_group("fresh").is_err());
+        e.create_group("g").unwrap();
+        assert!(e.stage_created_dataset("g", i32_dataset(&[9])).is_err());
+        assert_eq!(kind(&e, "g"), Some(StagedKind::Group));
+
+        e.commit().unwrap();
+    }
+
+    #[test]
+    fn a_replacement_is_staged_once_and_a_withdrawal_frees_the_name_again() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        // A creation over a link this session deletes is a replacement, which
+        // the file arm admits — but only one of them, since the second would
+        // still be staged behind the first.
+        e.delete("existing").unwrap();
+        e.stage_created_dataset("existing", i32_dataset(&[9]))
+            .unwrap();
+        assert!(
+            e.stage_created_dataset("existing", i32_dataset(&[8, 8]))
+                .is_err()
+        );
+        assert_eq!(
+            e.staged_dataset_meta("existing").unwrap().dimensions,
+            vec![1]
+        );
+
+        // Deleting a staged creation withdraws it, which is what puts the name
+        // back within reach of another creation.
+        e.delete("existing").unwrap();
+        e.stage_created_dataset("existing", i32_dataset(&[8, 8]))
+            .unwrap();
+        assert_eq!(
+            e.staged_dataset_meta("existing").unwrap().dimensions,
+            vec![2]
+        );
+        e.commit().unwrap();
+    }
+
+    #[test]
+    fn a_group_staged_twice_is_one_group_and_stays_allowed() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        // Two group creations at one path name one node: the commit builds a
+        // single group from them, so a handle onto either addresses it and
+        // nothing is misreported. Re-staging is how attributes and children are
+        // added to a group already staged.
+        e.create_group("g").unwrap();
+        e.create_group("g").unwrap();
+        assert_eq!(kind(&e, "g"), Some(StagedKind::Group));
+        assert_eq!(
+            child_names(&e, ""),
+            vec![("g".to_string(), StagedKind::Group)]
+        );
+        e.stage_created_dataset("g/inner", i32_dataset(&[7]))
+            .unwrap();
         e.commit().unwrap();
     }
 

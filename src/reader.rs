@@ -3867,7 +3867,14 @@ impl Group {
     /// links to is refused here with
     /// [`Error::EditUnsupported`](crate::Error::EditUnsupported) unless this
     /// session also deletes it — a [replacement](Self::delete) — since there
-    /// would otherwise be no new object for the handle to address.
+    /// would otherwise be no new object for the handle to address. A name this
+    /// session already staged a *dataset* at is refused for the same reason —
+    /// one name cannot mean two objects, and the handle would answer for
+    /// whichever was staged first — while staging the same group twice is
+    /// allowed and hands back another handle onto that one group, which is how
+    /// attributes and children are added to a group already staged.
+    /// [`delete`](Self::delete) withdraws a staged creation, which frees the
+    /// name for another.
     ///
     /// ```no_run
     /// # use hdf5_pure::File;
@@ -3904,7 +3911,9 @@ impl Group {
     /// every [`Group`] and [`Dataset`] handle does; see [`File::close`].
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
-    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly). Name collisions are refused
+    /// on [`create_group`](Self::create_group)'s terms, for the group this
+    /// creates and for everything the closure stages under it.
     ///
     /// ```no_run
     /// # use hdf5_pure::{AttrValue, File};
@@ -3966,7 +3975,11 @@ impl Group {
     /// links to is refused here with
     /// [`Error::EditUnsupported`](crate::Error::EditUnsupported) unless this
     /// session also deletes it — a [replacement](Self::delete) — since there
-    /// would otherwise be no new dataset for the handle to address.
+    /// would otherwise be no new dataset for the handle to address. A name this
+    /// session already staged a creation at is refused for the same reason:
+    /// two creations at one path are one name for two objects, and the handle
+    /// would answer for whichever was staged first. [`delete`](Self::delete)
+    /// withdraws a staged creation, which frees the name for another.
     ///
     /// ```no_run
     /// # use hdf5_pure::File;

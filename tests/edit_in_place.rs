@@ -329,8 +329,11 @@ fn duplicate_name_is_rejected_without_writing() {
     }
     assert_eq!(std::fs::read(&path).unwrap(), before);
 
-    // Collide between two datasets staged in the same commit. Neither shadows
-    // an object in the file, so this one is still the commit's to refuse.
+    // Collide between two datasets staged in the same commit. Neither shadows an
+    // object in the file, but the by-path index keeps the first record, so the
+    // handle the second call returns would answer for the first creation until
+    // the commit refused the batch. Refused where it is staged, for the same
+    // reason the file collision above is.
     {
         let session = File::open_rw(&path).unwrap();
         session
@@ -339,15 +342,140 @@ fn duplicate_name_is_rejected_without_writing() {
                 b.with_i32_data(&[1]);
             })
             .unwrap();
-        session
+        let err = session
             .root()
             .create_dataset("dup", |b| {
-                b.with_i32_data(&[2]);
+                b.with_f64_data(&[2.0, 3.0]).with_shape(&[2]);
             })
-            .unwrap();
-        assert!(session.commit().is_err());
+            .unwrap_err();
+        assert!(err.to_string().contains("already stages"), "got: {err}");
     }
     assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // A group creation collides with a staged dataset, and a dataset creation
+    // with a staged group: one path, two objects, and a handle onto either
+    // reports the kind the index found first.
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("mixed", |b| {
+                b.with_i32_data(&[1]);
+            })
+            .unwrap();
+        let err = session.root().create_group("mixed").unwrap_err();
+        assert!(err.to_string().contains("already stages"), "got: {err}");
+    }
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("mixed").unwrap();
+        let err = session
+            .root()
+            .create_dataset("mixed", |b| {
+                b.with_i32_data(&[1]);
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("already stages"), "got: {err}");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+/// The refusal above leaves the session holding exactly what it held before the
+/// second call: the first creation still commits, and its handle still addresses
+/// it. A rejected duplicate must not withdraw the staging it collided with.
+#[test]
+fn refused_duplicate_leaves_the_first_creation_standing() {
+    let path = temp_path("hdf5_pure_edit_dup_first_stands.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    let first = session
+        .root()
+        .create_dataset("dup", |b| {
+            b.with_i32_data(&[1, 2, 3]);
+        })
+        .unwrap();
+    let err = session
+        .root()
+        .create_dataset("dup", |b| {
+            b.with_f64_data(&[4.0, 5.0]).with_shape(&[2]);
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("already stages"), "got: {err}");
+
+    // The surviving handle answers for what it staged, not for the refused call.
+    assert_eq!(first.shape().unwrap(), vec![3]);
+    assert_eq!(first.dtype().unwrap(), DType::I32);
+    session.commit().unwrap();
+    assert_eq!(first.read_i32().unwrap(), vec![1, 2, 3]);
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("dup").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+}
+
+/// Deleting a staged creation withdraws it, which is what makes the path free
+/// again: stage, withdraw, stage another, and the second one is the one that
+/// commits.
+#[test]
+fn withdrawing_a_staged_creation_frees_its_name_again() {
+    let path = temp_path("hdf5_pure_edit_dup_withdraw.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    session
+        .root()
+        .create_dataset("swap", |b| {
+            b.with_i32_data(&[1, 2, 3]);
+        })
+        .unwrap();
+    session.root().delete("swap").unwrap();
+    let second = session
+        .root()
+        .create_dataset("swap", |b| {
+            b.with_f64_data(&[4.0, 5.0]).with_shape(&[2]);
+        })
+        .unwrap();
+    assert_eq!(second.shape().unwrap(), vec![2]);
+    session.commit().unwrap();
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("swap").unwrap().read_f64().unwrap(),
+        vec![4.0, 5.0]
+    );
+}
+
+/// Two group creations at one path stay allowed: they name one node, so a
+/// handle onto either addresses the group the commit builds. Re-staging is how
+/// attributes and children are added to a group already staged.
+#[test]
+fn restaging_a_group_addresses_the_same_group() {
+    let path = temp_path("hdf5_pure_edit_dup_group.h5");
+    write_starter(&path);
+
+    let session = File::open_rw(&path).unwrap();
+    let first = session.root().create_group("g").unwrap();
+    first.set_attr("from", AttrValue::I64(1)).unwrap();
+    let again = session.root().create_group("g").unwrap();
+    again.set_attr("also", AttrValue::I64(2)).unwrap();
+    again
+        .create_dataset("inner", |b| {
+            b.with_i32_data(&[7]);
+        })
+        .unwrap();
+    session.commit().unwrap();
+
+    let file = File::open(&path).unwrap();
+    let attrs = file.group("g").unwrap().attrs().unwrap();
+    assert_eq!(attrs.get("from"), Some(&AttrValue::I64(1)));
+    assert_eq!(attrs.get("also"), Some(&AttrValue::I64(2)));
+    assert_eq!(
+        file.dataset("g/inner").unwrap().read_i32().unwrap(),
+        vec![7]
+    );
 }
 
 #[test]
