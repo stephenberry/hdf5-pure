@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use crate::address::BaseAddress;
 use crate::edit::{
     AppendBuilder, AppendGeometry, AppendTarget, EditBacking, MemoryStrategy, SpaceAccounting,
-    SyncPolicy, WriteEngine,
+    StagedChild, StagedKind, StagedMeta, StagedObject, SyncPolicy, WriteEngine,
 };
 use crate::element::H5Element;
 use crate::type_builders::{DatasetBuilder, VL_REF_SIZE};
@@ -1129,13 +1129,77 @@ impl FileInner {
     /// [`Error::NotAGroup`](crate::Error::NotAGroup) for an object whose kind
     /// never changed. That is the same staleness reporting itself instead of
     /// answering, which is the better half of the trade.
-    fn locate(&self, path: Option<&str>, memo: Resolution) -> Result<Resolution, Error> {
+    fn locate(&self, path: Option<&str>, memo: Option<Resolution>) -> Result<Resolution, Error> {
         let revisions = self.revisions();
-        Ok(revisions.at(match path {
-            _ if revisions.address == memo.address_revision => memo.address,
-            Some(path) => self.resolve_path(path)?,
-            None => return Err(Error::StaleHandle),
+        // A handle with no memo has never resolved — it names an object this
+        // session staged — so there is nothing to short-circuit on, and its path
+        // is walked afresh every time until a commit gives it a header.
+        Ok(revisions.at(match (path, memo) {
+            (_, Some(memo)) if revisions.address == memo.address_revision => memo.address,
+            (Some(path), _) => self.resolve_path(path)?,
+            (None, _) => return Err(Error::StaleHandle),
         }))
+    }
+
+    /// [`locate`](Self::locate), reported as [`Error::NotCommitted`] when this
+    /// session has the path *staged* rather than written.
+    ///
+    /// Every handle onto a staged object comes through here, so the distinction
+    /// between "there is no such object" and "there is one, and `commit` has not
+    /// written it yet" is made in one place rather than at each caller.
+    ///
+    /// The staged set is consulted *before* the file for a handle that has never
+    /// resolved, because a staged creation can sit on a path the file still
+    /// holds: a delete and a create in one commit replace the object there
+    /// (issue #305), and until that commit runs the old bytes are still
+    /// perfectly readable. Answering from them would hand the caller the object
+    /// their handle was explicitly not opened onto.
+    fn locate_staged(
+        &self,
+        path: Option<&str>,
+        memo: Option<Resolution>,
+    ) -> Result<Resolution, Error> {
+        if let (None, Some(named)) = (memo, path) {
+            if self.staged_object(named).is_some() {
+                return Err(Error::NotCommitted(named.to_string()));
+            }
+        }
+        match self.locate(path, memo) {
+            Err(Error::Format(FormatError::PathNotFound(missing))) => {
+                let named = path.unwrap_or_default();
+                match self.staged_object(named) {
+                    Some(_) => Err(Error::NotCommitted(named.to_string())),
+                    None => Err(Error::Format(FormatError::PathNotFound(missing))),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Run `f` against this file's write session, or `None` when there is none
+    /// (a read-only file stages nothing, so it has nothing to be asked about).
+    fn query_engine<R>(&self, f: impl FnOnce(&WriteEngine) -> R) -> Option<R> {
+        match &self.backend {
+            Backend::Edit(m) => Some(f(&m.lock().unwrap_or_else(PoisonError::into_inner))),
+            _ => None,
+        }
+    }
+
+    /// What this session has staged at `path`, if anything. See
+    /// [`WriteEngine::staged_object`] for the rule.
+    fn staged_object(&self, path: &str) -> Option<StagedObject> {
+        self.query_engine(|e| e.staged_object(path)).flatten()
+    }
+
+    /// What a dataset staged at `path` says about itself before it is written.
+    fn staged_dataset_meta(&self, path: &str) -> Option<StagedMeta> {
+        self.query_engine(|e| e.staged_dataset_meta(path)).flatten()
+    }
+
+    /// The direct children `parent` gains from this session's staged creations.
+    fn staged_children(&self, parent: &str) -> StagedChildren {
+        self.query_engine(|e| e.staged_children(parent))
+            .unwrap_or_default()
     }
 
     /// The revisions to label a resolution that is about to be worked out with.
@@ -2454,6 +2518,13 @@ impl File {
     /// immediate [`Dataset::append`] is known to leave every header where it
     /// stands. Dereference again from a fresh read.
     ///
+    /// A handle onto an object this commit *publishes* — one
+    /// [`Group::create_group`], [`Group::create_group_with`] or
+    /// [`Group::create_dataset`] handed back, or a lookup of a staged name found
+    /// — starts reading its object here. Until then it answers
+    /// [`Error::NotCommitted`](crate::Error::NotCommitted) for anything needing
+    /// bytes, and a refused commit leaves it doing so.
+    ///
     /// The commit is durable when it returns, under the default
     /// [`SyncPolicy::Always`]; under
     /// [`SyncPolicy::OnClose`](crate::SyncPolicy::OnClose) it has reached the
@@ -2684,19 +2755,31 @@ impl File {
         path: &str,
         properties: DatasetAccessProperties,
     ) -> Result<Dataset, Error> {
+        let chunk_cache = properties.resolved_chunk_cache(self.inner.access_properties.chunk_cache);
+        let normalized = normalize_path(path);
+        match self.inner.staged_object(&normalized).map(|o| o.kind) {
+            Some(StagedKind::Dataset) => {
+                return Ok(Dataset::pending(
+                    self.inner.clone(),
+                    chunk_cache,
+                    normalized,
+                ));
+            }
+            Some(StagedKind::Group) => return Err(Error::NotADataset(normalized)),
+            None => {}
+        }
         let revisions = self.inner.revisions();
         let addr = self.inner.resolve_path(path)?;
         let hdr = self.inner.parse_header(addr)?;
         if !has_message(&hdr, MessageType::DataLayout) {
             return Err(Error::NotADataset(path.to_string()));
         }
-        let chunk_cache = properties.resolved_chunk_cache(self.inner.access_properties.chunk_cache);
         Ok(Dataset::new(
             self.inner.clone(),
             revisions.at(addr),
             hdr,
             chunk_cache,
-            Some(normalize_path(path)),
+            Some(normalized),
         ))
     }
 
@@ -2711,18 +2794,26 @@ impl File {
     /// naming that component's own path rather than the one asked for: `a/b/c`
     /// stopped by a dataset at `a/b` reports `NotAGroup("a/b")` (issue #365).
     pub fn group(&self, path: &str) -> Result<Group, Error> {
+        let normalized = normalize_path(path);
+        match self.inner.staged_object(&normalized).map(|o| o.kind) {
+            Some(StagedKind::Group) => {
+                return Ok(Group::pending(self.inner.clone(), normalized));
+            }
+            Some(StagedKind::Dataset) => return Err(Error::NotAGroup(normalized)),
+            None => {}
+        }
         let revisions = self.inner.revisions();
         let addr = self.inner.resolve_path(path)?;
         if !is_group(&self.inner.parse_header(addr)?) {
             // Normalized, so that the same object refused here and refused by a
             // live handle below names itself the same way: a handle knows only
             // the normalized path it memoized.
-            return Err(Error::NotAGroup(normalize_path(path)));
+            return Err(Error::NotAGroup(normalized));
         }
         Ok(Group::new(
             self.inner.clone(),
             revisions.at(addr),
-            Some(normalize_path(path)),
+            Some(normalized),
         ))
     }
 
@@ -2915,17 +3006,21 @@ impl std::fmt::Debug for Object {
 // ---------------------------------------------------------------------------
 
 /// A group that exists only as a staged edit, handed to
-/// [`Group::create_group_with`]'s closure so attributes can be set on a group
-/// that is not yet committed (and so has no resolvable header to hang a
-/// [`Group`] handle off).
+/// [`Group::create_group_with`]'s closure so a whole subtree — attributes,
+/// nested groups, datasets — can be described in one call.
 ///
-/// Every method stages; nothing is written until [`File::commit`], and a staged
-/// object is not resolvable by name until then.
+/// It is a convenience, not the only way in: [`Group::create_group`] and
+/// [`Group::create_group_with`] both return a live [`Group`] handle onto the
+/// staged group, and everything this offers can be staged through that handle
+/// instead. Reach for the closure when the shape of the subtree is known at the
+/// call, and for the handle when it is built up by code that takes a `&Group`.
+///
+/// Every method stages; nothing is written until [`File::commit`].
 ///
 /// The closure holding this records into a buffer rather than into the file's
 /// writable session, so nothing is locked while it runs. The recorded operations
-/// are applied together when it returns, which is also why a staged object is not
-/// resolvable until [`File::commit`].
+/// are applied together when it returns, which is why an object staged here is
+/// addressable only once the closure has returned.
 pub struct StagedGroup<'a> {
     ops: &'a mut Vec<StagedOp>,
     path: String,
@@ -2946,7 +3041,9 @@ impl StagedGroup<'_> {
     /// Stage an empty subgroup of this group.
     ///
     /// To configure it in the same commit, use
-    /// [`create_group_with`](Self::create_group_with).
+    /// [`create_group_with`](Self::create_group_with). To get a [`Group`] handle
+    /// onto it, look it up by name once this closure has returned, or stage it
+    /// through [`Group::create_group`] instead, which hands one back.
     pub fn create_group(&mut self, name: &str) -> &mut Self {
         self.create_group_with(name, |_| {})
     }
@@ -3037,7 +3134,12 @@ pub struct Group {
     /// own — it re-reads one per call — so the address is the whole memo, and the
     /// content revision the [`Resolution`] carries beside it names no header this
     /// handle read and is never read back.
-    state: RwLock<Resolution>,
+    ///
+    /// `None` for a group this session has *staged* and not yet committed: there
+    /// is no header to name one. Such a handle resolves its path on every use,
+    /// and installs a memo the first time a commit gives it something to point
+    /// at.
+    state: RwLock<Option<Resolution>>,
     /// Root-relative path of this group (e.g. `""` for the root, `"a/b"`), used
     /// to address the group and its children for write operations on a
     /// read-write file, and to find it again after an edit moved it. `None` for
@@ -3058,13 +3160,44 @@ impl Clone for Group {
     }
 }
 
+impl std::fmt::Debug for Group {
+    /// Reports the handle as it stands, without re-resolving: a `Debug` that
+    /// read the file could fail, and one that failed would have nothing to
+    /// print. `staged` is true for a group this session has created and not yet
+    /// committed, which has no address to report.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        f.debug_struct("Group")
+            .field("path", &self.path)
+            .field("staged", &state.is_none())
+            .finish()
+    }
+}
+
 impl Group {
     /// Build a handle for a group whose header was found at `at`.
     fn new(file: Arc<FileInner>, at: Resolution, path: Option<String>) -> Self {
         Self {
             file,
-            state: RwLock::new(at),
+            state: RwLock::new(Some(at)),
             path,
+        }
+    }
+
+    /// Build a handle for a group this session has staged and not yet
+    /// committed, which has no header to memoize.
+    ///
+    /// It addresses the group by name from the moment it is staged: further
+    /// creations, deletions and attribute edits under it are staged through it
+    /// like any other handle. Anything that has to *read* the group reports
+    /// [`Error::NotCommitted`](crate::Error::NotCommitted) until
+    /// [`File::commit`], after which the first use resolves the path and the
+    /// handle behaves as if it had been opened by name.
+    fn pending(file: Arc<FileInner>, path: String) -> Self {
+        Self {
+            file,
+            state: RwLock::new(None),
+            path: Some(path),
         }
     }
 
@@ -3076,15 +3209,20 @@ impl Group {
     /// that has no path to re-resolve — one an object reference produced — once
     /// a commit has run under it, and the resolution's own error (a
     /// `PathNotFound`, say, for a group a commit deleted) when the path no
-    /// longer names anything. A commit that replaces this group with a dataset
-    /// of the same name (issue #305) leaves the path naming something that is
-    /// not a group, and that is [`Error::NotAGroup`](crate::Error::NotAGroup).
+    /// longer names anything. A group this session has staged and not committed
+    /// has no header at all, and that is
+    /// [`Error::NotCommitted`](crate::Error::NotCommitted). A commit that
+    /// replaces this group with a dataset of the same name (issue #305) leaves
+    /// the path naming something that is not a group, and that is
+    /// [`Error::NotAGroup`](crate::Error::NotAGroup).
     pub(crate) fn header_address(&self) -> Result<u64, Error> {
         let memo = *self.state.read().unwrap_or_else(PoisonError::into_inner);
-        if memo.address_revision == self.file.address_revision() {
-            return Ok(memo.address);
+        if let Some(memo) = memo {
+            if memo.address_revision == self.file.address_revision() {
+                return Ok(memo.address);
+            }
         }
-        let at = self.file.locate(self.path.as_deref(), memo)?;
+        let at = self.file.locate_staged(self.path.as_deref(), memo)?;
         // Checked before it is memoized. The short-circuit above does not
         // re-check, so an address installed and then refused would be the
         // answer every later call returns without looking at it again.
@@ -3098,9 +3236,10 @@ impl Group {
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
         // Two threads can re-resolve at once. The older answer must not land on
         // top of the newer one, or the newer handle would go on serving an
-        // address the file has already moved past.
-        if at.address_revision >= state.address_revision {
-            *state = at;
+        // address the file has already moved past. A handle that had no memo
+        // takes this one: any address beats naming nothing.
+        if state.is_none_or(|memo| at.address_revision >= memo.address_revision) {
+            *state = Some(at);
         }
         Ok(at.address)
     }
@@ -3111,15 +3250,24 @@ impl Group {
     /// [`iter_datasets`](Self::iter_datasets): it hands back opened handles for
     /// the cost of this call, where opening each name separately re-walks the
     /// group once per member.
+    ///
+    /// A dataset this session has staged and not yet committed is listed too,
+    /// once — a name that is both on disk and staged is the replacement of issue
+    /// #305, and the staged object is what that name already resolves to.
     pub fn datasets(&self) -> Result<Vec<String>, Error> {
-        let entries = self.children()?;
+        let (entries, staged) = self.children_and_staged()?;
+        let members = staged_members(&staged, StagedKind::Dataset, &entries);
         let mut names = Vec::new();
         for entry in &entries {
+            if superseded(&staged, &entry.name) {
+                continue;
+            }
             let hdr = self.file.parse_header(entry.object_header_address)?;
             if has_message(&hdr, MessageType::DataLayout) {
                 names.push(entry.name.clone());
             }
         }
+        names.extend(members);
         Ok(names)
     }
 
@@ -3153,9 +3301,10 @@ impl Group {
     ///
     /// Members arrive in the order the group's link structure yields them — the
     /// same order [`datasets`](Self::datasets) reports, which is not necessarily
-    /// sorted. Each handle is a snapshot taken when the iterator was built, so a
-    /// [`File::commit`] that runs mid-walk is not reflected in the members still
-    /// to come; re-open the group to see past it.
+    /// sorted, with this session's staged datasets after them. Each handle is a
+    /// snapshot taken when the iterator was built, so a [`File::commit`] that
+    /// runs mid-walk is not reflected in the members still to come; re-open the
+    /// group to see past it.
     ///
     /// ```no_run
     /// # use hdf5_pure::File;
@@ -3171,27 +3320,46 @@ impl Group {
         &self,
     ) -> Result<impl ExactSizeIterator<Item = (String, Dataset)> + use<>, Error> {
         let revisions = self.file.revisions();
-        let mut members = Vec::new();
-        for entry in self.children()? {
+        let (entries, staged) = self.children_and_staged()?;
+        // Taken before the entries are consumed below, since which staged
+        // members survive depends on the names the file already holds.
+        let staged_members = staged_members(&staged, StagedKind::Dataset, &entries);
+        // A member is either an on-disk header this walk read, or a staged
+        // creation with no header to read yet.
+        let mut members: Vec<(String, Option<(u64, ObjectHeader)>)> = Vec::new();
+        for entry in entries {
+            if superseded(&staged, &entry.name) {
+                continue;
+            }
             let hdr = self.file.parse_header(entry.object_header_address)?;
             if has_message(&hdr, MessageType::DataLayout) {
-                members.push((entry, hdr));
+                members.push((entry.name, Some((entry.object_header_address, hdr))));
             }
         }
+        members.extend(staged_members.into_iter().map(|name| (name, None)));
         let file = Arc::clone(&self.file);
         let parent = self.path.clone();
         let chunk_cache = DatasetAccessProperties::new()
             .resolved_chunk_cache(self.file.access_properties.chunk_cache);
-        Ok(members.into_iter().map(move |(entry, header)| {
-            let path = child_path_of(parent.as_deref(), &entry.name);
-            let dataset = Dataset::new(
-                Arc::clone(&file),
-                revisions.at(entry.object_header_address),
-                header,
-                chunk_cache,
-                path,
-            );
-            (entry.name, dataset)
+        Ok(members.into_iter().map(move |(name, on_disk)| {
+            let path = child_path_of(parent.as_deref(), &name);
+            let dataset = match on_disk {
+                Some((address, header)) => Dataset::new(
+                    Arc::clone(&file),
+                    revisions.at(address),
+                    header,
+                    chunk_cache,
+                    path,
+                ),
+                // Only a group with a path of its own reports staged children,
+                // so a staged member always has one to be named by.
+                None => Dataset::pending(
+                    Arc::clone(&file),
+                    chunk_cache,
+                    path.expect("a staged member's parent has a path"),
+                ),
+            };
+            (name, dataset)
         }))
     }
 
@@ -3288,15 +3456,23 @@ impl Group {
     /// To descend into the subgroups themselves, prefer
     /// [`iter_groups`](Self::iter_groups), which hands back opened handles for
     /// the cost of this call.
+    ///
+    /// A group this session has staged and not yet committed is listed too, on
+    /// the terms [`datasets`](Self::datasets) sets out.
     pub fn groups(&self) -> Result<Vec<String>, Error> {
-        let entries = self.children()?;
+        let (entries, staged) = self.children_and_staged()?;
+        let members = staged_members(&staged, StagedKind::Group, &entries);
         let mut names = Vec::new();
         for entry in &entries {
+            if superseded(&staged, &entry.name) {
+                continue;
+            }
             let hdr = self.file.parse_header(entry.object_header_address)?;
             if is_group(&hdr) {
                 names.push(entry.name.clone());
             }
         }
+        names.extend(members);
         Ok(names)
     }
 
@@ -3315,7 +3491,7 @@ impl Group {
     ///
     /// Members arrive in the order the group's link structure yields them — the
     /// same order [`groups`](Self::groups) reports, which is not necessarily
-    /// sorted.
+    /// sorted, with this session's staged groups after them.
     ///
     /// ```no_run
     /// # use hdf5_pure::{Error, Group};
@@ -3331,25 +3507,38 @@ impl Group {
         &self,
     ) -> Result<impl ExactSizeIterator<Item = (String, Group)> + use<>, Error> {
         let revisions = self.file.revisions();
-        let mut members = Vec::new();
-        for entry in self.children()? {
+        let (entries, staged) = self.children_and_staged()?;
+        // Taken before the entries are consumed, as in `iter_datasets`.
+        let staged_members = staged_members(&staged, StagedKind::Group, &entries);
+        // `None` for a staged member, which has no address to resolve until the
+        // commit places its header.
+        let mut members: Vec<(String, Option<u64>)> = Vec::new();
+        for entry in entries {
+            if superseded(&staged, &entry.name) {
+                continue;
+            }
             // A `Group` handle carries no parsed header, so the header that
             // classified this child is dropped here rather than held for the
             // length of the walk.
             if is_group(&self.file.parse_header(entry.object_header_address)?) {
-                members.push(entry);
+                members.push((entry.name, Some(entry.object_header_address)));
             }
         }
+        members.extend(staged_members.into_iter().map(|name| (name, None)));
         let file = Arc::clone(&self.file);
         let parent = self.path.clone();
-        Ok(members.into_iter().map(move |entry| {
-            let path = child_path_of(parent.as_deref(), &entry.name);
-            let group = Group::new(
-                Arc::clone(&file),
-                revisions.at(entry.object_header_address),
-                path,
-            );
-            (entry.name, group)
+        Ok(members.into_iter().map(move |(name, address)| {
+            let path = child_path_of(parent.as_deref(), &name);
+            let group = match address {
+                Some(address) => Group::new(Arc::clone(&file), revisions.at(address), path),
+                // As in `iter_datasets`: staged members exist only under a
+                // group that has a path.
+                None => Group::pending(
+                    Arc::clone(&file),
+                    path.expect("a staged member's parent has a path"),
+                ),
+            };
+            (name, group)
         }))
     }
 
@@ -3444,6 +3633,16 @@ impl Group {
         name: &str,
         properties: DatasetAccessProperties,
     ) -> Result<Dataset, Error> {
+        let chunk_cache = properties.resolved_chunk_cache(self.file.access_properties.chunk_cache);
+        if let Some(child) = self.child_path(name) {
+            match self.file.staged_object(&child).map(|o| o.kind) {
+                Some(StagedKind::Dataset) => {
+                    return Ok(Dataset::pending(self.file.clone(), chunk_cache, child));
+                }
+                Some(StagedKind::Group) => return Err(Error::NotADataset(name.to_string())),
+                None => {}
+            }
+        }
         let revisions = self.file.revisions();
         let address = self
             .child_address(name)?
@@ -3452,7 +3651,6 @@ impl Group {
         if !has_message(&hdr, MessageType::DataLayout) {
             return Err(Error::NotADataset(name.to_string()));
         }
-        let chunk_cache = properties.resolved_chunk_cache(self.file.access_properties.chunk_cache);
         Ok(Dataset::new(
             self.file.clone(),
             revisions.at(address),
@@ -3468,6 +3666,15 @@ impl Group {
     /// [`dataset`](Self::dataset) returns [`Error::NotADataset`] for the mirror
     /// case, and [`FormatError::PathNotFound`] if there is no such child.
     pub fn group(&self, name: &str) -> Result<Group, Error> {
+        if let Some(child) = self.child_path(name) {
+            match self.file.staged_object(&child).map(|o| o.kind) {
+                Some(StagedKind::Group) => {
+                    return Ok(Group::pending(self.file.clone(), child));
+                }
+                Some(StagedKind::Dataset) => return Err(Error::NotAGroup(name.to_string())),
+                None => {}
+            }
+        }
         let revisions = self.file.revisions();
         let address = self
             .child_address(name)?
@@ -3510,10 +3717,20 @@ impl Group {
     }
 
     /// Create an empty subgroup `name` within this group, staged until
-    /// [`File::commit`].
+    /// [`File::commit`], and return a handle to it.
     ///
-    /// To give the new group attributes or children in the same commit, use
-    /// [`create_group_with`](Self::create_group_with).
+    /// The handle addresses the new group straight away: further groups,
+    /// datasets, deletions and attributes can be staged through it, and
+    /// [`group`](Self::group) finds it by name from the same session — as does
+    /// any group named in this call, but not an intermediate one the commit
+    /// fills in (`create_group("a/b")` leaves `a` unaddressable until then).
+    /// Reading it
+    /// — its attributes, or a member's data — reports
+    /// [`Error::NotCommitted`](crate::Error::NotCommitted) until the commit,
+    /// after which the same handle answers for the group in the file.
+    ///
+    /// [`create_group_with`](Self::create_group_with) builds a whole subtree in
+    /// one call instead.
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
@@ -3522,23 +3739,27 @@ impl Group {
     /// # use hdf5_pure::File;
     /// # fn main() -> Result<(), hdf5_pure::Error> {
     /// let file = File::open_rw("runs.h5")?;
-    /// file.root().create_group("run2")?;
+    /// let run = file.root().create_group("run2")?;
+    /// run.create_dataset("signal", |b| {
+    ///     b.with_f64_data(&[1.0, 2.0, 3.0]);
+    /// })?;
     /// file.commit()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn create_group(&self, name: &str) -> Result<(), Error> {
+    pub fn create_group(&self, name: &str) -> Result<Group, Error> {
         self.create_group_with(name, |_| {})
     }
 
     /// Create a subgroup `name` within this group, configuring it through
     /// `build` (attributes, nested groups and datasets), staged until
-    /// [`File::commit`].
+    /// [`File::commit`], and return a handle to it.
     ///
-    /// The closure exists because [`set_attr`](Self::set_attr) needs a group
-    /// that already *resolves*, so it cannot reach a group that is itself still
-    /// staged; this can, and the creation and its attributes land in one commit.
-    /// For a plain empty group use [`create_group`](Self::create_group).
+    /// The closure describes a whole subtree in one call, which is what makes it
+    /// worth having over [`create_group`](Self::create_group) plus calls on the
+    /// handle that returns; either way the new group is addressable by name
+    /// before the commit, and the handle this returns is the same one
+    /// [`group`](Self::group) would give back.
     ///
     /// The closure records into a buffer rather than into the file itself, and
     /// nothing it stages resolves until [`File::commit`], so reading the same
@@ -3563,18 +3784,32 @@ impl Group {
         &self,
         name: &str,
         build: impl FnOnce(&mut StagedGroup<'_>),
-    ) -> Result<(), Error> {
+    ) -> Result<Group, Error> {
         let child = self.child_edit_path(name)?;
         let mut ops = vec![StagedOp::CreateGroup(child.clone())];
         build(&mut StagedGroup {
             ops: &mut ops,
-            path: child,
+            path: child.clone(),
         });
-        self.apply_staged(ops)
+        self.apply_staged(ops)?;
+        Ok(Group::pending(self.file.clone(), child))
     }
 
     /// Create a dataset `name` within this group, configuring it through `build`
-    /// (shape, data, chunks, filters, …), staged until [`File::commit`].
+    /// (shape, data, chunks, filters, …), staged until [`File::commit`], and
+    /// return a handle to it.
+    ///
+    /// The handle addresses the new dataset straight away, which is what lets a
+    /// writer cache one per column while it is still building the schema. It
+    /// answers [`shape`](Dataset::shape), [`maxshape`](Dataset::maxshape),
+    /// [`dtype`](Dataset::dtype), [`datatype`](Dataset::datatype),
+    /// [`is_chunked`](Dataset::is_chunked) and [`filters`](Dataset::filters)
+    /// from what was staged, and [`append_staged`](Dataset::append_staged) folds
+    /// more elements into the pending creation. Anything that reads the
+    /// dataset's bytes — a `read_*`, its attributes, an immediate
+    /// [`append`](Dataset::append) — reports
+    /// [`Error::NotCommitted`](crate::Error::NotCommitted) until the commit,
+    /// after which the same handle reads the dataset in the file.
     ///
     /// As with [`create_group_with`](Self::create_group_with), the closure
     /// configures a builder rather than the file, so it may read the same
@@ -3582,18 +3817,43 @@ impl Group {
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    ///
+    /// ```no_run
+    /// # use hdf5_pure::File;
+    /// # fn main() -> Result<(), hdf5_pure::Error> {
+    /// let file = File::open_rw("runs.h5")?;
+    /// let mut col = file.root().create_dataset("col", |b| {
+    ///     b.with_f64_data(&[])
+    ///         .with_shape(&[0])
+    ///         .with_maxshape(&[u64::MAX])
+    ///         .with_chunks(&[512]);
+    /// })?;
+    /// col.append_staged(|a| {
+    ///     a.append_f64(&[1.0, 2.0, 3.0]);
+    /// })?;
+    /// file.commit()?;
+    /// assert_eq!(col.read_f64()?, vec![1.0, 2.0, 3.0]);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn create_dataset(
         &self,
         name: &str,
         build: impl FnOnce(&mut DatasetBuilder),
-    ) -> Result<(), Error> {
+    ) -> Result<Dataset, Error> {
         let child = self.child_edit_path(name)?;
         let mut builder = DatasetBuilder::new(name);
         build(&mut builder);
         self.apply_staged(vec![StagedOp::CreateDataset {
-            path: child,
+            path: child.clone(),
             builder: Box::new(builder),
-        }])
+        }])?;
+        Ok(Dataset::pending(
+            self.file.clone(),
+            DatasetAccessProperties::new()
+                .resolved_chunk_cache(self.file.access_properties.chunk_cache),
+            child,
+        ))
     }
 
     /// Delete the object named `name` from this group, staged until
@@ -3604,6 +3864,12 @@ impl Group {
     /// the removal is applied before the addition and one superblock write
     /// publishes both, so a rotation costs one commit and the path is never
     /// momentarily absent.
+    ///
+    /// Deleting an object this session **staged** and has not committed
+    /// withdraws that staging instead — its attributes, appends and staged
+    /// children go with it — since there is no link in the file to unlink. Where
+    /// the deletion was part of a replacement, the plain deletion of the file's
+    /// own object is what remains.
     ///
     /// ```no_run
     /// # use hdf5_pure::File;
@@ -3702,6 +3968,53 @@ impl Group {
         let hdr = self.file.parse_header(self.header_address()?)?;
         self.file.group_children(&hdr)
     }
+
+    /// This group's on-disk children, paired with the children the session has
+    /// staged under it.
+    ///
+    /// A staged name supersedes an on-disk link of the same name: the two can
+    /// coexist only as a replacement (issue #305), where the commit removes the
+    /// link before adding the new object, and every by-name lookup already
+    /// answers with the staged one. A group that is *itself* staged has no links
+    /// on disk to enumerate, and its members are exactly what is staged under
+    /// it.
+    fn children_and_staged(&self) -> Result<(Vec<GroupEntry>, StagedChildren), Error> {
+        let staged = match self.path.as_deref() {
+            Some(path) => self.file.staged_children(path),
+            // A group reached by object reference cannot name itself, so nothing
+            // can have been staged under it by name either.
+            None => Vec::new(),
+        };
+        match self.children() {
+            Ok(entries) => Ok((entries, staged)),
+            Err(Error::NotCommitted(_)) => Ok((Vec::new(), staged)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The children of one group this session has staged.
+type StagedChildren = Vec<StagedChild>;
+
+/// Whether a staged creation takes `name` over from the link the file holds
+/// there — which it does only when the same commit removes that link.
+///
+/// A creation that merely collides with a surviving link is one the commit
+/// refuses, so the file's own object is what the name lists as until then.
+fn superseded(staged: &[StagedChild], name: &str) -> bool {
+    staged.iter().any(|c| c.name == name && c.replaces_link)
+}
+
+/// The staged children of `kind` that own their names, given the on-disk links
+/// they sit beside, in the order they were staged.
+fn staged_members(staged: &[StagedChild], kind: StagedKind, entries: &[GroupEntry]) -> Vec<String> {
+    staged
+        .iter()
+        .filter(|c| c.kind == kind)
+        // Either the file has no link of this name, or the commit removes it.
+        .filter(|c| c.replaces_link || !entries.iter().any(|e| e.name == c.name))
+        .map(|c| c.name.clone())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3742,7 +4055,12 @@ pub struct Dataset {
     /// Where this dataset's object header sits and what it says, as of the file
     /// revision they were read at. Re-taken on first use after the file changes;
     /// see [`Dataset::resolved`].
-    state: RwLock<Arc<DatasetState>>,
+    ///
+    /// `None` for a dataset this session has *staged* and not yet committed:
+    /// there is no header to read. Such a handle answers the metadata questions
+    /// from what was staged and resolves its path on every other use, until a
+    /// commit gives it a header to memoize.
+    state: RwLock<Option<Arc<DatasetState>>>,
     // Held per-dataset: the chunk index is keyed only by chunk coordinate, so
     // a file-level cache would alias chunk addresses across datasets. Shared
     // between clones, which are the same dataset: a chunk read through one is
@@ -3764,9 +4082,12 @@ impl Clone for Dataset {
     fn clone(&self) -> Self {
         Self {
             file: Arc::clone(&self.file),
-            state: RwLock::new(Arc::clone(
-                &self.state.read().unwrap_or_else(PoisonError::into_inner),
-            )),
+            state: RwLock::new(
+                self.state
+                    .read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            ),
             chunk_cache: Arc::clone(&self.chunk_cache),
             chunk_cache_config: self.chunk_cache_config,
             path: self.path.clone(),
@@ -3779,9 +4100,13 @@ impl std::fmt::Debug for Dataset {
     /// the file could fail, and one that failed would have nothing to print.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
-        f.debug_struct("Dataset")
-            .field("messages", &state.header.messages.len())
-            .finish()
+        match state.as_ref() {
+            Some(state) => f
+                .debug_struct("Dataset")
+                .field("messages", &state.header.messages.len())
+                .finish(),
+            None => f.debug_struct("Dataset").field("staged", &true).finish(),
+        }
     }
 }
 
@@ -3877,10 +4202,57 @@ impl Dataset {
     ) -> Self {
         Self {
             file,
-            state: RwLock::new(Arc::new(DatasetState { at, header })),
+            state: RwLock::new(Some(Arc::new(DatasetState { at, header }))),
             chunk_cache: Arc::new(ChunkCache::with_config(chunk_cache_config)),
             chunk_cache_config,
             path,
+        }
+    }
+
+    /// Build a handle for a dataset this session has staged and not yet
+    /// committed, which has no object header to read.
+    ///
+    /// It answers the questions the staged builder already settles — shape,
+    /// maximum shape, datatype, whether the storage is chunked and which filters
+    /// it carries — and stages further edits on the pending creation. Everything
+    /// that needs bytes reports [`Error::NotCommitted`](crate::Error::NotCommitted)
+    /// until [`File::commit`], after which the first use resolves the path and
+    /// the handle behaves as if it had been opened by name.
+    fn pending(file: Arc<FileInner>, chunk_cache_config: ChunkCacheConfig, path: String) -> Self {
+        Self {
+            file,
+            state: RwLock::new(None),
+            chunk_cache: Arc::new(ChunkCache::with_config(chunk_cache_config)),
+            chunk_cache_config,
+            path: Some(path),
+        }
+    }
+
+    /// What this dataset's staged creation says about itself, or `None` once it
+    /// is committed (or when it never was staged).
+    ///
+    /// Only a handle with no memo can be pending: one that has resolved a header
+    /// names an object the file already holds, so this costs a lock read rather
+    /// than a session lock on the common path.
+    fn staged_meta(&self) -> Option<StagedMeta> {
+        if self
+            .state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+        {
+            return None;
+        }
+        self.file.staged_dataset_meta(self.path.as_deref()?)
+    }
+
+    /// Refuse an operation that needs this dataset's bytes while it is still
+    /// staged.
+    fn refuse_if_pending(&self) -> Result<(), Error> {
+        match self.staged_meta() {
+            // `staged_meta` answers only for a handle with a path.
+            Some(_) => Err(Error::NotCommitted(self.path.clone().unwrap_or_default())),
+            None => Ok(()),
         }
     }
 
@@ -3891,19 +4263,25 @@ impl Dataset {
     /// that has no path to re-resolve — one an object reference produced — once
     /// a commit has run under it, and the resolution's own error (a
     /// `PathNotFound`, say, for a dataset a commit deleted) when the path no
-    /// longer names anything. A path that now names something other than a
-    /// dataset is [`Error::NotADataset`](crate::Error::NotADataset), the same
-    /// answer opening it afresh would give.
+    /// longer names anything. A dataset this session has staged and not
+    /// committed has no header at all, and that is
+    /// [`Error::NotCommitted`](crate::Error::NotCommitted). A path that now
+    /// names something other than a dataset is
+    /// [`Error::NotADataset`](crate::Error::NotADataset), the same answer
+    /// opening it afresh would give.
     fn resolved(&self) -> Result<Arc<DatasetState>, Error> {
         let live = self.file.content_revision();
         let memo = {
             let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
-            if state.at.content_revision == live {
-                return Ok(Arc::clone(&state));
+            match state.as_ref() {
+                Some(state) if state.at.content_revision == live => {
+                    return Ok(Arc::clone(state));
+                }
+                Some(state) => Some(state.at),
+                None => None,
             }
-            state.at
         };
-        let at = self.file.locate(self.path.as_deref(), memo)?;
+        let at = self.file.locate_staged(self.path.as_deref(), memo)?;
         let header = self.file.parse_header(at.address)?;
         // Checked *before* it is memoized. A header installed and then refused is
         // the answer every later call short-circuits on, so this handle would
@@ -3929,9 +4307,13 @@ impl Dataset {
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
         // Two threads can re-resolve at once. The older answer must not land on
         // top of the newer one, or the newer handle would go on serving a header
-        // the file has already moved past.
-        if at.content_revision >= state.at.content_revision {
-            *state = Arc::clone(&fresh);
+        // the file has already moved past. A handle that had no memo takes this
+        // one: any header beats naming nothing.
+        if state
+            .as_ref()
+            .is_none_or(|memo| at.content_revision >= memo.at.content_revision)
+        {
+            *state = Some(Arc::clone(&fresh));
         }
         fresh
     }
@@ -4131,6 +4513,11 @@ impl Dataset {
     /// write session, which also applies every refusal that does not depend on
     /// the bytes being appended.
     pub(crate) fn append_geometry(&self) -> Result<AppendGeometry, Error> {
+        // An in-place append rewrites bytes where they stand, and a dataset this
+        // session has only staged has none. Refused here rather than deep in the
+        // engine, so `append`, `append_raw` and `buffered_appender` all say the
+        // same thing.
+        self.refuse_if_pending()?;
         let target = self.append_target()?;
         self.file
             .with_engine_mut(Change::Nothing, |engine| engine.append_geometry(target))
@@ -4295,10 +4682,30 @@ impl Dataset {
     /// The closure configures a standalone builder, not the file, so it may read
     /// the same [`File`]; nothing it stages resolves until [`File::commit`].
     pub fn append_staged(&mut self, build: impl FnOnce(&mut AppendBuilder)) -> Result<(), Error> {
-        self.check_staged_edit()?;
+        // A dataset *this handle* names and this session has not written has no
+        // bytes to grow, so the elements are folded into the pending creation
+        // instead (see the note above). `check_staged_edit` refuses that dataset,
+        // so ask it only about one the file already holds; the file-mode and path
+        // gates apply either way.
+        //
+        // The distinction is the handle's, not the path's: a handle onto the
+        // object a staged creation *replaces* is not pending, and the session
+        // refuses its append rather than growing the replacement under it.
+        let pending = self.staged_meta().is_some();
+        if pending {
+            self.file.check_staged_writable()?;
+        } else {
+            self.check_staged_edit()?;
+        }
         let mut builder = AppendBuilder::new();
         build(&mut builder);
-        self.with_session_mut(|session, path| session.stage_dataset_append(path, builder))
+        self.with_session_mut(|session, path| {
+            if pending {
+                session.stage_dataset_append_pending(path, builder)
+            } else {
+                session.stage_dataset_append(path, builder)
+            }
+        })
     }
 
     /// Add or update an attribute on this dataset, staged until
@@ -4309,12 +4716,14 @@ impl Dataset {
     /// The file must have been opened with [`File::open_rw`], else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn set_attr(&mut self, name: &str, value: AttrValue) -> Result<(), Error> {
+        self.refuse_if_pending()?;
         self.with_session_mut(|session, path| session.set_dataset_attr(path, name, value))
     }
 
     /// Remove an attribute from this dataset, staged until [`File::commit`].
     /// See [`set_attr`](Self::set_attr) for the file-mode rules.
     pub fn remove_attr(&mut self, name: &str) -> Result<(), Error> {
+        self.refuse_if_pending()?;
         self.with_session_mut(|session, path| session.remove_dataset_attr(path, name))
     }
 
@@ -4338,6 +4747,10 @@ impl Dataset {
         if self.path.is_none() {
             return Err(Error::ReadOnly);
         }
+        // Ahead of the external-storage question, which reads a header this
+        // dataset does not have yet. `append_staged` is the one staged edit that
+        // *is* supported on a pending dataset, and it re-admits itself below.
+        self.refuse_if_pending()?;
         // The elements of an externally stored dataset are not in this file, and
         // the engine writes only this file. Its contiguous layout message records
         // no address, so a write took it for never-allocated storage, appended the
@@ -4415,7 +4828,14 @@ the same commit to replace it",
     }
 
     /// Returns the shape (dimensions) of the dataset.
+    ///
+    /// A dataset this session has staged and not yet committed answers from what
+    /// was staged, which includes the elements
+    /// [`append_staged`](Self::append_staged) has folded into it.
     pub fn shape(&self) -> Result<Vec<u64>, Error> {
+        if let Some(meta) = self.staged_meta() {
+            return Ok(meta.dimensions);
+        }
         let ds = self.dataspace()?;
         Ok(ds.dimensions.clone())
     }
@@ -4431,6 +4851,9 @@ the same commit to replace it",
     /// (which requires a chunked dataset whose first maximum dimension is
     /// `u64::MAX`) instead of relying on the append's refusal error.
     pub fn maxshape(&self) -> Result<Option<Vec<u64>>, Error> {
+        if let Some(meta) = self.staged_meta() {
+            return Ok(meta.maxshape);
+        }
         let ds = self.dataspace()?;
         match &ds.max_dimensions {
             Some(md) if *md != ds.dimensions => Ok(Some(md.clone())),
@@ -4442,8 +4865,12 @@ the same commit to replace it",
     /// compact). Filtered datasets are always chunked. Returns `false` for a
     /// dataset with no data-layout message, for a non-chunked layout, and — like
     /// the other accessors that return no `Result` — for a handle that can no
-    /// longer be resolved.
+    /// longer be resolved. A dataset this session has staged and not yet
+    /// committed answers with the storage its builder selected.
     pub fn is_chunked(&self) -> bool {
+        if let Some(meta) = self.staged_meta() {
+            return meta.chunked;
+        }
         matches!(self.data_layout(), Ok(DataLayout::Chunked { .. }))
     }
 
@@ -4474,8 +4901,12 @@ the same commit to replace it",
     /// (application) order, or an empty vector when the dataset is unfiltered.
     /// The IDs are the registered HDF5 filter numbers — e.g. 1 = deflate,
     /// 2 = shuffle, 3 = fletcher32, 6 = scale-offset — so a caller can inspect
-    /// the pipeline without decoding a chunk.
+    /// the pipeline without decoding a chunk. A dataset this session has staged
+    /// and not yet committed reports the pipeline its builder asked for.
     pub fn filters(&self) -> Vec<u16> {
+        if let Some(meta) = self.staged_meta() {
+            return meta.filters.into_iter().map(|(id, _)| id).collect();
+        }
         self.filter_pipeline_parsed()
             .map(|p| p.filters.iter().map(|f| f.filter_id).collect())
             .unwrap_or_default()
@@ -4578,7 +5009,24 @@ the same commit to replace it",
     /// on-disk pipeline order, matching [`filters`](Self::filters); a reader
     /// inverts them in the *reverse* of this order to decode a chunk. The curated
     /// analogue of `H5Pget_nfilters` + `H5Pget_filter2`.
+    ///
+    /// A dataset this session has staged and not yet committed reports each
+    /// filter's identifier and optional flag, and no name or client data: those
+    /// are derived from the dataset being written (element size, chunk geometry,
+    /// fill value) when [`File::commit`] writes it.
     pub fn filter_pipeline(&self) -> Vec<Filter> {
+        if let Some(meta) = self.staged_meta() {
+            return meta
+                .filters
+                .into_iter()
+                .map(|(id, is_optional)| Filter {
+                    id,
+                    is_optional,
+                    name: None,
+                    client_data: Vec::new(),
+                })
+                .collect();
+        }
         self.filter_pipeline_parsed()
             .map(|p| {
                 p.filters
@@ -4605,6 +5053,9 @@ the same commit to replace it",
     }
 
     /// Returns the simplified datatype of the dataset.
+    ///
+    /// A dataset this session has staged and not yet committed answers with the
+    /// datatype its builder settled on.
     pub fn dtype(&self) -> Result<DType, Error> {
         let dt = self.datatype()?;
         Ok(classify_datatype(&dt))
@@ -5188,6 +5639,9 @@ the same commit to replace it",
     /// `create_dataset(..., dtype=f["t"])` — is stored as a reference to the
     /// datatype's own object header and is resolved to the type it names.
     pub fn datatype(&self) -> Result<Datatype, Error> {
+        if let Some(meta) = self.staged_meta() {
+            return Ok(meta.datatype);
+        }
         let state = self.resolved()?;
         let msg = find_message(&state.header, MessageType::Datatype)?;
         let (dt, _) = Datatype::parse(&self.file.message_body(msg)?)?;

@@ -599,6 +599,87 @@ struct StagedEdits {
     /// — and foreign-address-screened — eagerly in `copy_from` (the source file is
     /// borrowed only for that call), then linked in at the next `commit`.
     cross_copies: Vec<(PathKey, CopyTree)>,
+    /// Where the creation at each full path sits in [`datasets`](Self::datasets)
+    /// / [`groups`](Self::groups), so a by-name question about the staged set
+    /// costs a hash rather than a scan of everything staged.
+    ///
+    /// The scan is what made a writer that stages one dataset per column and
+    /// then binds a handle to each quadratic in the number of columns (issue
+    /// #392). Both maps are derived from the vectors beside them and are kept in
+    /// step at the three places those change: the push that stages a creation,
+    /// the truncation [`rewind`](Self::rewind) makes, and the rebuild
+    /// [`withdraw_at`](Self::withdraw_at) makes after removing from the middle.
+    /// A path staged twice keeps its *first* position, which is the entry a scan
+    /// would have found; the commit refuses such a pair anyway.
+    dataset_at: HashMap<PathKey, usize>,
+    group_at: HashMap<PathKey, usize>,
+}
+
+/// The full path of a dataset staged under `parent` as `name`.
+fn child_key(parent: &[String], name: &str) -> PathKey {
+    let mut full = parent.to_vec();
+    full.push(name.to_string());
+    full
+}
+
+/// Whether the dataset staged under `parent` as `name` lies at or under
+/// `prefix`, without building its full path.
+fn dataset_under(parent: &[String], name: &str, prefix: &[String]) -> bool {
+    match prefix.len() {
+        n if n <= parent.len() => parent.starts_with(prefix),
+        n if n == parent.len() + 1 => {
+            parent[..] == prefix[..parent.len()] && prefix[parent.len()] == name
+        }
+        _ => false,
+    }
+}
+
+/// What a session has staged at a path, for a handle addressing an object the
+/// commit has not written yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StagedKind {
+    Group,
+    Dataset,
+}
+
+/// A creation this session has staged at a path, and whether it takes that path
+/// over from the file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct StagedObject {
+    pub(crate) kind: StagedKind,
+    /// Whether this same commit removes the link the file holds at that path.
+    ///
+    /// True makes the creation a *replacement* (issue #305). False means the
+    /// file holds no link there at all — a creation colliding with one that
+    /// survives is not reported as staged, since the commit refuses it and the
+    /// file's own object is what the name means until then.
+    pub(crate) replaces_link: bool,
+}
+
+/// One direct child a group gains from this session's staged creations.
+pub(crate) struct StagedChild {
+    pub(crate) name: String,
+    pub(crate) kind: StagedKind,
+    /// Whether a staged deletion removes the link this name has in the file, so
+    /// the creation supersedes it rather than colliding with it. See
+    /// [`StagedObject::replaces_link`].
+    pub(crate) replaces_link: bool,
+}
+
+/// What a staged dataset can say about itself before it is written.
+///
+/// Everything here is settled when the dataset is staged — [`flatten_dataset`]
+/// has already validated the builder — so a handle answers from it without
+/// reading the file, and the answers are what the commit goes on to write.
+pub(crate) struct StagedMeta {
+    pub(crate) datatype: Datatype,
+    pub(crate) dimensions: Vec<u64>,
+    /// `None` for a fixed-shape dataset, matching `Dataset::maxshape`.
+    pub(crate) maxshape: Option<Vec<u64>>,
+    pub(crate) chunked: bool,
+    /// Each staged filter's registered id and its `H5Z_FLAG_OPTIONAL` flag, in
+    /// pipeline order.
+    pub(crate) filters: Vec<(u16, bool)>,
 }
 
 /// Where a [`StagedEdits`] stood before a batch of staging calls, so a batch
@@ -637,6 +718,9 @@ impl StagedEdits {
             deletes,
             copies,
             cross_copies,
+            // Derived from `datasets` and `groups`, and restored with them.
+            dataset_at: _,
+            group_at: _,
         } = self;
         StagedMark {
             datasets: datasets.len(),
@@ -653,10 +737,37 @@ impl StagedEdits {
 
     /// Drop everything staged since `mark`.
     ///
-    /// Staging only ever appends — every `stage_*` entry point validates and
-    /// then pushes — so truncating to the recorded lengths is an exact undo of
-    /// the calls made in between, and leaves anything staged before them alone.
+    /// Staging inside a batch only ever appends — every `stage_*` entry point
+    /// validates and then pushes — so truncating to the recorded lengths is an
+    /// exact undo of the calls made in between, and leaves anything staged
+    /// before them alone. The two operations that instead *change* what is
+    /// already staged — the fold
+    /// [`WriteEngine::stage_dataset_append_pending`] makes into a staged
+    /// creation, and the withdrawal [`withdraw_at`](Self::withdraw_at) makes for
+    /// [`WriteEngine::delete`] — would leave that untrue, so
+    /// [`WriteEngine::refuse_mid_batch`] refuses them while a batch is open
+    /// rather than leaving the claim to be hoped for.
+    ///
+    /// The by-path index is truncated with the vectors it describes, so a
+    /// rewound creation stops answering as well as stops existing.
     fn rewind(&mut self, mark: StagedMark) {
+        for i in mark.datasets..self.datasets.len() {
+            let key = {
+                let (parent, fd) = &self.datasets[i];
+                child_key(parent, &fd.name)
+            };
+            // Only where it still points at the entry being dropped: a second
+            // creation at one path never displaced the first.
+            if self.dataset_at.get(&key) == Some(&i) {
+                self.dataset_at.remove(&key);
+            }
+        }
+        for i in mark.groups..self.groups.len() {
+            let key = self.groups[i].clone();
+            if self.group_at.get(&key) == Some(&i) {
+                self.group_at.remove(&key);
+            }
+        }
         let StagedMark {
             datasets,
             writes,
@@ -677,6 +788,124 @@ impl StagedEdits {
         self.deletes.truncate(deletes);
         self.copies.truncate(copies);
         self.cross_copies.truncate(cross_copies);
+    }
+
+    /// Stage a dataset creation, indexing it by its full path.
+    fn push_dataset(&mut self, parent: PathKey, fd: FlatDataset) {
+        self.dataset_at
+            .entry(child_key(&parent, &fd.name))
+            .or_insert(self.datasets.len());
+        self.datasets.push((parent, fd));
+    }
+
+    /// Stage a group creation, indexing it by its path.
+    fn push_group(&mut self, path: PathKey) {
+        self.group_at
+            .entry(path.clone())
+            .or_insert(self.groups.len());
+        self.groups.push(path);
+    }
+
+    /// Where the staged dataset at `path` sits, if there is one.
+    ///
+    /// The position the index gives is checked against the entry it names
+    /// rather than trusted: an index that fell behind the vector then reads as a
+    /// miss — the answer a scan would give — instead of as another dataset.
+    fn dataset_position(&self, path: &[String]) -> Option<usize> {
+        let i = *self.dataset_at.get(path)?;
+        let (parent, fd) = self.datasets.get(i)?;
+        dataset_under(parent, &fd.name, path).then_some(i)
+    }
+
+    /// The staged dataset at `path` (given as components), if there is one.
+    fn dataset_at(&self, path: &[String]) -> Option<&FlatDataset> {
+        let i = self.dataset_position(path)?;
+        self.datasets.get(i).map(|(_, fd)| fd)
+    }
+
+    /// The staged dataset at `path`, mutably.
+    fn dataset_at_mut(&mut self, path: &[String]) -> Option<&mut FlatDataset> {
+        let i = self.dataset_position(path)?;
+        self.datasets.get_mut(i).map(|(_, fd)| fd)
+    }
+
+    /// Whether a group creation is staged at `path`. Checked against the entry
+    /// the index names, for the reason [`dataset_position`](Self::dataset_position)
+    /// gives.
+    fn has_group_at(&self, path: &[String]) -> bool {
+        match self.group_at.get(path) {
+            Some(&i) => self.groups.get(i).is_some_and(|p| p[..] == *path),
+            None => false,
+        }
+    }
+
+    /// Whether a staged deletion removes the link at `path`, or the link to an
+    /// ancestor that carries it away.
+    fn deletes_cover(&self, path: &[String]) -> bool {
+        self.deletes.iter().any(|d| path.starts_with(&d[..]))
+    }
+
+    /// Withdraw every edit staged at or under `path`, as though the calls that
+    /// staged them had never been made, and report whether a *creation* was
+    /// among them.
+    ///
+    /// This is what lets [`WriteEngine::delete`] cancel an object this session
+    /// staged and has not written: there is nothing in the file to unlink, so a
+    /// deletion of it is a withdrawal. Deletions are deliberately left alone —
+    /// one under a withdrawn creation still names a link the file holds, and two
+    /// overlapping deletions are the commit's refusal to make rather than this
+    /// call's.
+    ///
+    /// Destructured for the reason [`mark`](Self::mark) is: a staged kind added
+    /// later has to be classified here rather than silently survive a
+    /// withdrawal.
+    fn withdraw_at(&mut self, path: &[String]) -> bool {
+        let before = {
+            let Self {
+                datasets,
+                writes,
+                appends,
+                groups,
+                group_attrs,
+                dataset_attrs,
+                deletes,
+                copies,
+                cross_copies,
+                dataset_at: _,
+                group_at: _,
+            } = self;
+            let before = datasets.len() + groups.len();
+            datasets.retain(|(parent, fd)| !dataset_under(parent, &fd.name, path));
+            writes.retain(|(p, _)| !p.starts_with(path));
+            appends.retain(|(p, _)| !p.starts_with(path));
+            groups.retain(|p| !p.starts_with(path));
+            group_attrs.retain(|(p, _)| !p.starts_with(path));
+            dataset_attrs.retain(|(p, _)| !p.starts_with(path));
+            copies.retain(|(_, dst)| !dst.starts_with(path));
+            cross_copies.retain(|(dst, _)| !dst.starts_with(path));
+            let _ = &deletes;
+            before
+        };
+        let withdrew = self.datasets.len() + self.groups.len() < before;
+        if withdrew {
+            self.reindex();
+        }
+        withdrew
+    }
+
+    /// Rebuild the by-path index from the vectors, after a removal from the
+    /// middle shifted every position after it.
+    fn reindex(&mut self) {
+        self.dataset_at.clear();
+        self.group_at.clear();
+        for (i, (parent, fd)) in self.datasets.iter().enumerate() {
+            self.dataset_at
+                .entry(child_key(parent, &fd.name))
+                .or_insert(i);
+        }
+        for (i, path) in self.groups.iter().enumerate() {
+            self.group_at.entry(path.clone()).or_insert(i);
+        }
     }
 
     /// Whether nothing at all is staged.
@@ -960,6 +1189,10 @@ pub(crate) struct WriteEngine {
     /// It is a property of one commit, not of the session, so `commit` clears it
     /// on entry rather than trusting the previous run to have left it false.
     publish_attempted: bool,
+    /// Whether a [`stage_atomically`](Self::stage_atomically) batch is open, so
+    /// [`refuse_mid_batch`](Self::refuse_mid_batch) can keep
+    /// [`StagedEdits::rewind`]'s truncation an exact undo.
+    staging_batch: bool,
     /// Superblock status flags this session raised on the file and holds for its
     /// lifetime — the SWMR pair, or the page buffer's crash mark — or `0` when it
     /// holds none.
@@ -2325,6 +2558,7 @@ impl WriteEngine {
             libver_ceiling: None,
             fsm_len: len,
             publish_attempted: false,
+            staging_batch: false,
             held_status_flags: 0,
             sync_policy: SyncPolicy::Always,
         };
@@ -2742,9 +2976,7 @@ impl WriteEngine {
         self.refuse_if_claimed(&split_path(path))?;
         let mut comps = split_path(path);
         builder.name = comps.pop().unwrap_or_default();
-        self.staged
-            .datasets
-            .push((comps, flatten_dataset(builder)?));
+        self.staged.push_dataset(comps, flatten_dataset(builder)?);
         Ok(())
     }
 
@@ -2847,7 +3079,150 @@ impl WriteEngine {
     ) -> Result<(), Error> {
         let comps = split_path(path);
         self.refuse_if_claimed(&comps)?;
+        if self.staged.dataset_at(&comps).is_some() {
+            // This call came through a handle onto the object *in the file*: a
+            // handle onto the staged creation goes to
+            // [`stage_dataset_append_pending`] instead. So the elements could
+            // only be meant for the object the same commit replaces, which is
+            // never what the caller wants and is what `commit` refuses two calls
+            // later. Said here, where the handle that asked is still in hand.
+            return Err(Error::EditUnsupported(
+                "a dataset is staged at this path in the same commit, so an append through a \
+                 handle onto the object the file holds there could only grow the object being \
+                 replaced; append through the handle that staged the creation, or commit first",
+            ));
+        }
         self.staged.appends.push((comps, builder));
+        Ok(())
+    }
+
+    /// Stage an append made through a handle onto a dataset **this session
+    /// staged and has not committed**, folding the elements into the pending
+    /// creation.
+    ///
+    /// The caller establishes that its handle is the pending one;
+    /// [`stage_dataset_append`](Self::stage_dataset_append) is the entry point
+    /// for a handle onto an object the file already holds, and refuses the same
+    /// path. Between the caller's check and this lock another thread can commit,
+    /// which leaves the dataset in the file and nothing staged at its path — so
+    /// the append becomes an ordinary staged one rather than an error.
+    pub(crate) fn stage_dataset_append_pending(
+        &mut self,
+        path: &str,
+        builder: AppendBuilder,
+    ) -> Result<(), Error> {
+        let comps = split_path(path);
+        self.refuse_if_claimed(&comps)?;
+        if self.staged.dataset_at(&comps).is_none() {
+            self.staged.appends.push((comps, builder));
+            return Ok(());
+        }
+        self.refuse_mid_batch()?;
+        self.extend_staged_dataset(&comps, &builder)
+    }
+
+    /// Refuse an edit that changes or withdraws something already staged while a
+    /// [`stage_atomically`](Self::stage_atomically) batch is open.
+    ///
+    /// [`StagedEdits::rewind`] undoes a batch by truncating the staged vectors,
+    /// which is exact only while staging appends to them. The two operations
+    /// that do otherwise — the fold
+    /// [`stage_dataset_append_pending`](Self::stage_dataset_append_pending)
+    /// makes, and the withdrawal [`delete`](Self::delete) makes — would leave a
+    /// refused batch holding half of one. No caller reaches this today: a batch
+    /// replays [`StagedOp`](crate::StagedGroup)s, which only ever create. It is
+    /// here so the claim `rewind` rests on is enforced rather than remembered.
+    fn refuse_mid_batch(&self) -> Result<(), Error> {
+        if self.staging_batch {
+            return Err(Error::EditUnsupported(
+                "an edit that changes or withdraws an already-staged object cannot be made \
+                 inside an atomic staging batch, whose undo drops additions only",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fold an append onto a dataset this same session staged and has not
+    /// committed into the pending creation: the elements are added to the
+    /// bytes the commit will write and the leading dimension grows to match.
+    ///
+    /// There is no dataset in the file to grow, so this is the same edit as
+    /// having handed the elements to the builder in the first place — which is
+    /// why it asks for neither an unlimited dimension nor a chunked layout,
+    /// where an append onto a *committed* dataset needs both. Anything the
+    /// staged creation must resolve at commit time per element — a
+    /// variable-length string payload, an object reference — is refused: those
+    /// carry a side table indexed by element that this cannot extend.
+    fn extend_staged_dataset(
+        &mut self,
+        comps: &[String],
+        builder: &AppendBuilder,
+    ) -> Result<(), Error> {
+        if builder.dt_conflict() {
+            return Err(Error::AppendUnsupported(
+                "this append mixes element datatypes; use one element type per append",
+            ));
+        }
+        let fd = self
+            .staged
+            .dataset_at_mut(comps)
+            .expect("caller checked a dataset is staged at this path");
+        if fd.vl_string_staging.is_some() || fd.reference_targets.is_some() {
+            return Err(Error::AppendUnsupported(
+                "a staged variable-length-string or object-reference dataset cannot be appended \
+                 to before it is committed: its per-element side table is built with the \
+                 dataset. Supply every element through the builder that creates it",
+            ));
+        }
+        if let Some(dt) = builder.elem_dt() {
+            if *dt != fd.dt {
+                return Err(Error::AppendUnsupported(
+                    "appended element datatype does not match the staged dataset's datatype",
+                ));
+            }
+        }
+        let Some((lead, inner)) = fd.ds.dimensions.split_first() else {
+            return Err(Error::AppendUnsupported(
+                "a scalar dataset has no dimension to append along",
+            ));
+        };
+        // One row of the leading dimension, in bytes: the element size times
+        // every trailing extent. A rank-1 dataset's row is one element.
+        let mut row_bytes = u64::from(fd.dt.type_size());
+        for &d in inner {
+            row_bytes = row_bytes.checked_mul(d).ok_or(Error::AppendUnsupported(
+                "staged dataset row size overflows",
+            ))?;
+        }
+        if row_bytes == 0 {
+            return Err(Error::AppendUnsupported(
+                "a staged dataset whose rows hold no bytes cannot be appended to",
+            ));
+        }
+        let bytes = builder.raw();
+        if bytes.len() as u64 % row_bytes != 0 {
+            return Err(Error::AppendUnsupported(
+                "appended byte length is not a whole number of rows of the staged dataset",
+            ));
+        }
+        let grown = lead
+            .checked_add(bytes.len() as u64 / row_bytes)
+            .ok_or(Error::AppendUnsupported("staged dataset length overflows"))?;
+        // A finite maximum is a promise the commit would refuse to break.
+        if let Some(max) = fd
+            .ds
+            .max_dimensions
+            .as_ref()
+            .and_then(|m| m.first().copied())
+        {
+            if max != u64::MAX && grown > max {
+                return Err(Error::AppendUnsupported(
+                    "appending would grow the staged dataset past its maximum shape",
+                ));
+            }
+        }
+        fd.raw.extend_from_slice(bytes);
+        fd.ds.dimensions[0] = grown;
         Ok(())
     }
 
@@ -2986,7 +3361,11 @@ impl WriteEngine {
         f: impl FnOnce(&mut Self) -> Result<R, Error>,
     ) -> Result<R, Error> {
         let mark = self.staged.mark();
+        // Saved and restored rather than simply cleared, so a nested batch does
+        // not lift the outer one's guard on its way out.
+        let outer = std::mem::replace(&mut self.staging_batch, true);
         let result = f(self);
+        self.staging_batch = outer;
         if result.is_err() {
             self.staged.rewind(mark);
         }
@@ -3702,6 +4081,178 @@ impl WriteEngine {
             })
     }
 
+    /// What this session has staged at `path`, for a handle that wants to
+    /// address a not-yet-committed object by name.
+    ///
+    /// Only a *creation* answers, and only when it owns the path — when the file
+    /// holds no link there, or when this same commit removes the one it does.
+    /// Both halves matter:
+    ///
+    /// - A staged **deletion** on its own hides nothing. The object is in the
+    ///   file and still readable, and a lookup that pretended otherwise would
+    ///   refuse a read the file can serve.
+    /// - A creation **colliding** with a link the commit does not remove is one
+    ///   the commit refuses ("a link with this name already exists"). Reporting
+    ///   it would shadow a live, readable object with a handle that never
+    ///   becomes valid, so the file's own object stays the meaning of the name.
+    /// - The two together are a **replacement** (issue #305), and the creation
+    ///   is what the path names from the moment it is staged, before the commit
+    ///   as after.
+    ///
+    /// Only a path the session **named** answers. A commit also creates the
+    /// intermediate groups on the way to an addition — `create_dataset("a/b")`
+    /// gets an `a` whether or not one was asked for — and those are *not*
+    /// reported, because a session cannot tell from its staged set alone whether
+    /// such a group is one it is adding or one already in the file. Reporting
+    /// them would hand a caller a not-yet-committed handle onto a group they can
+    /// read today, which is the worse of the two mistakes; stage the group by
+    /// name to address it before the commit.
+    pub(crate) fn staged_object(&self, path: &str) -> Option<StagedObject> {
+        if self.stages_no_creations() {
+            return None;
+        }
+        let comps = split_path(path);
+        if comps.is_empty() {
+            // The root always exists; nothing can stage it.
+            return None;
+        }
+        let kind = if self.staged.dataset_at(&comps).is_some() {
+            StagedKind::Dataset
+        } else if self.staged.has_group_at(&comps) {
+            StagedKind::Group
+        } else {
+            return None;
+        };
+        let replaces_link = self.staged.deletes_cover(&comps);
+        // The file is asked only about a path a creation actually names, so an
+        // ordinary open of an object nothing is staged at never pays for this.
+        if !replaces_link && self.path_in_file(&comps) {
+            return None;
+        }
+        Some(StagedObject {
+            kind,
+            replaces_link,
+        })
+    }
+
+    /// Whether the file this session is editing holds a link at `path`, as of
+    /// its committed state.
+    ///
+    /// Resolved against a borrowed slice where the backing can lend one, as the
+    /// reader's own path resolution does: this is asked once per by-name lookup
+    /// of a path a creation is staged at, so the copy a `Source` read would make
+    /// per link block is worth avoiding.
+    fn path_in_file(&self, path: &[String]) -> bool {
+        let joined = path.join("/");
+        match self.image.as_slice() {
+            Some(data) => {
+                crate::group_v2::resolve_path_any(data, &self.superblock, &joined).is_ok()
+            }
+            None => crate::group_v2::resolve_path_any_from_source(
+                &self.image(),
+                &self.superblock,
+                &joined,
+            )
+            .is_ok(),
+        }
+    }
+
+    /// Whether this session has staged no creations at all, which is the common
+    /// case on the by-name lookup path. Checked before splitting a path into
+    /// components, so an ordinary open of an existing object does not allocate
+    /// one per call to ask a question whose answer is already known.
+    fn stages_no_creations(&self) -> bool {
+        self.staged.groups.is_empty() && self.staged.datasets.is_empty()
+    }
+
+    /// What a staged dataset at `path` says about itself, for the introspection
+    /// a handle onto it can answer before the commit writes any bytes.
+    ///
+    /// Cloned out of the staged [`FlatDataset`], which is the whole record of
+    /// what the commit will write, so these answers cannot drift from the
+    /// dataset that lands. Answers only for a creation that owns its path, on
+    /// the terms [`staged_object`](Self::staged_object) sets out.
+    pub(crate) fn staged_dataset_meta(&self, path: &str) -> Option<StagedMeta> {
+        if self.staged_object(path)?.kind != StagedKind::Dataset {
+            return None;
+        }
+        let fd = self.staged.dataset_at(&split_path(path))?;
+        Some(StagedMeta {
+            datatype: fd.dt.clone(),
+            dimensions: fd.ds.dimensions.clone(),
+            // Reported the way `Dataset::maxshape` reports an on-disk one: a
+            // maximum equal to the current shape is a fixed-shape dataset.
+            maxshape: match &fd.ds.max_dimensions {
+                Some(md) if *md != fd.ds.dimensions => Some(md.clone()),
+                _ => None,
+            },
+            // The rule the commit applies: chunk options or an extensible shape
+            // select chunked storage, anything else contiguous.
+            chunked: fd.chunk_options.is_chunked() || fd.maxshape.is_some(),
+            filters: fd
+                .chunk_options
+                .filters
+                .iter()
+                .map(|f| (f.kind.filter_id(), f.optional))
+                .collect(),
+        })
+    }
+
+    /// The direct children `parent` gains from this session's staged creations:
+    /// the groups first and then the datasets, each in the order it was staged.
+    ///
+    /// `parent` may itself be staged, which is what lets a listing on a
+    /// not-yet-committed group report its members. Only children the session
+    /// named answer, for the reason [`staged_object`](Self::staged_object)
+    /// gives.
+    ///
+    /// Unlike [`staged_object`](Self::staged_object) this does not ask the file
+    /// whether each name is already taken: the caller is enumerating a group and
+    /// already holds its on-disk links, so `replaces_link` is all it needs to
+    /// apply the same rule without a path resolution per child.
+    pub(crate) fn staged_children(&self, parent: &str) -> Vec<StagedChild> {
+        if self.stages_no_creations() {
+            return Vec::new();
+        }
+        let base = split_path(parent);
+        // Whether a deletion carries the whole group away, and which links
+        // directly under it are removed by name: the two ways a creation here
+        // is a replacement rather than a collision.
+        let base_deleted = self.staged.deletes_cover(&base);
+        let deleted_here: HashSet<&str> = self
+            .staged
+            .deletes
+            .iter()
+            .filter(|d| d.len() == base.len() + 1 && d[..base.len()] == base[..])
+            .map(|d| d[base.len()].as_str())
+            .collect();
+
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut out: Vec<StagedChild> = Vec::new();
+        for path in &self.staged.groups {
+            if path.len() == base.len() + 1 && path[..base.len()] == base[..] {
+                let name = path[base.len()].as_str();
+                if seen.insert(name) {
+                    out.push(StagedChild {
+                        name: name.to_string(),
+                        kind: StagedKind::Group,
+                        replaces_link: base_deleted || deleted_here.contains(name),
+                    });
+                }
+            }
+        }
+        for (p, fd) in &self.staged.datasets {
+            if p[..] == base[..] && seen.insert(fd.name.as_str()) {
+                out.push(StagedChild {
+                    name: fd.name.clone(),
+                    kind: StagedKind::Dataset,
+                    replaces_link: base_deleted || deleted_here.contains(fd.name.as_str()),
+                });
+            }
+        }
+        out
+    }
+
     /// Stage a new (empty) group at `path`, created on the next
     /// [`commit`](Self::commit). The parent must already exist or be created in
     /// the same session; populate the group with datasets via
@@ -3709,7 +4260,7 @@ impl WriteEngine {
     pub fn create_group(&mut self, path: &str) -> Result<(), Error> {
         let comps = split_path(path);
         self.refuse_if_claimed(&comps)?;
-        self.staged.groups.push(comps);
+        self.staged.push_group(comps);
         Ok(())
     }
 
@@ -3855,9 +4406,26 @@ impl WriteEngine {
     /// same commit), nor an edit to the object being removed (an attribute set
     /// on it, or a value overwrite of something inside it); split those into
     /// separate commits.
+    /// Deleting something this session **staged** and has not committed
+    /// withdraws that staging instead: there is no link in the file to unlink,
+    /// so the session is left as though the creation had never been made — its
+    /// attributes, appends and staged children go with it. When the file *also*
+    /// holds a link at the path (the creation was replacing it), the withdrawal
+    /// leaves the plain deletion of the file's own object behind.
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
         let comps = split_path(path);
         self.refuse_if_claimed(&comps)?;
+        if self.staged.dataset_at(&comps).is_some() || self.staged.has_group_at(&comps) {
+            self.refuse_mid_batch()?;
+            self.staged.withdraw_at(&comps);
+            // Withdrawing is the whole deletion unless the file holds a link
+            // here too — and if it does, a deletion of it may already be staged,
+            // which is what made this a replacement in the first place. A second
+            // one would be an overlapping deletion the commit refuses.
+            if self.staged.deletes_cover(&comps) || !self.path_in_file(&comps) {
+                return Ok(());
+            }
+        }
         self.staged.deletes.push(comps);
         Ok(())
     }
@@ -16908,6 +17476,387 @@ mod tests {
             read < payload + (64 << 10),
             "and not much more than it: {read} against {payload}"
         );
+    }
+}
+
+#[cfg(test)]
+mod staged_query_tests {
+    //! The queries a handle asks about objects a session has staged and not
+    //! committed (issue #392).
+
+    use super::*;
+    use crate::type_builders::DatasetBuilder;
+    use tempfile::tempdir;
+
+    /// A session over a file holding one dataset, `existing`.
+    fn open_session(path: &Path) -> WriteEngine {
+        let mut b = crate::writer::FileBuilder::new();
+        b.create_dataset("existing").with_i32_data(&[1, 2, 3]);
+        b.write(path).unwrap();
+        WriteEngine::open_rw_with_strategy(
+            path,
+            crate::source::MetadataCacheConfig::disabled(),
+            FileLocking::Enabled,
+            MemoryStrategy::Mirrored,
+        )
+        .unwrap()
+    }
+
+    fn i32_dataset(data: &[i32]) -> DatasetBuilder {
+        let mut b = DatasetBuilder::new("");
+        b.with_i32_data(data);
+        b
+    }
+
+    fn kind(e: &WriteEngine, path: &str) -> Option<StagedKind> {
+        e.staged_object(path).map(|o| o.kind)
+    }
+
+    fn child_names(e: &WriteEngine, parent: &str) -> Vec<(String, StagedKind)> {
+        e.staged_children(parent)
+            .into_iter()
+            .map(|c| (c.name, c.kind))
+            .collect()
+    }
+
+    #[test]
+    fn a_staged_creation_is_named_at_every_level_of_its_path() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.create_group("a").unwrap();
+        let mut col = DatasetBuilder::new("");
+        col.with_i32_data(&[1, 2])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[2]);
+        e.stage_created_dataset("a/b/col", col).unwrap();
+
+        assert_eq!(kind(&e, "a"), Some(StagedKind::Group));
+        assert_eq!(kind(&e, "a/b/col"), Some(StagedKind::Dataset));
+        // `a/b` was never named: the commit creates it on the way to `col`, and
+        // a session cannot tell from its staged set whether such a group is one
+        // it is adding or one the file already holds. Naming it is the way to
+        // address it.
+        assert_eq!(kind(&e, "a/b"), None);
+        // The root always exists, an on-disk object is not staged, and neither
+        // is a name nothing reaches.
+        assert_eq!(kind(&e, ""), None);
+        assert_eq!(kind(&e, "existing"), None);
+        assert_eq!(kind(&e, "a/missing"), None);
+
+        assert_eq!(
+            child_names(&e, ""),
+            vec![("a".to_string(), StagedKind::Group)]
+        );
+        assert_eq!(
+            child_names(&e, "a/b"),
+            vec![("col".to_string(), StagedKind::Dataset)]
+        );
+        // `b` under `a` is the unnamed intermediate again.
+        assert!(child_names(&e, "a").is_empty());
+        assert!(child_names(&e, "existing").is_empty());
+
+        // Named outright, it answers at every level.
+        e.create_group("a/b").unwrap();
+        assert_eq!(kind(&e, "a/b"), Some(StagedKind::Group));
+        assert_eq!(
+            child_names(&e, "a"),
+            vec![("b".to_string(), StagedKind::Group)]
+        );
+    }
+
+    #[test]
+    fn a_staged_dataset_reports_what_its_builder_settled() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        let mut col = DatasetBuilder::new("");
+        col.with_i32_data(&[1, 2, 3, 4])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[2])
+            .with_deflate(4);
+        e.stage_created_dataset("col", col).unwrap();
+        e.stage_created_dataset("plain", i32_dataset(&[5])).unwrap();
+
+        let meta = e.staged_dataset_meta("col").unwrap();
+        assert_eq!(meta.dimensions, vec![4]);
+        assert_eq!(meta.maxshape, Some(vec![u64::MAX]));
+        assert_eq!(meta.datatype.type_size(), 4);
+        assert!(meta.chunked);
+        assert_eq!(meta.filters, vec![(1u16, false)]);
+
+        // A fixed-shape, unfiltered dataset is contiguous and reports no
+        // maximum, the way `Dataset::maxshape` reports an on-disk one.
+        let plain = e.staged_dataset_meta("plain").unwrap();
+        assert_eq!(plain.dimensions, vec![1]);
+        assert_eq!(plain.maxshape, None);
+        assert!(!plain.chunked);
+        assert!(plain.filters.is_empty());
+
+        // Only datasets answer.
+        e.create_group("g").unwrap();
+        assert!(e.staged_dataset_meta("g").is_none());
+        assert!(e.staged_dataset_meta("existing").is_none());
+    }
+
+    #[test]
+    fn a_deletion_hides_nothing_until_a_creation_replaces_it() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.delete("existing").unwrap();
+        // The object is still in the file, and still readable, so a handle must
+        // not be told it is staged.
+        assert_eq!(kind(&e, "existing"), None);
+        assert!(e.staged_children("").is_empty());
+
+        e.stage_created_dataset("existing", i32_dataset(&[9]))
+            .unwrap();
+        let staged = e.staged_object("existing").unwrap();
+        assert_eq!(staged.kind, StagedKind::Dataset);
+        assert!(staged.replaces_link, "the same commit removes the link");
+        assert_eq!(
+            e.staged_dataset_meta("existing").unwrap().dimensions,
+            vec![1]
+        );
+        assert!(e.staged_children("")[0].replaces_link);
+    }
+
+    #[test]
+    fn a_creation_colliding_with_a_surviving_link_does_not_shadow_it() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        // No deletion beside it, so `commit` refuses this creation for the name
+        // it collides with. Until then the file's own object is what `existing`
+        // means: reporting the creation would refuse reads the file can serve,
+        // and would go on refusing them after the commit failed.
+        e.stage_created_dataset("existing", i32_dataset(&[9]))
+            .unwrap();
+        assert_eq!(kind(&e, "existing"), None);
+        assert!(e.staged_dataset_meta("existing").is_none());
+        assert!(!e.staged_children("")[0].replaces_link);
+
+        // The same rule with a kind change, which a listing would otherwise
+        // misreport as turning a dataset into a group.
+        e.create_group("existing").unwrap();
+        assert_eq!(kind(&e, "existing"), None);
+
+        // And the collision is still a collision at commit time.
+        assert!(e.commit().is_err());
+    }
+
+    #[test]
+    fn an_append_onto_a_staged_dataset_grows_the_pending_creation() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.stage_created_dataset("col", i32_dataset(&[1, 2]))
+            .unwrap();
+
+        let mut b = AppendBuilder::new();
+        b.append_i32(&[3, 4]);
+        e.stage_dataset_append_pending("col", b).unwrap();
+        assert_eq!(e.staged_dataset_meta("col").unwrap().dimensions, vec![4]);
+        // Folded into the creation rather than queued beside it, so the commit
+        // has one dataset to write and no append to apply to it.
+        assert!(e.staged.appends.is_empty());
+
+        e.commit().unwrap();
+        let addr = crate::group_v2::resolve_path_any_from_source(&e.image(), e.superblock(), "col")
+            .unwrap();
+        assert!(addr > 0);
+    }
+
+    #[test]
+    fn an_append_through_a_handle_onto_the_replaced_object_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.delete("existing").unwrap();
+        e.stage_created_dataset("existing", i32_dataset(&[100]))
+            .unwrap();
+
+        // `stage_dataset_append` is the entry point a handle onto the object in
+        // the file uses. Growing the replacement under it would silently move
+        // the elements to another object.
+        let mut b = AppendBuilder::new();
+        b.append_i32(&[200]);
+        assert!(matches!(
+            e.stage_dataset_append("existing", b),
+            Err(Error::EditUnsupported(_))
+        ));
+        assert_eq!(
+            e.staged_dataset_meta("existing").unwrap().dimensions,
+            vec![1],
+            "the refusal must leave the replacement alone"
+        );
+        assert!(e.staged.appends.is_empty());
+    }
+
+    #[test]
+    fn an_append_the_staged_dataset_cannot_carry_is_refused_without_changing_it() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.stage_created_dataset("col", i32_dataset(&[1, 2]))
+            .unwrap();
+
+        let mut wrong_type = AppendBuilder::new();
+        wrong_type.append_f64(&[1.0]);
+        assert!(matches!(
+            e.stage_dataset_append_pending("col", wrong_type),
+            Err(Error::AppendUnsupported(_))
+        ));
+
+        let mut partial = AppendBuilder::new();
+        partial.append_raw(&[0u8, 1, 2]);
+        assert!(matches!(
+            e.stage_dataset_append_pending("col", partial),
+            Err(Error::AppendUnsupported(_))
+        ));
+
+        // A finite maximum is a promise the commit would refuse to break.
+        let mut capped = DatasetBuilder::new("");
+        capped
+            .with_i32_data(&[1, 2])
+            .with_maxshape(&[3])
+            .with_chunks(&[2]);
+        e.stage_created_dataset("capped", capped).unwrap();
+        let mut over = AppendBuilder::new();
+        over.append_i32(&[3, 4]);
+        assert!(matches!(
+            e.stage_dataset_append_pending("capped", over),
+            Err(Error::AppendUnsupported(_))
+        ));
+
+        // Nothing the refusals touched changed.
+        assert_eq!(e.staged_dataset_meta("col").unwrap().dimensions, vec![2]);
+        assert_eq!(e.staged_dataset_meta("capped").unwrap().dimensions, vec![2]);
+    }
+
+    #[test]
+    fn an_append_onto_a_committed_dataset_still_stages_an_append() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        let mut b = AppendBuilder::new();
+        b.append_i32(&[4]);
+        e.stage_dataset_append("existing", b).unwrap();
+        assert_eq!(e.staged.appends.len(), 1);
+
+        // And so does one made through a handle whose creation was committed
+        // between the caller's check and this lock.
+        let mut b = AppendBuilder::new();
+        b.append_i32(&[5]);
+        e.stage_dataset_append_pending("existing", b).unwrap();
+        assert_eq!(e.staged.appends.len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_staged_creation_withdraws_it() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.stage_created_dataset("col", i32_dataset(&[1, 2]))
+            .unwrap();
+        e.delete("col").unwrap();
+        // Withdrawn, not queued for a deletion the commit could not perform.
+        assert_eq!(kind(&e, "col"), None);
+        assert!(e.staged.deletes.is_empty());
+        assert!(!e.has_staged_edits());
+        e.commit().unwrap();
+    }
+
+    #[test]
+    fn deleting_a_staged_group_withdraws_its_staged_subtree() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.create_group("g").unwrap();
+        e.create_group("g/inner").unwrap();
+        e.stage_created_dataset("g/inner/col", i32_dataset(&[1]))
+            .unwrap();
+        e.set_group_attr("g", "kind", AttrValue::I64(1)).unwrap();
+
+        e.delete("g").unwrap();
+        assert_eq!(kind(&e, "g"), None);
+        assert_eq!(kind(&e, "g/inner"), None);
+        assert_eq!(kind(&e, "g/inner/col"), None);
+        assert!(
+            !e.has_staged_edits(),
+            "the attribute and the subtree go with the group"
+        );
+        e.commit().unwrap();
+    }
+
+    #[test]
+    fn deleting_a_staged_replacement_leaves_the_plain_deletion() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.delete("existing").unwrap();
+        e.stage_created_dataset("existing", i32_dataset(&[9]))
+            .unwrap();
+        // Changing one's mind about the replacement leaves the deletion of the
+        // object in the file, which is what was asked for first.
+        e.delete("existing").unwrap();
+        assert_eq!(kind(&e, "existing"), None);
+        assert_eq!(e.staged.deletes.len(), 1);
+        e.commit().unwrap();
+        assert!(
+            crate::group_v2::resolve_path_any_from_source(&e.image(), e.superblock(), "existing",)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_batch_that_fails_leaves_the_staged_index_matching_the_staged_set() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.stage_created_dataset("kept", i32_dataset(&[1])).unwrap();
+        let refused: Result<(), Error> = e.stage_atomically(|s| {
+            s.create_group("gone")?;
+            s.stage_created_dataset("gone/col", i32_dataset(&[2]))?;
+            Err(Error::EditUnsupported("refused on purpose"))
+        });
+        assert!(refused.is_err());
+        // The index must forget what the rewind dropped, or a lookup would hand
+        // back a handle onto an entry that is no longer there.
+        assert_eq!(kind(&e, "gone"), None);
+        assert_eq!(kind(&e, "gone/col"), None);
+        assert_eq!(kind(&e, "kept"), Some(StagedKind::Dataset));
+        assert!(e.staged_children("gone").is_empty());
+
+        // And it must forget them for good: an index entry left behind would be
+        // found by the *next* creation at that path and keep it pointing at the
+        // position the rewind dropped, so the retry would stage a dataset no
+        // lookup could see.
+        // Staged behind an unrelated creation, so the retry lands at a
+        // *different* position than the one the rewind dropped: an index entry
+        // left behind would still name the old one.
+        e.create_group("other").unwrap();
+        e.stage_created_dataset("other/col", i32_dataset(&[3]))
+            .unwrap();
+        e.create_group("gone").unwrap();
+        e.stage_created_dataset("gone/col", i32_dataset(&[2]))
+            .unwrap();
+        assert_eq!(kind(&e, "gone"), Some(StagedKind::Group));
+        assert_eq!(kind(&e, "gone/col"), Some(StagedKind::Dataset));
+        assert_eq!(
+            e.staged_dataset_meta("gone/col").unwrap().dimensions,
+            vec![1]
+        );
+        e.commit().unwrap();
+    }
+
+    #[test]
+    fn an_edit_that_changes_staged_work_is_refused_inside_a_batch() {
+        let dir = tempdir().unwrap();
+        let mut e = open_session(&dir.path().join("q.h5"));
+        e.stage_created_dataset("col", i32_dataset(&[1, 2]))
+            .unwrap();
+        // `rewind` undoes a batch by truncating, which is exact only while
+        // staging appends. Both operations that do otherwise say so here rather
+        // than leaving half of themselves behind in a refused batch.
+        let folded: Result<(), Error> = e.stage_atomically(|s| {
+            let mut b = AppendBuilder::new();
+            b.append_i32(&[3]);
+            s.stage_dataset_append_pending("col", b)
+        });
+        assert!(matches!(folded, Err(Error::EditUnsupported(_))));
+        let withdrawn: Result<(), Error> = e.stage_atomically(|s| s.delete("col"));
+        assert!(matches!(withdrawn, Err(Error::EditUnsupported(_))));
+        assert_eq!(e.staged_dataset_meta("col").unwrap().dimensions, vec![2]);
     }
 }
 
