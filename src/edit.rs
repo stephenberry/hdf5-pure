@@ -7967,14 +7967,17 @@ impl WriteEngine {
             .map_err(|_| Error::AppendUnsupported("chunk count exceeds this platform"))?;
         let has_partial = current_dim0 % chunk_elems != 0;
 
-        // NOTE: this path rewrites that chunk for a *lossy* pipeline too, which is
-        // not value-preserving — the immediate path refuses exactly that, through
-        // `pipeline_lossless`. It is left alone here on purpose: seven
-        // `scaleoffset_fill_crosscheck` tests grow a float D-scale dataset from an
-        // unaligned length through this code and assert the result is byte-identical
-        // to the reference C library's own encoding, so the same predicate cannot be
-        // applied without taking a deliberately exercised, crosschecked capability
-        // away. Filed separately (issue #393's review); the demonstrated case is ZFP.
+        // Rewriting that chunk decodes and re-encodes committed values, which a
+        // *lossy* pipeline does not reproduce: a ZFP block re-quantizes to fit
+        // its new contents, and float D-scale packs offsets from a per-chunk
+        // minimum that a smaller appended value moves (measured: 1.45 became 1.5
+        // at one decimal). Refused here as on the immediate path (#407).
+        if has_partial
+            && let Some(pl) = &pipeline
+            && !pipeline_lossless(pl)
+        {
+            return Err(Error::AppendUnsupported(LOSSY_TAIL_REFUSAL));
+        }
 
         let mut kept_chunks: Vec<WrittenChunk> = Vec::with_capacity(n_full);
         for ci in grid_order.iter().take(n_full) {
@@ -11166,9 +11169,10 @@ pub(crate) fn pipeline_lossless(pipeline: &FilterPipeline) -> bool {
     })
 }
 
-/// The refusal the immediate append path raises for a lossy pipeline sitting on a
-/// partial trailing chunk. Named here beside the predicate it goes with, and used
-/// from [`chunk_index_inplace`](crate::chunk_index_inplace).
+/// The refusal both append paths raise for a lossy pipeline sitting on a partial
+/// trailing chunk. Named here beside the predicate it goes with, and used from
+/// [`chunk_index_inplace`](crate::chunk_index_inplace) as well as the staged
+/// rebuild above.
 pub(crate) const LOSSY_TAIL_REFUSAL: &str = "this dataset's filter pipeline is lossy (ZFP, or float D-scale scale-offset), and its \
      length is not a whole multiple of the chunk length: growing that trailing chunk would \
      decode and re-encode values that are already committed, changing them. Append whole \
@@ -13762,6 +13766,33 @@ mod tests {
             .read_f64()
             .unwrap();
         assert_eq!(back[..4], committed[..4], "an untouched chunk changed");
+
+        // The staged path rebuilds the index at commit and rewrote the same
+        // chunk on the way; it refuses at commit and leaves the file alone.
+        let p = dir.path().join("staged.h5");
+        build(&p);
+        let before = std::fs::read(&p).unwrap();
+        {
+            let f = crate::reader::File::open_rw(&p).unwrap();
+            f.dataset("d")
+                .unwrap()
+                .append_staged(|b| {
+                    b.append_f64(&[99.0, 98.0, 97.0]);
+                })
+                .unwrap();
+            let err = f
+                .commit()
+                .expect_err("a staged append must not re-encode the committed tail either");
+            assert!(
+                matches!(&err, Error::AppendUnsupported(m) if m.contains("lossy")),
+                "got: {err:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            before,
+            "the refusal wrote bytes"
+        );
 
         // A buffered appender over the unaligned shape is refused when it is
         // made, since its very first write would be the rewrite above.
