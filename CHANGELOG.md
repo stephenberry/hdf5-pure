@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.43.1] - 2026-09-03
+
+A file that deletes and re-appends objects smaller than a megabyte no longer grows without bound: `Dataset::append` and `BufferedAppender` now reuse a freed hole of any size on a paged file and on a file that persists its free-space managers ([#413](https://github.com/stephenberry/hdf5-pure/issues/413)). Patch release, no API change.
+
 ### Fixed
 
 - `Dataset::append` and `BufferedAppender` reuse a freed hole of any size on a paged file and on a file that persists its free-space managers, where holes under a megabyte were left alone and a file that deleted and re-appended objects smaller than that grew without bound. One manager rewrite now takes every hole the appended chunk fits in, up to a megabyte of them, and places its own tail inside that space rather than at end-of-file ([#413](https://github.com/stephenberry/hdf5-pure/issues/413)).
@@ -863,7 +867,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.43.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.43.1...HEAD
+[0.43.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.43.0...v0.43.1
 [0.43.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.42.0...v0.43.0
 [0.42.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.41.0...v0.42.0
 [0.41.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.40.0...v0.41.0
