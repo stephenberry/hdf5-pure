@@ -103,7 +103,7 @@ Passing `persist = true` records that freed space should be tracked on disk acro
 
 Every commit rewrites those manager blocks, and they are themselves placed in free space where any fits, so a file under delete-and-recreate churn settles at a steady size instead of gaining a set of managers per commit.
 
-An in-place `Dataset::append` reuses persisted free space as well, on the flat strategies and on a paged file alike, but it has no superblock repoint of its own to update the managers with. It therefore takes a megabyte of space out of them first — rewriting them without it, under the same crash-atomic repoint a commit uses — and spends only from there, so a hole the managers still advertise is never written into. What a session does not spend goes back at its next commit and at close; a crash in between strands it, which wastes those bytes and never hands them out twice. A file whose largest hole is under that batch keeps appending at the end of the file.
+An in-place `Dataset::append` reuses persisted free space as well, on the flat strategies and on a paged file alike, but it has no superblock repoint of its own to update the managers with. It therefore takes space out of them first — every hole the appended chunk fits in, up to a megabyte of them per draw, rewriting the managers without that space under the same crash-atomic repoint a commit uses — and spends only from there, so a hole the managers still advertise is never written into. What a session does not spend goes back at its next commit and at close; a crash in between strands it, which wastes those bytes and never hands them out twice. The file grows only when no hole can hold the chunk.
 
 ```rust
 use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};

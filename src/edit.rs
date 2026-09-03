@@ -287,16 +287,26 @@ use crate::type_builders::{
 /// An undefined on-disk address (all bits set), HDF5's "no address" sentinel.
 const UNDEF: u64 = u64::MAX;
 
-/// How much free space an immediate in-place append takes out of a persisting
-/// file's on-disk managers at once, when the allocation in front of it needs
+/// The most free space an immediate in-place append takes out of a persisting
+/// file's on-disk managers in one draw, when the allocation in front of it needs
 /// less (issue #387).
 ///
 /// Every draw costs a manager rewrite and a superblock repoint — a few kilobytes
 /// and two ordering barriers — so drawing per allocation would put a commit
 /// between every pair of chunks and make reuse cost more than the growth it
-/// avoids. A megabyte covers sixteen chunks at the 64 KiB scale the C library's
-/// own chunk-cache default is sized for, which puts the rewrite well outside the
-/// per-chunk path.
+/// avoids. A draw therefore takes as much as this of whatever holes can each hold
+/// the allocation, largest first, and a megabyte covers sixteen chunks at the
+/// 64 KiB scale the C library's own chunk-cache default is sized for, which puts
+/// the rewrite well outside the per-chunk path.
+///
+/// It is a cap, not a floor. A file whose holes are all smaller than this still
+/// has them drawn, one rewrite for however many of them fit under the cap: a
+/// floor here made every persisting file whose deleted objects were under a
+/// megabyte grow without bound, since no hole it left was ever spent
+/// (issue #413). What a draw refuses is only a hole too small for the allocation
+/// in hand, which nothing could be placed in. Every hole exists because a commit
+/// freed it, so the rewrites spent reusing them are bounded by the commits the
+/// caller already paid for.
 ///
 /// It bounds one draw, not a session's total. A fresh draw is made whenever the
 /// largest reserved region is smaller than the allocation in hand, and the
@@ -1039,7 +1049,7 @@ pub(crate) struct WriteEngine {
     /// out twice, and a later `H5repack` or whole-file rewrite recovers it. That
     /// is the same trade the module header records for
     /// [`finalize_persist`](Self::finalize_persist), on a surface bounded per
-    /// draw — see [`APPEND_RESERVE_BYTES`], which is what one draw is worth,
+    /// draw — see [`APPEND_RESERVE_BYTES`], which is the most one draw takes,
     /// and note that this list holds the unspent remainder of every draw the
     /// session has made, not just the last.
     ///
@@ -1258,8 +1268,9 @@ pub(crate) struct WriteEngine {
     /// the only answer that is never actively wrong, and the error the caller
     /// gets is the write failure that says so (issue #344).
     ///
-    /// It is a property of one commit, not of the session, so `commit` clears it
-    /// on entry rather than trusting the previous run to have left it false.
+    /// It is a property of one publish, not of the session, so every publisher —
+    /// `commit`, and the manager rewrite an append's draw makes — clears it on
+    /// entry rather than trusting the previous run to have left it false.
     publish_attempted: bool,
     /// Whether a [`stage_atomically`](Self::stage_atomically) batch is open, so
     /// [`refuse_mid_batch`](Self::refuse_mid_batch) can keep
@@ -1956,6 +1967,21 @@ impl PagedEdit {
         Some(addr)
     }
 
+    /// The longest contiguous run [`alloc_typed`](Self::alloc_typed) could serve
+    /// `ty` from in one call, or `0` when nothing could: the larger of its own
+    /// list's longest region and the longest run of whole free pages in the
+    /// other's.
+    ///
+    /// The same two sources in the same terms, so a caller sizing a draw on this
+    /// figure gets exactly the run `alloc_typed` then hands it.
+    fn largest_typed(&self, ty: PageType) -> u64 {
+        let (own, other) = match ty {
+            PageType::Meta => (&self.meta, &self.raw),
+            PageType::Raw => (&self.raw, &self.meta),
+        };
+        own.largest().max(other.largest_whole_units(self.page_size))
+    }
+
     /// Every free region this session could still hand out, ascending by address.
     /// Used for space accounting, where the caller wants one total rather than a
     /// per-page-type breakdown.
@@ -2212,10 +2238,11 @@ pub struct SpaceAccounting {
     /// **Which write can spend it is not uniform on a persisting file.** Such a
     /// session may write into a hole only once it has taken that hole *out* of
     /// the on-disk managers, so an in-place [`append`](crate::Dataset::append)
-    /// holds a reserve of up to a megabyte that this figure counts and the next
-    /// [`commit`](crate::File::commit) cannot place into: the commit gives the
-    /// unspent part back in the same tail that rewrites the managers, which runs
-    /// *after* it has placed everything. The commit after that one can. So on a
+    /// holds a reserve of up to a megabyte per draw that this figure counts and
+    /// the next [`commit`](crate::File::commit) cannot place into: the commit
+    /// gives the unspent part back in the same tail that rewrites the managers,
+    /// which runs *after* it has placed everything. The commit after that one
+    /// can. So on a
     /// persisting file read this as "space this session will reuse rather than
     /// grow for", not as "space the very next commit can fill".
     ///
@@ -3870,8 +3897,9 @@ impl WriteEngine {
 
     /// Take a batch of free space out of the on-disk free-space managers so an
     /// immediate in-place append may spend it, for a session that persists them
-    /// (issue #387). Returns whether [`reserved`](Self::reserved) can now serve a
-    /// contiguous `want` bytes.
+    /// (issue #387). Afterwards [`reserved`](Self::reserved) holds whatever could
+    /// be drawn; the allocator that spends it is what says whether that serves
+    /// the append, since the rewrite's own tail may have taken part of it.
     ///
     /// The draw and the publication are one step and in that order: the bytes
     /// leave [`free`](Self::free) (or [`PagedEdit`]'s raw list) first, and the
@@ -3889,36 +3917,89 @@ impl WriteEngine {
     /// still valid across this call, which is what lets it run between an
     /// append's plan and its apply.
     ///
-    /// Returns `Ok(false)` — not an error — when the session persists nothing to
-    /// draw from, or when no hole as large as a whole batch is left; the caller
-    /// simply grows the file, as it always did. An error means the manager rewrite
-    /// itself failed, and the batch is handed back so the session's lists agree
-    /// with whatever the disk now holds: if the rewrite never published, they
-    /// match it exactly, and if it did, they over-report free space that is
-    /// genuinely free (nothing was written into it) and the next commit records
-    /// it again.
-    fn reserve_for_immediate_append(&mut self, want: u64) -> Result<bool, Error> {
-        if want == 0 || self.persist.is_none() || self.swmr_mode {
-            return Ok(false);
+    /// Draws nothing — not an error — when the session persists nothing to draw
+    /// from, or when no hole can hold the allocation in hand; the caller simply
+    /// grows the file, as it always did. An error means the manager rewrite
+    /// itself failed, and the lists are put back so they agree with whatever the
+    /// disk now holds, on the rule [`commit`](Self::commit) applies: a rewrite that
+    /// never reached its superblock write left the managers as they were, so the
+    /// lists go back to exactly what they were, tail placement included; one that
+    /// did may have published, so the draw is handed back — those bytes are
+    /// genuinely free, nothing having been written into them, and the next commit
+    /// records them again — while the span its tail took stays out, since that
+    /// tail may now be the live one.
+    fn reserve_for_immediate_append(&mut self, want: u64) -> Result<(), Error> {
+        if want == 0 || self.persist.is_none() || self.swmr_mode || self.reserved.largest() >= want
+        {
+            return Ok(());
         }
-        if self.reserved.largest() >= want {
-            return Ok(true);
+        let snapshot = self.snapshot_free();
+        if !self.take_raw_spans(want, APPEND_RESERVE_BYTES) {
+            return Ok(());
         }
-        // One draw covers many appends: each costs a manager rewrite and a
-        // superblock repoint, so drawing per allocation would put a commit
-        // between every pair of chunks — which is why the batch size is a floor
-        // rather than a preference. A file whose largest hole is under it keeps
-        // appending at end-of-file, and gives up nothing worth the rewrite: a
-        // hole that small is not a file growing without bound.
-        if !self.take_raw_span(want.max(APPEND_RESERVE_BYTES)) {
-            return Ok(false);
-        }
+        self.publish_attempted = false;
         match self.commit_persisting(self.superblock.root_group_address, Vec::new()) {
-            Ok(()) => Ok(true),
+            Ok(()) => Ok(()),
             Err(e) => {
-                self.release_reserve();
+                if self.publish_attempted {
+                    self.release_reserve();
+                } else {
+                    self.restore_free(snapshot);
+                }
                 Err(e)
             }
+        }
+    }
+
+    /// Move raw-appendable free space into [`reserved`](Self::reserved) for one
+    /// manager rewrite to publish: runs that can each hold `want` bytes, until
+    /// `cap` bytes are held or no hole that large is left. Reports whether
+    /// anything was drawn, which is exactly whether the first hole could hold
+    /// `want`.
+    ///
+    /// The draw is sized on what the file has rather than on a fixed batch, and
+    /// that is the whole of the fix for issue #413 — [`APPEND_RESERVE_BYTES`]
+    /// says why the cap is a cap and not a floor. The rewrite that publishes a
+    /// draw is the expensive part, so one draw gathers as many holes as the cap
+    /// allows and the rewrite is paid once for all of them: a file fragmented
+    /// into chunk-sized holes costs one rewrite per cap's worth of them, not one
+    /// per chunk.
+    ///
+    /// Each run is sized on the largest hole and taken best fit, so it is a whole
+    /// hole or a `cap`-bounded prefix of one, and the reserve never holds a
+    /// fragment too small for the allocation that drew it. `want` above `cap`
+    /// draws one run of exactly `want`: the cap bounds the amortization, not
+    /// what a single allocation may need.
+    fn take_raw_spans(&mut self, want: u64, cap: u64) -> bool {
+        debug_assert!(want > 0, "a draw is sized on a real allocation");
+        // The cap is the budget, except that a single allocation larger than it
+        // still draws one run for itself.
+        let budget = cap.max(want);
+        let mut drawn = 0u64;
+        while budget - drawn >= want {
+            let available = self.largest_raw_run();
+            if available < want {
+                break;
+            }
+            let len = available.min(budget - drawn);
+            if !self.take_raw_span(len) {
+                // Sized on the allocator's own figure, so it serves; a refusal
+                // here means the two disagree, and drawing nothing further is
+                // the answer that leaves the file merely larger.
+                debug_assert!(false, "a run of {len} bytes was reported and not served");
+                break;
+            }
+            drawn += len;
+        }
+        drawn > 0
+    }
+
+    /// The longest contiguous run [`take_raw_span`](Self::take_raw_span) could
+    /// move into the reserve right now, or `0` when nothing could.
+    fn largest_raw_run(&self) -> u64 {
+        match self.paged.as_ref() {
+            Some(pg) => pg.largest_typed(PageType::Raw),
+            None => self.free.largest(),
         }
     }
 
@@ -6897,6 +6978,25 @@ impl WriteEngine {
     /// that does not snapshot is [`finalize_persist`](Self::finalize_persist), whose
     /// failure leaves this session's list short by the reservation — in memory only,
     /// on a session already being torn down, with the on-disk managers unchanged.
+    ///
+    /// When `self.free` has no hole for it, the tail may take one out of
+    /// [`reserved`](Self::reserved) instead. Only the rewrite that publishes an
+    /// append's draw ([`reserve_for_immediate_append`](Self::reserve_for_immediate_append))
+    /// reaches this with anything there — every other caller releases the reserve
+    /// first — and for that rewrite the fallback is what keeps the draw from
+    /// growing the file: a draw takes every hole the append fits in, and on a
+    /// flat file that is the one list the tail is placed from, so without it the
+    /// rewrite appended its tail at end-of-file every time and the file grew by a
+    /// tail per draw (issue #413). Space in the reserve is exactly what this
+    /// rewrite publishes as *not* free, so a tail placed there is live in bytes
+    /// the managers do not advertise, which is the same standing a tail placed
+    /// from `self.free` has once the repoint lands. `self.free` first, so that an
+    /// ordinary hole is spent before the append's own space is; best fit within
+    /// the reserve then takes its smallest run, leaving the largest for the
+    /// append that drew it. The paged tail ([`tail_layout`](Self::tail_layout))
+    /// has no such fallback: it opens a page when nothing fits, and
+    /// `paged_group_churn_with_populated_datasets_reaches_a_steady_size` holds it
+    /// to not doing so once per draw.
     fn flat_tail_layout(
         &mut self,
         to_free: &[(u64, u64, FreeClass)],
@@ -6917,15 +7017,23 @@ impl WriteEngine {
         let mut proposed = appended_len;
 
         for _ in 0..ROUNDS {
-            let Some(at) = self.free.alloc(proposed) else {
-                break;
+            let (at, from_reserve) = match self.free.alloc(proposed) {
+                Some(at) => (at, false),
+                None => match self.reserved.alloc(proposed) {
+                    Some(at) => (at, true),
+                    None => break,
+                },
             };
             let post = self.flat_post_free(to_free, old_blocks);
             let len = ext_len + file_fsm_blocks_len(&free_sections(&post), os);
             if len <= proposed {
                 return (post, Some(at), proposed);
             }
-            self.free.free(at, proposed);
+            if from_reserve {
+                self.reserved.free(at, proposed);
+            } else {
+                self.free.free(at, proposed);
+            }
             proposed = len;
         }
         (probe, None, appended_len)
@@ -17919,6 +18027,116 @@ mod tests {
         want.extend_from_slice(&appended);
         assert_eq!(f.dataset("t0").unwrap().read_i32().unwrap(), want);
         assert_eq!(f.dataset("ceiling").unwrap().read_i32().unwrap(), [9, 9, 9]);
+    }
+
+    /// A persisting session's fixture for the draw tests: `t0` to append onto,
+    /// `victims` datasets of `victim_elems` `i32`s each, every one followed by a
+    /// small keeper so that deleting the victims leaves that many *separate*
+    /// holes, and a `ceiling` above them all so none of the holes is trailing.
+    fn fragmented_persisting_fixture(
+        path: &std::path::Path,
+        victims: usize,
+        victim_elems: usize,
+    ) -> WriteEngine {
+        use crate::writer::FileBuilder;
+
+        let mut b = FileBuilder::new();
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+        b.create_dataset("t0")
+            .with_i32_data(&[0i32])
+            .with_shape(&[1])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[64]);
+        for v in 0..victims {
+            b.create_dataset(&std::format!("victim{v}"))
+                .with_i32_data(&vec![7i32; victim_elems]);
+            b.create_dataset(&std::format!("keeper{v}"))
+                .with_i32_data(&[v as i32]);
+        }
+        b.create_dataset("ceiling").with_i32_data(&[9i32, 9, 9]);
+        b.write(path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(path, FileLocking::Enabled).unwrap();
+        s.set_sync_policy(SyncPolicy::OnClose);
+        for v in 0..victims {
+            s.delete(&std::format!("victim{v}")).unwrap();
+        }
+        s.commit().unwrap();
+        s
+    }
+
+    /// One draw takes every hole the append fits in, not only the largest, so a
+    /// file fragmented into small holes pays one manager rewrite for all of them
+    /// rather than one per hole (issue #413).
+    ///
+    /// Three holes of a few chunks each, each far under a batch, separated by
+    /// live objects so they cannot coalesce. One chunk-sized append then has to
+    /// leave the reserve holding runs from more than one of them: a draw that
+    /// took the largest hole alone would have served the chunk just as well and
+    /// held exactly one run, so the count is what tells the two apart.
+    #[test]
+    fn a_draw_gathers_every_hole_the_append_fits_in() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("draw_gathers.h5");
+        let mut s = fragmented_persisting_fixture(&path, 3, 4 * 64);
+        assert!(
+            s.free.sections().len() >= 3,
+            "the fixture must leave three separate holes, not {:?}",
+            s.free.sections()
+        );
+        let before = s.free.sections();
+
+        s.append_inplace_i32_phased("t0", &[1i32; 64], 4).unwrap();
+
+        let held = s.reserved.sections();
+        // A run per hole, less what the chunk and the rewrite's tail took out of
+        // them: the chunk out of one, the tail out of at most one more.
+        assert!(
+            held.len() >= 2,
+            "one draw should have gathered runs from several of the holes {before:?}, \
+             not only {held:?}"
+        );
+        let drawn: u64 = held.iter().map(|&(_, len)| len).sum();
+        assert!(
+            drawn > before.iter().map(|&(_, len)| len).max().unwrap(),
+            "the reserve holds {drawn} bytes, no more than the largest hole alone"
+        );
+    }
+
+    /// The manager rewrite that publishes a draw places its own tail inside the
+    /// space the draw is taking when the draw has emptied the free list, rather
+    /// than appending it (issue #413).
+    ///
+    /// On a flat file the draw and the tail are served from the same list, and
+    /// a draw takes every hole the append fits in, so the case is the ordinary
+    /// one, not a corner: without the fallback every draw appended one tail at
+    /// end-of-file and freed the previous one, a persisting file's whole growth
+    /// under churn once the floor on the draw was gone. Measured as the file's
+    /// length across the append, which a tail landing anywhere inside leaves
+    /// alone.
+    #[test]
+    fn a_draws_rewrite_places_its_tail_inside_the_draw() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("draw_tail.h5");
+        let mut s = fragmented_persisting_fixture(&path, 1, 8 * 64);
+        let len_before = s.image.len();
+
+        s.append_inplace_i32_phased("t0", &[1i32; 64], 4).unwrap();
+
+        assert!(
+            !s.reserved.is_empty(),
+            "no reserve was drawn, so this measured an ordinary end-of-file append"
+        );
+        assert_eq!(
+            s.image.len(),
+            len_before,
+            "the rewrite appended its tail at end-of-file instead of placing it in \
+             the hole it was publishing as taken"
+        );
     }
 
     /// One in-place append costs a small constant number of writes even where

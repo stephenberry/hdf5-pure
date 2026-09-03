@@ -33,6 +33,24 @@ impl FreeRegion {
     fn end(&self) -> u64 {
         self.addr + self.len
     }
+
+    /// The whole `align`-sized units inside this region, as `(start, span)`, or
+    /// `None` when the region contains no whole unit.
+    ///
+    /// This is the part of a region that is provably in no unit shared with
+    /// anything live: the partial edges sit in units whose other bytes may be
+    /// occupied, so they are left out. Both the allocation over such interiors
+    /// ([`FreeList::alloc_whole_units`]) and the question of how large one is
+    /// ([`FreeList::largest_whole_units`]) are defined by this one function, so
+    /// the two cannot disagree about what counts.
+    fn aligned_interior(&self, align: u64) -> Option<(u64, u64)> {
+        let start = self.addr.next_multiple_of(align);
+        let end = (self.end() / align) * align;
+        // `then`, not `then_some`: a region with no aligned interior at all has
+        // `end < start`, and `then_some`'s argument is evaluated whatever the
+        // condition says.
+        (end > start).then(|| (start, end - start))
+    }
 }
 
 /// A sorted, coalesced set of free regions in a single file being edited.
@@ -163,17 +181,10 @@ impl FreeList {
         );
         // Best-fit over the *aligned interior*, which is the part that can serve
         // the request, rather than over the region as a whole.
-        let interior = |r: &FreeRegion| -> Option<(u64, u64)> {
-            let start = r.addr.next_multiple_of(align);
-            let end = (r.end() / align) * align;
-            // `then`, not `then_some`: a region with no aligned interior at all
-            // has `end < start`, and `then_some`'s argument is evaluated whatever
-            // the condition says.
-            (end > start && end - start >= len).then(|| (start, end - start))
-        };
         let mut best: Option<(usize, u64, u64)> = None;
         for (i, r) in self.regions.iter().enumerate() {
-            if let Some((start, span)) = interior(r)
+            if let Some((start, span)) = r.aligned_interior(align)
+                && span >= len
                 && best.is_none_or(|(_, _, b)| span < b)
             {
                 best = Some((i, start, span));
@@ -258,6 +269,26 @@ impl FreeList {
     /// before it decides whether to draw more (issue #387).
     pub(crate) fn largest(&self) -> u64 {
         self.regions.iter().map(|r| r.len).max().unwrap_or(0)
+    }
+
+    /// The largest run of whole `align`-sized units inside any one region — the
+    /// most [`alloc_whole_units`](Self::alloc_whole_units) could hand out in a
+    /// single call — or `0` when no region holds a whole unit. `align` of 0
+    /// reports `0`, as that allocator refuses it.
+    ///
+    /// The whole-page counterpart of [`largest`](Self::largest), for the same
+    /// caller: on a paged file an append's reserve may claim whole free pages
+    /// out of the other page type's list, so how much it can draw is the larger
+    /// of this and its own list's `largest`.
+    pub(crate) fn largest_whole_units(&self, align: u64) -> u64 {
+        if align == 0 {
+            return 0;
+        }
+        self.regions
+            .iter()
+            .filter_map(|r| r.aligned_interior(align).map(|(_, span)| span))
+            .max()
+            .unwrap_or(0)
     }
 
     /// If a free region ends exactly at `eof` (the current end-of-file), remove
@@ -404,6 +435,30 @@ mod tests {
         // Coalescing is what `largest` reports over, not the frees as issued.
         fl.free(240, 40);
         assert_eq!(fl.largest(), 80);
+    }
+
+    /// `largest_whole_units` reports exactly what `alloc_whole_units` could take
+    /// in one call: the aligned interior, not the region.
+    #[test]
+    fn largest_whole_units_reports_the_aligned_interior() {
+        let mut fl = FreeList::new();
+        assert_eq!(fl.largest_whole_units(16), 0);
+        // [10, 40): thirty bytes, and the only whole unit in it is [16, 32).
+        fl.free(10, 30);
+        assert_eq!(fl.largest(), 30);
+        assert_eq!(fl.largest_whole_units(16), 16);
+        // [100, 110): ten bytes with no whole unit at all.
+        fl.free(100, 10);
+        assert_eq!(fl.largest_whole_units(16), 16);
+        // [200, 260): sixty bytes whose whole units are [208, 256), three of them.
+        fl.free(200, 60);
+        assert_eq!(fl.largest_whole_units(16), 48);
+        assert_eq!(fl.largest_whole_units(0), 0);
+        // The allocator agrees: that run is claimable in one call, and one unit
+        // more is not.
+        let mut probe = fl.clone();
+        assert_eq!(probe.alloc_whole_units(64, 16), None);
+        assert_eq!(probe.alloc_whole_units(48, 16), Some(208));
     }
 
     #[test]

@@ -4583,9 +4583,9 @@ impl Dataset {
     /// (including every paged file) spends only space the session has first taken
     /// *out* of them, in a rewrite of its own, so no byte an append writes is one
     /// a durable manager advertises — a crash can strand the unspent remainder of
-    /// such a batch, but nothing can be handed out twice. That batch is a
-    /// megabyte, so a file whose largest hole is smaller than one keeps growing at
-    /// end-of-file, where the rewrite would cost more than it saves.
+    /// such a batch, but nothing can be handed out twice. A batch gathers every
+    /// hole the appended chunk fits in, up to a megabyte of them, so the file
+    /// grows only when no hole can hold the chunk.
     ///
     /// A handle reached by object reference ([`dereference`](Self::dereference))
     /// has no resolvable path, so it names its dataset by the object-header

@@ -1821,30 +1821,36 @@ fn immediate_append_reuses_a_freed_hole() {
 }
 
 /// An immediate append onto a file that **persists** its free-space managers may
-/// spend only space it has first taken *out* of them (issue #387).
+/// spend only space it has first taken *out* of them (issue #387), and takes a
+/// hole out whenever the append fits in it, however far under a batch the hole
+/// is (issue #413).
 ///
 /// The managers are a durable record, and an append has no superblock repoint of
 /// its own to update that record with. So the bytes it writes must already be
-/// ones no manager advertises: the session draws a batch, republishes the
+/// ones no manager advertises: the session draws what it can, republishes the
 /// managers without it, and spends only from there. What it must never do is
 /// write into a hole the published managers still offer — through a clean close
 /// as much as a crash, that would leave the next session (this crate or the C
 /// library) allocating over a live chunk.
 ///
-/// The hole here is far smaller than one reserve batch, so nothing is drawn at
-/// all and the append extends end-of-file. That is what makes this the "no
-/// unreserved hole is spent" case rather than a size comparison: the persisted
-/// free space has to be exactly as large afterwards as it was before.
+/// The hole here is far smaller than one reserve batch. That used to mean nothing
+/// was drawn and the append extended end-of-file, so a persisting file whose
+/// deleted objects were all under a megabyte grew forever. Now the hole is drawn
+/// and spent: the file does not grow, the session's reusable space falls by what
+/// the append placed, and the managers on disk afterwards advertise nothing a
+/// live chunk occupies — which is the half of this that is about safety rather
+/// than size, and holds whichever way the draw is sized.
 #[test]
-fn a_persisting_file_spends_no_unreserved_hole() {
+fn a_persisting_file_reuses_a_hole_smaller_than_a_batch() {
     let payload: Vec<i32> = (0..16384).collect();
+    let payload_bytes = payload.len() as u64 * 4;
     let path = temp_path("hdf5_pure_fs_immediate_append_persisting.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
     // Comfortably larger than the payload, so the hole still holds the whole
     // append after the commits below have placed their own tails inside it —
-    // and still well under the batch an append reserves, so the append is
-    // offered a hole it must decline rather than one it never sees.
+    // and still well under the batch an append reserves at most, so this is a
+    // hole the old floor declined.
     b.create_dataset("scratch")
         .with_i32_data(&vec![7; payload.len() + 1024]);
     b.create_dataset("ceiling").with_i32_data(&[9, 9, 9]);
@@ -1858,24 +1864,33 @@ fn a_persisting_file_spends_no_unreserved_hole() {
     // (legitimate) reuse is not counted against the append.
     create_log(&session, "log");
     let freed = session.space_accounting().unwrap().reusable_free_bytes;
-    assert!(freed >= payload.len() as u64 * 4, "expected a sizable hole");
+    assert!(freed >= payload_bytes, "expected a sizable hole");
+    let size_before = session.file_size();
 
     session.dataset("log").unwrap().append(&payload).unwrap();
     assert_eq!(
-        session.space_accounting().unwrap().reusable_free_bytes,
-        freed,
-        "an immediate append must not spend free space the on-disk managers \
-         still advertise"
+        session.file_size(),
+        size_before,
+        "the append fits in the hole, so the file must not grow"
+    );
+    let left = session.space_accounting().unwrap().reusable_free_bytes;
+    assert!(
+        left + payload_bytes <= freed,
+        "the append must have spent the hole: {freed} bytes were reusable before it \
+         and {left} are after, for a {payload_bytes}-byte payload"
     );
     session.close().unwrap();
 
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("log").unwrap().read_i32().unwrap(), payload);
+    assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), [1, 2, 3]);
     let persisted: u64 = file.persisted_free_space().iter().map(|(_, l)| l).sum();
     assert!(
-        persisted >= freed,
-        "the managers must still describe the untouched hole ({persisted} of {freed})"
+        persisted + payload_bytes <= freed,
+        "the managers must describe the hole less what the append placed in it \
+         ({persisted} of {freed})"
     );
+    drop(file);
     assert_no_persisted_free_space_holds_live_chunks(&path, &["log"]);
 }
 
@@ -2055,16 +2070,18 @@ fn a_paged_file_reuses_a_hole_it_has_taken_out_of_the_managers() {
 ///
 /// What this does **not** discriminate, stated plainly rather than left to be
 /// discovered: no mutation of the reserve's page typing has been found that fails
-/// it. Drawing the batch as metadata instead of raw does not, because a
-/// batch-sized draw is a whole number of pages at any power-of-two page size, so
-/// `alloc_typed`'s cross-type path can only take *wholly free* pages — which
-/// belong to neither type and mix nothing. Returning the unspent remainder to the
-/// metadata list does not either, because placement is best-fit and a large
-/// misfiled run is the last fragment a small metadata allocation would choose.
-/// So this is a net for the mixing class — a raw append packing into a live
-/// metadata page, a metadata allocation landing in a raw one — and not a proof of
-/// the `PageType::Raw` argument, which rests on the reasoning at
-/// `WriteEngine::take_raw_span` instead.
+/// it. Drawing as metadata instead of raw is caught elsewhere — the draw is sized
+/// on the raw list's own figure, so an allocator asked for metadata may not serve
+/// it and `WriteEngine::take_raw_spans` asserts on the disagreement, or in a
+/// release build draws nothing, which
+/// `paged_group_churn_with_populated_datasets_reaches_a_steady_size` fails on as
+/// growth — but not here, and not as a mixed page. Returning the unspent
+/// remainder to the metadata list does not fail this either, because placement
+/// is best-fit and a large misfiled run is the last fragment a small metadata
+/// allocation would choose. So this is a net for the mixing class — a raw append
+/// packing into a live metadata page, a metadata allocation landing in a raw one
+/// — and not a proof of the `PageType::Raw` argument, which rests on the
+/// reasoning at `WriteEngine::take_raw_span` instead.
 #[test]
 fn a_paged_append_reserve_keeps_pages_homogeneous() {
     // Deliberately *not* a divisor of the page: 6,000 bytes of chunk against a
@@ -2147,6 +2164,9 @@ fn a_paged_append_reserve_keeps_pages_homogeneous() {
 /// enough that a page holds several objects, which is what makes the reclaim
 /// question interesting rather than trivially per-object.
 const RECLAIM_PAGE: u64 = 16384;
+/// Rows appended onto each dataset of a populated churn cycle: a few kilobytes,
+/// far under the megabyte an immediate append draws at most.
+const CHURN_ROWS: usize = 1024;
 
 /// Open `path` for editing without an `fsync` per write: every loop below closes
 /// its session, and `SyncPolicy::OnClose` writes byte-identical files.
@@ -2299,7 +2319,6 @@ fn paged_delete_of_an_empty_extensible_dataset_reclaims_its_index() {
 #[test]
 fn paged_group_churn_with_empty_datasets_reaches_a_steady_size() {
     const CYCLES: usize = 40;
-    const SETTLED: usize = 25;
 
     let path = temp_path("hdf5_pure_fs_paged_empty_churn.h5");
     let f = churn_fixture(&path, FileSpaceStrategy::Page);
@@ -2326,28 +2345,150 @@ fn paged_group_churn_with_empty_datasets_reaches_a_steady_size() {
         sizes.push(f.file_size());
         used.push(f.file_size() - acct.reusable_free_bytes);
     }
+    f.close().unwrap();
+    assert_churn_settled(&sizes, &used);
+    assert_churn_survivors(&path);
+}
+
+/// The reporter's loop for issue #413: a persisting file that creates a group of
+/// resizable datasets, appends a payload onto each **in place**, commits, deletes
+/// the group, commits again, and repeats, reaches a steady size.
+///
+/// Returns the file size and the space neither live nor reusable after every
+/// cycle, and leaves one populated group in the closed file for the caller to
+/// inspect.
+///
+/// The payload is a few kilobytes per dataset, far under the megabyte an
+/// immediate append draws from the on-disk managers at most. A *floor* of that
+/// size on the draw meant no hole this loop left was ever spent, so the file
+/// grew by a payload (a page, on a paged file) per cycle while reporting all of
+/// it as reusable — the empty-dataset loop of issue #388 and the staged append
+/// were both stable, and this in-place one was not. A long-lived `keep` group
+/// goes in first so the space each cycle vacates is interior rather than
+/// trailing, which makes reuse, not truncation, the only way to stop growing.
+fn populated_group_churn(
+    path: &std::path::Path,
+    strategy: FileSpaceStrategy,
+    cycles: usize,
+) -> (Vec<u64>, Vec<u64>) {
+    let f = churn_fixture(path, strategy);
+    let mut sizes = Vec::with_capacity(cycles);
+    let mut used = Vec::with_capacity(cycles);
+    let payload: Vec<i32> = (0..CHURN_ROWS as i32).collect();
+    let populate = |name: &str| {
+        f.root()
+            .create_group_with(name, |g| {
+                for i in 0..3 {
+                    g.create_dataset(&format!("log{i}"), |b| {
+                        b.with_i32_data(&[])
+                            .with_shape(&[0])
+                            .with_chunks(&[64])
+                            .with_maxshape(&[u64::MAX]);
+                    });
+                }
+            })
+            .unwrap();
+        f.commit().unwrap();
+        for i in 0..3 {
+            f.dataset(&format!("{name}/log{i}"))
+                .unwrap()
+                .append(&payload)
+                .unwrap();
+        }
+        f.commit().unwrap();
+    };
+    for cycle in 0..cycles {
+        let name = format!("scratch_{cycle}");
+        populate(&name);
+        f.root().delete(&name).unwrap();
+        f.commit().unwrap();
+        let acct = f.space_accounting().unwrap();
+        sizes.push(f.file_size());
+        used.push(f.file_size() - acct.reusable_free_bytes);
+    }
+    populate("last");
+    f.close().unwrap();
+    (sizes, used)
+}
+
+/// A churn loop's steady state: the last third of the run adds nothing, to the
+/// file or to the space that is neither live nor reusable.
+fn assert_churn_settled(sizes: &[u64], used: &[u64]) {
+    let settled = sizes.len() * 2 / 3;
     assert_eq!(
-        sizes[CYCLES - 1],
-        sizes[SETTLED],
+        sizes[sizes.len() - 1],
+        sizes[settled],
         "the file must stop growing once the churn is in its steady state \
          (sizes: {sizes:?})"
     );
     assert_eq!(
-        used[CYCLES - 1],
-        used[SETTLED],
+        used[used.len() - 1],
+        used[settled],
         "space that is neither live nor reusable must stop accumulating \
          (used: {used:?})"
     );
+}
 
-    f.close().unwrap();
-    let f = File::open(&path).unwrap();
+/// What every churn loop over a [`churn_fixture`] leaves behind: the long-lived
+/// group intact, every scratch group gone, and the recorded end-of-file true.
+fn assert_churn_survivors(path: &std::path::Path) {
+    let f = File::open(path).unwrap();
     assert_eq!(
         f.group("keep").unwrap().attrs().unwrap().get("kind"),
         Some(&AttrValue::I64(1))
     );
     assert!(f.group("scratch_0").is_err(), "every scratch group is gone");
     drop(f);
-    assert_eof_matches_file(&path);
+    assert_eof_matches_file(path);
+}
+
+/// The populated group [`populated_group_churn`] leaves behind reads back in
+/// full.
+fn assert_last_group_populated(path: &std::path::Path) {
+    let f = File::open(path).unwrap();
+    let want: Vec<i32> = (0..CHURN_ROWS as i32).collect();
+    for i in 0..3 {
+        assert_eq!(
+            f.dataset(&format!("last/log{i}"))
+                .unwrap()
+                .read_i32()
+                .unwrap(),
+            want
+        );
+    }
+}
+
+/// A paged persisting file under the populated delete-and-recreate loop of
+/// issue #413 reaches a steady size, and every page it reused holds one kind of
+/// byte.
+#[test]
+fn paged_group_churn_with_populated_datasets_reaches_a_steady_size() {
+    let path = temp_path("hdf5_pure_fs_paged_populated_churn.h5");
+    let (sizes, used) = populated_group_churn(&path, FileSpaceStrategy::Page, 30);
+    assert_churn_settled(&sizes, &used);
+    assert_churn_survivors(&path);
+    assert_last_group_populated(&path);
+    let last = ["last/log0", "last/log1", "last/log2"];
+    assert_pages_homogeneous(&path, RECLAIM_PAGE, &last);
+    assert_no_persisted_free_space_holds_live_chunks(&path, &last);
+}
+
+/// The flat persisting strategy under the same loop (issue #413). The reporter
+/// measured it as the one that recycled; it had the same floor on its draw, and
+/// on top of that the draw's own manager rewrite had nowhere to put its tail once
+/// the draw had emptied the file's one free list, so it appended a tail at
+/// end-of-file per draw.
+#[test]
+fn persisting_group_churn_with_populated_datasets_reaches_a_steady_size() {
+    let path = temp_path("hdf5_pure_fs_flat_populated_churn.h5");
+    let (sizes, used) = populated_group_churn(&path, FileSpaceStrategy::FsmAggr, 30);
+    assert_churn_settled(&sizes, &used);
+    assert_churn_survivors(&path);
+    assert_last_group_populated(&path);
+    assert_no_persisted_free_space_holds_live_chunks(
+        &path,
+        &["last/log0", "last/log1", "last/log2"],
+    );
 }
 
 /// Repeated `Dataset::append_staged` + `commit` on a paged file does not strand

@@ -408,6 +408,9 @@ fn refused_duplicate_leaves_the_first_creation_standing() {
     assert_eq!(first.dtype().unwrap(), DType::I32);
     session.commit().unwrap();
     assert_eq!(first.read_i32().unwrap(), vec![1, 2, 3]);
+    // Windows refuses a second open while the session still holds its lock.
+    drop(first);
+    drop(session);
 
     let file = File::open(&path).unwrap();
     assert_eq!(
@@ -440,6 +443,9 @@ fn withdrawing_a_staged_creation_frees_its_name_again() {
         .unwrap();
     assert_eq!(second.shape().unwrap(), vec![2]);
     session.commit().unwrap();
+    // Windows refuses a second open while the session still holds its lock.
+    drop(second);
+    drop(session);
 
     let file = File::open(&path).unwrap();
     assert_eq!(
@@ -467,6 +473,10 @@ fn restaging_a_group_addresses_the_same_group() {
         })
         .unwrap();
     session.commit().unwrap();
+    // Windows refuses a second open while the session still holds its lock.
+    drop(again);
+    drop(first);
+    drop(session);
 
     let file = File::open(&path).unwrap();
     let attrs = file.group("g").unwrap().attrs().unwrap();
