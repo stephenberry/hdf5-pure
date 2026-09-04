@@ -10794,7 +10794,12 @@ impl OverwriteBytes {
 
 /// How a staged value overwrite (`write_dataset`) will be applied, decided by
 /// [`WriteEngine::prepare_write`] during the all-or-nothing preflight.
-#[expect(
+// `allow` rather than `expect`, which is otherwise this module's habit: the lint
+// fires on a 64-bit pointer width and not on i686, where the `Vec` and `usize`
+// fields inside `MovingWrite` shrink and the variant gap falls back under
+// clippy's threshold. An `expect` is therefore unfulfilled on exactly the two
+// 32-bit CI jobs, both of which deny `unfulfilled_lint_expectations`.
+#[allow(
     clippy::large_enum_variant,
     reason = "boxing the large variant would cost more than it saves: this enum is returned by \
               `prepare_write` and destructured at its one call site, which moves the `MovingWrite` \
