@@ -155,7 +155,8 @@ pub(crate) fn acquire_exclusive(
 ///   bit alone. That session holds dirty pages across the write engine's
 ///   ordering barriers, so a process that died mid-flush could leave a file that
 ///   reads clean and returns the wrong bytes; the mark makes it a file every
-///   reader refuses instead (issue #308).
+///   reader refuses instead (issue #308), until one says with
+///   [`WriteMarkPolicy::AllowSnapshot`] that it knows what it is reading.
 ///
 /// An ordinary [`crate::File::open_rw`] session raises nothing, and is guarded by
 /// the OS lock alone.
@@ -165,13 +166,40 @@ pub(crate) const WRITE_ACCESS: u32 = 0x01;
 /// holding the file is a SWMR writer, so a SWMR reader may attach to it.
 pub(crate) const SWMR_WRITE_ACCESS: u32 = 0x04;
 
+/// Policy for a read-only open of a file whose superblock marks it as open for
+/// write by a writer that is *not* a SWMR writer — superblock status-flag bit 0
+/// (`H5F_SUPER_WRITE_ACCESS`) alone, the mark a page-buffered session
+/// ([`crate::FileAccessProperties::with_page_buffer_size`]) holds for its life.
+///
+/// Set it with
+/// [`FileAccessProperties::with_write_mark_policy`](crate::FileAccessProperties::with_write_mark_policy),
+/// which states when the assertion [`AllowSnapshot`](Self::AllowSnapshot) makes
+/// is true. It governs the read-only opens only: a SWMR pair is followed with
+/// [`crate::File::open_swmr`] whatever this says, and no value of it lets a
+/// second writer join a file a writer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteMarkPolicy {
+    /// Refuse the open with [`Error::FileMarkedInUse`]. The default, and what
+    /// `H5Fopen` does with the same byte.
+    #[default]
+    Refuse,
+    /// Read the file as it stands, on the caller's assertion that the writer
+    /// has flushed: it called [`crate::File::sync`], or it stopped after a flush
+    /// and the mark stands only because nothing cleared it. Every other refusal
+    /// stays in place.
+    AllowSnapshot,
+}
+
 /// What an open intends to do with the file, selecting which status-flag
 /// combinations [`check_status_flags`] refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenIntent {
     /// A plain read — [`crate::File::open`] and
     /// [`crate::File::open_streaming`], the C library's `H5F_ACC_RDONLY`.
-    Read,
+    ///
+    /// Carries the caller's [`WriteMarkPolicy`], which is the one intent it can
+    /// mean anything for: the other two have no snapshot to take.
+    Read(WriteMarkPolicy),
     /// A SWMR read — [`crate::File::open_swmr`], the C library's
     /// `H5F_ACC_RDONLY | H5F_ACC_SWMR_READ`.
     SwmrRead,
@@ -205,20 +233,48 @@ pub(crate) enum OpenTarget<'a> {
 }
 
 impl OpenTarget<'_> {
-    /// What a caller refused a snapshot read can do instead, which is not the
-    /// same list for both: a source has no path for `open_swmr` to follow or
-    /// for `clear_swmr_flag` to write to.
-    fn read_recovery(self) -> &'static str {
-        match self {
-            Self::Path(_) => {
+    /// What a caller refused a snapshot read can do instead, which depends on
+    /// both the target and the mark.
+    ///
+    /// The target, because a source has no path for `open_swmr` to follow or for
+    /// `clear_swmr_flag` to write to. The mark, because `open_swmr` follows a
+    /// SWMR writer and nothing else: naming it to a caller refused by
+    /// [`WRITE_ACCESS`] alone would name a recovery that fails in its turn, the
+    /// mismatched pair a SWMR reader refuses (issue #419). That caller's opt-in
+    /// is [`WriteMarkPolicy::AllowSnapshot`], which is what this names instead.
+    ///
+    /// `swmr_claimed` is the SWMR bit, not the pair: a file carrying it without
+    /// [`WRITE_ACCESS`] claims a SWMR writer this crate's opt-in deliberately
+    /// does not unlock, so it is pointed at the SWMR reader — whose own refusal
+    /// then names the inconsistency — rather than at an opt-in that would refuse
+    /// it again.
+    fn read_recovery(self, swmr_claimed: bool) -> &'static str {
+        match (self, swmr_claimed) {
+            (Self::Path(_), true) => {
                 "Use File::open_swmr to follow a live SWMR writer, or File::from_bytes to read \
                  the bytes as they stand; if a writer exited without closing the file, clear \
                  the flag with File::clear_swmr_flag"
             }
-            Self::Source => {
+            (Self::Source, true) => {
                 "Use File::from_bytes to read the bytes as they stand; following a live writer \
                  with File::open_swmr, and clearing a flag a writer left behind with \
                  File::clear_swmr_flag, both need a filesystem path"
+            }
+            (Self::Path(_), false) => {
+                "No SWMR writer holds it, so no reader can follow it as one. Pass \
+                 FileAccessProperties::with_write_mark_policy(WriteMarkPolicy::AllowSnapshot) to \
+                 read it as it stands, which is a consistent snapshot once the writer has called \
+                 File::sync or closed the file, or use File::from_bytes to read the bytes as they \
+                 stand; if a writer exited without closing the file, clear the flag with \
+                 File::clear_swmr_flag"
+            }
+            (Self::Source, false) => {
+                "No SWMR writer holds it, so no reader can follow it as one. Pass \
+                 FileAccessProperties::with_write_mark_policy(WriteMarkPolicy::AllowSnapshot) to \
+                 read it as it stands, which is a consistent snapshot once the writer has called \
+                 File::sync or closed the file, or use File::from_bytes to read the bytes as they \
+                 stand; clearing a flag a writer left behind with File::clear_swmr_flag needs a \
+                 filesystem path"
             }
         }
     }
@@ -247,7 +303,12 @@ impl core::fmt::Display for OpenTarget<'_> {
 ///   not already cover, because a SWMR writer takes no lock.
 /// - [`Read`](OpenIntent::Read) refuses either bit: a plain reader buffers a
 ///   snapshot with no protocol for a writer mutating the file underneath it. To
-///   follow a live SWMR writer, use [`crate::File::open_swmr`].
+///   follow a live SWMR writer, use [`crate::File::open_swmr`]. The one way past
+///   it is [`WriteMarkPolicy::AllowSnapshot`], which the intent carries: it
+///   admits a read of [`WRITE_ACCESS`] *alone* — the mark a page-buffered
+///   session leaves, which no SWMR reader can follow (issue #419) — on the
+///   caller's assertion that the writer has flushed. It does not admit a SWMR
+///   pair, which has a reader of its own.
 /// - [`SwmrRead`](OpenIntent::SwmrRead) refuses only a *mismatched* pair — one
 ///   bit without the other. Both bits is exactly the live SWMR writer it exists
 ///   to follow, and neither is a quiescent file.
@@ -265,9 +326,10 @@ impl core::fmt::Display for OpenTarget<'_> {
 /// buffer behind a mark no reader would honor — so no flag this crate raises
 /// falls outside the gate.
 ///
-/// `target` does not enter the decision, which the superblock makes alone. It
-/// shapes the error: what to call the file that was refused, and which
-/// recoveries to name, since two of the three need a filesystem path.
+/// `target` does not enter the decision, which the superblock and the intent's
+/// own policy make between them. It shapes the error: what to call the file that
+/// was refused, and which recoveries to name, since some of them need a
+/// filesystem path.
 pub(crate) fn check_status_flags(
     superblock: &Superblock,
     intent: OpenIntent,
@@ -288,11 +350,19 @@ pub(crate) fn check_status_flags(
              another writer holds it. Open it read-only, or — if a writer exited without \
              closing the file — clear the flag with File::clear_swmr_flag"
         ),
-        OpenIntent::Read if write || swmr => format!(
-            "the superblock marks the file as open for write (status flags {flags:#04x}), so a \
-             snapshot read is not safe. {}",
-            target.read_recovery()
-        ),
+        // The opt-in is checked inside the arm rather than in its guard so that
+        // the arm keeps stating the whole rule in one place: what the flags say,
+        // and the one assertion that overrides it.
+        OpenIntent::Read(policy) if write || swmr => {
+            if policy == WriteMarkPolicy::AllowSnapshot && !swmr {
+                return Ok(());
+            }
+            format!(
+                "the superblock marks the file as open for write (status flags {flags:#04x}), so \
+                 a snapshot read is not safe. {}",
+                target.read_recovery(swmr)
+            )
+        }
         OpenIntent::SwmrRead if write != swmr => format!(
             "the superblock's status flags disagree ({flags:#04x}): a SWMR reader needs a SWMR \
              writer (both the write and SWMR-write bits) or a quiescent file (neither). Clear \
@@ -407,6 +477,10 @@ mod tests {
         }
     }
 
+    /// A snapshot read under the default policy, which is what every rule
+    /// below is stated against unless it names the opt-in.
+    const READ: OpenIntent = OpenIntent::Read(WriteMarkPolicy::Refuse);
+
     fn allows(version: u8, flags: u32, intent: OpenIntent) -> bool {
         check_status_flags(
             &flagged(version, flags),
@@ -428,7 +502,7 @@ mod tests {
                 "a writer may open a file only when no flag claims it (flags {flags:#04x})"
             );
             assert_eq!(
-                allows(3, flags, OpenIntent::Read),
+                allows(3, flags, READ),
                 !held,
                 "a snapshot read is refused whenever a writer holds the file (flags {flags:#04x})"
             );
@@ -444,7 +518,7 @@ mod tests {
     /// so a file carrying only it opens for any intent.
     #[test]
     fn the_file_ok_bit_alone_refuses_nothing() {
-        for intent in [OpenIntent::Read, OpenIntent::SwmrRead, OpenIntent::Write] {
+        for intent in [READ, OpenIntent::SwmrRead, OpenIntent::Write] {
             assert!(allows(3, 0x02, intent), "{intent:?} refused flags 0x02");
         }
     }
@@ -455,7 +529,7 @@ mod tests {
     #[test]
     fn an_older_superblock_is_not_checked() {
         for version in [0, 1, 2] {
-            for intent in [OpenIntent::Read, OpenIntent::SwmrRead, OpenIntent::Write] {
+            for intent in [READ, OpenIntent::SwmrRead, OpenIntent::Write] {
                 assert!(
                     allows(version, 0x05, intent),
                     "v{version} superblock refused {intent:?} on flags 0x05"
@@ -468,12 +542,8 @@ mod tests {
     /// recovery a user would otherwise have to find in the C library's docs.
     #[test]
     fn the_refusal_names_the_recovery() {
-        let err = check_status_flags(
-            &flagged(3, 0x05),
-            OpenIntent::Read,
-            OpenTarget::Path(Path::new("d.h5")),
-        )
-        .expect_err("a flagged file is refused for a snapshot read");
+        let err = check_status_flags(&flagged(3, 0x05), READ, OpenTarget::Path(Path::new("d.h5")))
+            .expect_err("a flagged file is refused for a snapshot read");
         let msg = err.to_string();
         assert!(matches!(err, Error::FileMarkedInUse(_)), "got {err:?}");
         // `from_bytes` is named because it is the only way through for a flagged
@@ -494,7 +564,7 @@ mod tests {
     /// a `Source` target falling back to it fails here.
     #[test]
     fn a_source_is_told_which_recovery_it_can_reach() {
-        let err = check_status_flags(&flagged(3, 0x05), OpenIntent::Read, OpenTarget::Source)
+        let err = check_status_flags(&flagged(3, 0x05), READ, OpenTarget::Source)
             .expect_err("a flagged file is refused for a snapshot read");
         let msg = err.to_string();
         assert!(
@@ -509,6 +579,89 @@ mod tests {
             msg.contains("both need a filesystem path"),
             "the refusal offers path-only recoveries without saying they need a path: {msg}"
         );
+    }
+
+    /// The mark a page-buffered writer leaves is the write bit alone, which no
+    /// SWMR reader can follow — so the refusal must not send the caller to
+    /// `File::open_swmr`, which refuses the same file in its turn (issue #419).
+    /// What applies instead is the opt-in, named in full so it can be pasted.
+    #[test]
+    fn a_write_only_mark_names_the_snapshot_opt_in() {
+        let err = check_status_flags(
+            &flagged(3, WRITE_ACCESS),
+            READ,
+            OpenTarget::Path(Path::new("buffered.h5")),
+        )
+        .expect_err("a marked file is refused for a snapshot read");
+        let msg = err.to_string();
+        assert!(matches!(err, Error::FileMarkedInUse(_)), "got {err:?}");
+        for part in [
+            "buffered.h5",
+            "0x01",
+            "FileAccessProperties::with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)",
+            "File::sync",
+            "from_bytes",
+            "clear_swmr_flag",
+        ] {
+            assert!(msg.contains(part), "refusal does not mention {part}: {msg}");
+        }
+        assert!(
+            !msg.contains("open_swmr"),
+            "refusal names a reader that refuses this mark too: {msg}"
+        );
+    }
+
+    /// A source refused by the same mark is offered the opt-in, which it can
+    /// take — it is a property of the open, not of the path — and told that the
+    /// recovery it cannot take needs one.
+    #[test]
+    fn a_source_refused_by_a_write_only_mark_is_offered_the_opt_in() {
+        let err = check_status_flags(&flagged(3, WRITE_ACCESS), READ, OpenTarget::Source)
+            .expect_err("a marked file is refused for a snapshot read");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)"),
+            "the refusal does not name the opt-in a source can take: {msg}"
+        );
+        assert!(
+            msg.contains("File::clear_swmr_flag needs a filesystem path"),
+            "the refusal offers a path-only recovery without saying it needs a path: {msg}"
+        );
+        assert!(!msg.contains("open_swmr"), "got {msg}");
+    }
+
+    /// The other half: the pair a SWMR writer leaves keeps the wording that
+    /// names its reader, and does not offer an opt-in that would refuse it.
+    #[test]
+    fn a_swmr_pair_names_its_reader_and_not_the_opt_in() {
+        let err = check_status_flags(
+            &flagged(3, WRITE_ACCESS | SWMR_WRITE_ACCESS),
+            READ,
+            OpenTarget::Path(Path::new("swmr.h5")),
+        )
+        .expect_err("a marked file is refused for a snapshot read");
+        let msg = err.to_string();
+        assert!(msg.contains("File::open_swmr"), "got {msg}");
+        assert!(
+            !msg.contains("write_mark_policy"),
+            "the opt-in does not admit a SWMR pair, so the refusal must not name it: {msg}"
+        );
+    }
+
+    /// What the opt-in admits, stated as the whole rule: the write bit alone,
+    /// and nothing carrying the SWMR bit — that file has a reader of its own.
+    /// The read-write opens cannot reach this at all, since only
+    /// [`OpenIntent::Read`] carries a policy.
+    #[test]
+    fn the_snapshot_opt_in_admits_the_write_mark_alone() {
+        for flags in [0x00, WRITE_ACCESS, SWMR_WRITE_ACCESS, 0x05] {
+            let allowed = flags & SWMR_WRITE_ACCESS == 0;
+            assert_eq!(
+                allows(3, flags, OpenIntent::Read(WriteMarkPolicy::AllowSnapshot)),
+                allowed,
+                "AllowSnapshot on flags {flags:#04x}"
+            );
+        }
     }
 
     /// Write a file at `path` whose superblock carries `version` and `flags`,
