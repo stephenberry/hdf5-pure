@@ -8,7 +8,7 @@
 
 use hdf5_pure::{
     Error, File, FileAccessProperties, FileBuilder, FileLocking, FileSpaceStrategy, MemoryStrategy,
-    SyncPolicy,
+    SyncPolicy, WriteMarkPolicy,
 };
 use tempfile::tempdir;
 
@@ -354,6 +354,155 @@ fn a_crashed_page_buffered_session_leaves_a_file_every_open_refuses() {
     File::open(&path).unwrap();
 }
 
+// --- The write mark and the snapshot opt-in (issue #419) ----------------------
+//
+// The mark a page-buffered session leaves is bit 0 alone, and no SWMR reader can
+// follow that: a SWMR reader needs the pair. So every path-based read was refused
+// while such a writer ran, and the refusal named `File::open_swmr`, which refused
+// the same file in its turn. `FileAccessProperties::with_write_mark_policy` is
+// the reader that does apply, on the caller's assertion that the writer has
+// flushed, and the refusal names it instead.
+
+/// Access properties that take a snapshot of a write-marked file.
+fn snapshot() -> FileAccessProperties {
+    FileAccessProperties::new().with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)
+}
+
+/// Leave a live page-buffered session holding `path`, its append flushed.
+///
+/// Leaked deliberately: the mark has to still be standing when the reads under
+/// test run, which is the whole scenario. The `sync` is what makes the snapshot
+/// a consistent one, and is the assertion the opt-in's contract asks for.
+fn live_page_buffered_writer(path: &std::path::Path) {
+    build_paged(path);
+    let file = File::open_rw_with_options(path, page_buffered()).unwrap();
+    let mut ds = file.dataset("d").unwrap();
+    ds.append(&[7i32; 64]).unwrap();
+    file.sync().unwrap();
+    std::mem::forget(ds);
+    std::mem::forget(file);
+    assert_eq!(flags(path), 0x01, "the live session marks the file");
+}
+
+/// The issue's repro: every path-based read is refused, and the refusal points
+/// at a recovery that exists rather than at `File::open_swmr`, which refuses the
+/// same mark itself.
+#[test]
+fn a_write_marked_file_names_a_recovery_that_works() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("live.h5");
+    live_page_buffered_writer(&path);
+
+    for (what, err) in [
+        ("File::open", File::open(&path).unwrap_err()),
+        (
+            "File::open_streaming",
+            File::open_streaming(&path).unwrap_err(),
+        ),
+    ] {
+        let msg = err.to_string();
+        assert_marked_in_use(err, what);
+        assert!(
+            !msg.contains("open_swmr"),
+            "{what} names a reader that refuses this mark too: {msg}"
+        );
+        assert!(
+            msg.contains("with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)"),
+            "{what} does not name the opt-in that reads it: {msg}"
+        );
+    }
+
+    // The mark is half a pair, so the SWMR reader refuses it — the behaviour the
+    // error text used to send callers into, and which stays as it is.
+    assert_marked_in_use(
+        File::open_swmr(&path).unwrap_err(),
+        "a SWMR reader following half a pair",
+    );
+}
+
+/// The opt-in reads what the writer flushed, through both path-based readers and
+/// through a source, none of which copies the file as `File::from_bytes` does.
+#[test]
+fn the_opt_in_reads_a_flushed_write_marked_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("live.h5");
+    live_page_buffered_writer(&path);
+
+    let expected: Vec<i32> = [0i32; 64].into_iter().chain([7i32; 64]).collect();
+    for (what, file) in [
+        (
+            "File::open_with_options",
+            File::open_with_options(&path, snapshot()).unwrap(),
+        ),
+        (
+            "File::open_streaming_with_options",
+            File::open_streaming_with_options(&path, snapshot()).unwrap(),
+        ),
+        ("File::from_source_with_options", {
+            let handle = std::fs::File::open(&path).unwrap();
+            let source = hdf5_pure::ReadSeekSource::new(handle).unwrap();
+            File::from_source_with_options(source, snapshot()).unwrap()
+        }),
+    ] {
+        assert_eq!(
+            file.dataset("d").unwrap().read_i32().unwrap(),
+            expected,
+            "{what} read something other than what the writer committed"
+        );
+        assert_eq!(file.superblock().consistency_flags, 0x01);
+    }
+}
+
+/// The opt-in is a *reader's*. It does not let a second writer join a file a
+/// writer holds, whichever backing that writer would take.
+#[test]
+fn the_opt_in_does_not_unlock_a_read_write_open() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("live.h5");
+    live_page_buffered_writer(&path);
+
+    // Locking off so the superblock byte is what refuses this, not the OS lock
+    // the leaked session still holds.
+    let props = snapshot().with_locking(FileLocking::Disabled);
+    assert_marked_in_use(
+        File::open_rw_with_options(&path, props).unwrap_err(),
+        "File::open_rw under the opt-in",
+    );
+    assert_marked_in_use(
+        File::open_rw_with_options(&path, props.with_memory_strategy(MemoryStrategy::Mirrored))
+            .unwrap_err(),
+        "a mirrored File::open_rw under the opt-in",
+    );
+}
+
+/// A live SWMR writer's pair is not what the opt-in admits: that file has a
+/// reader of its own, which follows the writer's later appends as a snapshot
+/// cannot.
+#[test]
+fn the_opt_in_does_not_unlock_a_swmr_pair() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("swmr.h5");
+    build_swmr(&path);
+    let writer = File::open_swmr_writer(&path).unwrap();
+    writer
+        .dataset("d")
+        .unwrap()
+        .append(&[4i32, 5, 6, 7])
+        .unwrap();
+    assert_eq!(flags(&path), 0x05);
+
+    assert_marked_in_use(
+        File::open_with_options(&path, snapshot()).unwrap_err(),
+        "a buffered read of a SWMR pair under the opt-in",
+    );
+    assert_marked_in_use(
+        File::open_streaming_with_options(&path, snapshot()).unwrap_err(),
+        "a streaming read of a SWMR pair under the opt-in",
+    );
+    File::open_swmr(&path).expect("the reader that does follow a SWMR writer");
+    writer.close().unwrap();
+}
+
 /// An ordinary editor raises nothing. The crate's divergence from the C library
 /// — which marks the file for *any* writer — is deliberate, and it is what makes
 /// the mark above mean "a page buffer held this file" rather than "someone
@@ -382,6 +531,10 @@ fn an_unbuffered_editor_raises_no_mark() {
         0x00,
         "an open_rw session without a page buffer marks nothing"
     );
+    // And so the plain readers need no opt-in to snapshot it while it runs:
+    // nothing on disk says a writer holds the file.
+    File::open(&path).unwrap();
+    File::open_streaming(&path).unwrap();
     file.close().unwrap();
     assert_eq!(flags(&path), 0x00);
 }

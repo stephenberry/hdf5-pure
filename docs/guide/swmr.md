@@ -91,6 +91,8 @@ While a `File::open_swmr_writer` is open, the file's superblock carries an activ
 
 That flag is durable under every `SyncPolicy` — clearing it is one of the writes `close` and `drop` force a barrier for, since a lost clear would refuse every subsequent open until `File::clear_swmr_flag` ran. It is what every other open consults: while it stands, `File::open`, `File::open_streaming`, `File::from_source`, `File::open_rw` and a second `File::open_swmr_writer` all fail with `Error::FileMarkedInUse`, exactly as `H5Fopen` fails with *"file is already open for write"*. `File::open_swmr` is the one open that follows it rather than refusing — that pairing is what the flag is for. `File::from_bytes` does not consult it, since its caller already holds a snapshot of the bytes.
 
+A page-buffered writer raises bit 0 of the same byte *without* the SWMR bit, and no SWMR reader can follow half a pair. That mark has a reader of its own: `FileAccessProperties::with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)`, which admits a snapshot read of it and never of a SWMR pair. See [Reading](reading.md).
+
 The flag cannot distinguish a live writer from a crashed one, so recover a file you know has no writer with the h5clear equivalent:
 
 ```rust

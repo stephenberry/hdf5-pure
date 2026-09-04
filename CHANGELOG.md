@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `File::open_rw` edits an object that tracks attribute creation order (h5py's `track_order=True`, and everything netCDF-4 writes), where every such object was refused: a new attribute takes the next creation index, an overwrite keeps the one it had, a deletion leaves a gap, and a set that goes dense gains a creation-order B-tree beside its name index. Adding a *link* to a group that tracks **link** creation order is still refused ([#416](https://github.com/stephenberry/hdf5-pure/issues/416)).
+- `FileAccessProperties::with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)` lets a read-only open take a path-based snapshot of a file a page-buffered writer holds, without copying it through `File::from_bytes`; the caller asserts the writer has synced, and a SWMR pair and every read-write open are still refused ([#419](https://github.com/stephenberry/hdf5-pure/issues/419)).
+
+### Fixed
+
+- `Error::FileMarkedInUse` no longer points a reader at `File::open_swmr` for a file marked by a page-buffered writer, which that reader refuses in its turn; the message now names the snapshot opt-in above, `File::from_bytes`, and `File::clear_swmr_flag` ([#419](https://github.com/stephenberry/hdf5-pure/issues/419)).
+- Deleting objects now gives the space at the end of the file back to the filesystem instead of leaving `File::file_size()` at a high-water mark, on a file that persists its free-space managers and on a paged file alike. A commit shortens the file to just above its last live allocation, page-aligned where the strategy requires it ([#418](https://github.com/stephenberry/hdf5-pure/issues/418)).
 
 ### Fixed
 

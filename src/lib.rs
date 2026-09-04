@@ -271,7 +271,7 @@ pub use reader::{
 pub use layout_info::{Chunk, ChunkIndex, Filter, Layout};
 
 #[cfg(feature = "std")]
-pub use file_lock::FileLocking;
+pub use file_lock::{FileLocking, WriteMarkPolicy};
 
 pub use chunk_cache::{ChunkCacheConfig, ChunkCacheStats};
 

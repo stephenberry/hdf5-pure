@@ -1160,6 +1160,125 @@ fn c_library_reads_our_paged_file_after_group_churn() {
     );
 }
 
+/// A file the commit shortened by releasing the free run at its end is read back
+/// by the reference library — data, strategy, and free-space total alike
+/// (issue #418).
+///
+/// The release publishes a *smaller* end-of-file and then truncates the file to
+/// it, so the two figures the C library cross-checks on open — the superblock's
+/// end-of-file and the length of the file it is opening — move together, and the
+/// free-space managers it parses must name no section above either. `h5stat`
+/// asks the same question through `H5Fget_freespace`, which can only answer it
+/// by loading the FSHD/FSSE blocks the release rewrote; a section pointing past
+/// the shortened file would be one it hands to the next writer.
+///
+/// Both strategies, because the run is released in whole pages on a paged file
+/// and in bytes on a flat one, and then the C library writes into the shortened
+/// file and hdf5-pure reads the result.
+#[test]
+fn c_library_reads_our_file_after_a_release_shortened_it() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    const ROWS: usize = 65536;
+    let payload: Vec<i32> = (0..ROWS as i32).collect();
+
+    for (label, strategy, paged) in [
+        ("flat", FileSpaceStrategy::FsmAggr, false),
+        ("paged", FileSpaceStrategy::Page, true),
+    ] {
+        let path = dir.path().join(format!("ours_released_{label}.h5"));
+        let mut b = FileBuilder::new();
+        b.with_file_space_strategy(strategy, true, 0);
+        if paged {
+            b.with_file_space_page_size(16384);
+        }
+        b.create_dataset("keep").with_i32_data(&[1, 2, 3, 4]);
+        b.write(&path).unwrap();
+
+        let peak = {
+            let file = File::open_rw_with_options(
+                &path,
+                FileAccessProperties::new().with_sync_policy(hdf5_pure::SyncPolicy::OnClose),
+            )
+            .unwrap();
+            file.root()
+                .create_group_with("scratch", |g| {
+                    for c in 0..2 {
+                        g.create_dataset(&format!("c{c}"), |b| {
+                            b.with_i32_data(&payload)
+                                .with_shape(&[ROWS as u64])
+                                .with_chunks(&[512])
+                                .with_maxshape(&[u64::MAX]);
+                        });
+                    }
+                })
+                .unwrap();
+            file.commit().unwrap();
+            let peak = file.file_size();
+            file.root().delete("scratch").unwrap();
+            file.commit().unwrap();
+            file.close().unwrap();
+            peak
+        };
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            len < peak / 4,
+            "{label}: the delete should have released the end of the file (peak \
+             {peak}, now {len})"
+        );
+
+        let ours = File::open(&path).unwrap();
+        assert_eq!(ours.file_size(), len, "{label}: superblock EOF matches");
+        let free_ours: Vec<(u64, u64)> = ours.persisted_free_space();
+        for &(addr, size) in &free_ours {
+            assert!(
+                addr + size <= len,
+                "{label}: a persisted section [{addr}, {}) runs past the {len}-byte \
+                 file",
+                addr + size
+            );
+        }
+        let total_ours: u64 = free_ours.iter().map(|(_, l)| l).sum();
+        drop(ours);
+
+        let f = hdf5::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("keep").unwrap().read_raw::<i32>().unwrap(),
+            vec![1, 2, 3, 4],
+            "{label}: the C library reads the survivor out of the shortened file"
+        );
+        let free_c = unsafe { H5Fget_freespace(f.id()) };
+        assert_eq!(
+            free_c as u64, total_ours,
+            "{label}: the C free-space total matches the managers the release rewrote"
+        );
+        drop(f);
+
+        // And the C library writes into the shortened file, which hdf5-pure reads.
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            f.new_dataset::<f64>()
+                .shape((4,))
+                .create("extra")
+                .unwrap()
+                .write(&[1.0f64, 2.0, 3.0, 4.0])
+                .unwrap();
+            f.close().unwrap();
+        }
+        let ours = File::open(&path).unwrap();
+        assert_eq!(
+            ours.dataset("extra").unwrap().read_f64().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0],
+            "{label}: hdf5-pure reads what the C library added"
+        );
+        assert_eq!(
+            ours.dataset("keep").unwrap().read_i32().unwrap(),
+            vec![1, 2, 3, 4]
+        );
+    }
+}
+
 /// An in-place `Dataset::append` on a persisting file spends holes an earlier
 /// commit left, and it does so by taking them out of the on-disk managers first
 /// (issue #387). The reference library is the reader that has to agree with the
