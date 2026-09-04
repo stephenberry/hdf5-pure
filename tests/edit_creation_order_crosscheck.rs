@@ -18,6 +18,11 @@
 //! `H5Aiterate2` over `H5_INDEX_CRT_ORDER` (h5py's `track_order` iteration) and
 //! `H5Aget_info_by_name`'s `corder`, which name the exact index each attribute
 //! carries.
+//!
+//! The tail of the file covers the same ground for **link** creation order, the
+//! separate mechanism `H5Pset_link_creation_order` turns on: there the judges
+//! are `H5Literate2` over `H5_INDEX_CRT_ORDER`, `H5Lget_info2`'s `corder`, and
+//! `H5Gget_info`'s `max_corder`.
 
 use std::ffi::{CString, c_char, c_int, c_uint, c_void};
 use std::path::Path;
@@ -100,6 +105,7 @@ unsafe extern "C" {
         op_data: *mut c_void,
     ) -> c_int;
     fn H5Gget_info(group: i64, info: *mut GroupInfo) -> c_int;
+    fn H5Lget_info2(loc: i64, name: *const c_char, info: *mut LinkInfo, lapl: i64) -> c_int;
 }
 
 unsafe extern "C" {
@@ -132,6 +138,22 @@ struct GroupInfo {
     nlinks: u64,
     max_corder: i64,
     mounted: u8,
+}
+
+/// `H5L_info2_t`: link type, whether the link carries a creation index, that
+/// index, the name's character set, and a union of an object token and a value
+/// size. The union is modelled as two `u64`s rather than the token's sixteen
+/// bytes so it carries the `size_t` member's eight-byte alignment, which is what
+/// puts `corder` and `cset` at the offsets the C library writes them to — the
+/// assertions that read an index back are what check that.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct LinkInfo {
+    link_type: c_int,
+    corder_valid: u8,
+    corder: i64,
+    cset: c_int,
+    token_or_size: [u64; 2],
 }
 
 const H5P_DEFAULT: i64 = 0;
@@ -453,24 +475,29 @@ impl Drop for Owner {
     }
 }
 
-/// The names of `/g`'s links in link creation order, and the highest creation
-/// index the group has ever assigned — the counter a deletion must leave alone.
+/// [`links_in_creation_order_of`] for `/g`, the group every fixture here tracks.
 fn links_in_creation_order(path: &Path) -> (Vec<String>, i64) {
+    links_in_creation_order_of(path, "g")
+}
+
+/// The names of `group`'s links in link creation order, and the highest creation
+/// index the group has ever assigned — the counter a deletion must leave alone.
+fn links_in_creation_order_of(path: &Path, group: &str) -> (Vec<String>, i64) {
     let _c = c_lib_guard();
     let name = cstr(path.to_str().expect("a temp path is UTF-8"));
-    let gname = cstr("g");
+    let gname = cstr(group);
     // Safety: both ids come from the C library and are closed below; `info` and
     // `names` are written by the calls that are handed them.
     unsafe {
         let file = H5Fopen(name.as_ptr(), H5F_ACC_RDONLY, H5P_DEFAULT);
         assert!(file > 0, "the C library opens {}", path.display());
-        let group = H5Gopen2(file, gname.as_ptr(), H5P_DEFAULT);
-        assert!(group > 0, "the C library opens /g");
+        let gid = H5Gopen2(file, gname.as_ptr(), H5P_DEFAULT);
+        assert!(gid > 0, "the C library opens /{group}");
 
         let mut names: Vec<String> = Vec::new();
         let mut idx = 0u64;
         let rc = H5Literate2(
-            group,
+            gid,
             H5_INDEX_CRT_ORDER,
             H5_ITER_INC,
             &raw mut idx,
@@ -481,14 +508,48 @@ fn links_in_creation_order(path: &Path) -> (Vec<String>, i64) {
 
         let mut info = GroupInfo::default();
         assert_eq!(
-            H5Gget_info(group, &raw mut info),
+            H5Gget_info(gid, &raw mut info),
             0,
             "the C library reads group info"
         );
 
-        H5Gclose(group);
+        H5Gclose(gid);
         H5Fclose(file);
         (names, info.max_corder)
+    }
+}
+
+/// [`link_creation_index_of`] for `/g`, the group every fixture here tracks.
+fn link_creation_index(path: &Path, link: &str) -> i64 {
+    link_creation_index_of(path, "g", link)
+}
+
+/// The creation index the C library reports for the link `<group>/<link>`, which
+/// must be one the group actually records: a link written without one reads back
+/// with `corder_valid` clear, and the assertion below is what catches that.
+fn link_creation_index_of(path: &Path, group: &str, link: &str) -> i64 {
+    let _c = c_lib_guard();
+    let name = cstr(path.to_str().expect("a temp path is UTF-8"));
+    let gname = cstr(group);
+    let lname = cstr(link);
+    // Safety: both ids come from the C library and are closed below; `info` is
+    // written by the call that is handed it.
+    unsafe {
+        let file = H5Fopen(name.as_ptr(), H5F_ACC_RDONLY, H5P_DEFAULT);
+        assert!(file > 0, "the C library opens {}", path.display());
+        let gid = H5Gopen2(file, gname.as_ptr(), H5P_DEFAULT);
+        assert!(gid > 0, "the C library opens /{group}");
+        let mut info = LinkInfo::default();
+        let rc = H5Lget_info2(gid, lname.as_ptr(), &raw mut info, H5P_DEFAULT);
+        assert_eq!(rc, 0, "the C library reads info for /{group}/{link}");
+        H5Gclose(gid);
+        H5Fclose(file);
+        assert!(
+            info.corder_valid != 0,
+            "/{group}/{link} carries no creation index, so it is unnumbered in the group's \
+             link order",
+        );
+        info.corder
     }
 }
 
@@ -763,14 +824,21 @@ fn an_object_already_dense_keeps_its_creation_order_across_an_edit() {
     }
 }
 
+/// A group that tracks link creation order takes additions: each new link is
+/// numbered from the running maximum its Link Info message records, and that
+/// maximum is bumped by the number added.
+///
+/// The reference C library is the judge, because this crate's own reader ignores
+/// link creation order entirely: `H5Literate2` over `H5_INDEX_CRT_ORDER` walks
+/// the per-link creation indexes, `H5Lget_info2`'s `corder` names the index one
+/// link carries, and `H5Gget_info`'s `max_corder` is the running counter.
 #[test]
-fn a_group_tracking_link_creation_order_refuses_a_new_child() {
+fn links_created_in_a_tracked_group_take_the_next_creation_indexes() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("t.h5");
-    write_link_tracked(&p, &["d"]);
+    write_link_tracked(&p, &["first", "second"]);
 
-    // Its attributes are editable — the object header's creation-order tracking
-    // is what this change lifted.
+    // Its attributes are editable, as they were before this change.
     {
         let s = File::open_rw(&p).unwrap();
         s.group("g")
@@ -781,32 +849,43 @@ fn a_group_tracking_link_creation_order_refuses_a_new_child() {
     }
     assert_eq!(Owner::open(&p, "g").value("note"), 1);
 
-    // Its membership is not: a Link message this crate emits carries no creation
-    // index, so adding one would leave an iteration by link creation order
-    // walking an unnumbered link.
-    let s = File::open_rw(&p).unwrap();
-    let g = s.group("g").unwrap();
-    g.create_dataset("extra", |d| {
-        d.with_i32_data(&[1, 2]);
-    })
-    .unwrap();
-    let err = s.commit().unwrap_err();
-    assert!(
-        matches!(&err, Error::EditUnsupported(m) if m.contains("link creation order")),
-        "got: {err}",
+    // A dataset and a child group, both added in one commit.
+    {
+        let s = File::open_rw(&p).unwrap();
+        let g = s.group("g").unwrap();
+        g.create_dataset("added_d", |d| {
+            d.with_i32_data(&[1, 2]);
+        })
+        .unwrap();
+        g.create_group("added_g").unwrap();
+        s.commit().expect("a tracked group takes an addition");
+    }
+
+    let (names, max_corder) = links_in_creation_order(&p);
+    assert_eq!(
+        names,
+        ["first", "second", "added_d", "added_g"],
+        "the additions must follow the originals in link creation order",
     );
+    assert_eq!(
+        max_corder, 4,
+        "the counter must advance by the number of links added",
+    );
+    // Two links added in one commit are numbered consecutively, in the order
+    // they were placed.
+    assert_eq!(link_creation_index(&p, "added_d"), 2);
+    assert_eq!(link_creation_index(&p, "added_g"), 3);
+    // The originals keep the indexes they were created with.
+    assert_eq!(link_creation_index(&p, "first"), 0);
+    assert_eq!(link_creation_index(&p, "second"), 1);
 }
 
-/// Deleting a link from a group that tracks link creation order is *not*
-/// refused: it leaves a gap in the order and touches no counter, the same shape
-/// this crate already gives an attribute deletion.
-///
-/// The reference C library is the judge, because this crate's own reader ignores
-/// link creation order entirely: `H5Literate2` over `H5_INDEX_CRT_ORDER` reads
-/// the per-link creation indexes, and `H5Gget_info`'s `max_corder` is the
-/// running maximum a deletion must not lower.
+/// Deleting a link from a group that tracks link creation order leaves a gap in
+/// the order and touches no counter, the same shape this crate already gives an
+/// attribute deletion — and the next addition takes the index past the old
+/// maximum rather than reusing the gap.
 #[test]
-fn a_group_tracking_link_creation_order_takes_a_deletion() {
+fn a_tracked_group_leaves_a_deletion_gap_and_adds_past_it() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("t.h5");
     write_link_tracked(&p, &["first", "middle", "last"]);
@@ -840,17 +919,135 @@ fn a_group_tracking_link_creation_order_takes_a_deletion() {
         "a deletion must not lower the group's link creation-index counter",
     );
 
-    // The group is still one this crate refuses to add to, so the deletion did
-    // not quietly turn the tracking off.
-    let s = File::open_rw(&p).unwrap();
-    let g = s.group("g").unwrap();
-    g.create_dataset("extra", |d| {
-        d.with_i32_data(&[1, 2]);
-    })
-    .unwrap();
-    let err = s.commit().unwrap_err();
+    {
+        let s = File::open_rw(&p).unwrap();
+        s.group("g")
+            .unwrap()
+            .create_dataset("added", |d| {
+                d.with_i32_data(&[1, 2]);
+            })
+            .unwrap();
+        s.commit().expect("a tracked group takes an addition");
+    }
+
+    let (names, max_corder) = links_in_creation_order(&p);
+    assert_eq!(names, ["first", "last", "added"]);
+    assert_eq!(max_corder, 4);
+    assert_eq!(
+        link_creation_index(&p, "added"),
+        3,
+        "the addition must take the index past the old maximum, not the gap the \
+         deletion left at 1",
+    );
+}
+
+/// A group at the compact-storage threshold its Group Info message declares
+/// cannot take another link: past it the reference C library moves the links
+/// into a fractal heap indexed by a creation-order B-tree, which this crate does
+/// not write (issue #102). The refusal lands before any byte changes.
+#[test]
+fn a_tracked_group_at_its_compact_threshold_is_refused() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("t.h5");
+    // Eight links is the C library's default maximum compact value, so the
+    // fixture is the largest tracked group that still stores its links in the
+    // object header.
+    let links: Vec<String> = (0..8).map(|i| format!("d{i}")).collect();
+    let refs: Vec<&str> = links.iter().map(String::as_str).collect();
+    write_link_tracked(&p, &refs);
+    assert_eq!(links_in_creation_order(&p).1, 8);
+    let before = std::fs::read(&p).unwrap();
+
+    // Scoped so the session — and the file lock it holds, which Windows
+    // enforces — is gone before the bytes are read back.
+    let err = {
+        let s = File::open_rw(&p).unwrap();
+        s.group("g")
+            .unwrap()
+            .create_dataset("extra", |d| {
+                d.with_i32_data(&[1, 2]);
+            })
+            .unwrap();
+        s.commit().unwrap_err()
+    };
     assert!(
-        matches!(&err, Error::EditUnsupported(m) if m.contains("link creation order")),
+        matches!(&err, Error::EditUnsupported(m)
+            if m.contains("link creation order") && m.contains("dense")),
         "got: {err}",
     );
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        before,
+        "the refusal wrote bytes"
+    );
+}
+
+/// A tracked group whose links are *already* dense is refused for the same
+/// reason, and refused as it is read rather than as the addition is planned.
+#[test]
+fn a_dense_tracked_group_is_refused() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("t.h5");
+    // One past the default maximum compact value, so the C library wrote the
+    // links into a fractal heap.
+    let links: Vec<String> = (0..9).map(|i| format!("d{i}")).collect();
+    let refs: Vec<&str> = links.iter().map(String::as_str).collect();
+    write_link_tracked(&p, &refs);
+    assert_eq!(links_in_creation_order(&p).1, 9);
+    let before = std::fs::read(&p).unwrap();
+
+    // Scoped so the session — and the file lock it holds, which Windows
+    // enforces — is gone before the bytes are read back.
+    let err = {
+        let s = File::open_rw(&p).unwrap();
+        s.group("g")
+            .unwrap()
+            .create_dataset("extra", |d| {
+                d.with_i32_data(&[1, 2]);
+            })
+            .unwrap();
+        s.commit().unwrap_err()
+    };
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("dense")),
+        "got: {err}",
+    );
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        before,
+        "the refusal wrote bytes"
+    );
+}
+
+/// Copying a group that tracks link creation order reproduces that order: the
+/// copy's Link Info message comes over verbatim, so each copied link has to keep
+/// the creation index the source recorded for it or the copy would claim an
+/// order none of its links carries.
+#[test]
+fn a_copied_group_keeps_its_link_creation_order() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("t.h5");
+    write_link_tracked(&p, &["first", "second", "third"]);
+
+    {
+        let s = File::open_rw(&p).unwrap();
+        s.copy("g", "g2").unwrap();
+        s.commit().expect("a tracked group is copyable");
+    }
+
+    assert_eq!(
+        links_in_creation_order_of(&p, "g2"),
+        (
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ],
+            3
+        ),
+        "the copy lost the source's link creation order",
+    );
+    for (i, name) in ["first", "second", "third"].iter().enumerate() {
+        assert_eq!(link_creation_index_of(&p, "g2", name), i as i64);
+    }
 }

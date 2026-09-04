@@ -96,8 +96,11 @@
 //!   message records are walked and re-emitted, a new attribute takes the
 //!   object's next creation index, an overwrite keeps the one it had, and a
 //!   deletion leaves a gap rather than renumbering. A group that tracks **link**
-//!   creation order is read, its attributes edited, and a link removed from it
-//!   or retargeted; only *adding* a link to one is refused.
+//!   creation order works the same way: a link added to it takes the next index
+//!   from the running maximum its Link Info message records, and a deletion
+//!   leaves a gap there too. Only an addition that would send such a group's
+//!   links *dense* is refused, since the creation-order B-tree that indexes them
+//!   is not written here.
 //! - Added datasets may be contiguous *or* chunked, with any filter the
 //!   whole-file writer supports (deflate, shuffle, fletcher32, scale-offset,
 //!   LZF, ZFP), and may declare extensible (maximum, optionally unlimited)
@@ -6261,24 +6264,27 @@ impl WriteEngine {
         // rebuilds the same grouping, by the same rule, once it owns the set.
         let datasets_by_group = group_by_parent(staged.datasets.iter().map(|(p, fd)| (p, fd)));
 
-        // Adding a link to a group that tracks *link* creation order is refused,
-        // before anything is written. Removing one is not: dropping a Link
-        // message leaves a gap in the order the same way dropping an Attribute
-        // message does, and the Link Info message's running maximum is copied
-        // through untouched — which is what the reference C library leaves
-        // behind too, since it never lowers that counter. A replacement (a
-        // delete and a creation at one path) adds a link, so it is refused here
-        // like any other addition.
+        // A group that tracks *link* creation order takes an addition — the
+        // apply loop numbers each added link from the running maximum its Link
+        // Info message records — up to the point the addition would send its
+        // links dense, which is refused before anything is written. The count
+        // this screens is the one the group would hold afterwards: the links it
+        // has now, less the ones this commit deletes, plus the ones it adds.
         for key in &keys {
             let node = &nodes[key];
-            let gains_a_link = !node.copies.is_empty()
-                || !node.cross_copies.is_empty()
-                || datasets_by_group.get(key).is_some_and(|d| !d.is_empty())
-                || children
-                    .get(key)
-                    .is_some_and(|kids| kids.iter().any(|child| nodes[child].is_new));
-            if gains_a_link {
-                reject_link_creation_order(&node.base_region)?;
+            let added = node.copies.len()
+                + node.cross_copies.len()
+                + datasets_by_group.get(key).map_or(0, Vec::len)
+                + children.get(key).map_or(0, |kids| {
+                    kids.iter().filter(|child| nodes[*child].is_new).count()
+                });
+            if added > 0 {
+                let kept = node
+                    .existing_links
+                    .iter()
+                    .filter(|name| !node.deletes.contains(name))
+                    .count();
+                reject_dense_link_creation_order(&node.base_region, kept + added)?;
             }
         }
 
@@ -6642,12 +6648,20 @@ impl WriteEngine {
                 region = remove_link_from_region(&region, name)?;
             }
 
+            // Every link appended below takes the next creation index from this
+            // group's running maximum, on the groups that track link creation
+            // order and on no others; `link_order.record` writes the bumped
+            // maximum back once the last of them is placed. Read after the
+            // deletions above because a deletion leaves the maximum alone — the
+            // gap it opens is never handed out again.
+            let mut link_order = LinkCreationOrder::for_region(&region)?;
+
             // Write each staged source subtree and link its root into this group.
             // `write_copy_subtree` returns an absolute header address; the parent
             // link stores it relative to the userblock base.
             for (leaf, tree) in copies {
                 let root = self.write_copy_subtree(&tree)?;
-                region.push_link(&leaf, base.relative(root)?);
+                region.push_link(&leaf, base.relative(root)?, link_order.take()?);
             }
 
             // Datasets directly under this group. Appended addresses are absolute
@@ -6743,7 +6757,7 @@ impl WriteEngine {
                     )?
                 };
                 let oh_addr = self.alloc_or_append_typed(&oh, PageType::Meta)?;
-                region.push_link(&fd.name, base.relative(oh_addr)?);
+                region.push_link(&fd.name, base.relative(oh_addr)?, link_order.take()?);
                 let mut full = key.clone();
                 full.push(fd.name.clone());
                 path_addr.insert(full, oh_addr);
@@ -6767,11 +6781,17 @@ impl WriteEngine {
                 let child_name = child.last().unwrap();
                 let child_addr = base.relative(path_addr[child])?;
                 if nodes[child].is_new {
-                    region.push_link(child_name, child_addr);
+                    region.push_link(child_name, child_addr, link_order.take()?);
                 } else {
                     patch_link_target(&mut region, child_name, child_addr)?;
                 }
             }
+
+            // Every addition to this group is placed, so its Link Info message
+            // can record the maximum creation index it has now assigned. A group
+            // that gained no link, or that does not track the order, is left
+            // byte-identical.
+            link_order.record(&mut region)?;
 
             // Whatever this group's attribute edits left to place: a
             // variable-length attribute's heap collection, or a whole dense set.
@@ -7933,8 +7953,11 @@ impl WriteEngine {
         for e in &entries {
             // Group-entry addresses are already stored relative to the base address,
             // matching how `encode_link_message` stores link targets — so they are
-            // re-emitted verbatim, no base conversion needed.
-            region.push_link(&e.name, e.object_header_address);
+            // re-emitted verbatim, no base conversion needed. A version 1 group
+            // records no link creation order — the mechanism arrived with the
+            // Link Info message — so these links carry no creation index, and
+            // `fresh_group_region` declares none.
+            region.push_link(&e.name, e.object_header_address, None);
             link_names.push(e.name.clone());
         }
         for m in &oh.messages {
@@ -8861,7 +8884,10 @@ impl WriteEngine {
 
         let mut layout: Option<(usize, usize)> = None; // (body offset in kept, size)
         let mut has_link_info = false;
-        let mut children: Vec<(String, u64)> = Vec::new();
+        // (name, creation index, target address) per hard link. The creation
+        // index is `None` unless the source group tracks link creation order,
+        // and is carried so a copy of one that does reproduces its order.
+        let mut children: Vec<(String, Option<u64>, u64)> = Vec::new();
         // The rebuilt chunk-0 region: every message kept verbatim except hard
         // Link messages (carried as `children`) and, when dense, the Attribute
         // Info message and inline Attribute messages (carried as `dense_attrs`).
@@ -8912,8 +8938,9 @@ impl WriteEngine {
                                 LinkTarget::Hard {
                                     object_header_address,
                                 },
+                            creation_order,
                             ..
-                        }) => children.push((name, object_header_address)),
+                        }) => children.push((name, creation_order, object_header_address)),
                         _ => {
                             return Err(Error::EditUnsupported(
                                 "a group contains a soft/external link (not copyable in place yet)",
@@ -9199,7 +9226,7 @@ impl WriteEngine {
                     reject_foreign_dense_attrs(&dense_attrs.attrs)?;
                 }
                 let mut kids = Vec::with_capacity(children.len());
-                for (name, child) in children {
+                for (name, creation_order, child) in children {
                     // Child link targets are stored base-relative; re-absolutize
                     // before descending so `addr` stays an absolute offset into `src`.
                     let child = base.absolute(child).map_err(|_| {
@@ -9207,6 +9234,7 @@ impl WriteEngine {
                     })?;
                     kids.push((
                         name,
+                        creation_order,
                         Self::read_copy_subtree(src, child, depth + 1, cross_file, base)?,
                     ));
                 }
@@ -9293,10 +9321,14 @@ impl WriteEngine {
                 dense_attrs,
             } => {
                 let mut region = non_link_region.clone();
-                for (name, child) in children {
+                for (name, creation_order, child) in children {
                     let new_child = self.write_copy_subtree(child)?;
                     // The link target is stored relative to the userblock base.
-                    region.push_link(name, base.relative(new_child)?);
+                    // A copied link keeps the creation index the source recorded
+                    // for it, so a copy of a group that tracks link creation
+                    // order carries the same order as its source — the Link Info
+                    // message naming that order is copied verbatim beside it.
+                    region.push_link(name, base.relative(new_child)?, *creation_order);
                 }
                 // The dense heap is built for whatever address it is placed at
                 // (see `append_dense_attrs`), so it needs no ordering against the
@@ -10526,7 +10558,7 @@ impl WriteEngine {
                 // Child link targets are stored base-relative; re-absolutize each
                 // before descending so the recursion keeps working in absolute
                 // offsets (matching `incoming`'s keys and `oh_chunk_spans`).
-                for (_, child) in children {
+                for (_, _, child) in children {
                     if let Some(c) = base
                         .absolute(child)
                         .ok()
@@ -10885,11 +10917,11 @@ enum ObjModel {
         dense_attrs: DenseAttrSet,
     },
     /// A group: every non-link message verbatim, plus its hard-link children to
-    /// copy and re-link by name. See
+    /// copy and re-link as `(name, creation index, target address)`. See
     /// [`DatasetVerbatim`](ObjModel::DatasetVerbatim) for `dense_attrs`.
     Group {
         non_link_region: OhRegion,
-        children: Vec<(String, u64)>,
+        children: Vec<(String, Option<u64>, u64)>,
         dense_attrs: DenseAttrSet,
     },
 }
@@ -10949,12 +10981,12 @@ enum CopyTree {
         chunk_bytes: Vec<Vec<u8>>,
         dense_attrs: DenseAttrSet,
     },
-    /// A group: every non-link message verbatim, plus the (name, child) subtrees
-    /// to write first and re-link by name. See
+    /// A group: every non-link message verbatim, plus the `(name, creation
+    /// index, subtree)` children to write first and re-link by name. See
     /// [`DatasetVerbatim`](CopyTree::DatasetVerbatim) for `dense_attrs`.
     Group {
         non_link_region: OhRegion,
-        children: Vec<(String, CopyTree)>,
+        children: Vec<(String, Option<u64>, CopyTree)>,
         dense_attrs: DenseAttrSet,
     },
 }
@@ -11853,8 +11885,12 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
 
     // The link message body (whose length is independent of the address) must
     // fit the object-header message's u16 size field; a pathologically long
-    // name would otherwise overflow it into silent corruption.
-    if make_link(&db.name, 0).serialize(OFFSET_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX {
+    // name would otherwise overflow it into silent corruption. Measured with a
+    // creation index present — the widest form, written into a group that tracks
+    // link creation order — since the parent group is not known here.
+    let mut sized = make_link(&db.name, 0);
+    sized.creation_order = Some(0);
+    if sized.serialize(OFFSET_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX {
         return Err(Error::EditUnsupported(
             "dataset name is too long to encode as a link message",
         ));
@@ -12612,8 +12648,23 @@ fn ensure_attribute_info(region: &mut OhRegion) -> Result<(), Error> {
 /// Encode a complete object-header Link message (4-byte record header + body)
 /// for a hard link `name -> addr`. The caller must have validated that the body
 /// fits the u16 size field (see [`flatten_dataset`]); group names are short.
-fn encode_link_message(layout: OhRecordLayout, name: &str, addr: u64) -> Vec<u8> {
-    let body = make_link(name, addr).serialize(OFFSET_SIZE);
+///
+/// `creation_order` is the link's creation index, which a group tracking **link**
+/// creation order carries on every link and no other group carries at all
+/// ([`LinkCreationOrder`] is what hands one out). It is a flagged field of the
+/// Link message *body*, quite separate from the object header's own per-message
+/// creation index: that one records an *attribute*'s creation order, and the
+/// reference C library writes it as the zero [`OhRecordLayout::record`] passes
+/// for every other message type.
+fn encode_link_message(
+    layout: OhRecordLayout,
+    name: &str,
+    addr: u64,
+    creation_order: Option<u64>,
+) -> Vec<u8> {
+    let mut link = make_link(name, addr);
+    link.creation_order = creation_order;
+    let body = link.serialize(OFFSET_SIZE);
     layout.record(MessageType::Link, &body)
 }
 
@@ -12721,41 +12772,171 @@ fn rebuild_compact_layout_region(region: &OhRegion, raw: &[u8]) -> Result<OhRegi
     Ok(region.with_bytes(out))
 }
 
-/// Refuse to *add* a link to a group that tracks **link** creation order.
+/// The link creation indexes one commit hands out to the links it adds to one
+/// group, and the running maximum its Link Info message ends up recording.
 ///
 /// Link creation order is a separate mechanism from the attribute creation order
-/// the object header's own flags describe: a group that tracks it carries a
-/// running maximum in its Link Info message and a creation index on every Link
-/// message, and this editor's Link emitter writes neither. netCDF-4 sets it on
-/// every group it writes, so such a group is read, and its *attributes* are
-/// edited, without difficulty — but a link added without a creation index would
-/// leave an iteration by link creation order walking an unnumbered link, so an
-/// addition is refused (issue #416).
+/// the object header's own flags describe: a group that tracks it — h5py's
+/// `track_order=True`, `H5Pset_link_creation_order`, and every group netCDF-4
+/// writes — carries a creation index on every Link message and, in its Link Info
+/// message, the maximum it has ever assigned. The reference C library hands out
+/// that maximum and increments it (`H5G_obj_insert`), so the recorded value is
+/// the *next* index rather than the highest in use, and deleting a link never
+/// lowers it. This is the link-side counterpart of [`next_attr_creation_index`],
+/// and it works the same way.
 ///
-/// Two things a commit does to such a group's links are *not* refused, because
-/// neither writes a creation order:
-///
-/// - **Removing** a link. Dropping the Link message leaves a gap in the order
-///   exactly as dropping an Attribute message does, and the running maximum is
-///   copied through untouched — the reference C library does not lower it on a
-///   deletion either, so the group is left in a state it could have reached on
-///   its own.
-/// - **Retargeting** one ([`patch_link_target`], how a relocated child is
-///   rewired), which rewrites an address inside a Link message and leaves every
-///   other field of it, creation index included, where it was.
-fn reject_link_creation_order(region: &OhRegion) -> Result<(), Error> {
+/// A group that does not track the order has no maximum recorded, hands out no
+/// index, and records nothing back — which is every group this crate writes
+/// itself.
+struct LinkCreationOrder {
+    /// The next index to assign, on a group that tracks link creation order.
+    next: Option<u64>,
+    /// Whether any index has been handed out. Nothing is recorded back
+    /// otherwise, so a commit that adds no link to the group leaves its Link
+    /// Info message byte-identical.
+    assigned: bool,
+}
+
+impl LinkCreationOrder {
+    /// Read a group's counter out of its object-header message `region`.
+    fn for_region(region: &OhRegion) -> Result<Self, Error> {
+        let next = find_link_info(region)?.and_then(|(_, _, info)| info.max_creation_order);
+        Ok(Self {
+            next,
+            assigned: false,
+        })
+    }
+
+    /// The creation index for one link being added, or `None` on a group that
+    /// does not track the order. Consecutive calls return consecutive indexes,
+    /// so links added in one commit are ordered by the order they are placed in.
+    fn take(&mut self) -> Result<Option<u64>, Error> {
+        let Some(index) = self.next else {
+            return Ok(None);
+        };
+        self.next = Some(index.checked_add(1).ok_or(Error::EditUnsupported(
+            "a group has assigned every link creation index its link-info message can record",
+        ))?);
+        self.assigned = true;
+        Ok(Some(index))
+    }
+
+    /// Write the running maximum back into the group's Link Info message, once
+    /// every link this commit adds to that group has taken an index.
+    ///
+    /// The maximum is patched in place rather than re-encoded: it is present
+    /// (that is what [`Self::for_region`] read) and it is the eight bytes
+    /// following the message's version and flags whatever the file's offset
+    /// size, so the record's length — and every offset into the region — is
+    /// unchanged.
+    fn record(&self, region: &mut OhRegion) -> Result<(), Error> {
+        if !self.assigned {
+            return Ok(());
+        }
+        let Some(next) = self.next else {
+            return Ok(());
+        };
+        let (_, body, _) = find_link_info(region)?.ok_or(Error::EditUnsupported(
+            "a group's link-info message went missing while its links were being added",
+        ))?;
+        let max = body.start + 2..body.start + 10;
+        if max.end > body.end {
+            return Err(Error::EditUnsupported(
+                "a group's link-info message is too short to record its link creation order",
+            ));
+        }
+        region.bytes_mut()[max].copy_from_slice(&next.to_le_bytes());
+        Ok(())
+    }
+}
+
+/// The Link Info message in `region`, as `(record start, body range, parsed
+/// message)`. An unparseable message is reported as absent, the same reading
+/// [`find_attribute_info`] gives an unparseable Attribute Info message — safe
+/// here because a group whose link storage this editor cannot account for is
+/// refused by [`inspect_group`](WriteEngine::inspect_group) before it reaches
+/// this.
+fn find_link_info(
+    region: &OhRegion,
+) -> Result<Option<(usize, core::ops::Range<usize>, LinkInfoMessage)>, Error> {
     let mut p = 0;
     while let Some((msg_type, body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::LinkInfo
             && let Ok(info) = LinkInfoMessage::parse(&region[body..body_end], OFFSET_SIZE)
-            && info.max_creation_order.is_some()
         {
-            return Err(Error::EditUnsupported(
-                "a group on the edited path tracks link creation order; links cannot be \
-                 added to it in place yet",
-            ));
+            return Ok(Some((p, body..body_end, info)));
         }
         p = body_end;
+    }
+    Ok(None)
+}
+
+/// The number of links a group keeps in its object header before they move into
+/// a fractal heap: the "maximum compact value" its Group Info message (type
+/// 0x000A) declares, or the reference C library's default of 8 where that
+/// message stores no link-phase-change values.
+///
+/// Body: version(1), flags(1), then the maximum compact (2) and minimum dense
+/// (2) values if bit 0 of the flags is set, then the estimated entry count (2)
+/// and name length (2) if bit 1 is. An absent or truncated message reads as the
+/// default, which is the value the C library itself would use for it.
+///
+/// Not to be confused with [`AttrPhaseChange`], the *attribute* thresholds
+/// (`H5Pset_attr_phase_change`) that live in the object header's own prefix:
+/// this is the *link* phase change, it lives in a message, and it is what
+/// [`reject_dense_link_creation_order`] measures an addition against.
+fn max_compact_links(region: &OhRegion) -> Result<u16, Error> {
+    /// `H5G_CRT_GINFO_MAX_COMPACT`, the C library's default.
+    const DEFAULT_MAX_COMPACT: u16 = 8;
+    let mut p = 0;
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
+        if msg_type == MessageType::GroupInfo {
+            let stores_phase_change = body_end - body >= 2 && region[body + 1] & 0x01 != 0;
+            if stores_phase_change && body + 4 <= body_end {
+                return Ok(u16::from_le_bytes([region[body + 2], region[body + 3]]));
+            }
+            return Ok(DEFAULT_MAX_COMPACT);
+        }
+        p = body_end;
+    }
+    Ok(DEFAULT_MAX_COMPACT)
+}
+
+/// Refuse to add a link to a group that tracks **link** creation order when the
+/// addition would move that group's links into *dense* (fractal-heap) storage.
+///
+/// `links_after_commit` is how many links the group would hold once this commit's
+/// deletions and additions are applied. Past the threshold its Group Info message
+/// declares, the reference C library moves a tracked group's links into a fractal
+/// heap indexed by *two* B-trees: one on name, and a type 6 one on creation
+/// order. This crate emits neither, so the point where the group would stop
+/// being compact is the point where an addition stops being reproducible — that
+/// work belongs with dense link storage as a whole (issue #102).
+///
+/// Below the threshold an addition is written rather than refused
+/// ([`LinkCreationOrder`] numbers it), as are the two things that write no
+/// creation order at all: **removing** a link, which leaves a gap in the order
+/// exactly as dropping an Attribute message does and copies the running maximum
+/// through untouched (the C library does not lower it on a deletion either), and
+/// **retargeting** one ([`patch_link_target`], how a relocated child is rewired),
+/// which rewrites an address inside a Link message and leaves every other field
+/// of it, creation index included, where it was.
+///
+/// A group whose links are *already* dense never reaches here at all:
+/// [`inspect_group`](WriteEngine::inspect_group) refuses every dense-link group,
+/// tracked or not, as it reads the header.
+fn reject_dense_link_creation_order(
+    region: &OhRegion,
+    links_after_commit: usize,
+) -> Result<(), Error> {
+    let tracked =
+        find_link_info(region)?.is_some_and(|(_, _, info)| info.max_creation_order.is_some());
+    if tracked && links_after_commit > usize::from(max_compact_links(region)?) {
+        return Err(Error::EditUnsupported(
+            "a group on the edited path tracks link creation order, and the links this commit \
+             adds to it would take it past the compact storage its group-info message allows; \
+             dense (fractal-heap) link storage cannot be written in place yet",
+        ));
     }
     Ok(())
 }
@@ -14275,9 +14456,12 @@ impl OhRegion {
         &mut self.bytes
     }
 
-    /// Append a hard Link message record for `name -> addr`.
-    fn push_link(&mut self, name: &str, addr: u64) {
-        let record = encode_link_message(self.props.layout, name, addr);
+    /// Append a hard Link message record for `name -> addr`, carrying
+    /// `creation_order` where the group tracks link creation order and `None`
+    /// where it does not (see [`LinkCreationOrder`], which is what decides
+    /// which).
+    fn push_link(&mut self, name: &str, addr: u64, creation_order: Option<u64>) {
+        let record = encode_link_message(self.props.layout, name, addr, creation_order);
         self.push_bytes(&record);
     }
 
@@ -14674,7 +14858,7 @@ fn screen_copied_references(
             }
         }
         CopyTree::Group { children, .. } => {
-            for (_, child) in children {
+            for (_, _, child) in children {
                 screen_copied_references(child, invalidated, src)?;
             }
         }
@@ -17467,6 +17651,179 @@ mod tests {
             }
             p = end;
         }
+    }
+
+    /// A group header region that tracks link creation order: a Link Info
+    /// message recording `max` as the next index it would hand out (with the
+    /// creation-order *index* declared when `indexed`, as h5py's
+    /// `track_order=True` does), a Group Info message, and one compact Link
+    /// message per name in `links`, numbered from zero.
+    fn link_tracked_region(max: u64, indexed: bool, links: &[&str]) -> OhRegion {
+        let mut li = vec![0u8, if indexed { 0x03 } else { 0x01 }];
+        li.extend_from_slice(&max.to_le_bytes());
+        li.extend_from_slice(&u64::MAX.to_le_bytes()); // fractal heap: compact
+        li.extend_from_slice(&u64::MAX.to_le_bytes()); // b-tree name index
+        if indexed {
+            li.extend_from_slice(&u64::MAX.to_le_bytes()); // b-tree creation order
+        }
+        let mut region = OhRegion::empty(OhHeaderProps::PLAIN);
+        region.push(MessageType::LinkInfo, &li);
+        region.push(MessageType::GroupInfo, &GROUP_INFO_BODY);
+        for (i, name) in links.iter().enumerate() {
+            region.push_link(name, 0x100 + i as u64, Some(i as u64));
+        }
+        region
+    }
+
+    /// Every Link message in `region`, as `(name, creation index)`.
+    fn region_links(region: &OhRegion) -> Vec<(String, Option<u64>)> {
+        let mut out = Vec::new();
+        let mut p = 0;
+        while let Some((mt, body, end)) = region.next_message(p).unwrap() {
+            if mt == MessageType::Link {
+                let link = LinkMessage::parse(&region[body..end], OFFSET_SIZE).unwrap();
+                out.push((link.name, link.creation_order));
+            }
+            p = end;
+        }
+        out
+    }
+
+    /// The maximum creation index `region`'s Link Info message records.
+    fn recorded_link_max(region: &OhRegion) -> Option<u64> {
+        find_link_info(region)
+            .unwrap()
+            .and_then(|(_, _, info)| info.max_creation_order)
+    }
+
+    #[test]
+    fn links_added_to_a_tracked_group_take_consecutive_creation_indexes() {
+        // A group that has handed out three indexes numbers the next two links
+        // 3 and 4, in the order they are placed, and its Link Info message ends
+        // up recording 5 — the next index, not the highest in use.
+        let mut region = link_tracked_region(3, false, &["a", "b", "c"]);
+        let mut order = LinkCreationOrder::for_region(&region).unwrap();
+        region.push_link("d", 0x200, order.take().unwrap());
+        region.push_link("e", 0x300, order.take().unwrap());
+        order.record(&mut region).unwrap();
+
+        assert_eq!(
+            region_links(&region),
+            vec![
+                ("a".to_string(), Some(0)),
+                ("b".to_string(), Some(1)),
+                ("c".to_string(), Some(2)),
+                ("d".to_string(), Some(3)),
+                ("e".to_string(), Some(4)),
+            ],
+        );
+        assert_eq!(recorded_link_max(&region), Some(5));
+    }
+
+    #[test]
+    fn a_tracked_group_resumes_past_a_gap_a_deletion_left() {
+        // Two links of three deleted, so the surviving link is index 1 and the
+        // recorded maximum still says 3: the addition takes 3, not one of the
+        // indexes the deletions freed.
+        let region = link_tracked_region(3, false, &["a", "b", "c"]);
+        let mut region = remove_link_from_region(&region, "a").unwrap();
+        region = remove_link_from_region(&region, "c").unwrap();
+        let mut order = LinkCreationOrder::for_region(&region).unwrap();
+        region.push_link("d", 0x200, order.take().unwrap());
+        order.record(&mut region).unwrap();
+
+        assert_eq!(
+            region_links(&region),
+            vec![("b".to_string(), Some(1)), ("d".to_string(), Some(3))],
+        );
+        assert_eq!(recorded_link_max(&region), Some(4));
+    }
+
+    #[test]
+    fn a_creation_order_index_shifts_no_field_the_maximum_is_written_into() {
+        // A group that also declares the creation-order *index* (h5py's
+        // `track_order=True`) has a longer Link Info body with a third address
+        // in it. The maximum still precedes every address, so the patch lands on
+        // it and leaves the three addresses undefined.
+        let mut region = link_tracked_region(1, true, &["a"]);
+        let mut order = LinkCreationOrder::for_region(&region).unwrap();
+        region.push_link("b", 0x200, order.take().unwrap());
+        order.record(&mut region).unwrap();
+
+        let (_, _, info) = find_link_info(&region).unwrap().unwrap();
+        assert_eq!(info.max_creation_order, Some(2));
+        assert_eq!(info.fractal_heap_address, None);
+        assert_eq!(info.btree_name_index_address, None);
+        assert_eq!(info.btree_creation_order_address, None);
+        assert_eq!(region_links(&region).last().unwrap().1, Some(1));
+    }
+
+    #[test]
+    fn an_untracked_group_numbers_none_of_its_links() {
+        // The groups this crate writes itself: no maximum recorded, so no link
+        // carries a creation index and the Link Info message is left as it was.
+        let mut region = fresh_group_region();
+        let before = region.clone();
+        let mut order = LinkCreationOrder::for_region(&region).unwrap();
+        assert_eq!(order.take().unwrap(), None);
+        region.push_link("d", 0x200, None);
+        order.record(&mut region).unwrap();
+
+        assert_eq!(region_links(&region), vec![("d".to_string(), None)]);
+        assert_eq!(recorded_link_max(&region), None);
+        // Only the appended link is new; every message that was there is
+        // untouched.
+        assert_eq!(&region[..before.len()], &*before);
+    }
+
+    #[test]
+    fn a_tracked_group_that_gains_no_link_keeps_its_maximum_byte_for_byte() {
+        // A commit that only deletes, or only edits attributes, must not bump
+        // the counter — the gap it leaves is never handed out again.
+        let region = link_tracked_region(3, false, &["a", "b", "c"]);
+        let mut after = remove_link_from_region(&region, "b").unwrap();
+        let order = LinkCreationOrder::for_region(&after).unwrap();
+        let before = after.clone();
+        order.record(&mut after).unwrap();
+        assert_eq!(*after, *before);
+        assert_eq!(recorded_link_max(&after), Some(3));
+    }
+
+    #[test]
+    fn max_compact_links_reads_the_declared_threshold_or_the_library_default() {
+        // A minimal Group Info message stores no link-phase-change values, so
+        // the C library's default of 8 applies.
+        assert_eq!(max_compact_links(&fresh_group_region()).unwrap(), 8);
+
+        // One that stores them (flags bit 0) declares its own maximum compact
+        // value in the two bytes after the flags.
+        let mut gi = vec![0u8, 0x01];
+        gi.extend_from_slice(&4u16.to_le_bytes()); // max compact
+        gi.extend_from_slice(&2u16.to_le_bytes()); // min dense
+        let mut region = OhRegion::empty(OhHeaderProps::PLAIN);
+        region.push(MessageType::GroupInfo, &gi);
+        assert_eq!(max_compact_links(&region).unwrap(), 4);
+    }
+
+    #[test]
+    fn a_tracked_group_is_refused_only_where_the_addition_would_go_dense() {
+        // Eight links is the default threshold, so a group holding seven takes
+        // one more and is refused the second.
+        let region = link_tracked_region(7, false, &["a", "b", "c", "d", "e", "f", "g"]);
+        reject_dense_link_creation_order(&region, 8).expect("eight links still store compactly");
+        let err = reject_dense_link_creation_order(&region, 9).unwrap_err();
+        assert!(
+            matches!(&err, Error::EditUnsupported(m) if m.contains("link creation order")
+                && m.contains("dense")),
+            "got: {err}",
+        );
+
+        // A group that does not track the order is not screened at all: this
+        // crate writes more than eight compact links routinely.
+        let mut untracked = fresh_group_region();
+        untracked.push_link("a", 0x100, None);
+        reject_dense_link_creation_order(&untracked, 99)
+            .expect("an untracked group has no creation order to lose");
     }
 
     #[test]
