@@ -228,10 +228,37 @@ pub enum FormatError {
     /// other bit means the message is not what it claims to be.
     InvalidAttributeFlags(u8),
     /// A message body is a reference to the file's shared object header message
-    /// (SOHM) heap, which this reader does not walk. A committed (`H5Tcommit`)
-    /// datatype is *not* stored there — it references another object header, and
-    /// is resolved.
+    /// (SOHM) heap, and the parse that met it holds no shared-message table to
+    /// find it in: the file's superblock extension carries no Shared Message
+    /// Table message, the table it names could not be read, or the parse was
+    /// handed a message body without the file it came from. A committed
+    /// (`H5Tcommit`) datatype is *not* stored in the heap — it references another
+    /// object header, and is resolved.
     UnsupportedSohmReference,
+    /// A file's shared-message table, or a Shared Message Table message naming
+    /// it, declares a version this format does not define.
+    InvalidSohmTableVersion(u8),
+    /// A Shared Message Table message declares no indexes, or more than the
+    /// eight the format allows. The count sizes the table's own read, so a
+    /// wrong one reads neighbouring bytes as index headers.
+    InvalidSohmIndexCount(u8),
+    /// The shared-message table does not start with its `SMTB` signature.
+    InvalidSohmTableSignature,
+    /// A shared-message list index does not start with its `SMLI` signature.
+    InvalidSohmListSignature,
+    /// A shared-message index header declares a storage kind that is neither a
+    /// list (0) nor a version 2 B-tree (1).
+    InvalidSohmIndexKind(u8),
+    /// A shared-message index names a version 2 B-tree that is not a
+    /// shared-message index (type 7). Carries the type it is.
+    InvalidSohmBTreeType(u8),
+    /// A shared-message index record names a storage location that is neither
+    /// the heap (0) nor an object header (1).
+    InvalidSohmRecordLocation(u8),
+    /// A message body references the shared-message heap, and no index of the
+    /// file's shared-message table covers that message type or has allocated a
+    /// heap. Carries the raw type ID of the referenced message.
+    SohmIndexMissing(u16),
     /// A shared message reference named an object header that holds no message of
     /// the referenced type.
     SharedMessageMissing {
@@ -815,8 +842,35 @@ impl fmt::Display for FormatError {
             FormatError::UnsupportedSohmReference => {
                 write!(
                     f,
-                    "a message stored in the shared object header message (SOHM) heap is not supported"
+                    "a message references the shared object header message (SOHM) heap, and no readable shared message table was found for it"
                 )
+            }
+            FormatError::InvalidSohmTableVersion(v) => {
+                write!(f, "invalid shared message table version: {v}")
+            }
+            FormatError::InvalidSohmIndexCount(n) => {
+                write!(f, "invalid shared message index count: {n}")
+            }
+            FormatError::InvalidSohmTableSignature => {
+                write!(f, "invalid shared message table signature")
+            }
+            FormatError::InvalidSohmListSignature => {
+                write!(f, "invalid shared message list signature")
+            }
+            FormatError::InvalidSohmIndexKind(v) => {
+                write!(f, "invalid shared message index storage kind: {v}")
+            }
+            FormatError::InvalidSohmBTreeType(v) => {
+                write!(
+                    f,
+                    "a shared message index names a v2 B-tree of type {v}, not a shared message index"
+                )
+            }
+            FormatError::InvalidSohmRecordLocation(v) => {
+                write!(f, "invalid shared message record location: {v}")
+            }
+            FormatError::SohmIndexMissing(t) => {
+                write!(f, "no shared message index holds messages of type {t:#06x}")
             }
             FormatError::SharedMessageMissing {
                 object_header_address,

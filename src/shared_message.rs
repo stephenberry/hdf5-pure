@@ -9,8 +9,10 @@
 //!
 //! - another **object header**, which is what `H5Tcommit` writes for a named
 //!   ("committed") datatype — resolved here;
-//! - the file's **shared object header message (SOHM) heap**, a fractal heap this
-//!   reader does not walk — refused by name rather than mis-read.
+//! - the file's **shared object header message (SOHM) heap**, a fractal heap the
+//!   file's shared-message table names — resolved through [`crate::sohm`] when the
+//!   resolver was given that table, and refused by name rather than mis-read when
+//!   it was not.
 //!
 //! The layouts and the type codes below follow `H5O__shared_decode` in the C
 //! library, which is the authority on what a file may contain: version 1 carries
@@ -27,10 +29,11 @@ use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
+use crate::sohm::SohmTable;
 use crate::source::Source;
 
 /// Fractal heap ID length for SOHM entries (fixed at 8 bytes).
-const FHEAP_ID_LEN: usize = 8;
+pub(crate) const FHEAP_ID_LEN: usize = 8;
 
 /// Shared-message location type: the message lives in the SOHM heap
 /// (`H5O_SHARE_TYPE_SOHM`). Every other code names an object header, which is how
@@ -142,6 +145,25 @@ pub fn encode_committed_ref(address: u64, offset_size: u8) -> Vec<u8> {
     buf
 }
 
+/// The shared-reference version that admits a heap ID.
+///
+/// A message stored in the shared-message heap has no encoding before version 3:
+/// versions 1 and 2 carry an object-header address and nothing else.
+const SOHM_REF_VERSION: u8 = 3;
+
+/// Encode a reference to the shared-message heap object `heap_id`.
+///
+/// The inverse of [`parse_shared_ref`]'s heap arm, and the modern form of a
+/// reference a rewrite has to carry across unchanged: it names the same heap
+/// entry, so the message's reference count is the same before and after.
+pub fn encode_sohm_ref(heap_id: &[u8; FHEAP_ID_LEN]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + FHEAP_ID_LEN);
+    buf.push(SOHM_REF_VERSION);
+    buf.push(REF_TYPE_SOHM);
+    buf.extend_from_slice(heap_id);
+    buf
+}
+
 /// Where a datatype is stored, for a message that could hold it either way.
 ///
 /// A datatype is the one part of a dataset or attribute that can live outside
@@ -210,13 +232,16 @@ pub trait SharedResolver {
     /// `target`-typed message it names.
     fn resolve(&self, reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError>;
 
-    /// The object-header address `reference` names, without reading it.
+    /// The object-header address `reference` names, without reading it, or
+    /// `None` for a reference into the shared-message heap.
     ///
     /// A rewrite needs the address as well as the content: the content says what
     /// the type *is*, and the address says which committed object every user of
     /// it shares — which is what makes them one named type on the other side
-    /// rather than several copies.
-    fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError>;
+    /// rather than several copies. A heap-stored message has no such object: it
+    /// is one copy of an *anonymous* message, which every user spells out again
+    /// when written back, so `None` is the answer rather than an error.
+    fn committed_address(&self, reference: &[u8]) -> Result<Option<u64>, FormatError>;
 }
 
 /// Resolves references against a whole-file slice, already framed at the file's
@@ -225,23 +250,47 @@ pub struct BufferedResolver<'a> {
     file_data: &'a [u8],
     offset_size: u8,
     length_size: u8,
+    sohm: Option<&'a SohmTable>,
 }
 
 impl<'a> BufferedResolver<'a> {
-    pub fn new(file_data: &'a [u8], offset_size: u8, length_size: u8) -> Self {
+    /// `sohm` is the file's shared-message table, which only a file created with
+    /// `H5Pset_shared_mesg_index` has. It is a parameter rather than a default
+    /// because a resolver without it refuses every heap-stored message, and a
+    /// caller that has the table and forgets to pass it would turn a readable
+    /// file into an unreadable one silently.
+    pub fn new(
+        file_data: &'a [u8],
+        offset_size: u8,
+        length_size: u8,
+        sohm: Option<&'a SohmTable>,
+    ) -> Self {
         Self {
             file_data,
             offset_size,
             length_size,
+            sohm,
         }
     }
 }
 
 impl SharedResolver for BufferedResolver<'_> {
     fn resolve(&self, reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError> {
-        // Through committed_address, so the address a rewrite records cannot
-        // drift from the one the content was read at.
-        let addr = self.committed_address(reference)?;
+        let parsed = parse_shared_ref(reference, self.offset_size, self.length_size)?;
+        let addr = match parsed.location {
+            SharedLocation::SohmHeap(id) => {
+                let table = self.sohm.ok_or(FormatError::UnsupportedSohmReference)?;
+                return crate::sohm::read_heap_message(
+                    self.file_data,
+                    table,
+                    target,
+                    &id,
+                    self.offset_size,
+                    self.length_size,
+                );
+            }
+            SharedLocation::ObjectHeader(addr) => addr,
+        };
         let header = ObjectHeader::parse(
             self.file_data,
             addr.to_usize()?,
@@ -251,7 +300,7 @@ impl SharedResolver for BufferedResolver<'_> {
         select_shared_message(&header, target, addr)
     }
 
-    fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
+    fn committed_address(&self, reference: &[u8]) -> Result<Option<u64>, FormatError> {
         committed_address_in(reference, self.offset_size, self.length_size)
     }
 }
@@ -262,21 +311,44 @@ pub struct SourceResolver<'a, S: Source + ?Sized> {
     source: &'a S,
     offset_size: u8,
     length_size: u8,
+    sohm: Option<&'a SohmTable>,
 }
 
 impl<'a, S: Source + ?Sized> SourceResolver<'a, S> {
-    pub fn new(source: &'a S, offset_size: u8, length_size: u8) -> Self {
+    /// See [`BufferedResolver::new`] for why the shared-message table is a
+    /// parameter here rather than something the resolver finds for itself.
+    pub fn new(
+        source: &'a S,
+        offset_size: u8,
+        length_size: u8,
+        sohm: Option<&'a SohmTable>,
+    ) -> Self {
         Self {
             source,
             offset_size,
             length_size,
+            sohm,
         }
     }
 }
 
 impl<S: Source + ?Sized> SharedResolver for SourceResolver<'_, S> {
     fn resolve(&self, reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError> {
-        let addr = self.committed_address(reference)?;
+        let parsed = parse_shared_ref(reference, self.offset_size, self.length_size)?;
+        let addr = match parsed.location {
+            SharedLocation::SohmHeap(id) => {
+                let table = self.sohm.ok_or(FormatError::UnsupportedSohmReference)?;
+                return crate::sohm::read_heap_message_from_source(
+                    self.source,
+                    table,
+                    target,
+                    &id,
+                    self.offset_size,
+                    self.length_size,
+                );
+            }
+            SharedLocation::ObjectHeader(addr) => addr,
+        };
         // base_address 0 matches the buffered path, whose slice is already framed
         // at the base address, so both treat the reference as absolute within it.
         let header = ObjectHeader::parse_from_source(
@@ -289,7 +361,7 @@ impl<S: Source + ?Sized> SharedResolver for SourceResolver<'_, S> {
         select_shared_message(&header, target, addr)
     }
 
-    fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
+    fn committed_address(&self, reference: &[u8]) -> Result<Option<u64>, FormatError> {
         committed_address_in(reference, self.offset_size, self.length_size)
     }
 }
@@ -307,23 +379,15 @@ impl SharedResolver for Unresolvable {
     /// Refused for the same reason as [`Self::resolve`]: the address is stored in
     /// the file's own offset width, which a parse without that file does not
     /// know, so any answer here would be a guess at the field width.
-    fn committed_address(&self, _reference: &[u8]) -> Result<u64, FormatError> {
+    fn committed_address(&self, _reference: &[u8]) -> Result<Option<u64>, FormatError> {
         Err(FormatError::UnresolvedSharedMessage(
             MessageType::Datatype.to_u16(),
         ))
     }
 }
 
-/// The address of the object header holding a referenced message, or an error
-/// naming the SOHM heap this reader does not walk.
-fn object_header_address(shared: &SharedMessageRef) -> Result<u64, FormatError> {
-    match shared.location {
-        SharedLocation::ObjectHeader(addr) => Ok(addr),
-        SharedLocation::SohmHeap(_) => Err(FormatError::UnsupportedSohmReference),
-    }
-}
-
-/// The object-header address `reference` names, read with the given field widths.
+/// The object-header address `reference` names, read with the given field widths,
+/// or `None` for a reference into the shared-message heap.
 ///
 /// Every resolver that can reach the file answers
 /// [`SharedResolver::committed_address`] this way; they differ only in how they
@@ -332,8 +396,11 @@ pub(crate) fn committed_address_in(
     reference: &[u8],
     offset_size: u8,
     length_size: u8,
-) -> Result<u64, FormatError> {
-    object_header_address(&parse_shared_ref(reference, offset_size, length_size)?)
+) -> Result<Option<u64>, FormatError> {
+    match parse_shared_ref(reference, offset_size, length_size)?.location {
+        SharedLocation::ObjectHeader(addr) => Ok(Some(addr)),
+        SharedLocation::SohmHeap(_) => Ok(None),
+    }
 }
 
 /// Pick the message of `target_msg_type` out of a resolved target object header.
@@ -470,6 +537,19 @@ mod tests {
         );
     }
 
+    /// A heap reference re-encoded from a parse is the same eight bytes at the
+    /// same offset, under the only version that carries them.
+    #[test]
+    fn a_heap_reference_round_trips_through_its_encoding() {
+        let id = [0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44];
+        let encoded = encode_sohm_ref(&id);
+        assert_eq!(encoded[0], 3);
+        assert_eq!(
+            parse_shared_ref(&encoded, 8, 8).unwrap().location,
+            SharedLocation::SohmHeap(id)
+        );
+    }
+
     #[test]
     fn parse_v3_sohm_too_short() {
         let data = vec![3, REF_TYPE_SOHM, 0xAA, 0xBB];
@@ -500,18 +580,29 @@ mod tests {
         assert_eq!(shared.location, SharedLocation::ObjectHeader(0x1000));
     }
 
-    /// A SOHM reference is refused by name. Its heap id is not an address, so the
-    /// alternative is an object-header parse at whatever those eight bytes spell.
+    /// A resolver given no shared-message table refuses a heap reference by
+    /// name. Its heap id is not an address, so the alternative is an
+    /// object-header parse at whatever those eight bytes spell.
     #[test]
-    fn a_sohm_reference_is_refused_rather_than_followed() {
+    fn a_sohm_reference_without_a_table_is_refused_rather_than_followed() {
         let mut reference = vec![3, REF_TYPE_SOHM];
         reference.extend_from_slice(&[0xFF; 8]);
-        let resolver = BufferedResolver::new(&[], 8, 8);
+        let resolver = BufferedResolver::new(&[], 8, 8, None);
 
         let err = resolver
             .resolve(&reference, MessageType::Datatype)
             .unwrap_err();
         assert_eq!(err, FormatError::UnsupportedSohmReference);
+    }
+
+    /// A heap reference names no object header, and says so with `None` rather
+    /// than an error: the message it stands for is one anonymous copy, not a
+    /// committed object every user shares by name.
+    #[test]
+    fn a_sohm_reference_names_no_committed_object() {
+        let mut reference = vec![3, REF_TYPE_SOHM];
+        reference.extend_from_slice(&[0xFF; 8]);
+        assert_eq!(committed_address_in(&reference, 8, 8).unwrap(), None);
     }
 
     /// The target header must hold the message the reference stands in for.

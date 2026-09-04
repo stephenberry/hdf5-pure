@@ -733,6 +733,17 @@ struct FileInner {
     /// one. Best-effort: a malformed or unreadable extension leaves this `None`
     /// rather than failing the open.
     file_space_info: Option<FileSpaceInfo>,
+    /// The shared object header message (SOHM) table, if the superblock
+    /// extension records one. `None` for almost every file: no common producer
+    /// enables shared-message indexes. Best-effort like `file_space_info`, so a
+    /// file whose table cannot be read still opens and still reads every object
+    /// that shares nothing; what fails is following a reference into the heap,
+    /// with [`FormatError::UnsupportedSohmReference`].
+    ///
+    /// Boxed because it is absent on essentially every file, and this struct is
+    /// allocated once per open: one pointer costs less here than the table
+    /// inline, and the absent case allocates nothing at all.
+    sohm_table: Option<Box<crate::sohm::SohmTable>>,
     access_properties: FileAccessProperties,
     /// Set by [`File::close`] to seal a read-write file: after it, a write
     /// through any surviving [`Dataset`]/[`Group`] handle or [`File`] clone
@@ -1480,6 +1491,7 @@ impl FileInner {
             addr_offset,
             handle,
             file_space_info: None,
+            sohm_table: None,
             access_properties,
             closed: AtomicBool::new(false),
             content_revision: AtomicU64::new(0),
@@ -1487,6 +1499,7 @@ impl FileInner {
             swmr_write: false,
         };
         file.file_space_info = file.read_file_space_info();
+        file.sohm_table = file.read_sohm_table();
         file
     }
 
@@ -1510,6 +1523,68 @@ impl FileInner {
             self.superblock.length_size,
         )
         .ok()
+    }
+
+    /// Parse the Shared Message Table message from the superblock extension and
+    /// read the master table it names, if the file records one.
+    ///
+    /// Best-effort in the same way and for the same reason as
+    /// [`Self::read_file_space_info`]: a file whose shared-message table is
+    /// unreadable still opens, and every object in it that shares no message
+    /// still reads.
+    fn read_sohm_table(&self) -> Option<Box<crate::sohm::SohmTable>> {
+        let rel = self.superblock.superblock_extension_address?;
+        if rel == u64::MAX {
+            return None;
+        }
+        let abs = self.addr_offset.absolute(rel).ok()?;
+        let header = self.parse_header(abs).ok()?;
+        let msg = header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::SharedMessageTable)?;
+        let message =
+            crate::sohm::SharedMessageTableMessage::parse(&msg.data, self.superblock.offset_size)
+                .ok()?;
+        // The table's address, like every address in a header message, is stored
+        // relative to the file's base address, so the read is framed the same way
+        // every other metadata walk here is.
+        let base = self.addr_offset;
+        let os = self.superblock.offset_size;
+        match &self.backend {
+            Backend::InMemory(v) => {
+                crate::sohm::SohmTable::read(frame(v, base).ok()?, &message, os).ok()
+            }
+            Backend::Streaming(s) if base.is_zero() => {
+                crate::sohm::SohmTable::read_from_source(s.as_ref(), &message, os).ok()
+            }
+            Backend::Streaming(s) => crate::sohm::SohmTable::read_from_source(
+                &BaseOffsetSource {
+                    inner: s.as_ref(),
+                    base,
+                },
+                &message,
+                os,
+            )
+            .ok(),
+            Backend::Edit(m) => Self::with_engine(
+                m,
+                |d| Ok::<_, Error>(crate::sohm::SohmTable::read(frame(d, base)?, &message, os)?),
+                |s| {
+                    if base.is_zero() {
+                        Ok(crate::sohm::SohmTable::read_from_source(s, &message, os)?)
+                    } else {
+                        Ok(crate::sohm::SohmTable::read_from_source(
+                            &BaseOffsetSource { inner: s, base },
+                            &message,
+                            os,
+                        )?)
+                    }
+                },
+            )
+            .ok(),
+        }
+        .map(Box::new)
     }
 
     /// Re-read the file from disk to pick up data appended by a concurrent
@@ -1552,6 +1627,7 @@ impl FileInner {
                     self.superblock = superblock;
                     self.addr_offset = addr_offset;
                     self.file_space_info = self.read_file_space_info();
+                    self.sohm_table = self.read_sohm_table();
                     // Every byte just moved. `File::refresh` takes `&mut self`
                     // through `Arc::get_mut`, so no handle can be alive to see
                     // it — but the counters are the file's statement about its
@@ -1897,14 +1973,14 @@ impl FileInner {
             return Ok(Cow::Borrowed(&msg.data));
         }
         let (os, ls, base) = (self.offset_size(), self.length_size(), self.addr_offset);
+        let sohm = self.sohm_table.as_deref();
         // A shared reference stores its address relative to the base address, so
         // frame the file at `base` exactly as [`Self::attr_messages_of`] does.
         let resolved = match &self.backend {
-            Backend::InMemory(v) => {
-                BufferedResolver::new(frame(v, base)?, os, ls).resolve(&msg.data, msg.msg_type)
-            }
+            Backend::InMemory(v) => BufferedResolver::new(frame(v, base)?, os, ls, sohm)
+                .resolve(&msg.data, msg.msg_type),
             Backend::Streaming(s) if base.is_zero() => {
-                SourceResolver::new(s.as_ref(), os, ls).resolve(&msg.data, msg.msg_type)
+                SourceResolver::new(s.as_ref(), os, ls, sohm).resolve(&msg.data, msg.msg_type)
             }
             Backend::Streaming(s) => SourceResolver::new(
                 &BaseOffsetSource {
@@ -1913,16 +1989,20 @@ impl FileInner {
                 },
                 os,
                 ls,
+                sohm,
             )
             .resolve(&msg.data, msg.msg_type),
             Backend::Edit(m) => Self::with_engine(
                 m,
-                |d| BufferedResolver::new(frame(d, base)?, os, ls).resolve(&msg.data, msg.msg_type),
+                |d| {
+                    BufferedResolver::new(frame(d, base)?, os, ls, sohm)
+                        .resolve(&msg.data, msg.msg_type)
+                },
                 |s| {
                     if base.is_zero() {
-                        SourceResolver::new(s, os, ls).resolve(&msg.data, msg.msg_type)
+                        SourceResolver::new(s, os, ls, sohm).resolve(&msg.data, msg.msg_type)
                     } else {
-                        SourceResolver::new(&BaseOffsetSource { inner: s, base }, os, ls)
+                        SourceResolver::new(&BaseOffsetSource { inner: s, base }, os, ls, sohm)
                             .resolve(&msg.data, msg.msg_type)
                     }
                 },
@@ -1932,12 +2012,15 @@ impl FileInner {
     }
 
     /// The object-header address a *shared* header message names, or `None` when
-    /// the record carries its own content.
+    /// the record carries its own content or names the shared-message heap.
     ///
     /// [`Self::message_body`] answers what the message says; this answers which
     /// object says it. A rewrite needs both: the content to reproduce the type,
     /// and the address to tell which users share one committed object rather than
-    /// each naming a type of their own.
+    /// each naming a type of their own. A heap-stored message has no such object
+    /// — it is one anonymous copy rather than a named one — so it answers `None`
+    /// and a rewrite spells the message out, which is what the file already
+    /// means.
     pub(crate) fn shared_target_address(
         &self,
         msg: &crate::object_header::HeaderMessage,
@@ -1949,9 +2032,7 @@ impl FileInner {
             shared_message::parse_shared_ref(&msg.data, self.offset_size(), self.length_size())?;
         match reference.location {
             shared_message::SharedLocation::ObjectHeader(addr) => Ok(Some(addr)),
-            shared_message::SharedLocation::SohmHeap(_) => {
-                Err(Error::Format(FormatError::UnsupportedSohmReference))
-            }
+            shared_message::SharedLocation::SohmHeap(_) => Ok(None),
         }
     }
 
@@ -1970,30 +2051,38 @@ impl FileInner {
         // file (`base == 0`) this is the identity; without it, a userblock file's
         // dense attributes are looked for one userblock too early.
         let base = self.addr_offset;
+        let sohm = self.sohm_table.as_deref();
         match &self.backend {
-            Backend::InMemory(v) => Ok(extract_attributes_full(frame(v, base)?, hdr, os, ls)?),
+            Backend::InMemory(v) => {
+                Ok(extract_attributes_full(frame(v, base)?, hdr, os, ls, sohm)?)
+            }
             Backend::Streaming(s) if base.is_zero() => Ok(extract_attributes_full_from_source(
                 s.as_ref(),
                 hdr,
                 os,
                 ls,
+                sohm,
             )?),
             Backend::Streaming(s) => {
                 let framed = BaseOffsetSource {
                     inner: s.as_ref(),
                     base,
                 };
-                Ok(extract_attributes_full_from_source(&framed, hdr, os, ls)?)
+                Ok(extract_attributes_full_from_source(
+                    &framed, hdr, os, ls, sohm,
+                )?)
             }
             Backend::Edit(m) => Self::with_engine(
                 m,
-                |d| Ok(extract_attributes_full(frame(d, base)?, hdr, os, ls)?),
+                |d| Ok(extract_attributes_full(frame(d, base)?, hdr, os, ls, sohm)?),
                 |s| {
                     if base.is_zero() {
-                        Ok(extract_attributes_full_from_source(s, hdr, os, ls)?)
+                        Ok(extract_attributes_full_from_source(s, hdr, os, ls, sohm)?)
                     } else {
                         let framed = BaseOffsetSource { inner: s, base };
-                        Ok(extract_attributes_full_from_source(&framed, hdr, os, ls)?)
+                        Ok(extract_attributes_full_from_source(
+                            &framed, hdr, os, ls, sohm,
+                        )?)
                     }
                 },
             ),
