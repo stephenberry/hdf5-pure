@@ -668,7 +668,11 @@ struct FileInner {
     /// file whose table cannot be read still opens and still reads every object
     /// that shares nothing; what fails is following a reference into the heap,
     /// with [`FormatError::UnsupportedSohmReference`].
-    sohm_table: Option<crate::sohm::SohmTable>,
+    ///
+    /// Boxed because it is absent on essentially every file, and this struct is
+    /// allocated once per open: one pointer costs less here than the table
+    /// inline, and the absent case allocates nothing at all.
+    sohm_table: Option<Box<crate::sohm::SohmTable>>,
     access_properties: FileAccessProperties,
     /// Set by [`File::close`] to seal a read-write file: after it, a write
     /// through any surviving [`Dataset`]/[`Group`] handle or [`File`] clone
@@ -1452,7 +1456,7 @@ impl FileInner {
     /// [`Self::read_file_space_info`]: a file whose shared-message table is
     /// unreadable still opens, and every object in it that shares no message
     /// still reads.
-    fn read_sohm_table(&self) -> Option<crate::sohm::SohmTable> {
+    fn read_sohm_table(&self) -> Option<Box<crate::sohm::SohmTable>> {
         let rel = self.superblock.superblock_extension_address?;
         if rel == u64::MAX {
             return None;
@@ -1504,6 +1508,7 @@ impl FileInner {
             )
             .ok(),
         }
+        .map(Box::new)
     }
 
     /// Re-read the file from disk to pick up data appended by a concurrent
@@ -1892,7 +1897,7 @@ impl FileInner {
             return Ok(Cow::Borrowed(&msg.data));
         }
         let (os, ls, base) = (self.offset_size(), self.length_size(), self.addr_offset);
-        let sohm = self.sohm_table.as_ref();
+        let sohm = self.sohm_table.as_deref();
         // A shared reference stores its address relative to the base address, so
         // frame the file at `base` exactly as [`Self::attr_messages_of`] does.
         let resolved = match &self.backend {
@@ -1970,7 +1975,7 @@ impl FileInner {
         // file (`base == 0`) this is the identity; without it, a userblock file's
         // dense attributes are looked for one userblock too early.
         let base = self.addr_offset;
-        let sohm = self.sohm_table.as_ref();
+        let sohm = self.sohm_table.as_deref();
         match &self.backend {
             Backend::InMemory(v) => {
                 Ok(extract_attributes_full(frame(v, base)?, hdr, os, ls, sohm)?)

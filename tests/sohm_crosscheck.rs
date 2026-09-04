@@ -309,9 +309,15 @@ fn shared_filter_pipelines_and_fill_values_read_back() {
 #[test]
 fn a_commit_on_a_shared_message_file_walks_its_index_and_proceeds() {
     for fixture in [list_fixture(4), btree_fixture()] {
-        let session = File::open_rw(&fixture.path).expect("open a shared-message file for edit");
-        session.root().create_group("added").unwrap();
-        session.commit().expect("commit on a shared-message file");
+        {
+            // Scoped: the write session holds the file's exclusive lock, which
+            // Windows enforces, so it has to be dropped before the file is
+            // reopened for reading.
+            let session =
+                File::open_rw(&fixture.path).expect("open a shared-message file for edit");
+            session.root().create_group("added").unwrap();
+            session.commit().expect("commit on a shared-message file");
+        }
 
         let file = File::open(&fixture.path).unwrap();
         assert!(file.group("added").is_ok());
