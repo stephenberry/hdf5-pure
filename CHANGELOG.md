@@ -18,6 +18,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Deleting objects now gives the space at the end of the file back to the filesystem instead of leaving `File::file_size()` at a high-water mark, on a file that persists its free-space managers and on a paged file alike. A commit shortens the file to just above its last live allocation, page-aligned where the strategy requires it ([#418](https://github.com/stephenberry/hdf5-pure/issues/418)).
 - `File::open_rw` keeps an object header's stored timestamps and `H5Pset_attr_phase_change` thresholds across an in-place edit, where every rewrite dropped both and left `H5Oget_info` reporting zero times on any file the C library, h5py or netCDF-4 wrote. The modification and change times are moved to the edit; the thresholds are preserved but do not yet steer the compact-to-dense switch ([#422](https://github.com/stephenberry/hdf5-pure/pull/422)).
 
+### Fixed
+
+- `File::open_rw` keeps an object header's stored timestamps and `H5Pset_attr_phase_change` thresholds across an in-place edit, where every rewrite dropped both and left `H5Oget_info` reporting zero times on any file the C library, h5py or netCDF-4 wrote. The modification and change times are moved to the edit; the thresholds are preserved but do not yet steer the compact-to-dense switch ([#422](https://github.com/stephenberry/hdf5-pure/pull/422)).
+
 ## [0.43.1] - 2026-09-03
 
 A file that deletes and re-appends objects smaller than a megabyte no longer grows without bound: `Dataset::append` and `BufferedAppender` now reuse a freed hole of any size on a paged file and on a file that persists its free-space managers ([#413](https://github.com/stephenberry/hdf5-pure/issues/413)). Patch release, no API change.
