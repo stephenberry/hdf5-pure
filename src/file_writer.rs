@@ -421,12 +421,13 @@ impl DenseAttrCreationOrder {
         matches!(self, Self::Tracked { indexed: true, .. })
     }
 
-    /// One creation index per attribute, or `None` for each where the object
-    /// does not track the order.
-    pub(crate) fn indices(&self) -> Box<dyn Iterator<Item = Option<u16>> + '_> {
+    /// The creation index recorded for attribute `i`, or `None` where the
+    /// object does not track the order — or, for a tracked set, where `i` is
+    /// past the attributes this describes.
+    pub(crate) fn index_at(&self, i: usize) -> Option<u16> {
         match self {
-            Self::Untracked => Box::new(core::iter::repeat(None)),
-            Self::Tracked { indices, .. } => Box::new(indices.iter().copied().map(Some)),
+            Self::Untracked => None,
+            Self::Tracked { indices, .. } => indices.get(i).copied(),
         }
     }
 }

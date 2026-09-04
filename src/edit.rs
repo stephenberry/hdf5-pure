@@ -12714,11 +12714,11 @@ fn plan_attr_ops<S: Source + ?Sized>(
     let mut set: Vec<DenseAttrSlot> = existing
         .attrs
         .into_iter()
-        .zip(existing.creation.indices())
-        .map(|(msg, creation_index)| DenseAttrSlot {
+        .enumerate()
+        .map(|(i, msg)| DenseAttrSlot {
             msg,
             collections: None,
-            creation_index,
+            creation_index: existing.creation.index_at(i),
         })
         .collect();
     for op in ops {
