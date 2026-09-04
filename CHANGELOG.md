@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `File::open` and `File::open_streaming` read a file that shares object header messages (`H5Pset_shared_mesg_index`), resolving a datatype, dataspace, fill value, filter pipeline or attribute message out of the shared-message heap where one was refused with `FormatError::UnsupportedSohmReference`, and `repack` rewrites such a file with every message stored inline. An edit that would leave the shared-message table stale is still refused ([#417](https://github.com/stephenberry/hdf5-pure/issues/417)).
 - `File::open_rw` edits an object that tracks attribute creation order (h5py's `track_order=True`, and everything netCDF-4 writes), where every such object was refused: a new attribute takes the next creation index, an overwrite keeps the one it had, a deletion leaves a gap, and a set that goes dense gains a creation-order B-tree beside its name index. Adding or removing a *link* in a group that tracks **link** creation order is still refused ([#416](https://github.com/stephenberry/hdf5-pure/issues/416)).
 
 ## [0.43.1] - 2026-09-03

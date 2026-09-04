@@ -365,15 +365,25 @@ const REFERENCE_TO_A_MOVED_OBJECT: &str = "a reference this commit writes holds 
 /// one, leaving the table's reference count naming an attribute that no longer
 /// exists.
 ///
-/// Both are backstops rather than refusals anything reaches today: measured here,
-/// the reference C library turns on message creation-order tracking for every
-/// object in a file whose shared-message index covers attributes, and such a file
-/// is refused earlier and whole (issue #104). What they buy is that the two paths
-/// answer a shared attribute message the same way if that ever changes — one of
-/// them resolving it silently is how the table would come to disagree with the
-/// file.
+/// Since issue #417 the reader follows such a reference, so these are live
+/// refusals rather than backstops: what they hold back is the *table*, whose
+/// reference count this engine cannot yet decrement, not the read. `repack`
+/// rewrites the file with every shared message inline, which is the way through
+/// today.
 const SHARED_ATTRIBUTE_MESSAGE: &str =
     "a target object has a shared attribute message (not editable in place yet)";
+
+/// A file that shares messages records the *sole* user of a shareable message as
+/// an object-header address in its shared-message (SOHM) index, rather than
+/// copying the message into a heap; the heap holds only messages two or more
+/// objects use. Such a record is a stored address like any other, and nothing
+/// repoints it: the index lives outside every object a commit rebuilds, and this
+/// engine does not write shared-message indexes. A commit that removed or moved
+/// the named header would leave the file's own index pointing at bytes that are
+/// no longer there, which the next library to share a message would follow.
+const SHARED_MESSAGE_INDEX_NAMES_A_MOVED_OBJECT: &str = "this file's shared-message (SOHM) index names an object header this commit \
+     removes or rewrites elsewhere, and the index cannot be updated in place; \
+     rewrite the file with `repack` instead";
 
 /// Refusal for an attribute whose references a commit repoints today and could
 /// not repoint from a heap. See [`plan_attr_ops`].
@@ -3659,6 +3669,75 @@ impl WriteEngine {
         &self.superblock
     }
 
+    /// The file's shared-message (SOHM) master table, or `None` for a file that
+    /// shares no messages — which is every file this crate writes and nearly
+    /// every file it is handed.
+    ///
+    /// Costs one small object-header parse per commit on a file that has a
+    /// superblock extension at all, and nothing on one that does not.
+    fn shared_message_table(&self) -> Result<Option<crate::sohm::SohmTable>, Error> {
+        let rel = match self.superblock.superblock_extension_address {
+            Some(rel) if rel != UNDEF => rel,
+            _ => return Ok(None),
+        };
+        let base = self.superblock.base_address;
+        let os = self.superblock.offset_size;
+        let ls = self.superblock.length_size;
+        // Best-effort down to here, and strict past it. A superblock extension
+        // this engine cannot parse is one nothing in this crate reads a shared
+        // message through either, so it is treated as a file that shares none;
+        // once the extension is readable and *says* the file shares messages,
+        // failing to read the table is an error, because the screen below is
+        // then the difference between a refusal and a corrupted index.
+        let Ok(abs) = base.absolute(rel) else {
+            return Ok(None);
+        };
+        let Ok(header) = ObjectHeader::parse_from_source(&self.image(), abs, os, ls, base) else {
+            return Ok(None);
+        };
+        let Some(msg) = header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::SharedMessageTable)
+        else {
+            return Ok(None);
+        };
+        let message = crate::sohm::SharedMessageTableMessage::parse(&msg.data, os)?;
+        let framed = BaseOffsetSource {
+            inner: self.image(),
+            base,
+        };
+        Ok(Some(crate::sohm::SohmTable::read_from_source(
+            &framed, &message, os,
+        )?))
+    }
+
+    /// Refuse a commit that would strand a shared-message index record naming an
+    /// object header. See [`SHARED_MESSAGE_INDEX_NAMES_A_MOVED_OBJECT`].
+    fn screen_shared_message_index(
+        &self,
+        invalidated: &InvalidatedAddresses,
+    ) -> Result<(), Error> {
+        if invalidated.is_empty() {
+            return Ok(());
+        }
+        let Some(table) = self.shared_message_table()? else {
+            return Ok(());
+        };
+        let base = self.superblock.base_address;
+        let os = self.superblock.offset_size;
+        let ls = self.superblock.length_size;
+        let framed = BaseOffsetSource {
+            inner: self.image(),
+            base,
+        };
+        for index in &table.indexes {
+            let records = crate::sohm::read_index_records_from_source(&framed, index, os, ls)?;
+            screen_shared_message_records(&records, invalidated)?;
+        }
+        Ok(())
+    }
+
     /// The on-disk format this session writes, read from the file it opened
     /// rather than chosen fresh, since a commit preserves the superblock version
     /// it found.
@@ -6191,6 +6270,11 @@ impl WriteEngine {
             ..for_copied
         };
 
+        // A shared-message index record can hold an object-header address too,
+        // and it is the one stored address the commit's closing repoint walk
+        // cannot reach. Screen it here, against the same two lists.
+        self.screen_shared_message_index(&for_supplied)?;
+
         // References a builder already resolved to addresses never reach
         // `resolve_reference_target`, so they are screened out of the element
         // bytes instead — additions and value overwrites alike, since neither
@@ -7638,15 +7722,34 @@ impl WriteEngine {
         }
         for m in &oh.messages {
             if m.msg_type == MessageType::Attribute {
-                if m.flags != 0 {
-                    return Err(Error::EditUnsupported(
-                        "a v0/v1 group has a shared attribute message (not convertible in place yet)",
-                    ));
-                }
                 if m.data.len() > OBJECT_HEADER_MESSAGE_MAX {
                     return Err(Error::EditUnsupported(
                         "a v0/v1 group attribute is too large to convert in place",
                     ));
+                }
+                if m.flags & !MSG_FLAG_SHARED != 0 {
+                    // Every other flag bit says something about the message this
+                    // rewrite would have to reproduce and does not — that it is
+                    // constant, that it must not be shared, what a reader should
+                    // do if it cannot decode it. The shared bit is the one this
+                    // conversion knows how to carry.
+                    return Err(Error::EditUnsupported(
+                        "a v0/v1 group attribute message carries an object-header flag this \
+                         conversion cannot reproduce",
+                    ));
+                }
+                if m.flags & MSG_FLAG_SHARED != 0 {
+                    // The body is a reference, not an attribute; the reference is
+                    // what gets rewrapped, in the encoding a version 2 header
+                    // uses. Reachable only from a file whose version 1 objects
+                    // share messages, which the reference C library does not
+                    // write — it moves an object to a version 2 header before
+                    // sharing anything on it.
+                    region.push_shared(
+                        MessageType::Attribute,
+                        &modernize_shared_reference(&m.data, os, ls)?,
+                    );
+                    continue;
                 }
                 // Re-wrap the attribute message body (it is self-describing) in a
                 // v2 message record. The rebuilt header does not track creation
@@ -12919,6 +13022,13 @@ fn read_object_attrs<S: Source + ?Sized>(
         &header,
         OFFSET_SIZE,
         LENGTH_SIZE,
+        // No shared-message table: this engine refuses an object carrying a
+        // shared attribute message before it gets here ([`SHARED_ATTRIBUTE_MESSAGE`]),
+        // and resolving one silently is exactly what that refusal prevents — the
+        // resolved copy is indistinguishable from a private attribute, and would
+        // be re-emitted as one, leaving the file's reference count naming an
+        // attribute that no longer exists.
+        None,
     )
     .map_err(|_| {
         Error::EditUnsupported("an object's dense (fractal-heap) attributes could not be read")
@@ -13750,6 +13860,18 @@ impl OhRegion {
         let record = self.layout.record(msg_type, body);
         self.push_bytes(&record);
     }
+
+    /// Append a message whose body is a *reference* to the one copy of it stored
+    /// elsewhere, rather than the message itself.
+    ///
+    /// The flag is what tells every reader to follow the body instead of
+    /// decoding it, so it travels with the bytes: a rewrite that dropped it
+    /// would leave a reference to be read as content.
+    fn push_shared(&mut self, msg_type: MessageType, reference: &[u8]) {
+        let mut record = self.layout.record(msg_type, reference);
+        record[3] = MSG_FLAG_SHARED;
+        self.push_bytes(&record);
+    }
 }
 
 /// Version-2 object-header message flag bit marking a message as *shared* (stored
@@ -13890,6 +14012,59 @@ fn reject_foreign_dense_attrs(attrs: &[crate::attribute::AttributeMessage]) -> R
     Ok(())
 }
 
+/// Re-encode a shared-message reference in the modern form, for a message being
+/// rewrapped from a version 1 object header into a version 2 one.
+///
+/// A version 1 header carries the oldest reference encoding: a symbol-table
+/// entry, with the object-header address buried behind a local-heap address.
+/// Copying those bytes into a version 2 header would put an encoding there that
+/// no writer of such a header has produced since the format gained one; parsing
+/// and re-encoding gives the shape every current reader and writer uses.
+///
+/// Which shape that is depends on where the message lives. An object header is
+/// named by the version 2 form this crate already writes for a committed
+/// datatype. The shared-message heap has no encoding before version 3, so a heap
+/// reference gets that one. Both name exactly what the version 1 reference named,
+/// so the message keeps its single copy and its reference count is unchanged.
+fn modernize_shared_reference(
+    body: &[u8],
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<u8>, Error> {
+    let reference = crate::shared_message::parse_shared_ref(body, offset_size, length_size)?;
+    Ok(match reference.location {
+        crate::shared_message::SharedLocation::ObjectHeader(addr) => {
+            crate::shared_message::encode_committed_ref(addr, offset_size)
+        }
+        crate::shared_message::SharedLocation::SohmHeap(id) => {
+            crate::shared_message::encode_sohm_ref(&id)
+        }
+    })
+}
+
+/// Refuse a commit that removes or moves an object header the file's
+/// shared-message (SOHM) index names.
+///
+/// A heap-stored record names no object, so it is not screened here: what a
+/// commit does to it is a *reference count* that goes stale, which the engine
+/// refuses at the point it would change one (see [`SHARED_ATTRIBUTE_MESSAGE`]).
+/// This screens the other record shape, whose address would dangle.
+fn screen_shared_message_records(
+    records: &[crate::sohm::SohmRecord],
+    invalidated: &InvalidatedAddresses,
+) -> Result<(), Error> {
+    for record in records {
+        if let crate::sohm::SohmLocation::ObjectHeader { address, .. } = record.location
+            && invalidated.refusal(address).is_some()
+        {
+            return Err(Error::EditUnsupported(
+                SHARED_MESSAGE_INDEX_NAMES_A_MOVED_OBJECT,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a staged dataset whose element bytes already hold *resolved* object
 /// references naming space this commit reclaims (issue #317).
 ///
@@ -13991,7 +14166,11 @@ fn screen_copied_references(
         return Ok(());
     }
     use crate::shared_message::SharedResolver as _;
-    let resolver = crate::shared_message::SourceResolver::new(src, OFFSET_SIZE, LENGTH_SIZE);
+    // No shared-message table: a heap-stored message is refused rather than
+    // followed here, and this screen treats an unreadable datatype as one it
+    // cannot clear, which is the conservative answer.
+    let resolver =
+        crate::shared_message::SourceResolver::new(src, OFFSET_SIZE, LENGTH_SIZE, None);
     let (region, dense_attrs) = match tree {
         CopyTree::DatasetVerbatim {
             region,
@@ -16838,6 +17017,105 @@ mod tests {
         let before = region.clone();
         ensure_group_info(&mut region).unwrap();
         assert_eq!(*region, *before);
+    }
+
+    // ---- shared (SOHM) messages (issue #417) ----
+
+    /// A shared-message index record naming an object header is a stored address
+    /// like any other, and the one no repoint walk reaches: it lives outside
+    /// every object a commit rebuilds. A commit that removes or moves that header
+    /// is refused rather than leaving the index naming bytes that have gone.
+    #[test]
+    fn a_commit_that_strands_a_shared_message_record_is_refused() {
+        let named = crate::sohm::SohmRecord {
+            hash: 1,
+            location: crate::sohm::SohmLocation::ObjectHeader {
+                message_type: MessageType::Attribute.to_u16() as u8,
+                creation_index: 0,
+                address: 0x400,
+            },
+        };
+        let moved = InvalidatedAddresses {
+            removed: Vec::new(),
+            moved: vec![0x400],
+            base: BaseAddress::ZERO,
+        };
+        let err = screen_shared_message_records(std::slice::from_ref(&named), &moved).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            Error::EditUnsupported(SHARED_MESSAGE_INDEX_NAMES_A_MOVED_OBJECT).to_string()
+        );
+
+        let elsewhere = InvalidatedAddresses {
+            removed: Vec::new(),
+            moved: vec![0x800],
+            base: BaseAddress::ZERO,
+        };
+        screen_shared_message_records(std::slice::from_ref(&named), &elsewhere).unwrap();
+    }
+
+    /// A heap-stored record names no object header, so no address of it can go
+    /// stale and the screen passes it. What a commit can spoil about one is its
+    /// reference count, which the attribute paths refuse to change instead.
+    #[test]
+    fn a_heap_stored_shared_message_record_is_not_screened_for_addresses() {
+        let heap = crate::sohm::SohmRecord {
+            hash: 1,
+            location: crate::sohm::SohmLocation::Heap {
+                reference_count: 2,
+                // The same eight bytes the address screen would refuse if it read
+                // them as one.
+                heap_id: 0x400u64.to_le_bytes(),
+            },
+        };
+        let moved = InvalidatedAddresses {
+            removed: Vec::new(),
+            moved: vec![0x400],
+            base: BaseAddress::ZERO,
+        };
+        screen_shared_message_records(&[heap], &moved).unwrap();
+    }
+
+    /// A version 1 reference to a committed object becomes the version 2 form
+    /// this crate writes everywhere else, naming the same address: the whole
+    /// point of rewrapping is that the message still resolves to one copy.
+    #[test]
+    fn a_version_1_reference_is_rewrapped_as_the_modern_committed_form() {
+        let mut v1 = vec![1u8, 0];
+        v1.extend_from_slice(&[0u8; 6]); // reserved
+        v1.extend_from_slice(&0x1111u64.to_le_bytes()); // local heap address
+        v1.extend_from_slice(&0x5678u64.to_le_bytes()); // object header address
+
+        let modern = modernize_shared_reference(&v1, OFFSET_SIZE, LENGTH_SIZE).unwrap();
+        assert_eq!(modern[0], 2, "the version this crate writes");
+        assert_eq!(
+            crate::shared_message::parse_shared_ref(&modern, OFFSET_SIZE, LENGTH_SIZE)
+                .unwrap()
+                .location,
+            crate::shared_message::SharedLocation::ObjectHeader(0x5678)
+        );
+    }
+
+    /// A reference into the shared-message heap keeps its heap ID and the only
+    /// version that encodes one. Re-encoding it as a committed reference would
+    /// turn eight bytes of heap ID into a file address.
+    #[test]
+    fn a_heap_reference_is_rewrapped_as_a_heap_reference() {
+        let mut v3 = vec![3u8, 1];
+        v3.extend_from_slice(&[9, 8, 7, 6, 5, 4, 3, 2]);
+
+        let modern = modernize_shared_reference(&v3, OFFSET_SIZE, LENGTH_SIZE).unwrap();
+        assert_eq!(modern, v3);
+    }
+
+    /// The rewrapped record keeps the shared flag. Without it every reader
+    /// decodes the reference as the attribute it stands for.
+    #[test]
+    fn a_rewrapped_shared_message_keeps_its_flag() {
+        let mut region = OhRegion::empty(OhRecordLayout::PLAIN);
+        region.push_shared(MessageType::Attribute, &[3, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(region[3], MSG_FLAG_SHARED);
+        assert!(region_has_shared_attr(&region).unwrap());
     }
 
     #[test]

@@ -91,11 +91,12 @@
 //! repack drops or that no hard link reaches. An object that cannot be
 //! reproduced fails the repack by name rather than being silently dropped.
 //!
-//! One thing is resolved rather than reproduced: a *shared dataspace*, which
-//! only a file with a shared-message (SOHM) table has, is written back inline.
-//! Unlike a datatype, a dataspace has no name and no HDF5 call reports one as
-//! shared, so there is nothing an inline copy loses. (In practice such a file is
-//! refused earlier: reading a SOHM-stored message is not supported.)
+//! One thing is resolved rather than reproduced: a *shared* message, which only
+//! a file with a shared-message (SOHM) table has, is written back inline. Unlike
+//! a committed datatype, a message in the shared-message heap has no name and no
+//! HDF5 call reports one as shared, so there is nothing an inline copy loses —
+//! the repacked file holds the same messages, one copy per user, and shares
+//! nothing.
 //!
 //! # Memory
 //!

@@ -4027,7 +4027,7 @@ mod tests {
         let hdr =
             ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let attrs =
-            crate::attribute::extract_attributes_full(&bytes, &hdr, sb.offset_size, sb.length_size)
+            crate::attribute::extract_attributes_full(&bytes, &hdr, sb.offset_size, sb.length_size, None)
                 .unwrap();
         assert_eq!(attrs.len(), 20);
         for i in 0..20 {
@@ -4059,7 +4059,7 @@ mod tests {
         )
         .unwrap();
         let attrs =
-            crate::attribute::extract_attributes_full(&bytes, &oh, sb.offset_size, sb.length_size)
+            crate::attribute::extract_attributes_full(&bytes, &oh, sb.offset_size, sb.length_size, None)
                 .unwrap();
         assert_eq!(attrs.len(), 15);
     }
@@ -4611,7 +4611,7 @@ mod tests {
         let hdr =
             ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let attrs =
-            crate::attribute::extract_attributes_full(&bytes, &hdr, sb.offset_size, sb.length_size)
+            crate::attribute::extract_attributes_full(&bytes, &hdr, sb.offset_size, sb.length_size, None)
                 .unwrap();
         assert_eq!(attrs.len(), count);
         for i in 0..count {

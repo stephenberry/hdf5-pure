@@ -19,6 +19,7 @@ use crate::object_header::ObjectHeader;
 use crate::shared_message::{
     self, BufferedResolver, DatatypeLocation, SharedResolver, SourceResolver, Unresolvable,
 };
+use crate::sohm::SohmTable;
 use crate::source::Source;
 
 /// Bit 0 of an attribute message's flags byte: the datatype field holds a
@@ -392,11 +393,20 @@ fn decode_type_and_space(
     }
 
     let (datatype, location) = if flags & FLAG_SHARED_DATATYPE != 0 {
+        // A shared datatype is either a committed object every user names, or
+        // one anonymous copy in the file's shared-message heap. Only the first
+        // has an address, and only the first is a *named* type: a heap-stored
+        // one has no path and no object, so it is reported as inline and written
+        // back spelled out, which is what every reader of such a file already
+        // shows.
         let address = resolver.committed_address(dt_field)?;
         let body = resolver.resolve(dt_field, MessageType::Datatype)?;
         (
             Datatype::parse(&body)?.0,
-            DatatypeLocation::Committed(address),
+            match address {
+                Some(address) => DatatypeLocation::Committed(address),
+                None => DatatypeLocation::Inline,
+            },
         )
     } else {
         (Datatype::parse(dt_field)?.0, DatatypeLocation::Inline)
@@ -515,8 +525,9 @@ pub fn extract_attributes_full(
     header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
+    sohm: Option<&SohmTable>,
 ) -> Result<Vec<AttributeMessage>, FormatError> {
-    let resolver = BufferedResolver::new(file_data, offset_size, length_size);
+    let resolver = BufferedResolver::new(file_data, offset_size, length_size, sohm);
     let mut attrs = Vec::new();
 
     // Collect compact attributes (inline in OH)
@@ -540,7 +551,7 @@ pub fn extract_attributes_full(
         && let Some(fh_addr) = info.fractal_heap_address
     {
         let dense_attrs =
-            extract_dense_attributes(file_data, &info, fh_addr, offset_size, length_size)?;
+            extract_dense_attributes(file_data, &info, fh_addr, offset_size, length_size, sohm)?;
         attrs.extend(dense_attrs);
     }
 
@@ -558,9 +569,10 @@ pub fn extract_attributes_full_from_source<S: Source + ?Sized>(
     header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
+    sohm: Option<&SohmTable>,
 ) -> Result<Vec<AttributeMessage>, FormatError> {
     Ok(
-        extract_stored_attributes_from_source(source, header, offset_size, length_size)?
+        extract_stored_attributes_from_source(source, header, offset_size, length_size, sohm)?
             .into_iter()
             .map(|a| a.message)
             .collect(),
@@ -591,8 +603,9 @@ pub fn extract_stored_attributes_from_source<S: Source + ?Sized>(
     header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
+    sohm: Option<&SohmTable>,
 ) -> Result<Vec<StoredAttribute>, FormatError> {
-    let resolver = SourceResolver::new(source, offset_size, length_size);
+    let resolver = SourceResolver::new(source, offset_size, length_size, sohm);
     let mut attrs = Vec::new();
 
     // Collect compact attributes (inline in OH)
@@ -616,8 +629,14 @@ pub fn extract_stored_attributes_from_source<S: Source + ?Sized>(
     if let Some(info) = attr_info
         && let Some(fh_addr) = info.fractal_heap_address
     {
-        let dense_attrs =
-            extract_dense_attributes_from_source(source, &info, fh_addr, offset_size, length_size)?;
+        let dense_attrs = extract_dense_attributes_from_source(
+            source,
+            &info,
+            fh_addr,
+            offset_size,
+            length_size,
+            sohm,
+        )?;
         attrs.extend(dense_attrs);
     }
 
@@ -645,6 +664,7 @@ fn extract_dense_attributes(
     fh_addr: u64,
     offset_size: u8,
     length_size: u8,
+    sohm: Option<&SohmTable>,
 ) -> Result<Vec<AttributeMessage>, FormatError> {
     // Parse fractal heap
     let fh = FractalHeapHeader::parse(file_data, fh_addr.to_usize()?, offset_size, length_size)?;
@@ -660,7 +680,7 @@ fn extract_dense_attributes(
         BTreeV2Header::parse(file_data, btree_addr.to_usize()?, offset_size, length_size)?;
     let records = collect_btree_v2_records(file_data, &btree_hdr, offset_size, length_size)?;
 
-    let resolver = BufferedResolver::new(file_data, offset_size, length_size);
+    let resolver = BufferedResolver::new(file_data, offset_size, length_size, sohm);
     let mut heap = fh.object_reader(offset_size, length_size);
     let mut attrs = Vec::new();
     for record in &records {
@@ -694,6 +714,7 @@ fn extract_dense_attributes_from_source<S: Source + ?Sized>(
     fh_addr: u64,
     offset_size: u8,
     length_size: u8,
+    sohm: Option<&SohmTable>,
 ) -> Result<Vec<StoredAttribute>, FormatError> {
     let fh = FractalHeapHeader::parse_from_source(source, fh_addr, offset_size, length_size)?;
 
@@ -707,7 +728,7 @@ fn extract_dense_attributes_from_source<S: Source + ?Sized>(
     let records =
         collect_btree_v2_records_from_source(source, &btree_hdr, offset_size, length_size)?;
 
-    let resolver = SourceResolver::new(source, offset_size, length_size);
+    let resolver = SourceResolver::new(source, offset_size, length_size, sohm);
     let mut heap = fh.object_reader(offset_size, length_size);
     let mut attrs = Vec::new();
     for record in &records {
@@ -856,7 +877,7 @@ mod tests {
 
         let source = CountingSource::new(bytes);
         let attrs =
-            extract_dense_attributes_from_source(&source, &info, fh_addr, offset_size, length_size)
+            extract_dense_attributes_from_source(&source, &info, fh_addr, offset_size, length_size, None)
                 .unwrap();
 
         assert_eq!(
@@ -885,7 +906,7 @@ mod tests {
 
         crate::fractal_heap::reset_huge_index_decodes();
         let attrs =
-            extract_dense_attributes(&bytes, &info, fh_addr, offset_size, length_size).unwrap();
+            extract_dense_attributes(&bytes, &info, fh_addr, offset_size, length_size, None).unwrap();
 
         assert_eq!(
             attrs.len(),
@@ -912,10 +933,10 @@ mod tests {
 
         crate::fractal_heap::reset_huge_index_decodes();
         let buffered =
-            extract_dense_attributes(&bytes, &info, fh_addr, offset_size, length_size).unwrap();
+            extract_dense_attributes(&bytes, &info, fh_addr, offset_size, length_size, None).unwrap();
         let source = BytesSource::new(bytes);
         let streamed =
-            extract_dense_attributes_from_source(&source, &info, fh_addr, offset_size, length_size)
+            extract_dense_attributes_from_source(&source, &info, fh_addr, offset_size, length_size, None)
                 .unwrap();
 
         assert_eq!(buffered.len(), COUNT, "the walk must read every attribute");
@@ -1256,7 +1277,7 @@ mod tests {
             Ok(self.0.clone())
         }
 
-        fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
+        fn committed_address(&self, reference: &[u8]) -> Result<Option<u64>, FormatError> {
             shared_message::committed_address_in(reference, 8, 8)
         }
     }
