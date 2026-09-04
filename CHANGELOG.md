@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `FileAccessProperties::with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)` lets a read-only open take a path-based snapshot of a file a page-buffered writer holds, without copying it through `File::from_bytes`; the caller asserts the writer has synced, and a SWMR pair and every read-write open are still refused ([#419](https://github.com/stephenberry/hdf5-pure/issues/419)).
+
+### Fixed
+
+- `Error::FileMarkedInUse` no longer points a reader at `File::open_swmr` for a file marked by a page-buffered writer, which that reader refuses in its turn; the message now names the snapshot opt-in above, `File::from_bytes`, and `File::clear_swmr_flag` ([#419](https://github.com/stephenberry/hdf5-pure/issues/419)).
+
 ## [0.43.1] - 2026-09-03
 
 A file that deletes and re-appends objects smaller than a megabyte no longer grows without bound: `Dataset::append` and `BufferedAppender` now reuse a freed hole of any size on a paged file and on a file that persists its free-space managers ([#413](https://github.com/stephenberry/hdf5-pure/issues/413)). Patch release, no API change.
