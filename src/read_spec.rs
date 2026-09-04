@@ -16,9 +16,6 @@
 //! layer at once, and the sites that must decide what it is are the few that
 //! build the spec.
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;

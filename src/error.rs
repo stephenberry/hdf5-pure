@@ -1239,13 +1239,25 @@ pub enum Error {
     FileLocked(String),
     /// The file could not be opened because its superblock's status-flags byte
     /// marks it as held by a writer — the durable flag
-    /// [`crate::File::open_swmr_writer`] raises, and the reference C library
-    /// raises for any writer. Unlike [`FileLocked`](Self::FileLocked) this
-    /// outlives the process that set it, so it means either that a writer is
-    /// active *or* that one exited without clearing it; the payload names
+    /// [`crate::File::open_swmr_writer`] raises, and which a page-buffered
+    /// session ([`crate::FileAccessProperties::with_page_buffer_size`]) raises
+    /// alone. Unlike [`FileLocked`](Self::FileLocked) this outlives the process
+    /// that set it, so it means either that a writer is active *or* that one
+    /// exited without clearing it; the payload names
     /// [`crate::File::clear_swmr_flag`] (the `h5clear -s` equivalent) as the
-    /// recovery for the latter. A live SWMR writer can still be followed with
-    /// [`crate::File::open_swmr`]. The payload is a human-readable reason.
+    /// recovery for the latter.
+    ///
+    /// Which reader can get at the file depends on which mark it is, and the
+    /// payload names the one that applies:
+    ///
+    /// - both bits, a live SWMR writer: follow it with
+    ///   [`crate::File::open_swmr`];
+    /// - the write bit alone, which no SWMR reader can follow: read a snapshot
+    ///   with
+    ///   [`crate::FileAccessProperties::with_write_mark_policy`], once the
+    ///   writer has synced or closed.
+    ///
+    /// The payload is a human-readable reason.
     FileMarkedInUse(String),
     /// A [`commit`](crate::File::commit) failed, *and* could not put back a
     /// value it had already written over — so the file holds part of a batch

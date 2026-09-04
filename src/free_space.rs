@@ -310,6 +310,41 @@ impl FreeList {
     }
 }
 
+/// The lowest address of the run of free space that reaches `eof`, across
+/// several lists that are individually coalesced and mutually disjoint. `eof`
+/// itself when nothing there is free.
+///
+/// The paged counterpart of [`FreeList::take_trailing`]. A paged file keeps free
+/// space in one list per page type, plus space whose page type is unproven and
+/// space it may record but never hand out ([`crate::edit`]), so the run at the
+/// end of the file can be split across them — free metadata, then free raw data,
+/// then a dead fragment — and no single list sees it whole. Only the union
+/// answers whether the file's last bytes are all unreferenced, which is what a
+/// shrink turns on.
+///
+/// The regions are walked from the top, joining those that touch: because each
+/// list is coalesced and the lists do not overlap, a region can only extend the
+/// run when its end meets the run's current start, so one descending pass is
+/// exact.
+pub(crate) fn trailing_run_start<'a, I>(lists: I, eof: u64) -> u64
+where
+    I: IntoIterator<Item = &'a FreeList>,
+{
+    let mut all: Vec<FreeRegion> = lists
+        .into_iter()
+        .flat_map(|l| l.regions.iter().copied())
+        .collect();
+    all.sort_unstable_by_key(|r| r.addr);
+    let mut start = eof;
+    for r in all.iter().rev() {
+        if r.end() < start {
+            break;
+        }
+        start = start.min(r.addr);
+    }
+    start
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +527,34 @@ mod tests {
     fn take_trailing_empty_list() {
         let mut fl = FreeList::new();
         assert_eq!(fl.take_trailing(0), None);
+    }
+
+    #[test]
+    fn trailing_run_start_joins_across_lists() {
+        // Free metadata, then free raw data, then a dead fragment, all abutting
+        // and reaching end-of-file: the run starts where the metadata does, and
+        // no single list can say so.
+        let (mut meta, mut raw, mut dead) = (FreeList::new(), FreeList::new(), FreeList::new());
+        meta.free(400, 100); // [400, 500)
+        raw.free(500, 50); // [500, 550)
+        dead.free(550, 50); // [550, 600)
+        assert_eq!(trailing_run_start([&meta, &raw, &dead], 600), 400);
+    }
+
+    #[test]
+    fn trailing_run_start_stops_at_the_first_live_gap() {
+        let (mut meta, mut raw) = (FreeList::new(), FreeList::new());
+        meta.free(100, 100); // [100, 200), below a live gap
+        raw.free(400, 200); // [400, 600)
+        assert_eq!(trailing_run_start([&meta, &raw], 600), 400);
+    }
+
+    #[test]
+    fn trailing_run_start_is_eof_when_the_last_byte_is_live() {
+        let mut meta = FreeList::new();
+        meta.free(400, 100); // [400, 500), then live bytes to 600
+        assert_eq!(trailing_run_start([&meta], 600), 600);
+        assert_eq!(trailing_run_start([&FreeList::new()], 600), 600);
     }
 
     #[test]
