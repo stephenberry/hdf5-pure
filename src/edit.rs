@@ -226,8 +226,9 @@
 //! of allocation stays a whole number of pages. Two things bound it. A few tails'
 //! worth of the run stays ([`release_trailing_run`]), because the manager blocks
 //! are rewritten by every commit and can never land in their own predecessor's
-//! extent, so a file trimmed closer than that appends a tail per commit forever;
-//! and a run that would give back less than it keeps is left alone, since
+//! extent, so a file trimmed closer than that sends its next tail past the end of
+//! the file instead of into the reserve; and a run that would give back less than
+//! it keeps is left alone, since
 //! trimming the top off a hole the next write was about to fill costs a whole
 //! object to return a fraction of one. A commit whose own tail had to be appended
 //! *above* the run it freed takes a second, tail-only rewrite to move the blocks
@@ -2100,14 +2101,16 @@ impl PagedPostFree {
 /// crash there falls back on. The end of the file therefore has to keep room for
 /// the tails that follow this one, and a tail is not a fixed size: every
 /// abandoned one adds a section to the managers, which makes the *next* tail
-/// longer again. A one-tail reserve starves that rotation within a few commits,
-/// and a file whose commits change nothing then grows by a tail per commit for as
-/// long as the session runs.
+/// longer again.
 ///
-/// Four is what the churn tests hold it to. At two,
-/// `persisting_churn_reaches_a_steady_size` settles at 24,685 bytes against the
-/// 15,854 it holds when trailing space is left alone entirely, and a loop of
-/// no-op commits climbs without settling at all.
+/// Measured rather than chosen, on the shipped rule. At one,
+/// `a_released_file_holds_its_length_across_many_tail_rewrites` leaves the flat
+/// file alternating between 5,992 and 6,303 bytes instead of holding one length,
+/// because a tail a section longer than the one that sized the reserve does not
+/// fit it. At two, `persisting_churn_reaches_a_steady_size` has not settled by
+/// its sixteenth round — 15,095 bytes after a middle third that held 14,685.
+/// Three is the smallest value both accept; four is one tail of margin, the tail
+/// length being itself a function of a section count that varies with the file.
 const TRAILING_RESERVE_TAILS: u64 = 4;
 
 /// Release the run of free space reaching `eof` from a flat file's post-commit

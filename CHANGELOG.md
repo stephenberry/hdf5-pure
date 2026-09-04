@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Deleting objects now gives the space at the end of the file back to the filesystem instead of leaving `File::file_size()` at a high-water mark, on a file that persists its free-space managers and on a paged file alike: a commit shortens the file to just above its last live allocation, page-aligned where the strategy requires it, keeping only what the next commits' manager blocks need ([#418](https://github.com/stephenberry/hdf5-pure/issues/418)).
+- Deleting objects now gives the space at the end of the file back to the filesystem instead of leaving `File::file_size()` at a high-water mark, on a file that persists its free-space managers and on a paged file alike. A commit shortens the file to just above its last live allocation, page-aligned where the strategy requires it ([#418](https://github.com/stephenberry/hdf5-pure/issues/418)).
 
 ## [0.43.1] - 2026-09-03
 

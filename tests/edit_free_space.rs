@@ -1961,6 +1961,102 @@ fn a_released_file_reopens_and_keeps_being_edited() {
     assert_eq!(f.dataset("keep").unwrap().read_i32().unwrap(), [1, 2, 3]);
 }
 
+/// A file that has released the end of itself then holds that length across a
+/// long run of tail-rewriting commits, instead of moving between two lengths a
+/// manager tail apart (issue #418).
+///
+/// This is what pins `TRAILING_RESERVE_TAILS` against being one. That reserve —
+/// the few manager tails' worth of a released run that the commit leaves in the
+/// file — is not a tidiness margin: the blocks are rewritten by *every* commit
+/// and can never land in their own predecessor's extent, because the on-disk
+/// superblock still points at it until the repoint. Trimmed to a single tail's
+/// worth, the reserve is the size of the tail that made it, and the next tail is
+/// a section longer whenever the section set has grown, so it goes past the end
+/// of the file instead: at a reserve of one, this loop leaves the flat file
+/// alternating between 5,992 and 6,303 bytes, so 100 of its 200 commits leave a
+/// length other than the one before them. What rules out *two* is not here but in
+/// `persisting_churn_reaches_a_steady_size`, which at that value has not settled
+/// by its sixteenth round.
+///
+/// A commit with nothing staged returns before the tail rewrite, so the loop
+/// overwrites one root attribute — a fixed-width `I64`, so the header it
+/// rewrites is the same size every round and the only thing that can move is the
+/// tail.
+#[test]
+fn a_released_file_holds_its_length_across_many_tail_rewrites() {
+    const ROWS: usize = 100;
+    const GROUPS: usize = 4;
+    const COMMITS: i64 = 200;
+
+    for (label, strategy, slack) in [
+        // A tail is a few hundred bytes on a flat file and a page on a paged one,
+        // which is the whole of the slack either may take.
+        ("flat", FileSpaceStrategy::FsmAggr, 1024),
+        ("paged", FileSpaceStrategy::Page, RECLAIM_PAGE),
+    ] {
+        let path = temp_path(&format!("hdf5_pure_fs_release_loop_{label}.h5"));
+        let mut b = FileBuilder::new();
+        b.with_file_space_strategy(strategy, true, 0);
+        if strategy == FileSpaceStrategy::Page {
+            b.with_file_space_page_size(RECLAIM_PAGE);
+        }
+        b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+        b.write(&path).unwrap();
+
+        let f = open_rw_on_close(&path);
+        for i in 0..GROUPS {
+            create_populated_group(&f, &format!("e{i}"), ROWS, 2);
+        }
+        for i in 1..GROUPS {
+            f.root().delete(&format!("e{i}")).unwrap();
+            f.commit().unwrap();
+        }
+        // One commit past the deletes, so the length being measured is the one
+        // the release settles at rather than the one the last delete published:
+        // a commit whose tail had to be appended above the run it freed moves it
+        // down on the commit after.
+        f.root().set_attr("n", AttrValue::I64(-1)).unwrap();
+        f.commit().unwrap();
+        let released = f.file_size();
+
+        let mut peak = released;
+        let mut moved = 0usize;
+        for i in 0..COMMITS {
+            f.root().set_attr("n", AttrValue::I64(i)).unwrap();
+            f.commit().unwrap();
+            peak = peak.max(f.file_size());
+            moved += usize::from(f.file_size() != released);
+        }
+        assert!(
+            peak <= released + slack,
+            "{label}: {COMMITS} tail rewrites must not climb past one tail's \
+             worth of the released length (released {released}, peak {peak})"
+        );
+        assert_eq!(
+            f.file_size(),
+            released,
+            "{label}: and must leave the file at the length the release left it"
+        );
+        // The load-bearing one: the length is not merely back where it started,
+        // it never left. A reserve too small to take the next tail sends it past
+        // end-of-file and the file moves on every commit.
+        assert_eq!(
+            moved, 0,
+            "{label}: {moved} of {COMMITS} tail rewrites changed the file's \
+             length (released {released}, peak {peak})"
+        );
+        f.close().unwrap();
+
+        assert_released_file_is_self_consistent(&path);
+        let f = File::open(&path).unwrap();
+        assert_eq!(f.dataset("keep").unwrap().read_i32().unwrap(), [1, 2, 3]);
+        assert_eq!(
+            f.dataset("e0/c0").unwrap().read_i32().unwrap(),
+            (0..ROWS as i32).collect::<Vec<i32>>()
+        );
+    }
+}
+
 /// Build `name` as a rank-1, unlimited, chunked i32 dataset of length zero.
 fn create_log(session: &File, name: &str) {
     session
