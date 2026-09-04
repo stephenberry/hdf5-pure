@@ -3,14 +3,25 @@
 //! The Attribute Info message describes dense attribute storage: a fractal heap
 //! and B-tree v2 indexes for attribute lookup by name or creation order.
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use crate::bytes::{ensure_len, read_optional_offset};
 use crate::error::FormatError;
 
 /// Parsed Attribute Info message from an object header.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttributeInfoMessage {
-    /// Maximum creation order index (if creation-order tracking is enabled).
+    /// Maximum creation order index — the next one the object would hand out —
+    /// present exactly when the object tracks attribute creation order.
     pub max_creation_index: Option<u16>,
+    /// Whether the object *indexes* attributes by creation order (flags bit 1).
+    ///
+    /// Distinct from [`btree_creation_order_address`](Self::btree_creation_order_address)
+    /// being `Some`: an object that indexes creation order while storing its
+    /// attributes compactly declares the index and leaves its address undefined,
+    /// which is what the reference C library writes before a set goes dense.
+    pub indexes_creation_order: bool,
     /// Address of the fractal heap storing attribute messages.
     pub fractal_heap_address: Option<u64>,
     /// Address of B-tree v2 (type 8) for name-ordered attribute index.
@@ -62,10 +73,49 @@ impl AttributeInfoMessage {
 
         Ok(AttributeInfoMessage {
             max_creation_index,
+            indexes_creation_order: has_creation_order_index,
             fractal_heap_address,
             btree_name_index_address,
             btree_creation_order_address,
         })
+    }
+
+    /// Encode this message's body, the inverse of [`parse`](Self::parse).
+    ///
+    /// The two optional fields are written exactly when the flags say so:
+    /// [`max_creation_index`](Self::max_creation_index) being `Some` is what
+    /// "attribute creation order is tracked" means on the wire, and
+    /// [`indexes_creation_order`](Self::indexes_creation_order) is what adds the
+    /// creation-order B-tree address — undefined while the attributes are still
+    /// stored in the object header.
+    pub(crate) fn serialize(&self, offset_size: u8) -> Vec<u8> {
+        let mut data = Vec::with_capacity(2 + 2 + 3 * offset_size as usize);
+        data.push(0); // version
+        let flags = u8::from(self.max_creation_index.is_some())
+            | (u8::from(self.indexes_creation_order) << 1);
+        data.push(flags);
+        if let Some(max) = self.max_creation_index {
+            data.extend_from_slice(&max.to_le_bytes());
+        }
+        write_offset(&mut data, self.fractal_heap_address, offset_size);
+        write_offset(&mut data, self.btree_name_index_address, offset_size);
+        if self.indexes_creation_order {
+            write_offset(&mut data, self.btree_creation_order_address, offset_size);
+        }
+        data
+    }
+}
+
+/// Write an address, or the all-ones "undefined" value for `None`, in
+/// `offset_size` little-endian bytes.
+fn write_offset(data: &mut Vec<u8>, address: Option<u64>, offset_size: u8) {
+    let value = address.unwrap_or(u64::MAX);
+    for i in 0..offset_size as usize {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "one byte of the address at a time"
+        )]
+        data.push((value >> (8 * i)) as u8);
     }
 }
 
@@ -116,9 +166,36 @@ mod tests {
 
         let msg = AttributeInfoMessage::parse(&data, 8).unwrap();
         assert_eq!(msg.max_creation_index, Some(42));
+        assert!(msg.indexes_creation_order);
         assert_eq!(msg.fractal_heap_address, Some(0x1000));
         assert_eq!(msg.btree_name_index_address, Some(0x2000));
         assert_eq!(msg.btree_creation_order_address, Some(0x3000));
+    }
+
+    /// Every shape of the message survives a round trip through
+    /// [`AttributeInfoMessage::serialize`], which is what lets the editor rewrite
+    /// one it read rather than rebuilding it from assumptions.
+    #[test]
+    fn serialize_round_trips_every_flag_combination() {
+        for max in [None, Some(7u16)] {
+            for indexed in [false, true] {
+                for heap in [None, Some(0x1000u64)] {
+                    let msg = AttributeInfoMessage {
+                        max_creation_index: max,
+                        indexes_creation_order: indexed,
+                        fractal_heap_address: heap,
+                        btree_name_index_address: heap.map(|_| 0x2000),
+                        btree_creation_order_address: (indexed && heap.is_some()).then_some(0x3000),
+                    };
+                    let bytes = msg.serialize(8);
+                    assert_eq!(
+                        AttributeInfoMessage::parse(&bytes, 8).unwrap(),
+                        msg,
+                        "round trip for max={max:?} indexed={indexed} heap={heap:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
