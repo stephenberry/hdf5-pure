@@ -8,7 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `File::open_rw` edits an object that tracks attribute creation order (h5py's `track_order=True`, and everything netCDF-4 writes), where every such object was refused: a new attribute takes the next creation index, an overwrite keeps the one it had, a deletion leaves a gap, and a set that goes dense gains a creation-order B-tree beside its name index. Adding a *link* to a group that tracks **link** creation order is still refused ([#416](https://github.com/stephenberry/hdf5-pure/issues/416)).
+- `File::open_rw` edits an object that tracks attribute creation order (h5py's `track_order=True`, and everything netCDF-4 writes), where every such object was refused: a new attribute takes the next creation index, an overwrite keeps the one it had, a deletion leaves a gap, and a set that goes dense gains a creation-order B-tree beside its name index ([#416](https://github.com/stephenberry/hdf5-pure/issues/416)).
+- `File::open_rw` creates a dataset or group inside a group that tracks **link** creation order (h5py's `track_order=True` groups, and every netCDF-4 group), each addition taking the group's next link creation index; an addition that would push the group's links past its compact-storage threshold — 8 by default — is still refused ([#422](https://github.com/stephenberry/hdf5-pure/pull/422)).
 
 ## [0.43.1] - 2026-09-03
 
