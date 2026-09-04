@@ -841,7 +841,7 @@ mod tests {
     /// A region of plain (4-byte-record) messages, the layout every writer in
     /// this crate emits.
     fn plain_region(bytes: Vec<u8>) -> crate::edit::OhRegion {
-        crate::edit::OhRegion::new(bytes, crate::edit::OhRecordLayout::PLAIN)
+        crate::edit::OhRegion::new(bytes, crate::edit::OhHeaderProps::PLAIN)
     }
 
     /// An object-reference attribute named `name` pointing at `address`.

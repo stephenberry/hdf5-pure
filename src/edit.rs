@@ -96,8 +96,11 @@
 //!   message records are walked and re-emitted, a new attribute takes the
 //!   object's next creation index, an overwrite keeps the one it had, and a
 //!   deletion leaves a gap rather than renumbering. A group that tracks **link**
-//!   creation order is read and its attributes edited, but adding or removing
-//!   one of its links is refused.
+//!   creation order works the same way: a link added to it takes the next index
+//!   from the running maximum its Link Info message records, and a deletion
+//!   leaves a gap there too. Only an addition that would send such a group's
+//!   links *dense* is refused, since the creation-order B-tree that indexes them
+//!   is not written here.
 //! - Added datasets may be contiguous *or* chunked, with any filter the
 //!   whole-file writer supports (deflate, shuffle, fletcher32, scale-offset,
 //!   LZF, ZFP), and may declare extensible (maximum, optionally unlimited)
@@ -6133,18 +6136,27 @@ impl WriteEngine {
         // rebuilds the same grouping, by the same rule, once it owns the set.
         let datasets_by_group = group_by_parent(staged.datasets.iter().map(|(p, fd)| (p, fd)));
 
-        // Changing which links a group holds is refused while it tracks *link*
-        // creation order, before anything is written.
+        // A group that tracks *link* creation order takes an addition — the
+        // apply loop numbers each added link from the running maximum its Link
+        // Info message records — up to the point the addition would send its
+        // links dense, which is refused before anything is written. The count
+        // this screens is the one the group would hold afterwards: the links it
+        // has now, less the ones this commit deletes, plus the ones it adds.
         for key in &keys {
             let node = &nodes[key];
-            let gains_a_link = !node.copies.is_empty()
-                || !node.cross_copies.is_empty()
-                || datasets_by_group.get(key).is_some_and(|d| !d.is_empty())
-                || children
-                    .get(key)
-                    .is_some_and(|kids| kids.iter().any(|child| nodes[child].is_new));
-            if gains_a_link || !node.deletes.is_empty() {
-                reject_link_creation_order(&node.base_region)?;
+            let added = node.copies.len()
+                + node.cross_copies.len()
+                + datasets_by_group.get(key).map_or(0, Vec::len)
+                + children.get(key).map_or(0, |kids| {
+                    kids.iter().filter(|child| nodes[*child].is_new).count()
+                });
+            if added > 0 {
+                let kept = node
+                    .existing_links
+                    .iter()
+                    .filter(|name| !node.deletes.contains(name))
+                    .count();
+                reject_dense_link_creation_order(&node.base_region, kept + added)?;
             }
         }
 
@@ -6513,12 +6525,20 @@ impl WriteEngine {
                 region = remove_link_from_region(&region, name)?;
             }
 
+            // Every link appended below takes the next creation index from this
+            // group's running maximum, on the groups that track link creation
+            // order and on no others; `link_order.record` writes the bumped
+            // maximum back once the last of them is placed. Read after the
+            // deletions above because a deletion leaves the maximum alone — the
+            // gap it opens is never handed out again.
+            let mut link_order = LinkCreationOrder::for_region(&region)?;
+
             // Write each staged source subtree and link its root into this group.
             // `write_copy_subtree` returns an absolute header address; the parent
             // link stores it relative to the userblock base.
             for (leaf, tree) in copies {
                 let root = self.write_copy_subtree(&tree)?;
-                region.push_link(&leaf, base.relative(root)?);
+                region.push_link(&leaf, base.relative(root)?, link_order.take()?);
             }
 
             // Datasets directly under this group. Appended addresses are absolute
@@ -6614,7 +6634,7 @@ impl WriteEngine {
                     )?
                 };
                 let oh_addr = self.alloc_or_append_typed(&oh, PageType::Meta)?;
-                region.push_link(&fd.name, base.relative(oh_addr)?);
+                region.push_link(&fd.name, base.relative(oh_addr)?, link_order.take()?);
                 let mut full = key.clone();
                 full.push(fd.name.clone());
                 path_addr.insert(full, oh_addr);
@@ -6638,11 +6658,17 @@ impl WriteEngine {
                 let child_name = child.last().unwrap();
                 let child_addr = base.relative(path_addr[child])?;
                 if nodes[child].is_new {
-                    region.push_link(child_name, child_addr);
+                    region.push_link(child_name, child_addr, link_order.take()?);
                 } else {
                     patch_link_target(&mut region, child_name, child_addr)?;
                 }
             }
+
+            // Every addition to this group is placed, so its Link Info message
+            // can record the maximum creation index it has now assigned. A group
+            // that gained no link, or that does not track the order, is left
+            // byte-identical.
+            link_order.record(&mut region)?;
 
             // Whatever this group's attribute edits left to place: a
             // variable-length attribute's heap collection, or a whole dense set.
@@ -7670,9 +7696,10 @@ impl WriteEngine {
         base: BaseAddress,
     ) -> Result<OhRegion, Error> {
         let chunks = read_oh_chunks(src, addr, base)?;
-        // Every chunk of one header shares the layout chunk 0 declared, which is
-        // what makes concatenating their records into one region well defined.
-        let mut out = OhRegion::empty(chunks[0].layout());
+        // Every chunk of one header shares what chunk 0's prefix declared, which
+        // is what makes concatenating their records into one region well defined,
+        // and what carries the prefix's optional blocks through to the rebuild.
+        let mut out = OhRegion::empty(chunks[0].props());
         for chunk in &chunks {
             let layout = chunk.layout();
             let (region, mut p) = chunk.message_region();
@@ -7714,8 +7741,11 @@ impl WriteEngine {
         for e in &entries {
             // Group-entry addresses are already stored relative to the base address,
             // matching how `encode_link_message` stores link targets — so they are
-            // re-emitted verbatim, no base conversion needed.
-            region.push_link(&e.name, e.object_header_address);
+            // re-emitted verbatim, no base conversion needed. A version 1 group
+            // records no link creation order — the mechanism arrived with the
+            // Link Info message — so these links carry no creation index, and
+            // `fresh_group_region` declares none.
+            region.push_link(&e.name, e.object_header_address, None);
             link_names.push(e.name.clone());
         }
         for m in &oh.messages {
@@ -8661,11 +8691,14 @@ impl WriteEngine {
 
         let mut layout: Option<(usize, usize)> = None; // (body offset in kept, size)
         let mut has_link_info = false;
-        let mut children: Vec<(String, u64)> = Vec::new();
+        // (name, creation index, target address) per hard link. The creation
+        // index is `None` unless the source group tracks link creation order,
+        // and is carried so a copy of one that does reproduces its order.
+        let mut children: Vec<(String, Option<u64>, u64)> = Vec::new();
         // The rebuilt chunk-0 region: every message kept verbatim except hard
         // Link messages (carried as `children`) and, when dense, the Attribute
         // Info message and inline Attribute messages (carried as `dense_attrs`).
-        let mut kept = OhRegion::empty(region.layout());
+        let mut kept = OhRegion::empty(region.props());
 
         let mut p = 0;
         while let Some((msg_type, body, body_end)) = region.next_message(p)? {
@@ -8712,8 +8745,9 @@ impl WriteEngine {
                                 LinkTarget::Hard {
                                     object_header_address,
                                 },
+                            creation_order,
                             ..
-                        }) => children.push((name, object_header_address)),
+                        }) => children.push((name, creation_order, object_header_address)),
                         _ => {
                             return Err(Error::EditUnsupported(
                                 "a group contains a soft/external link (not copyable in place yet)",
@@ -8999,7 +9033,7 @@ impl WriteEngine {
                     reject_foreign_dense_attrs(&dense_attrs.attrs)?;
                 }
                 let mut kids = Vec::with_capacity(children.len());
-                for (name, child) in children {
+                for (name, creation_order, child) in children {
                     // Child link targets are stored base-relative; re-absolutize
                     // before descending so `addr` stays an absolute offset into `src`.
                     let child = base.absolute(child).map_err(|_| {
@@ -9007,6 +9041,7 @@ impl WriteEngine {
                     })?;
                     kids.push((
                         name,
+                        creation_order,
                         Self::read_copy_subtree(src, child, depth + 1, cross_file, base)?,
                     ));
                 }
@@ -9093,10 +9128,14 @@ impl WriteEngine {
                 dense_attrs,
             } => {
                 let mut region = non_link_region.clone();
-                for (name, child) in children {
+                for (name, creation_order, child) in children {
                     let new_child = self.write_copy_subtree(child)?;
                     // The link target is stored relative to the userblock base.
-                    region.push_link(name, base.relative(new_child)?);
+                    // A copied link keeps the creation index the source recorded
+                    // for it, so a copy of a group that tracks link creation
+                    // order carries the same order as its source — the Link Info
+                    // message naming that order is copied verbatim beside it.
+                    region.push_link(name, base.relative(new_child)?, *creation_order);
                 }
                 // The dense heap is built for whatever address it is placed at
                 // (see `append_dense_attrs`), so it needs no ordering against the
@@ -10326,7 +10365,7 @@ impl WriteEngine {
                 // Child link targets are stored base-relative; re-absolutize each
                 // before descending so the recursion keeps working in absolute
                 // offsets (matching `incoming`'s keys and `oh_chunk_spans`).
-                for (_, child) in children {
+                for (_, _, child) in children {
                     if let Some(c) = base
                         .absolute(child)
                         .ok()
@@ -10685,11 +10724,11 @@ enum ObjModel {
         dense_attrs: DenseAttrSet,
     },
     /// A group: every non-link message verbatim, plus its hard-link children to
-    /// copy and re-link by name. See
+    /// copy and re-link as `(name, creation index, target address)`. See
     /// [`DatasetVerbatim`](ObjModel::DatasetVerbatim) for `dense_attrs`.
     Group {
         non_link_region: OhRegion,
-        children: Vec<(String, u64)>,
+        children: Vec<(String, Option<u64>, u64)>,
         dense_attrs: DenseAttrSet,
     },
 }
@@ -10749,12 +10788,12 @@ enum CopyTree {
         chunk_bytes: Vec<Vec<u8>>,
         dense_attrs: DenseAttrSet,
     },
-    /// A group: every non-link message verbatim, plus the (name, child) subtrees
-    /// to write first and re-link by name. See
+    /// A group: every non-link message verbatim, plus the `(name, creation
+    /// index, subtree)` children to write first and re-link by name. See
     /// [`DatasetVerbatim`](CopyTree::DatasetVerbatim) for `dense_attrs`.
     Group {
         non_link_region: OhRegion,
-        children: Vec<(String, CopyTree)>,
+        children: Vec<(String, Option<u64>, CopyTree)>,
         dense_attrs: DenseAttrSet,
     },
 }
@@ -10888,6 +10927,18 @@ impl OverwriteBytes {
 
 /// How a staged value overwrite (`write_dataset`) will be applied, decided by
 /// [`WriteEngine::prepare_write`] during the all-or-nothing preflight.
+// `allow` rather than `expect`, which is otherwise this module's habit: the lint
+// fires on a 64-bit pointer width and not on i686, where the `Vec` and `usize`
+// fields inside `MovingWrite` shrink and the variant gap falls back under
+// clippy's threshold. An `expect` is therefore unfulfilled on exactly the two
+// 32-bit CI jobs, both of which deny `unfulfilled_lint_expectations`.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing the large variant would cost more than it saves: this enum is returned by \
+              `prepare_write` and destructured at its one call site, which moves the `MovingWrite` \
+              straight into a `Vec<MovingWrite>` that stores it unboxed either way -- so a box \
+              here adds an allocation and a free without removing a single copy"
+)]
 enum WritePlan {
     /// A contiguous dataset whose new data is the same length as its existing,
     /// defined data block: overwrite the bytes straight in place at `data_addr`.
@@ -11641,8 +11692,12 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
 
     // The link message body (whose length is independent of the address) must
     // fit the object-header message's u16 size field; a pathologically long
-    // name would otherwise overflow it into silent corruption.
-    if make_link(&db.name, 0).serialize(OFFSET_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX {
+    // name would otherwise overflow it into silent corruption. Measured with a
+    // creation index present — the widest form, written into a group that tracks
+    // link creation order — since the parent group is not known here.
+    let mut sized = make_link(&db.name, 0);
+    sized.creation_order = Some(0);
+    if sized.serialize(OFFSET_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX {
         return Err(Error::EditUnsupported(
             "dataset name is too long to encode as a link message",
         ));
@@ -12336,7 +12391,7 @@ fn fresh_group_region() -> OhRegion {
     li.push(0); // flags
     li.extend_from_slice(&u64::MAX.to_le_bytes()); // fractal heap addr = UNDEF
     li.extend_from_slice(&u64::MAX.to_le_bytes()); // btree name index addr = UNDEF
-    let mut region = OhRegion::empty(OhRecordLayout::PLAIN);
+    let mut region = OhRegion::empty(OhHeaderProps::PLAIN);
     region.push(MessageType::LinkInfo, &li);
     region.push(MessageType::GroupInfo, &GROUP_INFO_BODY);
     region
@@ -12400,8 +12455,23 @@ fn ensure_attribute_info(region: &mut OhRegion) -> Result<(), Error> {
 /// Encode a complete object-header Link message (4-byte record header + body)
 /// for a hard link `name -> addr`. The caller must have validated that the body
 /// fits the u16 size field (see [`flatten_dataset`]); group names are short.
-fn encode_link_message(layout: OhRecordLayout, name: &str, addr: u64) -> Vec<u8> {
-    let body = make_link(name, addr).serialize(OFFSET_SIZE);
+///
+/// `creation_order` is the link's creation index, which a group tracking **link**
+/// creation order carries on every link and no other group carries at all
+/// ([`LinkCreationOrder`] is what hands one out). It is a flagged field of the
+/// Link message *body*, quite separate from the object header's own per-message
+/// creation index: that one records an *attribute*'s creation order, and the
+/// reference C library writes it as the zero [`OhRecordLayout::record`] passes
+/// for every other message type.
+fn encode_link_message(
+    layout: OhRecordLayout,
+    name: &str,
+    addr: u64,
+    creation_order: Option<u64>,
+) -> Vec<u8> {
+    let mut link = make_link(name, addr);
+    link.creation_order = creation_order;
+    let body = link.serialize(OFFSET_SIZE);
     layout.record(MessageType::Link, &body)
 }
 
@@ -12509,34 +12579,171 @@ fn rebuild_compact_layout_region(region: &OhRegion, raw: &[u8]) -> Result<OhRegi
     Ok(region.with_bytes(out))
 }
 
-/// Refuse to add a link to, or remove one from, a group that tracks **link**
-/// creation order.
+/// The link creation indexes one commit hands out to the links it adds to one
+/// group, and the running maximum its Link Info message ends up recording.
 ///
 /// Link creation order is a separate mechanism from the attribute creation order
-/// the object header's own flags describe: a group that tracks it carries a
-/// running maximum in its Link Info message and a creation index on every Link
-/// message, and neither this editor's Link emitter nor its Link Info handling
-/// maintains those. netCDF-4 sets it on every group it writes, so such a group
-/// is read, and its *attributes* are edited, without difficulty — but a link
-/// added without a creation index would leave `H5Literate` by creation order
-/// walking an unnumbered link, so changing the membership is refused instead
-/// (issue #416).
+/// the object header's own flags describe: a group that tracks it — h5py's
+/// `track_order=True`, `H5Pset_link_creation_order`, and every group netCDF-4
+/// writes — carries a creation index on every Link message and, in its Link Info
+/// message, the maximum it has ever assigned. The reference C library hands out
+/// that maximum and increments it (`H5G_obj_insert`), so the recorded value is
+/// the *next* index rather than the highest in use, and deleting a link never
+/// lowers it. This is the link-side counterpart of [`next_attr_creation_index`],
+/// and it works the same way.
 ///
-/// Retargeting an existing link ([`patch_link_target`], how a relocated child is
-/// rewired) changes no creation order and is not refused.
-fn reject_link_creation_order(region: &OhRegion) -> Result<(), Error> {
+/// A group that does not track the order has no maximum recorded, hands out no
+/// index, and records nothing back — which is every group this crate writes
+/// itself.
+struct LinkCreationOrder {
+    /// The next index to assign, on a group that tracks link creation order.
+    next: Option<u64>,
+    /// Whether any index has been handed out. Nothing is recorded back
+    /// otherwise, so a commit that adds no link to the group leaves its Link
+    /// Info message byte-identical.
+    assigned: bool,
+}
+
+impl LinkCreationOrder {
+    /// Read a group's counter out of its object-header message `region`.
+    fn for_region(region: &OhRegion) -> Result<Self, Error> {
+        let next = find_link_info(region)?.and_then(|(_, _, info)| info.max_creation_order);
+        Ok(Self {
+            next,
+            assigned: false,
+        })
+    }
+
+    /// The creation index for one link being added, or `None` on a group that
+    /// does not track the order. Consecutive calls return consecutive indexes,
+    /// so links added in one commit are ordered by the order they are placed in.
+    fn take(&mut self) -> Result<Option<u64>, Error> {
+        let Some(index) = self.next else {
+            return Ok(None);
+        };
+        self.next = Some(index.checked_add(1).ok_or(Error::EditUnsupported(
+            "a group has assigned every link creation index its link-info message can record",
+        ))?);
+        self.assigned = true;
+        Ok(Some(index))
+    }
+
+    /// Write the running maximum back into the group's Link Info message, once
+    /// every link this commit adds to that group has taken an index.
+    ///
+    /// The maximum is patched in place rather than re-encoded: it is present
+    /// (that is what [`Self::for_region`] read) and it is the eight bytes
+    /// following the message's version and flags whatever the file's offset
+    /// size, so the record's length — and every offset into the region — is
+    /// unchanged.
+    fn record(&self, region: &mut OhRegion) -> Result<(), Error> {
+        if !self.assigned {
+            return Ok(());
+        }
+        let Some(next) = self.next else {
+            return Ok(());
+        };
+        let (_, body, _) = find_link_info(region)?.ok_or(Error::EditUnsupported(
+            "a group's link-info message went missing while its links were being added",
+        ))?;
+        let max = body.start + 2..body.start + 10;
+        if max.end > body.end {
+            return Err(Error::EditUnsupported(
+                "a group's link-info message is too short to record its link creation order",
+            ));
+        }
+        region.bytes_mut()[max].copy_from_slice(&next.to_le_bytes());
+        Ok(())
+    }
+}
+
+/// The Link Info message in `region`, as `(record start, body range, parsed
+/// message)`. An unparseable message is reported as absent, the same reading
+/// [`find_attribute_info`] gives an unparseable Attribute Info message — safe
+/// here because a group whose link storage this editor cannot account for is
+/// refused by [`inspect_group`](WriteEngine::inspect_group) before it reaches
+/// this.
+fn find_link_info(
+    region: &OhRegion,
+) -> Result<Option<(usize, core::ops::Range<usize>, LinkInfoMessage)>, Error> {
     let mut p = 0;
     while let Some((msg_type, body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::LinkInfo
             && let Ok(info) = LinkInfoMessage::parse(&region[body..body_end], OFFSET_SIZE)
-            && info.max_creation_order.is_some()
         {
-            return Err(Error::EditUnsupported(
-                "a group on the edited path tracks link creation order; its links cannot be \
-                 added to or removed in place yet",
-            ));
+            return Ok(Some((p, body..body_end, info)));
         }
         p = body_end;
+    }
+    Ok(None)
+}
+
+/// The number of links a group keeps in its object header before they move into
+/// a fractal heap: the "maximum compact value" its Group Info message (type
+/// 0x000A) declares, or the reference C library's default of 8 where that
+/// message stores no link-phase-change values.
+///
+/// Body: version(1), flags(1), then the maximum compact (2) and minimum dense
+/// (2) values if bit 0 of the flags is set, then the estimated entry count (2)
+/// and name length (2) if bit 1 is. An absent or truncated message reads as the
+/// default, which is the value the C library itself would use for it.
+///
+/// Not to be confused with [`AttrPhaseChange`], the *attribute* thresholds
+/// (`H5Pset_attr_phase_change`) that live in the object header's own prefix:
+/// this is the *link* phase change, it lives in a message, and it is what
+/// [`reject_dense_link_creation_order`] measures an addition against.
+fn max_compact_links(region: &OhRegion) -> Result<u16, Error> {
+    /// `H5G_CRT_GINFO_MAX_COMPACT`, the C library's default.
+    const DEFAULT_MAX_COMPACT: u16 = 8;
+    let mut p = 0;
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
+        if msg_type == MessageType::GroupInfo {
+            let stores_phase_change = body_end - body >= 2 && region[body + 1] & 0x01 != 0;
+            if stores_phase_change && body + 4 <= body_end {
+                return Ok(u16::from_le_bytes([region[body + 2], region[body + 3]]));
+            }
+            return Ok(DEFAULT_MAX_COMPACT);
+        }
+        p = body_end;
+    }
+    Ok(DEFAULT_MAX_COMPACT)
+}
+
+/// Refuse to add a link to a group that tracks **link** creation order when the
+/// addition would move that group's links into *dense* (fractal-heap) storage.
+///
+/// `links_after_commit` is how many links the group would hold once this commit's
+/// deletions and additions are applied. Past the threshold its Group Info message
+/// declares, the reference C library moves a tracked group's links into a fractal
+/// heap indexed by *two* B-trees: one on name, and a type 6 one on creation
+/// order. This crate emits neither, so the point where the group would stop
+/// being compact is the point where an addition stops being reproducible — that
+/// work belongs with dense link storage as a whole (issue #102).
+///
+/// Below the threshold an addition is written rather than refused
+/// ([`LinkCreationOrder`] numbers it), as are the two things that write no
+/// creation order at all: **removing** a link, which leaves a gap in the order
+/// exactly as dropping an Attribute message does and copies the running maximum
+/// through untouched (the C library does not lower it on a deletion either), and
+/// **retargeting** one ([`patch_link_target`], how a relocated child is rewired),
+/// which rewrites an address inside a Link message and leaves every other field
+/// of it, creation index included, where it was.
+///
+/// A group whose links are *already* dense never reaches here at all:
+/// [`inspect_group`](WriteEngine::inspect_group) refuses every dense-link group,
+/// tracked or not, as it reads the header.
+fn reject_dense_link_creation_order(
+    region: &OhRegion,
+    links_after_commit: usize,
+) -> Result<(), Error> {
+    let tracked =
+        find_link_info(region)?.is_some_and(|(_, _, info)| info.max_creation_order.is_some());
+    if tracked && links_after_commit > usize::from(max_compact_links(region)?) {
+        return Err(Error::EditUnsupported(
+            "a group on the edited path tracks link creation order, and the links this commit \
+             adds to it would take it past the compact storage its group-info message allows; \
+             dense (fractal-heap) link storage cannot be written in place yet",
+        ));
     }
     Ok(())
 }
@@ -13448,15 +13655,17 @@ pub(crate) fn rewrite_extension_region_bytes(
 /// `prefix` holds the bytes at `[addr, addr + prefix.len())` — up to
 /// [`OH_PREFIX_MAX`], fewer when the header sits near the end of the image — and
 /// `file_len` is the length of the image the header lives in, which bounds the
-/// region. Rejects headers that are not OHDR v2. The record layout the flags
-/// byte declares is returned with the region, since a header that tracks
-/// attribute creation order carries 6-byte message records and every walk of
-/// this region has to step by that width.
+/// region. Rejects headers that are not OHDR v2. Everything the prefix declares
+/// ([`OhHeaderProps`]) is returned with the region: the record layout, because a
+/// header that tracks attribute creation order carries 6-byte message records
+/// and every walk of this region has to step by that width, and the two optional
+/// blocks, because nothing below the prefix records them and a rebuild has to
+/// put them back.
 fn oh_region_at(
     prefix: &[u8],
     addr: u64,
     file_len: u64,
-) -> Result<(u64, u64, OhRecordLayout), Error> {
+) -> Result<(u64, u64, OhHeaderProps), Error> {
     if prefix.len() < 6 || &prefix[..4] != b"OHDR" || prefix[4] != 2 {
         return Err(Error::EditUnsupported(
             "an object does not use a version 2 object header",
@@ -13465,12 +13674,31 @@ fn oh_region_at(
     let flags = prefix[5];
     let layout = OhRecordLayout::from_header_flags(flags);
     let mut pos = 6usize;
-    if flags & 0x20 != 0 {
-        pos += 16; // optional timestamps
-    }
-    if flags & 0x10 != 0 {
-        pos += 4; // optional attribute phase-change thresholds
-    }
+    let mut take = |len: usize| -> Result<usize, Error> {
+        let at = pos;
+        pos += len;
+        if prefix.len() < pos {
+            return Err(Error::EditUnsupported("truncated object header"));
+        }
+        Ok(at)
+    };
+    let times = if flags & OH_FLAG_STORE_TIMES != 0 {
+        let at = take(ObjectTimes::LEN)?;
+        Some(ObjectTimes::parse(prefix, at))
+    } else {
+        None
+    };
+    let attr_phase_change = if flags & OH_FLAG_ATTR_PHASE_CHANGE != 0 {
+        let at = take(AttrPhaseChange::LEN)?;
+        Some(AttrPhaseChange::parse(prefix, at))
+    } else {
+        None
+    };
+    let props = OhHeaderProps {
+        layout,
+        times,
+        attr_phase_change,
+    };
     let size_width = match flags & 0x03 {
         0 => 1usize,
         1 => 2,
@@ -13490,7 +13718,7 @@ fn oh_region_at(
         .checked_add(chunk0_size)
         .filter(|e| e.checked_add(4).is_some_and(|end| end <= file_len))
         .ok_or(Error::EditUnsupported("truncated object header"))?;
-    Ok((region_start, region_end, layout))
+    Ok((region_start, region_end, props))
 }
 
 /// One chunk of a version 2 object header, read out of a file image.
@@ -13506,9 +13734,9 @@ pub(crate) struct OhChunk {
     buf: Vec<u8>,
     /// Offset of the first message within [`buf`](Self::buf).
     messages_start: usize,
-    /// The record layout chunk 0 of this header declared, which every chunk of
+    /// What chunk 0 of this header declared in its prefix, which every chunk of
     /// the header shares.
-    layout: OhRecordLayout,
+    props: OhHeaderProps,
 }
 
 impl OhChunk {
@@ -13521,7 +13749,12 @@ impl OhChunk {
 
     /// The record layout to walk [`message_region`](Self::message_region) in.
     pub(crate) fn layout(&self) -> OhRecordLayout {
-        self.layout
+        self.props.layout
+    }
+
+    /// Everything this header's chunk-0 prefix declared.
+    pub(crate) fn props(&self) -> OhHeaderProps {
+        self.props
     }
 }
 
@@ -13533,7 +13766,7 @@ fn read_oh_chunk0<S: Source + ?Sized>(src: &S, addr: u64) -> Result<OhChunk, Err
         .min(OH_PREFIX_MAX as u64)
         .to_usize()?;
     let prefix = src.read_metadata_at(addr, window)?;
-    let (rs, re, layout) = oh_region_at(&prefix, addr, file_len)?;
+    let (rs, re, props) = oh_region_at(&prefix, addr, file_len)?;
     // `re >= rs > addr`, so both differences are non-negative, and `oh_region_at`
     // has checked that the 4-byte checksum past `re` is present.
     let len = (re - addr).to_usize()?;
@@ -13541,7 +13774,7 @@ fn read_oh_chunk0<S: Source + ?Sized>(src: &S, addr: u64) -> Result<OhChunk, Err
         span: (addr, len as u64 + 4),
         buf: src.read_metadata_at(addr, len)?,
         messages_start: (rs - addr).to_usize()?,
-        layout,
+        props,
     })
 }
 
@@ -13568,12 +13801,13 @@ pub(crate) fn read_oh_chunks<S: Source + ?Sized>(
         // Collect this chunk's continuations before extending the worklist, so the
         // borrow of `chunks[i]` ends first.
         let mut found = Vec::new();
-        let layout = chunks[i].layout();
+        let props = chunks[i].props();
+        let layout = props.layout;
         let (region, mut p) = chunks[i].message_region();
         while let Some((msg_type, body, body_end)) = layout.next_message(region, p)? {
             if msg_type == MessageType::ObjectHeaderContinuation {
                 found.push(read_oh_continuation(
-                    src, region, body, body_end, base, layout,
+                    src, region, body, body_end, base, props,
                 )?);
             }
             p = body_end;
@@ -13594,7 +13828,7 @@ fn read_oh_continuation<S: Source + ?Sized>(
     body: usize,
     body_end: usize,
     base: BaseAddress,
-    layout: OhRecordLayout,
+    props: OhHeaderProps,
 ) -> Result<OhChunk, Error> {
     if body_end - body < (OFFSET_SIZE + LENGTH_SIZE) as usize {
         return Err(Error::EditUnsupported("malformed continuation message"));
@@ -13626,7 +13860,7 @@ fn read_oh_continuation<S: Source + ?Sized>(
         span: (off, len),
         buf,
         messages_start: 4,
-        layout,
+        props,
     })
 }
 
@@ -13663,6 +13897,183 @@ const OH_FLAG_CREATION_ORDER_TRACKED: u8 = 0x04;
 /// tracked, so dense attribute storage carries a creation-order B-tree beside
 /// its name index.
 const OH_FLAG_CREATION_ORDER_INDEXED: u8 = 0x08;
+
+/// Object header flags bit 4: the header prefix carries the attribute
+/// phase-change thresholds (`H5O_HDR_ATTR_STORE_PHASE_CHANGE`).
+const OH_FLAG_ATTR_PHASE_CHANGE: u8 = 0x10;
+
+/// Object header flags bit 5: the header prefix carries the four access,
+/// modification, change and birth timestamps (`H5O_HDR_STORE_TIMES`).
+const OH_FLAG_STORE_TIMES: u8 = 0x20;
+
+/// The four timestamps a version 2 object header stores when
+/// [`OH_FLAG_STORE_TIMES`] is set, each 4 bytes of seconds since the Unix epoch
+/// and stored in this order.
+///
+/// The reference C library stores them on **every** version 2 header it writes:
+/// `H5O_CRT_OHDR_FLAGS_DEF` is `H5O_HDR_STORE_TIMES`, so a header from libhdf5,
+/// h5py or netCDF-4 carries all four, and `H5Oget_info` reads them straight out
+/// of this block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ObjectTimes {
+    access: u32,
+    modification: u32,
+    change: u32,
+    birth: u32,
+}
+
+impl ObjectTimes {
+    /// Bytes this block occupies in a header prefix.
+    const LEN: usize = 16;
+
+    /// Parse the block at `at`. The caller must have checked that 16 bytes are
+    /// available there.
+    fn parse(prefix: &[u8], at: usize) -> Self {
+        let field =
+            |i: usize| u32::from_le_bytes(prefix[at + 4 * i..at + 4 * i + 4].try_into().unwrap());
+        Self {
+            access: field(0),
+            modification: field(1),
+            change: field(2),
+            birth: field(3),
+        }
+    }
+
+    /// The block's on-disk bytes.
+    fn to_bytes(self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..4].copy_from_slice(&self.access.to_le_bytes());
+        out[4..8].copy_from_slice(&self.modification.to_le_bytes());
+        out[8..12].copy_from_slice(&self.change.to_le_bytes());
+        out[12..16].copy_from_slice(&self.birth.to_le_bytes());
+        out
+    }
+
+    /// The same times with the modification and change times moved to `now`.
+    /// The access and birth times are the object's own history and are left
+    /// where they were.
+    ///
+    /// The reference C library's `H5O_touch_oh` reaches the same two-of-four
+    /// shape by a different pair: on a version 2 header it writes
+    /// `oh->atime = oh->ctime = now` and carries a source comment saying the
+    /// modification time still needs code to update. A rewrite is a
+    /// modification, and it is not an *access*, so this writes the field that
+    /// says so; both agree on the change time, and neither disturbs the birth
+    /// time.
+    fn touched(self, now: u32) -> Self {
+        Self {
+            modification: now,
+            change: now,
+            ..self
+        }
+    }
+}
+
+/// The attribute phase-change thresholds a version 2 object header stores when
+/// [`OH_FLAG_ATTR_PHASE_CHANGE`] is set: `H5Pset_attr_phase_change`'s maximum
+/// number of attributes kept compact (in the header) and minimum kept dense (in
+/// a fractal heap).
+///
+/// The reference C library writes this block only when the pair differs from its
+/// defaults of 8 and 6, so most headers carry no such block at all. Preserved
+/// verbatim: this editor's own compact/dense decision still uses
+/// [`MAX_COMPACT_ATTRS`], so a non-default pair survives a rewrite without yet
+/// steering it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttrPhaseChange {
+    max_compact: u16,
+    min_dense: u16,
+}
+
+impl AttrPhaseChange {
+    /// Bytes this block occupies in a header prefix.
+    const LEN: usize = 4;
+
+    /// Parse the block at `at`. The caller must have checked that 4 bytes are
+    /// available there.
+    fn parse(prefix: &[u8], at: usize) -> Self {
+        Self {
+            max_compact: u16::from_le_bytes(prefix[at..at + 2].try_into().unwrap()),
+            min_dense: u16::from_le_bytes(prefix[at + 2..at + 4].try_into().unwrap()),
+        }
+    }
+
+    /// The block's on-disk bytes.
+    fn to_bytes(self) -> [u8; Self::LEN] {
+        let mut out = [0u8; Self::LEN];
+        out[0..2].copy_from_slice(&self.max_compact.to_le_bytes());
+        out[2..4].copy_from_slice(&self.min_dense.to_le_bytes());
+        out
+    }
+}
+
+/// Everything chunk 0's prefix declares about a version 2 object header: the
+/// record layout its messages are written in, and the two optional blocks the
+/// prefix itself may carry.
+///
+/// All of it is a property of the *header*, shared by chunk 0 and every
+/// continuation block, and none of it can be re-derived from the message bytes —
+/// so it travels beside them ([`OhRegion`]) from the parse right through to the
+/// rebuild. A rewrite that dropped the optional blocks would silently zero every
+/// timestamp `H5Oget_info` reports on a file the C library wrote, and reset the
+/// phase-change thresholds a caller set with `H5Pset_attr_phase_change`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OhHeaderProps {
+    /// How wide a message record prefix is, and whether creation order is
+    /// tracked and indexed.
+    layout: OhRecordLayout,
+    /// The access/modification/change/birth block, where the header stores one.
+    times: Option<ObjectTimes>,
+    /// The compact/dense attribute thresholds, where the header stores them.
+    attr_phase_change: Option<AttrPhaseChange>,
+}
+
+impl OhHeaderProps {
+    /// 4-byte records, no creation order, and neither optional block: what this
+    /// crate's whole-file writer emits, and what a header this editor creates
+    /// from nothing uses.
+    pub(crate) const PLAIN: Self = Self::with_layout(OhRecordLayout::PLAIN);
+
+    /// A header in `layout` carrying neither optional block.
+    pub(crate) const fn with_layout(layout: OhRecordLayout) -> Self {
+        Self {
+            layout,
+            times: None,
+            attr_phase_change: None,
+        }
+    }
+
+    /// The object-header flag bits these properties imply, above the two size
+    /// bits the emitter chooses from the region's length.
+    const fn header_flags(self) -> u8 {
+        let times = if self.times.is_some() {
+            OH_FLAG_STORE_TIMES
+        } else {
+            0
+        };
+        let phase = if self.attr_phase_change.is_some() {
+            OH_FLAG_ATTR_PHASE_CHANGE
+        } else {
+            0
+        };
+        self.layout.header_flags() | times | phase
+    }
+
+    /// Bytes the optional blocks add to the header prefix.
+    const fn optional_len(self) -> usize {
+        let times = if self.times.is_some() {
+            ObjectTimes::LEN
+        } else {
+            0
+        };
+        let phase = if self.attr_phase_change.is_some() {
+            AttrPhaseChange::LEN
+        } else {
+            0
+        };
+        times + phase
+    }
+}
 
 impl OhRecordLayout {
     /// 4-byte record prefixes and no creation order at all: what this crate's
@@ -13796,7 +14207,7 @@ impl OhRecordLayout {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OhRegion {
     bytes: Vec<u8>,
-    layout: OhRecordLayout,
+    props: OhHeaderProps,
 }
 
 impl core::ops::Deref for OhRegion {
@@ -13807,24 +14218,30 @@ impl core::ops::Deref for OhRegion {
 }
 
 impl OhRegion {
-    /// A region of `bytes` whose records are written in `layout`.
-    pub(crate) fn new(bytes: Vec<u8>, layout: OhRecordLayout) -> Self {
-        Self { bytes, layout }
+    /// A region of `bytes` belonging to a header with these `props`.
+    pub(crate) fn new(bytes: Vec<u8>, props: OhHeaderProps) -> Self {
+        Self { bytes, props }
     }
 
-    /// An empty region in `layout`, to be filled record by record.
-    fn empty(layout: OhRecordLayout) -> Self {
-        Self::new(Vec::new(), layout)
+    /// An empty region for a header with these `props`, to be filled record by
+    /// record.
+    fn empty(props: OhHeaderProps) -> Self {
+        Self::new(Vec::new(), props)
     }
 
-    /// The same header's layout over different bytes: what every rewriter that
-    /// copies a region message by message returns.
+    /// The same header's properties over different bytes: what every rewriter
+    /// that copies a region message by message returns.
     fn with_bytes(&self, bytes: Vec<u8>) -> Self {
-        Self::new(bytes, self.layout)
+        Self::new(bytes, self.props)
     }
 
     pub(crate) fn layout(&self) -> OhRecordLayout {
-        self.layout
+        self.props.layout
+    }
+
+    /// Everything the header's prefix declares, which a rebuild re-emits.
+    pub(crate) fn props(&self) -> OhHeaderProps {
+        self.props
     }
 
     /// [`OhRecordLayout::next_message`] over this region's own bytes.
@@ -13832,13 +14249,13 @@ impl OhRegion {
         &self,
         p: usize,
     ) -> Result<Option<(MessageType, usize, usize)>, Error> {
-        self.layout.next_message(&self.bytes, p)
+        self.props.layout.next_message(&self.bytes, p)
     }
 
     /// The creation index of the record at `msg_start`, or `None` for a header
     /// that does not track it.
     fn creation_index(&self, msg_start: usize) -> Option<u16> {
-        self.layout.creation_index(&self.bytes, msg_start)
+        self.props.layout.creation_index(&self.bytes, msg_start)
     }
 
     /// Append one already-encoded record (or run of records) written in this
@@ -13853,16 +14270,19 @@ impl OhRegion {
         &mut self.bytes
     }
 
-    /// Append a hard Link message record for `name -> addr`.
-    fn push_link(&mut self, name: &str, addr: u64) {
-        let record = encode_link_message(self.layout, name, addr);
+    /// Append a hard Link message record for `name -> addr`, carrying
+    /// `creation_order` where the group tracks link creation order and `None`
+    /// where it does not (see [`LinkCreationOrder`], which is what decides
+    /// which).
+    fn push_link(&mut self, name: &str, addr: u64, creation_order: Option<u64>) {
+        let record = encode_link_message(self.props.layout, name, addr, creation_order);
         self.push_bytes(&record);
     }
 
     /// Append a message record for `body`, with the zero creation index the
     /// reference C library writes for every non-attribute message.
     fn push(&mut self, msg_type: MessageType, body: &[u8]) {
-        let record = self.layout.record(msg_type, body);
+        let record = self.props.layout.record(msg_type, body);
         self.push_bytes(&record);
     }
 
@@ -13873,7 +14293,7 @@ impl OhRegion {
     /// decoding it, so it travels with the bytes: a rewrite that dropped it
     /// would leave a reference to be read as content.
     fn push_shared(&mut self, msg_type: MessageType, reference: &[u8]) {
-        let mut record = self.layout.record(msg_type, reference);
+        let mut record = self.props.layout.record(msg_type, reference);
         record[3] = MSG_FLAG_SHARED;
         self.push_bytes(&record);
     }
@@ -14320,7 +14740,7 @@ fn screen_copied_references(
             }
         }
         CopyTree::Group { children, .. } => {
-            for (_, child) in children {
+            for (_, _, child) in children {
                 screen_copied_references(child, invalidated, src)?;
             }
         }
@@ -14356,6 +14776,22 @@ pub(crate) fn build_v2_object_header(region: &OhRegion) -> Result<Vec<u8>, Error
 
 /// [`build_v2_object_header`] without the attribute-storage normalization, for
 /// the region that function has already normalized.
+///
+/// **The header's optional prefix blocks are re-emitted, and its timestamps are
+/// stamped.** A region carries whatever chunk 0's prefix declared
+/// ([`OhHeaderProps`]), so a rewrite of a header from the reference C library,
+/// h5py or netCDF-4 puts its four timestamps and any attribute phase-change
+/// thresholds back where it found them, with the flag bits that announce them.
+///
+/// Of those, the **modification and change times are moved to now**: this
+/// function runs once per rebuilt header, and every rebuild is a modification.
+/// Access and birth times are the object's own history and are copied verbatim
+/// ([`ObjectTimes::touched`] says how that compares with `H5O_touch_oh`).
+/// Under `no_std` there is no clock to read, so all four are preserved as they
+/// were rather than zeroed — a stale modification time being the honest reading
+/// of "this build cannot tell the time", where a zero would claim the epoch.
+/// A header this crate creates from nothing stores no times at all, so nothing
+/// here applies to it.
 fn build_v2_object_header_verbatim(region: &OhRegion) -> Vec<u8> {
     let total = region.len();
     let (size_flags, width) = if total <= 255 {
@@ -14365,13 +14801,25 @@ fn build_v2_object_header_verbatim(region: &OhRegion) -> Vec<u8> {
     } else {
         (2u8, 4)
     };
-    // The creation-order bits are the header's own claim about the records
-    // below, so they come from the layout those records were written in.
-    let flags = size_flags | region.layout().header_flags();
-    let mut buf = Vec::with_capacity(8 + total + 4);
+    let props = region.props();
+    // The creation-order bits and the two optional-block bits are the header's
+    // own claim about what follows, so they come from the properties the region
+    // was parsed with.
+    let flags = size_flags | props.header_flags();
+    let mut buf = Vec::with_capacity(8 + props.optional_len() + total + 4);
     buf.extend_from_slice(b"OHDR");
     buf.push(2); // version
     buf.push(flags);
+    if let Some(times) = props.times {
+        let stamped = match unix_time_now() {
+            Some(now) => times.touched(now),
+            None => times,
+        };
+        buf.extend_from_slice(&stamped.to_bytes());
+    }
+    if let Some(phase) = props.attr_phase_change {
+        buf.extend_from_slice(&phase.to_bytes());
+    }
     #[expect(
         clippy::cast_possible_truncation,
         reason = "width was selected just above to be the smallest field that holds total"
@@ -14385,6 +14833,29 @@ fn build_v2_object_header_verbatim(region: &OhRegion) -> Vec<u8> {
     let checksum = jenkins_lookup3(&buf);
     buf.extend_from_slice(&checksum.to_le_bytes());
     buf
+}
+
+/// Seconds since the Unix epoch, for the object-header timestamps a rebuild
+/// stamps, or `None` where this build has no clock.
+///
+/// The crate carries no other wall-clock reader: every other date it writes
+/// comes from its caller. `no_std` builds have no `SystemTime` at all and return
+/// `None`, and so does a `std` build whose clock is set before 1970 — neither is
+/// a reason to fail a commit, so both leave the header's stored times alone (see
+/// [`build_v2_object_header_verbatim`]). The 4-byte field saturates rather than
+/// wrapping, which matters only past 2106.
+#[cfg(feature = "std")]
+fn unix_time_now() -> Option<u32> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
+}
+
+/// No wall clock outside `std`; see the `std` definition.
+#[cfg(not(feature = "std"))]
+fn unix_time_now() -> Option<u32> {
+    None
 }
 
 /// Read a little-endian unsigned integer of `bytes.len()` (≤ 8) bytes.
@@ -14591,7 +15062,7 @@ mod tests {
     /// A region of plain (4-byte-record) messages, the layout every writer in
     /// this crate emits.
     fn plain_region(bytes: Vec<u8>) -> OhRegion {
-        OhRegion::new(bytes, OhRecordLayout::PLAIN)
+        OhRegion::new(bytes, OhHeaderProps::PLAIN)
     }
 
     /// A header region holding one attribute inline.
@@ -17013,6 +17484,179 @@ mod tests {
         }
     }
 
+    /// A group header region that tracks link creation order: a Link Info
+    /// message recording `max` as the next index it would hand out (with the
+    /// creation-order *index* declared when `indexed`, as h5py's
+    /// `track_order=True` does), a Group Info message, and one compact Link
+    /// message per name in `links`, numbered from zero.
+    fn link_tracked_region(max: u64, indexed: bool, links: &[&str]) -> OhRegion {
+        let mut li = vec![0u8, if indexed { 0x03 } else { 0x01 }];
+        li.extend_from_slice(&max.to_le_bytes());
+        li.extend_from_slice(&u64::MAX.to_le_bytes()); // fractal heap: compact
+        li.extend_from_slice(&u64::MAX.to_le_bytes()); // b-tree name index
+        if indexed {
+            li.extend_from_slice(&u64::MAX.to_le_bytes()); // b-tree creation order
+        }
+        let mut region = OhRegion::empty(OhHeaderProps::PLAIN);
+        region.push(MessageType::LinkInfo, &li);
+        region.push(MessageType::GroupInfo, &GROUP_INFO_BODY);
+        for (i, name) in links.iter().enumerate() {
+            region.push_link(name, 0x100 + i as u64, Some(i as u64));
+        }
+        region
+    }
+
+    /// Every Link message in `region`, as `(name, creation index)`.
+    fn region_links(region: &OhRegion) -> Vec<(String, Option<u64>)> {
+        let mut out = Vec::new();
+        let mut p = 0;
+        while let Some((mt, body, end)) = region.next_message(p).unwrap() {
+            if mt == MessageType::Link {
+                let link = LinkMessage::parse(&region[body..end], OFFSET_SIZE).unwrap();
+                out.push((link.name, link.creation_order));
+            }
+            p = end;
+        }
+        out
+    }
+
+    /// The maximum creation index `region`'s Link Info message records.
+    fn recorded_link_max(region: &OhRegion) -> Option<u64> {
+        find_link_info(region)
+            .unwrap()
+            .and_then(|(_, _, info)| info.max_creation_order)
+    }
+
+    #[test]
+    fn links_added_to_a_tracked_group_take_consecutive_creation_indexes() {
+        // A group that has handed out three indexes numbers the next two links
+        // 3 and 4, in the order they are placed, and its Link Info message ends
+        // up recording 5 — the next index, not the highest in use.
+        let mut region = link_tracked_region(3, false, &["a", "b", "c"]);
+        let mut order = LinkCreationOrder::for_region(&region).unwrap();
+        region.push_link("d", 0x200, order.take().unwrap());
+        region.push_link("e", 0x300, order.take().unwrap());
+        order.record(&mut region).unwrap();
+
+        assert_eq!(
+            region_links(&region),
+            vec![
+                ("a".to_string(), Some(0)),
+                ("b".to_string(), Some(1)),
+                ("c".to_string(), Some(2)),
+                ("d".to_string(), Some(3)),
+                ("e".to_string(), Some(4)),
+            ],
+        );
+        assert_eq!(recorded_link_max(&region), Some(5));
+    }
+
+    #[test]
+    fn a_tracked_group_resumes_past_a_gap_a_deletion_left() {
+        // Two links of three deleted, so the surviving link is index 1 and the
+        // recorded maximum still says 3: the addition takes 3, not one of the
+        // indexes the deletions freed.
+        let region = link_tracked_region(3, false, &["a", "b", "c"]);
+        let mut region = remove_link_from_region(&region, "a").unwrap();
+        region = remove_link_from_region(&region, "c").unwrap();
+        let mut order = LinkCreationOrder::for_region(&region).unwrap();
+        region.push_link("d", 0x200, order.take().unwrap());
+        order.record(&mut region).unwrap();
+
+        assert_eq!(
+            region_links(&region),
+            vec![("b".to_string(), Some(1)), ("d".to_string(), Some(3))],
+        );
+        assert_eq!(recorded_link_max(&region), Some(4));
+    }
+
+    #[test]
+    fn a_creation_order_index_shifts_no_field_the_maximum_is_written_into() {
+        // A group that also declares the creation-order *index* (h5py's
+        // `track_order=True`) has a longer Link Info body with a third address
+        // in it. The maximum still precedes every address, so the patch lands on
+        // it and leaves the three addresses undefined.
+        let mut region = link_tracked_region(1, true, &["a"]);
+        let mut order = LinkCreationOrder::for_region(&region).unwrap();
+        region.push_link("b", 0x200, order.take().unwrap());
+        order.record(&mut region).unwrap();
+
+        let (_, _, info) = find_link_info(&region).unwrap().unwrap();
+        assert_eq!(info.max_creation_order, Some(2));
+        assert_eq!(info.fractal_heap_address, None);
+        assert_eq!(info.btree_name_index_address, None);
+        assert_eq!(info.btree_creation_order_address, None);
+        assert_eq!(region_links(&region).last().unwrap().1, Some(1));
+    }
+
+    #[test]
+    fn an_untracked_group_numbers_none_of_its_links() {
+        // The groups this crate writes itself: no maximum recorded, so no link
+        // carries a creation index and the Link Info message is left as it was.
+        let mut region = fresh_group_region();
+        let before = region.clone();
+        let mut order = LinkCreationOrder::for_region(&region).unwrap();
+        assert_eq!(order.take().unwrap(), None);
+        region.push_link("d", 0x200, None);
+        order.record(&mut region).unwrap();
+
+        assert_eq!(region_links(&region), vec![("d".to_string(), None)]);
+        assert_eq!(recorded_link_max(&region), None);
+        // Only the appended link is new; every message that was there is
+        // untouched.
+        assert_eq!(&region[..before.len()], &*before);
+    }
+
+    #[test]
+    fn a_tracked_group_that_gains_no_link_keeps_its_maximum_byte_for_byte() {
+        // A commit that only deletes, or only edits attributes, must not bump
+        // the counter — the gap it leaves is never handed out again.
+        let region = link_tracked_region(3, false, &["a", "b", "c"]);
+        let mut after = remove_link_from_region(&region, "b").unwrap();
+        let order = LinkCreationOrder::for_region(&after).unwrap();
+        let before = after.clone();
+        order.record(&mut after).unwrap();
+        assert_eq!(*after, *before);
+        assert_eq!(recorded_link_max(&after), Some(3));
+    }
+
+    #[test]
+    fn max_compact_links_reads_the_declared_threshold_or_the_library_default() {
+        // A minimal Group Info message stores no link-phase-change values, so
+        // the C library's default of 8 applies.
+        assert_eq!(max_compact_links(&fresh_group_region()).unwrap(), 8);
+
+        // One that stores them (flags bit 0) declares its own maximum compact
+        // value in the two bytes after the flags.
+        let mut gi = vec![0u8, 0x01];
+        gi.extend_from_slice(&4u16.to_le_bytes()); // max compact
+        gi.extend_from_slice(&2u16.to_le_bytes()); // min dense
+        let mut region = OhRegion::empty(OhHeaderProps::PLAIN);
+        region.push(MessageType::GroupInfo, &gi);
+        assert_eq!(max_compact_links(&region).unwrap(), 4);
+    }
+
+    #[test]
+    fn a_tracked_group_is_refused_only_where_the_addition_would_go_dense() {
+        // Eight links is the default threshold, so a group holding seven takes
+        // one more and is refused the second.
+        let region = link_tracked_region(7, false, &["a", "b", "c", "d", "e", "f", "g"]);
+        reject_dense_link_creation_order(&region, 8).expect("eight links still store compactly");
+        let err = reject_dense_link_creation_order(&region, 9).unwrap_err();
+        assert!(
+            matches!(&err, Error::EditUnsupported(m) if m.contains("link creation order")
+                && m.contains("dense")),
+            "got: {err}",
+        );
+
+        // A group that does not track the order is not screened at all: this
+        // crate writes more than eight compact links routinely.
+        let mut untracked = fresh_group_region();
+        untracked.push_link("a", 0x100, None);
+        reject_dense_link_creation_order(&untracked, 99)
+            .expect("an untracked group has no creation order to lose");
+    }
+
     #[test]
     fn ensure_group_info_is_idempotent() {
         // A region that already has a Group Info message is left untouched, so
@@ -17116,7 +17760,7 @@ mod tests {
     /// decodes the reference as the attribute it stands for.
     #[test]
     fn a_rewrapped_shared_message_keeps_its_flag() {
-        let mut region = OhRegion::empty(OhRecordLayout::PLAIN);
+        let mut region = OhRegion::empty(OhHeaderProps::PLAIN);
         region.push_shared(MessageType::Attribute, &[3, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(region[3], MSG_FLAG_SHARED);
         assert!(region_has_shared_attr(&region).unwrap());
@@ -17154,10 +17798,17 @@ mod tests {
             .serialize(LENGTH_SIZE)
     }
 
-    /// A region in `layout` holding one Attribute message per `(name, creation
-    /// index)`, preceded by the Attribute Info message a tracked object carries.
+    /// [`attr_region_in`] for a header carrying neither optional prefix block.
     fn attr_region(layout: OhRecordLayout, attrs: &[(&str, u16)], max: u16) -> OhRegion {
-        let mut region = OhRegion::empty(layout);
+        attr_region_in(OhHeaderProps::with_layout(layout), attrs, max)
+    }
+
+    /// A region belonging to a header with `props`, holding one Attribute message
+    /// per `(name, creation index)`, preceded by the Attribute Info message a
+    /// tracked object carries.
+    fn attr_region_in(props: OhHeaderProps, attrs: &[(&str, u16)], max: u16) -> OhRegion {
+        let layout = props.layout;
+        let mut region = OhRegion::empty(props);
         let info = AttributeInfoMessage {
             max_creation_index: layout.tracks_creation_order().then_some(max),
             indexes_creation_order: layout.indexes_creation_order(),
@@ -17220,7 +17871,7 @@ mod tests {
         // region four bytes at a time misparses it from the first record on,
         // which is the defect this width exists to prevent.
         let tracked = attr_region(TRACKED, &[("alpha", 0), ("beta", 7)], 8);
-        let misread = OhRegion::new(tracked.to_vec(), OhRecordLayout::PLAIN);
+        let misread = OhRegion::new(tracked.to_vec(), OhHeaderProps::PLAIN);
         let mut p = 0;
         let mut agreed = true;
         while let Ok(Some((_, _, body_end))) = misread.next_message(p) {
@@ -17268,13 +17919,184 @@ mod tests {
             let header = build_v2_object_header(&region).unwrap();
             let (start, end, read_back) =
                 oh_region_at(&header, 0, header.len() as u64).expect("the header parses");
-            assert_eq!(read_back, layout, "the flags lost the layout");
+            assert_eq!(
+                read_back,
+                OhHeaderProps::with_layout(layout),
+                "the flags lost the layout"
+            );
             let round_tripped =
                 OhRegion::new(header[start as usize..end as usize].to_vec(), read_back);
             assert_eq!(
                 walk_attrs(&round_tripped),
                 walk_attrs(&region),
                 "layout {layout:?}",
+            );
+        }
+    }
+
+    // ---- the optional prefix blocks of a version 2 object header (PR #422) ----
+
+    /// Timestamps distinct enough that a field read at the wrong offset — or one
+    /// copied from a neighbour — shows up as a different number.
+    const FIXTURE_TIMES: ObjectTimes = ObjectTimes {
+        access: 0x1111_1111,
+        modification: 0x2222_2222,
+        change: 0x3333_3333,
+        birth: 0x4444_4444,
+    };
+
+    /// A phase-change pair the reference C library would never write by default
+    /// (its defaults are 8 and 6), so a rebuild that dropped the block and a
+    /// rebuild that substituted the defaults both fail.
+    const FIXTURE_PHASE: AttrPhaseChange = AttrPhaseChange {
+        max_compact: 32,
+        min_dense: 24,
+    };
+
+    /// Hand-assemble the version 2 object header `props` describes around
+    /// `region`'s bytes, with a 1-byte chunk-0 size field.
+    ///
+    /// Written out here rather than taken from [`build_v2_object_header`] so the
+    /// parse is checked against bytes the emitter did not produce: an emitter and
+    /// a parser that agreed on a wrong prefix layout would round-trip perfectly.
+    fn v2_header_bytes(props: OhHeaderProps, region: &OhRegion) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"OHDR");
+        buf.push(2); // version
+        buf.push(props.header_flags()); // size flags 0: a 1-byte length field
+        if let Some(times) = props.times {
+            buf.extend_from_slice(&times.to_bytes());
+        }
+        if let Some(phase) = props.attr_phase_change {
+            buf.extend_from_slice(&phase.to_bytes());
+        }
+        buf.push(u8::try_from(region.len()).expect("the fixture region is under 256 bytes"));
+        buf.extend_from_slice(region);
+        let checksum = jenkins_lookup3(&buf);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        buf
+    }
+
+    /// Every combination of the two optional prefix blocks and the record layout:
+    /// the parse finds the message region, and a rebuild puts both blocks back
+    /// with the flag bits that announce them.
+    ///
+    /// A dropped block is not a lost field alone — the chunk-0 size field sits
+    /// *after* both, so the message walk is checked too.
+    #[test]
+    fn a_headers_optional_prefix_blocks_survive_a_rebuild() {
+        for layout in [OhRecordLayout::PLAIN, TRACKED] {
+            for times in [None, Some(FIXTURE_TIMES)] {
+                for attr_phase_change in [None, Some(FIXTURE_PHASE)] {
+                    let props = OhHeaderProps {
+                        layout,
+                        times,
+                        attr_phase_change,
+                    };
+                    let region = attr_region_in(props, &[("alpha", 3), ("beta", 5)], 6);
+                    let header = v2_header_bytes(props, &region);
+
+                    let (start, end, read_back) = oh_region_at(&header, 0, header.len() as u64)
+                        .expect("the hand-built header parses");
+                    assert_eq!(read_back, props, "the prefix lost a block");
+                    let parsed =
+                        OhRegion::new(header[start as usize..end as usize].to_vec(), read_back);
+                    assert_eq!(
+                        walk_attrs(&parsed),
+                        walk_attrs(&region),
+                        "the message region was located wrongly for {props:?}",
+                    );
+
+                    let rebuilt = build_v2_object_header(&parsed).unwrap();
+                    let (_, _, again) = oh_region_at(&rebuilt, 0, rebuilt.len() as u64)
+                        .expect("the rebuilt header parses");
+                    assert_eq!(
+                        again.attr_phase_change, attr_phase_change,
+                        "the rebuild lost the attribute phase-change thresholds",
+                    );
+                    assert_eq!(
+                        again.times.is_some(),
+                        times.is_some(),
+                        "the rebuild changed whether the header stores times",
+                    );
+                    assert_eq!(again.layout, layout, "the rebuild lost the record layout");
+                }
+            }
+        }
+    }
+
+    /// The flag bits the emitter sets are the ones the format assigns: bit 4 for
+    /// the phase-change block, bit 5 for the timestamps.
+    #[test]
+    fn the_optional_blocks_are_announced_by_their_own_flag_bits() {
+        let with_times = OhHeaderProps {
+            times: Some(FIXTURE_TIMES),
+            ..OhHeaderProps::PLAIN
+        };
+        let with_phase = OhHeaderProps {
+            attr_phase_change: Some(FIXTURE_PHASE),
+            ..OhHeaderProps::PLAIN
+        };
+        assert_eq!(OhHeaderProps::PLAIN.header_flags(), 0);
+        assert_eq!(with_times.header_flags(), 0x20);
+        assert_eq!(with_phase.header_flags(), 0x10);
+        assert_eq!(OhHeaderProps::PLAIN.optional_len(), 0);
+        assert_eq!(with_times.optional_len(), 16);
+        assert_eq!(with_phase.optional_len(), 4);
+    }
+
+    /// A rebuild of a header that stores times moves the modification and change
+    /// times to now and leaves the access and birth times alone.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_rebuild_stamps_the_modification_and_change_times() {
+        let props = OhHeaderProps {
+            times: Some(FIXTURE_TIMES),
+            ..OhHeaderProps::PLAIN
+        };
+        let region = attr_region_in(props, &[("alpha", 0)], 1);
+
+        let before = unix_time_now().expect("a std test build reads the clock");
+        let header = build_v2_object_header(&region).unwrap();
+        let after = unix_time_now().expect("a std test build reads the clock");
+
+        let (_, _, read_back) = oh_region_at(&header, 0, header.len() as u64).unwrap();
+        let times = read_back.times.expect("the header still stores times");
+        assert_eq!(
+            (times.access, times.birth),
+            (FIXTURE_TIMES.access, FIXTURE_TIMES.birth),
+            "a rewrite is not an access and not a birth",
+        );
+        assert!(
+            (before..=after).contains(&times.modification),
+            "the modification time {} is outside [{before}, {after}]",
+            times.modification,
+        );
+        assert!(
+            (before..=after).contains(&times.change),
+            "the change time {} is outside [{before}, {after}]",
+            times.change,
+        );
+    }
+
+    /// A prefix that declares a block it does not carry is a malformed file, not
+    /// a panic: the parse reads only what the buffer holds.
+    #[test]
+    fn a_prefix_truncated_inside_an_optional_block_is_refused() {
+        let props = OhHeaderProps {
+            times: Some(FIXTURE_TIMES),
+            attr_phase_change: Some(FIXTURE_PHASE),
+            ..OhHeaderProps::PLAIN
+        };
+        let region = attr_region_in(props, &[("alpha", 0)], 1);
+        let header = v2_header_bytes(props, &region);
+        // Every prefix length short of the chunk-0 size field, which is the last
+        // thing the parse reads: 6 bytes of signature and flags, then 20 bytes of
+        // optional blocks.
+        for cut in 6..6 + 16 + 4 + 1 {
+            assert!(
+                oh_region_at(&header[..cut], 0, header.len() as u64).is_err(),
+                "a {cut}-byte prefix must not parse as a whole header",
             );
         }
     }
@@ -17360,7 +18182,7 @@ mod tests {
     /// records themselves.
     #[test]
     fn a_tracked_header_without_an_info_message_gains_one() {
-        let mut region = OhRegion::empty(TRACKED);
+        let mut region = OhRegion::empty(OhHeaderProps::with_layout(TRACKED));
         for (name, index) in [("alpha", 0u16), ("beta", 4)] {
             let record = TRACKED.record_with_creation_index(
                 MessageType::Attribute,
@@ -20574,8 +21396,7 @@ mod object_header_wrap_tests {
         region.push(0); // flags
         region.extend_from_slice(&[0u8; 4]); // a body far shorter than declared
 
-        let err =
-            build_v2_object_header(&OhRegion::new(region, OhRecordLayout::PLAIN)).unwrap_err();
+        let err = build_v2_object_header(&OhRegion::new(region, OhHeaderProps::PLAIN)).unwrap_err();
         assert!(
             matches!(err, Error::EditUnsupported(_)),
             "an unwalkable region gave {err:?}"
@@ -20593,7 +21414,7 @@ mod object_header_wrap_tests {
         region.extend_from_slice(&body);
 
         let oh =
-            build_v2_object_header(&OhRegion::new(region.clone(), OhRecordLayout::PLAIN)).unwrap();
+            build_v2_object_header(&OhRegion::new(region.clone(), OhHeaderProps::PLAIN)).unwrap();
         assert_eq!(&oh[..4], b"OHDR");
         assert!(
             oh.len() > 8 + region.len() + 4,
