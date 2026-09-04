@@ -667,7 +667,7 @@ struct FileInner {
     /// enables shared-message indexes. Best-effort like `file_space_info`, so a
     /// file whose table cannot be read still opens and still reads every object
     /// that shares nothing; what fails is following a reference into the heap,
-    /// with [`FormatError::SohmTableMissing`].
+    /// with [`FormatError::UnsupportedSohmReference`].
     sohm_table: Option<crate::sohm::SohmTable>,
     access_properties: FileAccessProperties,
     /// Set by [`File::close`] to seal a read-write file: after it, a write

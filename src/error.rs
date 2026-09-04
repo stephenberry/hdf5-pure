@@ -228,9 +228,10 @@ pub enum FormatError {
     /// other bit means the message is not what it claims to be.
     InvalidAttributeFlags(u8),
     /// A message body is a reference to the file's shared object header message
-    /// (SOHM) heap in a context that cannot follow one: a parse holding no
-    /// shared-message table, or a request for the *object header address* a
-    /// reference names, which a heap-stored message does not have. A committed
+    /// (SOHM) heap, and the parse that met it holds no shared-message table to
+    /// find it in: the file's superblock extension carries no Shared Message
+    /// Table message, the table it names could not be read, or the parse was
+    /// handed a message body without the file it came from. A committed
     /// (`H5Tcommit`) datatype is *not* stored in the heap — it references another
     /// object header, and is resolved.
     UnsupportedSohmReference,
@@ -254,11 +255,6 @@ pub enum FormatError {
     /// A shared-message index record names a storage location that is neither
     /// the heap (0) nor an object header (1).
     InvalidSohmRecordLocation(u8),
-    /// A message body references the shared-message heap, and the reader holds
-    /// no shared-message table to find it in: the file's superblock extension
-    /// carries no Shared Message Table message, the table it names could not be
-    /// read, or the parse was handed a message body without its file.
-    SohmTableMissing,
     /// A message body references the shared-message heap, and no index of the
     /// file's shared-message table covers that message type or has allocated a
     /// heap. Carries the raw type ID of the referenced message.
@@ -846,7 +842,7 @@ impl fmt::Display for FormatError {
             FormatError::UnsupportedSohmReference => {
                 write!(
                     f,
-                    "a reference to the shared object header message (SOHM) heap cannot be followed here"
+                    "a message references the shared object header message (SOHM) heap, and no readable shared message table was found for it"
                 )
             }
             FormatError::InvalidSohmTableVersion(v) => {
@@ -872,12 +868,6 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidSohmRecordLocation(v) => {
                 write!(f, "invalid shared message record location: {v}")
-            }
-            FormatError::SohmTableMissing => {
-                write!(
-                    f,
-                    "a message references the shared object header message (SOHM) heap, and no readable shared message table was found for it"
-                )
             }
             FormatError::SohmIndexMissing(t) => {
                 write!(f, "no shared message index holds messages of type {t:#06x}")

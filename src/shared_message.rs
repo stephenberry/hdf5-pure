@@ -279,7 +279,7 @@ impl SharedResolver for BufferedResolver<'_> {
         let parsed = parse_shared_ref(reference, self.offset_size, self.length_size)?;
         let addr = match parsed.location {
             SharedLocation::SohmHeap(id) => {
-                let table = self.sohm.ok_or(FormatError::SohmTableMissing)?;
+                let table = self.sohm.ok_or(FormatError::UnsupportedSohmReference)?;
                 return crate::sohm::read_heap_message(
                     self.file_data,
                     table,
@@ -337,7 +337,7 @@ impl<S: Source + ?Sized> SharedResolver for SourceResolver<'_, S> {
         let parsed = parse_shared_ref(reference, self.offset_size, self.length_size)?;
         let addr = match parsed.location {
             SharedLocation::SohmHeap(id) => {
-                let table = self.sohm.ok_or(FormatError::SohmTableMissing)?;
+                let table = self.sohm.ok_or(FormatError::UnsupportedSohmReference)?;
                 return crate::sohm::read_heap_message_from_source(
                     self.source,
                     table,
@@ -592,7 +592,7 @@ mod tests {
         let err = resolver
             .resolve(&reference, MessageType::Datatype)
             .unwrap_err();
-        assert_eq!(err, FormatError::SohmTableMissing);
+        assert_eq!(err, FormatError::UnsupportedSohmReference);
     }
 
     /// A heap reference names no object header, and says so with `None` rather
