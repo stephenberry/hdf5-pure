@@ -880,10 +880,7 @@ impl fmt::Display for FormatError {
                 )
             }
             FormatError::SohmIndexMissing(t) => {
-                write!(
-                    f,
-                    "no shared message index holds messages of type {t:#06x}"
-                )
+                write!(f, "no shared message index holds messages of type {t:#06x}")
             }
             FormatError::SharedMessageMissing {
                 object_header_address,

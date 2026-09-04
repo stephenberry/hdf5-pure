@@ -876,9 +876,15 @@ mod tests {
         let btree_addr = heap.btree_huge_objects_address;
 
         let source = CountingSource::new(bytes);
-        let attrs =
-            extract_dense_attributes_from_source(&source, &info, fh_addr, offset_size, length_size, None)
-                .unwrap();
+        let attrs = extract_dense_attributes_from_source(
+            &source,
+            &info,
+            fh_addr,
+            offset_size,
+            length_size,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             attrs.len(),
@@ -906,7 +912,8 @@ mod tests {
 
         crate::fractal_heap::reset_huge_index_decodes();
         let attrs =
-            extract_dense_attributes(&bytes, &info, fh_addr, offset_size, length_size, None).unwrap();
+            extract_dense_attributes(&bytes, &info, fh_addr, offset_size, length_size, None)
+                .unwrap();
 
         assert_eq!(
             attrs.len(),
@@ -933,11 +940,18 @@ mod tests {
 
         crate::fractal_heap::reset_huge_index_decodes();
         let buffered =
-            extract_dense_attributes(&bytes, &info, fh_addr, offset_size, length_size, None).unwrap();
-        let source = BytesSource::new(bytes);
-        let streamed =
-            extract_dense_attributes_from_source(&source, &info, fh_addr, offset_size, length_size, None)
+            extract_dense_attributes(&bytes, &info, fh_addr, offset_size, length_size, None)
                 .unwrap();
+        let source = BytesSource::new(bytes);
+        let streamed = extract_dense_attributes_from_source(
+            &source,
+            &info,
+            fh_addr,
+            offset_size,
+            length_size,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(buffered.len(), COUNT, "the walk must read every attribute");
         assert_eq!(streamed.len(), COUNT);

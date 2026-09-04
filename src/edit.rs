@@ -3714,10 +3714,7 @@ impl WriteEngine {
 
     /// Refuse a commit that would strand a shared-message index record naming an
     /// object header. See [`SHARED_MESSAGE_INDEX_NAMES_A_MOVED_OBJECT`].
-    fn screen_shared_message_index(
-        &self,
-        invalidated: &InvalidatedAddresses,
-    ) -> Result<(), Error> {
+    fn screen_shared_message_index(&self, invalidated: &InvalidatedAddresses) -> Result<(), Error> {
         if invalidated.is_empty() {
             return Ok(());
         }
@@ -14176,8 +14173,7 @@ fn screen_copied_references(
     // No shared-message table: a heap-stored message is refused rather than
     // followed here, and this screen treats an unreadable datatype as one it
     // cannot clear, which is the conservative answer.
-    let resolver =
-        crate::shared_message::SourceResolver::new(src, OFFSET_SIZE, LENGTH_SIZE, None);
+    let resolver = crate::shared_message::SourceResolver::new(src, OFFSET_SIZE, LENGTH_SIZE, None);
     let (region, dense_attrs) = match tree {
         CopyTree::DatasetVerbatim {
             region,

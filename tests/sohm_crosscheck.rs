@@ -211,7 +211,7 @@ fn a_list_indexed_shared_message_file_reads_back_whole() {
 fn the_streaming_backend_resolves_shared_messages_too() {
     let fixture = list_fixture(3);
     let file = File::open_streaming(&fixture.path).expect("streaming open");
-    for i in 0..3 {
+    for i in 0..3i32 {
         let group = file.group(&format!("g{i}")).unwrap();
         assert_eq!(
             group.attrs().unwrap().get(SHARED_ATTR),
@@ -219,7 +219,7 @@ fn the_streaming_backend_resolves_shared_messages_too() {
         );
         let dataset = file.dataset(&format!("d{i}")).unwrap();
         assert_eq!(dataset.datatype().unwrap(), i32_type());
-        assert_eq!(dataset.read_i32().unwrap(), dataset_values(i as i32));
+        assert_eq!(dataset.read_i32().unwrap(), dataset_values(i));
     }
 }
 
@@ -322,7 +322,6 @@ fn a_commit_on_a_shared_message_file_walks_its_index_and_proceeds() {
         );
     }
 }
-
 
 /// `repack` rewrites a shared-message file into one that shares nothing: every
 /// message it resolves is written back inline, which is a faithful file (sharing

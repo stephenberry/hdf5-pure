@@ -18,12 +18,13 @@
 //! - the **index**, which is either an unsorted list (signature `SMLI`) or a
 //!   version 2 B-tree of type 7, holding one [`SohmRecord`] per shared message.
 //!
-//! Reading a message needs only the table and the heap: the fractal-heap ID in
-//! the reference locates the message directly, and the index exists so that a
-//! *writer* can find an equal message to share and can count how many objects
-//! use it. This module parses the index anyway, because the reference count is
-//! the one piece of the picture the heap does not carry, and because an index
-//! that disagrees with the heap is how a file becomes silently wrong.
+//! Reading a message needs only the first two: the fractal-heap ID in the
+//! reference locates it directly, and the index exists so that a *writer* can
+//! find an equal message to share. The index is read for a different question —
+//! what a commit would strand. A record may name an object *header* rather than
+//! a heap entry, and that address is one no rewrite repoints, so
+//! [`crate::edit`] walks the records of every index before it moves or removes
+//! anything.
 //!
 //! The layouts follow `H5SM__cache_table_deserialize`, `H5SM__cache_list_deserialize`
 //! and `H5SM__message_decode` in the reference C library, which are the authority
@@ -31,7 +32,7 @@
 //! version byte after its index-type byte, and the library writes it before.
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use crate::btree_v2::{BTreeV2Header, collect_btree_v2_records_from_source};
 use crate::bytes::{ensure_len, read_offset};
@@ -316,11 +317,7 @@ impl SohmTable {
 }
 
 /// Read an address field that may carry the all-ones undefined marker.
-fn optional_address(
-    data: &[u8],
-    pos: usize,
-    offset_size: u8,
-) -> Result<Option<u64>, FormatError> {
+fn optional_address(data: &[u8], pos: usize, offset_size: u8) -> Result<Option<u64>, FormatError> {
     let addr = read_offset(data, pos, offset_size)?;
     Ok((!is_undefined_addr(addr, offset_size)).then_some(addr))
 }
@@ -330,15 +327,19 @@ fn optional_address(
 pub enum SohmLocation {
     /// In the index's fractal heap, under this ID, used by this many objects.
     Heap {
-        /// How many messages in the file reference this one. The editor's
-        /// bookkeeping: at zero the heap entry and the record are reclaimed.
+        /// How many messages in the file reference this one. The reference C
+        /// library reclaims the heap entry and the record when a deletion takes
+        /// it to zero; this crate does not write shared messages and does not
+        /// change the count, so an edit that would have to is refused.
         reference_count: u32,
         /// The fractal-heap ID, as a shared reference carries it.
         heap_id: [u8; FHEAP_ID_LEN],
     },
-    /// Still in the object header that first wrote it. The library leaves the
-    /// sole user's copy where it is and moves it to the heap when a second user
-    /// appears, so a record of this shape means exactly one user.
+    /// Still in the object header that wrote it. The reference C library records
+    /// a shareable message this way when it is written into an object header
+    /// that is already open, and moves it into the heap when a second user
+    /// appears — so a record of this shape means exactly one user, and its
+    /// address is a stored address like any other.
     ObjectHeader {
         /// Raw type ID of the message within that header.
         message_type: u8,
@@ -369,12 +370,8 @@ impl SohmRecord {
             LOCATION_HEAP => {
                 ensure_len(data, RECORD_PREFIX_LEN, HEAP_LOCATION_LEN)?;
                 let at = RECORD_PREFIX_LEN;
-                let reference_count = u32::from_le_bytes([
-                    data[at],
-                    data[at + 1],
-                    data[at + 2],
-                    data[at + 3],
-                ]);
+                let reference_count =
+                    u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
                 let mut heap_id = [0u8; FHEAP_ID_LEN];
                 heap_id.copy_from_slice(&data[at + 4..at + 4 + FHEAP_ID_LEN]);
                 SohmLocation::Heap {
@@ -487,10 +484,10 @@ fn check_btree_type(header: &BTreeV2Header) -> Result<(), FormatError> {
 
 /// The index that must hold `message_type`, or an error naming why the lookup
 /// cannot proceed.
-fn index_for_read<'t>(
-    table: &'t SohmTable,
+fn index_for_read(
+    table: &SohmTable,
     message_type: MessageType,
-) -> Result<(&'t SohmIndexHeader, u64), FormatError> {
+) -> Result<(&SohmIndexHeader, u64), FormatError> {
     let index = table
         .index_for(message_type)
         .ok_or(FormatError::SohmIndexMissing(message_type.to_u16()))?;
@@ -515,8 +512,12 @@ pub fn read_heap_message(
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
     let (_, heap_address) = index_for_read(table, message_type)?;
-    let heap =
-        FractalHeapHeader::parse(file_data, heap_address.to_usize()?, offset_size, length_size)?;
+    let heap = FractalHeapHeader::parse(
+        file_data,
+        heap_address.to_usize()?,
+        offset_size,
+        length_size,
+    )?;
     heap.object_reader(offset_size, length_size)
         .read(file_data, &heap_id[..heap.heap_id_length as usize])
 }
@@ -639,7 +640,7 @@ mod tests {
     #[test]
     fn an_index_header_round_trips_through_its_image() {
         let index = sample_index();
-        let table = SohmTable::parse(&table_image(&[index.clone()]), 1, 8).unwrap();
+        let table = SohmTable::parse(&table_image(std::slice::from_ref(&index)), 1, 8).unwrap();
         assert_eq!(table.indexes, vec![index]);
     }
 
@@ -905,9 +906,11 @@ mod tests {
     #[test]
     fn a_list_index_is_read_at_the_address_its_header_names() {
         let mut image = vec![0u8; 64];
-        image.extend_from_slice(&list_image(&[
-            heap_record_bytes(3, [7, 0, 0, 0, 0, 0, 0, 0], 8),
-        ]));
+        image.extend_from_slice(&list_image(&[heap_record_bytes(
+            3,
+            [7, 0, 0, 0, 0, 0, 0, 0],
+            8,
+        )]));
         let mut index = sample_index();
         index.index_address = Some(64);
         index.message_count = 1;
