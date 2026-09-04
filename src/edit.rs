@@ -12817,11 +12817,11 @@ fn plan_attr_ops<S: Source + ?Sized>(
     let mut set: Vec<DenseAttrSlot> = existing
         .attrs
         .into_iter()
-        .zip(existing.creation.indices())
-        .map(|(msg, creation_index)| DenseAttrSlot {
+        .enumerate()
+        .map(|(i, msg)| DenseAttrSlot {
             msg,
             collections: None,
-            creation_index,
+            creation_index: existing.creation.index_at(i),
         })
         .collect();
     for op in ops {
@@ -12886,6 +12886,13 @@ fn plan_attr_ops<S: Source + ?Sized>(
         if let Some(collections) = slot.collections {
             vl.push((i, collections));
         }
+        // Every slot of a tracked object carries an index: one read from its
+        // storage, or one this edit just handed out. `indices` is discarded for
+        // an untracked object, where none of them do.
+        debug_assert!(
+            !tracked || slot.creation_index.is_some(),
+            "a tracked object's attribute must carry a creation index"
+        );
         indices.push(slot.creation_index.unwrap_or_default());
         attrs.push(slot.msg);
     }
