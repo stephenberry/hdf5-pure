@@ -26,7 +26,7 @@ use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, ReferenceType};
 use crate::error::{Error, FormatError};
 use crate::file_create_properties::FileCreateProperties;
-use crate::file_lock::{self, FileLocking, OpenIntent, OpenTarget};
+use crate::file_lock::{self, FileLocking, OpenIntent, OpenTarget, WriteMarkPolicy};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterPipeline;
@@ -234,6 +234,10 @@ impl Source for SourceView<'_> {
 ///   [`DatasetAccessProperties`].
 /// - The locking policy (`H5Pset_file_locking`) applies to the read-write opens.
 ///   Readers and the SWMR writer take no lock by design, so they ignore it.
+/// - The write-mark policy applies to the read-only opens, and has no C
+///   counterpart: `H5Fopen` refuses a file marked open for write with no
+///   override, where [`with_write_mark_policy`](Self::with_write_mark_policy)
+///   can admit a snapshot read of one.
 ///
 /// See the [property-support reference] for the full property-by-property map.
 ///
@@ -248,6 +252,7 @@ pub struct FileAccessProperties {
     libver_bounds: Option<(LibVer, LibVer)>,
     sync_policy: SyncPolicy,
     page_buffer_size: usize,
+    write_mark_policy: WriteMarkPolicy,
 }
 
 impl FileAccessProperties {
@@ -261,6 +266,7 @@ impl FileAccessProperties {
             libver_bounds: None,
             sync_policy: SyncPolicy::Always,
             page_buffer_size: 0,
+            write_mark_policy: WriteMarkPolicy::Refuse,
         }
     }
 
@@ -512,6 +518,66 @@ impl FileAccessProperties {
         self
     }
 
+    /// Let a read-only open proceed past a superblock marked open for write by a
+    /// writer that is not a SWMR writer — status-flag bit 0 alone, which is what
+    /// [`with_page_buffer_size`](Self::with_page_buffer_size) raises for a
+    /// session's whole life.
+    ///
+    /// Defaults to [`WriteMarkPolicy::Refuse`], which is what `H5Fopen` does with
+    /// the same byte: [`File::open`], [`File::open_streaming`] and
+    /// [`File::from_source`] all report
+    /// [`Error::FileMarkedInUse`](crate::Error::FileMarkedInUse).
+    /// [`WriteMarkPolicy::AllowSnapshot`] reads the file as it stands instead,
+    /// through whichever of those opens is passed these properties.
+    ///
+    /// # What the caller is asserting
+    ///
+    /// That the writer has flushed: it called [`File::sync`], or it stopped
+    /// after a flush and the mark stands only because nothing cleared it (a
+    /// clean [`File::close`] takes the mark down, and leaves nothing to opt past).
+    /// The mark is durable and says nothing about *when* — a live writer
+    /// mid-operation and one that exited without closing carry the same byte —
+    /// so this crate cannot check the assertion, and passing this value is how a
+    /// caller states it. It is exactly true for a writer under
+    /// [`SyncPolicy::OnClose`](crate::SyncPolicy::OnClose) that syncs at the
+    /// points it wants readable, and it is what the mark exists to guard against
+    /// when it is false: a page-buffered session's publish points are written
+    /// before the content they name, so a snapshot taken mid-flush can show a
+    /// dataset that reads clean and returns fill values, with every checksum
+    /// verifying.
+    ///
+    /// The snapshot is of the bytes on disk at open. A buffered open takes it
+    /// whole; a streaming open reads regions on demand, so a writer that carries
+    /// on writing can move bytes under it — reach for
+    /// [`File::open_with_options`] when the writer may continue, and for
+    /// [`File::open_streaming_with_options`] when it has stopped and the file is
+    /// too large to buffer.
+    ///
+    /// # What it does not unlock
+    ///
+    /// - a **SWMR pair** (both bits): that file has a reader of its own, and
+    ///   [`File::open_swmr`] follows it — including across the writer's later
+    ///   appends, which a snapshot cannot;
+    /// - [`File::open_rw`] and [`File::open_swmr_writer`], which are refused
+    ///   whatever this says. A second writer must not join a file a writer
+    ///   already holds;
+    /// - the OS advisory lock, a separate guard with its own policy
+    ///   ([`with_locking`](Self::with_locking)).
+    ///
+    /// A file left marked by a writer that *crashed* is a different question,
+    /// and this is not the answer to it: it reads such a file as willingly as a
+    /// flushed one, and leaves the mark standing for the next reader to meet.
+    /// [`File::clear_swmr_flag`] — the `h5clear -s` equivalent — is the recovery
+    /// there, and it records the decision by clearing the byte.
+    ///
+    /// The C library offers no counterpart: `H5Fopen` refuses the byte with no
+    /// override, and `h5clear` is its only way through. This is the narrower one,
+    /// since it changes nothing on disk.
+    pub const fn with_write_mark_policy(mut self, policy: WriteMarkPolicy) -> Self {
+        self.write_mark_policy = policy;
+        self
+    }
+
     /// Return the configured streaming metadata cache.
     pub const fn metadata_cache(&self) -> MetadataCacheConfig {
         self.metadata_cache
@@ -555,6 +621,11 @@ impl FileAccessProperties {
     /// asked for.
     pub const fn page_buffer_size(&self) -> usize {
         self.page_buffer_size
+    }
+
+    /// Return the configured write-mark policy.
+    pub const fn write_mark_policy(&self) -> WriteMarkPolicy {
+        self.write_mark_policy
     }
 }
 
@@ -772,6 +843,7 @@ impl FileInner {
         properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
+        let write_mark = properties.write_mark_policy;
         let inner = Self::from_bytes_with_options(bytes, properties)?;
         // The status-flag check belongs to every open that reads the live file
         // — this one, `open_streaming` and `from_source` — and not to
@@ -782,7 +854,7 @@ impl FileInner {
         // which checks under its in-memory core driver too.
         file_lock::check_status_flags(
             &inner.superblock,
-            OpenIntent::Read,
+            OpenIntent::Read(write_mark),
             OpenTarget::Path(path.as_ref()),
         )?;
         Ok(inner)
@@ -859,7 +931,11 @@ impl FileInner {
             Box::new(source)
         };
         let (superblock, addr_offset) = Self::parse_superblock_source(source.as_ref())?;
-        file_lock::check_status_flags(&superblock, OpenIntent::Read, target)?;
+        file_lock::check_status_flags(
+            &superblock,
+            OpenIntent::Read(properties.write_mark_policy),
+            target,
+        )?;
         Ok(Self::from_parts(
             Backend::Streaming(source),
             superblock,
