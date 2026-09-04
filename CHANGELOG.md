@@ -10,9 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `File::open_rw` edits an object that tracks attribute creation order (h5py's `track_order=True`, and everything netCDF-4 writes), where every such object was refused: a new attribute takes the next creation index, an overwrite keeps the one it had, a deletion leaves a gap, and a set that goes dense gains a creation-order B-tree beside its name index ([#416](https://github.com/stephenberry/hdf5-pure/issues/416)).
 - `File::open_rw` creates a dataset or group inside a group that tracks **link** creation order (h5py's `track_order=True` groups, and every netCDF-4 group), each addition taking the group's next link creation index; an addition that would push the group's links past its compact-storage threshold — 8 by default — is still refused ([#422](https://github.com/stephenberry/hdf5-pure/pull/422)).
+- `FileAccessProperties::with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)` lets a read-only open take a path-based snapshot of a file a page-buffered writer holds, without copying it through `File::from_bytes`; the caller asserts the writer has synced, and a SWMR pair and every read-write open are still refused ([#419](https://github.com/stephenberry/hdf5-pure/issues/419)).
 
 ### Fixed
 
+- `Error::FileMarkedInUse` no longer points a reader at `File::open_swmr` for a file marked by a page-buffered writer, which that reader refuses in its turn; the message now names the snapshot opt-in above, `File::from_bytes`, and `File::clear_swmr_flag` ([#419](https://github.com/stephenberry/hdf5-pure/issues/419)).
+- Deleting objects now gives the space at the end of the file back to the filesystem instead of leaving `File::file_size()` at a high-water mark, on a file that persists its free-space managers and on a paged file alike. A commit shortens the file to just above its last live allocation, page-aligned where the strategy requires it ([#418](https://github.com/stephenberry/hdf5-pure/issues/418)).
 - `File::open_rw` keeps an object header's stored timestamps and `H5Pset_attr_phase_change` thresholds across an in-place edit, where every rewrite dropped both and left `H5Oget_info` reporting zero times on any file the C library, h5py or netCDF-4 wrote. The modification and change times are moved to the edit; the thresholds are preserved but do not yet steer the compact-to-dense switch ([#422](https://github.com/stephenberry/hdf5-pure/pull/422)).
 
 ## [0.43.1] - 2026-09-03

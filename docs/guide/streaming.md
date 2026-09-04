@@ -59,7 +59,7 @@ A `Read + Seek` needs no implementation of its own: `ReadSeekSource` wraps one. 
 Two things are worth knowing before pointing this at a remote store:
 
 - **Turn the metadata cache on**, through `File::from_source_with_options`. It is off by default, and without one every read a parser makes is a round trip. See `MetadataCacheConfig`.
-- **A file the superblock marks as held by a writer is refused here too**, with `Error::FileMarkedInUse`. The recoveries a path open would name do not apply: `File::open_swmr` and `File::clear_swmr_flag` both need a path, so a source is left with `File::from_bytes` and the whole file in memory. The refusal says so.
+- **A file the superblock marks as held by a writer is refused here too**, with `Error::FileMarkedInUse`. Some of the recoveries a path open would name do not apply: `File::open_swmr` and `File::clear_swmr_flag` both need a path. What a source can take is `FileAccessProperties::with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)`, which reads a file marked by a non-SWMR writer that has flushed (see [Reading](reading.md)), or `File::from_bytes` with the whole file in memory. The refusal says which.
 
 ## What streaming supports
 

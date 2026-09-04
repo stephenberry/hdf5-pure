@@ -224,12 +224,28 @@
 //! `FSHD`/`FSSE` blocks the superblock-extension File Space Info message points
 //! at), and each commit rewrites those managers, so freed regions survive
 //! close/reopen and are reused across sessions — by this crate and the reference
-//! C library alike. A persisting commit *retains* freed space (recording it on
-//! disk) rather than truncating it; the blocks holding the managers go into space
-//! an earlier commit freed, or past all live data when none fits, and the
-//! superblock is repointed last, so a crash before the repoint leaves the prior
-//! file wholly intact. Whole-file compaction that reclaims every hole at once is
-//! still the separate repack path.
+//! C library alike. Such a commit *records* the freed space it keeps rather than
+//! forgetting it; the blocks holding the managers go into space an earlier commit
+//! freed, or past all live data when none fits, and the superblock is repointed
+//! last, so a crash before the repoint leaves the prior file wholly intact.
+//!
+//! Freed space that reaches the end of the file is given back there too
+//! (issue #418): the commit lowers the end-of-allocation to where the run starts,
+//! drops those sections from the managers it writes, and truncates the file once
+//! the smaller superblock is durable — page-aligned on a paged file, so the end
+//! of allocation stays a whole number of pages. Two things bound it. A few tails'
+//! worth of the run stays ([`release_trailing_run`]), because the manager blocks
+//! are rewritten by every commit and can never land in their own predecessor's
+//! extent, so a file trimmed closer than that sends its next tail past the end of
+//! the file instead of into the reserve; and a run that would give back less than
+//! it keeps is left alone, since
+//! trimming the top off a hole the next write was about to fill costs a whole
+//! object to return a fraction of one. A commit whose own tail had to be appended
+//! *above* the run it freed takes a second, tail-only rewrite to move the blocks
+//! down into it ([`WriteEngine::shrink_to_the_trailing_free_run`]) — the delete
+//! case, where the freed regions only become writable once the repoint that
+//! freed them is durable. Whole-file compaction that reclaims every hole at once
+//! is still the separate repack path.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -273,7 +289,7 @@ use crate::filter_pipeline::{
     FilterPipeline,
 };
 use crate::filters::{ChunkContext, FilterScratch, compress_chunk_with, decompress_chunk};
-use crate::free_space::FreeList;
+use crate::free_space::{FreeList, trailing_run_start};
 use crate::free_space_manager::{
     self, FreeSection, FsmHeader, PageType, PagedManagerPlan, SECT_CLASS_SIMPLE, align_up,
     file_fsm_blocks_len, free_sections, fshd_len, plan_paged_managers, serialize_file_fsm,
@@ -1747,10 +1763,11 @@ struct PagedEdit {
     /// which records no type. Metadata claims from here on the same terms.
     raw: FreeList,
     /// Free space this session may record but must never hand out, because the
-    /// page it sits in is of unknown type. Seeded at open and constant
-    /// thereafter — nothing this engine frees is ever of unknown type — and
-    /// written back to the generic-large manager verbatim, so the space stays
-    /// available to the writer that recorded it.
+    /// page it sits in is of unknown type. Seeded at open — nothing this engine
+    /// frees is ever of unknown type, so it only ever shrinks, and only where a
+    /// commit released the end of the file over it (issue #418) — and written
+    /// back to the generic-large manager verbatim, so the space stays available
+    /// to the writer that recorded it.
     ///
     /// It exists because the reference C library's generic-large manager is
     /// exactly that: `H5F_MEM_PAGE_GENERIC` is *"large-sized generic: meta and
@@ -2043,6 +2060,127 @@ struct PagedPostFree {
     dead: FreeList,
     /// Already flattened: nothing in a commit adds to or draws from this one.
     unclassified: Vec<FreeSection>,
+}
+
+impl PagedPostFree {
+    /// Give the run of unreferenced space that reaches `eof` back to the
+    /// filesystem: drop it from every list here and return the end-of-allocation
+    /// the commit should publish, which the caller truncates the file to
+    /// (issue #418). `eof` itself when nothing at the end of the file is free.
+    ///
+    /// The cut is rounded **up** to a page boundary, so a paged file's
+    /// end-of-allocation stays a whole number of pages: a run that begins
+    /// mid-page begins in a page whose earlier bytes are live, and only the whole
+    /// pages above it can go. That is the same granularity the reference C
+    /// library shrinks a paged file at — its `H5MF__sect_large_can_shrink` sees
+    /// only the large (whole-page) sections, the small per-type managers having
+    /// no shrink at all — so a partial page at the end is kept and recorded,
+    /// exactly as it is there.
+    ///
+    /// Every list is cut, including the space this session may record but never
+    /// place ([`PagedEdit::unclassified`]) and the space it has vacated but
+    /// cannot type ([`PagedEdit::dead`]). Bytes past the end-of-allocation are
+    /// not in the file at all, so a section describing them would point outside
+    /// it — the one thing the persisted managers must never do.
+    ///
+    /// Whole pages holding [`TRAILING_RESERVE_TAILS`] tails stay in the file, and
+    /// stay recorded, for the reason [`release_trailing_run`] gives on a flat
+    /// file — with the same refusal to release a run that gives back less than it
+    /// keeps.
+    fn release_trailing(&mut self, eof: u64, page_size: u64, tail_len: u64) -> u64 {
+        let mut unclassified = FreeList::new();
+        for s in &self.unclassified {
+            unclassified.free(s.addr, s.size);
+        }
+        let start = trailing_run_start([&self.meta, &self.raw, &self.dead, &unclassified], eof);
+        let cut = align_up(start, page_size);
+        if cut >= eof {
+            return eof;
+        }
+        // Whole pages are this file's unit, so the reserve is one too, and the
+        // same "give back more than you keep" condition applies.
+        let keep = align_up(TRAILING_RESERVE_TAILS * tail_len, page_size);
+        if eof - cut < 2 * keep {
+            return eof;
+        }
+        let eoa = cut + keep;
+        let span = eof - eoa;
+        self.meta.take_range(eoa, span);
+        self.raw.take_range(eoa, span);
+        self.dead.take_range(eoa, span);
+        // Clamped rather than dropped: a section straddling the cut keeps the part
+        // that is still inside the file.
+        for s in &mut self.unclassified {
+            s.size = s.size.min(eoa.saturating_sub(s.addr));
+        }
+        self.unclassified.retain(|s| s.size > 0);
+        eoa
+    }
+}
+
+/// How much free space a released trailing run leaves behind, as a multiple of
+/// the manager tail a persisting commit writes.
+///
+/// A persisting file rewrites those blocks on *every* commit, and a rewrite can
+/// never land in its own predecessor's extent — the on-disk superblock still
+/// points at it until the repoint, so overwriting it would destroy the file a
+/// crash there falls back on. The end of the file therefore has to keep room for
+/// the tails that follow this one, and a tail is not a fixed size: every
+/// abandoned one adds a section to the managers, which makes the *next* tail
+/// longer again.
+///
+/// Measured rather than chosen, on the shipped rule. At one,
+/// `a_released_file_holds_its_length_across_many_tail_rewrites` leaves the flat
+/// file alternating between 5,992 and 6,303 bytes instead of holding one length,
+/// because a tail a section longer than the one that sized the reserve does not
+/// fit it. At two, `persisting_churn_reaches_a_steady_size` has not settled by
+/// its sixteenth round — 15,095 bytes after a middle third that held 14,685.
+/// Three is the smallest value both accept; four is one tail of margin, the tail
+/// length being itself a function of a section count that varies with the file.
+const TRAILING_RESERVE_TAILS: u64 = 4;
+
+/// Release the run of free space reaching `eof` from a flat file's post-commit
+/// free list, and return the end-of-allocation the commit should publish
+/// (issue #418).
+///
+/// Not the whole run: [`TRAILING_RESERVE_TAILS`] tails' worth of it stays in the
+/// file, and stays recorded, so the commits after this one still have somewhere
+/// to write their own manager blocks.
+///
+/// And nothing at all unless the run gives back at least as much as it keeps.
+/// Trimming the top off a hole that is *about* to be reused is the worst of both:
+/// it returns a few hundred bytes and leaves the hole too small for the object
+/// that would have filled it, which then goes past end-of-file instead, so the
+/// file grows by a whole object to give back a fraction of one.
+///
+/// So `eof` — the file's length, unchanged — when it ends in live bytes and when
+/// the run is not worth releasing; the list is then left exactly as it came in.
+fn release_trailing_run(post: &mut FreeList, eof: u64, tail_len: u64) -> u64 {
+    let run_start = trailing_run_start([&*post], eof);
+    let keep = TRAILING_RESERVE_TAILS * tail_len;
+    if eof - run_start < 2 * keep {
+        return eof;
+    }
+    post.take_range(run_start + keep, eof - run_start - keep);
+    run_start + keep
+}
+
+/// Whether a persisting file's tail rewrite may grow the file to place its
+/// manager blocks.
+///
+/// The two callers want opposite things from a tail that will not fit in free
+/// space, and the difference is not a preference: a commit publishing a tree
+/// *must* record its free space somewhere, while the shrink pass exists only to
+/// make the file smaller and would defeat itself by appending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TailPlacement {
+    /// Place the tail in free space where it fits and past end-of-file where it
+    /// does not. Every commit that publishes a tree.
+    Anywhere,
+    /// Place the tail in free space or not at all: when nothing fits, the
+    /// rewrite is abandoned before it writes a byte and the file is left exactly
+    /// as the commit before it published.
+    ReuseOnly,
 }
 
 /// Where a commit has decided to put one allocation's bytes, handed out by
@@ -3964,7 +4102,11 @@ impl WriteEngine {
             return Ok(());
         }
         self.publish_attempted = false;
-        match self.commit_persisting(self.superblock.root_group_address, Vec::new()) {
+        match self.commit_persisting(
+            self.superblock.root_group_address,
+            Vec::new(),
+            TailPlacement::Anywhere,
+        ) {
             Ok(()) => Ok(()),
             Err(e) => {
                 if self.publish_attempted {
@@ -4084,7 +4226,8 @@ impl WriteEngine {
     }
 
     /// Rewrite the on-disk free-space managers for a persisting commit, giving
-    /// the unspent append reserve back first so the managers record it.
+    /// the unspent append reserve back first so the managers record it, and then
+    /// give any trailing free space the rewrite exposed back to the filesystem.
     ///
     /// Every caller that publishes a *tree* takes this rather than
     /// [`commit_persisting`](Self::commit_persisting) directly. The one caller
@@ -4096,7 +4239,66 @@ impl WriteEngine {
         to_free: Vec<(u64, u64, FreeClass)>,
     ) -> Result<(), Error> {
         self.release_reserve();
-        self.commit_persisting(new_root, to_free)
+        self.commit_persisting(new_root, to_free, TailPlacement::Anywhere)?;
+        self.shrink_to_the_trailing_free_run(new_root)
+    }
+
+    /// Move a commit's manager blocks down into the space that commit freed, and
+    /// truncate the file to them (issue #418).
+    ///
+    /// A commit that frees a run reaching end-of-file cannot land its own tail in
+    /// that run: the regions it is vacating are still referenced by the *on-disk*
+    /// root until the superblock repoint, so writing over them would destroy the
+    /// pre-commit file if the process died in between. The tail therefore goes
+    /// past end-of-file, above the very space that should have been given back,
+    /// and the file cannot shrink — the delete-then-commit case of issue #418.
+    ///
+    /// Once that repoint is durable those regions are genuinely free, so a second
+    /// tail-only rewrite can place the blocks inside them. It publishes through
+    /// the same crash-atomic tail as any other commit, with nothing to free and
+    /// the root unchanged, and the truncation follows its superblock write.
+    ///
+    /// It runs under [`TailPlacement::ReuseOnly`], so it places the tail in free
+    /// space or writes nothing at all. That is the safety property: a pass taken
+    /// for the sake of a smaller file can never leave a larger one.
+    ///
+    /// Skipped unless the last commit's tail is the highest thing in the file and
+    /// the free run reaching it is long enough for [`release_trailing_run`] to
+    /// release any of — the shape a delete leaves, and the condition that bounds
+    /// this to one extra rewrite on the commits that can actually use it. A
+    /// non-persisting file never gets here (its commit truncates directly), and
+    /// neither does the SWMR writer, which
+    /// [`open_swmr_writer`](crate::File::open_swmr_writer) refuses to open on a
+    /// file that persists its free space at all.
+    fn shrink_to_the_trailing_free_run(&mut self, new_root: u64) -> Result<(), Error> {
+        let Some(persist) = self.persist.as_ref() else {
+            return Ok(());
+        };
+        let (Some(tail_start), Some(tail_end)) = (
+            persist.old_blocks.iter().map(|&(a, _)| a).min(),
+            persist.old_blocks.iter().map(|&(a, l)| a + l).max(),
+        ) else {
+            return Ok(());
+        };
+        // Only a tail at the very end of the file is standing in the way of one.
+        if tail_end != self.image.len() {
+            return Ok(());
+        }
+        // The free run reaching up to it, plus the tail the rewrite frees, is what
+        // the rewrite would have to release from. Held to the same threshold
+        // `release_trailing_run` applies, since below it that call returns the
+        // file's length unchanged and the pass would cost a rewrite to publish
+        // exactly what the commit before it did.
+        let run_start = match self.paged.as_ref() {
+            Some(pg) => {
+                trailing_run_start([&pg.meta, &pg.raw, &pg.dead, &pg.unclassified], tail_start)
+            }
+            None => trailing_run_start([&self.free], tail_start),
+        };
+        if tail_end - run_start < 2 * TRAILING_RESERVE_TAILS * (tail_end - tail_start) {
+            return Ok(());
+        }
+        self.commit_persisting(new_root, Vec::new(), TailPlacement::ReuseOnly)
     }
 
     /// Adopt the fapl's `fsync` cadence. Called once, on the funnel every
@@ -4212,6 +4414,9 @@ impl WriteEngine {
     /// spend has its managers inside it, above and below live data alike. What has
     /// to hold is that they describe the file as it now stands, which is what makes
     /// this call's own writes the last the session issues.
+    ///
+    /// It is also where a session's last release of trailing free space happens,
+    /// since it takes the same tail as a commit (issue #418).
     ///
     /// A no-op for a non-persisting file, and skipped when the file has not grown
     /// past the managers since they were last written *and* the session holds no
@@ -6811,11 +7016,12 @@ impl WriteEngine {
         &mut self,
         new_root: u64,
         to_free: Vec<(u64, u64, FreeClass)>,
+        placement: TailPlacement,
     ) -> Result<(), Error> {
         // A paged file records its free space in per-page-type managers and keeps
         // its allocation page-aligned, so it takes its own tail (issue #198).
         if self.paged.is_some() {
-            return self.commit_persisting_paged(new_root, to_free);
+            return self.commit_persisting_paged(new_root, to_free, placement);
         }
         let os = self.superblock.offset_size;
         let (strategy, threshold, page_size, old_blocks) = {
@@ -6859,19 +7065,30 @@ impl WriteEngine {
         // frees stay in `to_free` until the repoint), so a reused span holds bytes
         // already unreachable from the on-disk root, which is the guarantee
         // [`reserve`](Self::reserve) rests on too.
-        let (post, placed_at, tail_len) = self.flat_tail_layout(&to_free, &old_blocks, ext_len, os);
+        let (post, placed_at, tail_len, eoa) =
+            self.flat_tail_layout(&to_free, &old_blocks, ext_len, os);
+        if placed_at.is_none() && placement == TailPlacement::ReuseOnly {
+            // The shrink pass appends nothing: growing the file by a tail is the
+            // opposite of what it was called for. Nothing has been written and the
+            // layout handed its reservation back, so the session is exactly as the
+            // commit before it left it.
+            return Ok(());
+        }
         let reused = placed_at.is_some();
         let ext_addr = placed_at.unwrap_or_else(|| self.image.len());
         let sections = free_sections(&post);
         let fshd_addr = ext_addr + ext_len;
         let fsse_addr = fshd_addr + fshd_len(os);
-        // A reused tail sits inside the file, which keeps the end-of-file where
-        // this commit's writes left it; an appended one ends the file.
-        let final_eof = if reused {
-            self.image.len()
-        } else {
-            ext_addr + tail_len
-        };
+        // A reused tail sits inside the file, which ends it at the end-of-allocation
+        // the layout settled on — the current end-of-file, less any run of free
+        // space reaching it, which `post` no longer records and the truncation
+        // below gives back to the filesystem (issue #418). An appended tail ends
+        // the file itself.
+        let final_eof = if reused { eoa } else { ext_addr + tail_len };
+        debug_assert!(
+            ext_addr + tail_len <= final_eof,
+            "the tail must end at or below the end-of-allocation it was placed under"
+        );
 
         // Build the real extension and the FSM blocks. With no free space to
         // record we still refresh the extension (persist on, managers undefined).
@@ -6946,6 +7163,17 @@ impl WriteEngine {
         self.barrier()?;
         self.superblock = new_sb;
 
+        // Physically shrink the file only after the superblock — now carrying the
+        // smaller end-of-file — is durable, exactly as the non-persisting tail
+        // does: a crash between the two leaves trailing bytes the next open
+        // ignores, where the reverse order would advertise an end-of-file past
+        // the file's actual length. The managers just written describe `post`,
+        // which no longer names anything above this cut.
+        if final_eof < self.image.len() {
+            self.image.truncate(final_eof)?;
+            self.barrier()?;
+        }
+
         // The repoint is durable: the prior free list plus this commit's vacated
         // regions are now genuinely free, and the freshly written blocks become
         // the ones a future commit will supersede.
@@ -6998,8 +7226,10 @@ impl WriteEngine {
 
     /// Reserve free space for a flat persisting commit's tail, returning the free
     /// list the tail leaves behind, the address it got — `None` when nothing
-    /// reusable fits, which is the caller's cue to append — and its length, which
-    /// the caller needs either way.
+    /// reusable fits, which is the caller's cue to append — its length, which the
+    /// caller needs either way, and the end-of-allocation the commit should
+    /// publish, which is the current end-of-file less any run of free space that
+    /// reaches it (issue #418).
     ///
     /// The reservation and the length define each other, exactly as they do for the
     /// paged tail ([`tail_layout`](Self::tail_layout)): drawing bytes out of the
@@ -7067,11 +7297,12 @@ impl WriteEngine {
         old_blocks: &[(u64, u64)],
         ext_len: u64,
         os: u8,
-    ) -> (FreeList, Option<u64>, u64) {
+    ) -> (FreeList, Option<u64>, u64, u64) {
         /// Enough rounds for the section set to settle after a reservation shrinks
         /// it, without letting a proposal that keeps growing spin.
         const ROUNDS: usize = 4;
 
+        let eof = self.image.len();
         // The first proposal: what the tail would measure with nothing reserved.
         // A manager block's length depends only on the sections it records, never
         // on where it sits. It is also the answer for a tail that ends up appended,
@@ -7088,10 +7319,21 @@ impl WriteEngine {
                     None => break,
                 },
             };
-            let post = self.flat_post_free(to_free, old_blocks);
+            let mut post = self.flat_post_free(to_free, old_blocks);
+            // Free space that reaches end-of-file is released rather than
+            // recorded: the file is truncated to where the run starts, so the
+            // sections these blocks are sized from must already leave it out
+            // (issue #418). The reservation was taken before this list was built,
+            // so the run can only begin at or above the tail's own end.
+            let eoa = release_trailing_run(&mut post, eof, proposed);
             let len = ext_len + file_fsm_blocks_len(&free_sections(&post), os);
             if len <= proposed {
-                return (post, Some(at), proposed);
+                debug_assert!(
+                    at + proposed <= eoa,
+                    "a reused tail at {at} of {proposed} bytes runs past the end-of-allocation \
+                     {eoa} it was placed under"
+                );
+                return (post, Some(at), proposed, eoa);
             }
             if from_reserve {
                 self.reserved.free(at, proposed);
@@ -7100,7 +7342,10 @@ impl WriteEngine {
             }
             proposed = len;
         }
-        (probe, None, appended_len)
+        // Nothing reusable fits, so the tail is appended past end-of-file and no
+        // trailing run is released: whatever free space reaches end-of-file was
+        // too small for the tail, and stays recorded below it.
+        (probe, None, appended_len, eof)
     }
 
     /// Commit tail for a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`, issue
@@ -7130,6 +7375,7 @@ impl WriteEngine {
         &mut self,
         new_root: u64,
         to_free: Vec<(u64, u64, FreeClass)>,
+        placement: TailPlacement,
     ) -> Result<(), Error> {
         let os = self.superblock.offset_size;
         let (strategy, threshold, page_size, old_blocks) = {
@@ -7196,13 +7442,19 @@ impl WriteEngine {
         // will not converge falls through to the append below, which has no length
         // to satisfy.
         let placed = self.tail_layout(&to_free, &old_blocks, ext_len, page_size, os);
+        if placed.is_none() && placement == TailPlacement::ReuseOnly {
+            // As on the flat path: the shrink pass opens no page of its own.
+            return Ok(());
+        }
         let reused = placed.is_some();
-        let (post, plan, ext_addr, blocks_len) = match placed {
+        let (post, plan, ext_addr, blocks_len, eoa) = match placed {
             Some(layout) => layout,
             None => {
                 // Nothing fits: open a metadata page at end-of-file. `pad_to_page`
                 // above already left the file page-aligned, so this only records the
-                // tail page's type.
+                // tail page's type. No trailing run is released here — whatever
+                // free space reaches end-of-file was too small for the tail, and
+                // stays recorded below it.
                 self.begin_page(PageType::Meta)?;
                 let at = self.image.len();
                 let post = self.paged_post_free(&to_free, &old_blocks);
@@ -7215,16 +7467,22 @@ impl WriteEngine {
                     os,
                 );
                 let blocks_len = plan.end_of_managers.max(at + ext_len) - at;
-                (post, plan, at, blocks_len)
+                (post, plan, at, blocks_len, at)
             }
         };
         let final_eof = if reused {
             // The tail landed inside the file; the end-of-allocation is where this
-            // commit's appends already left it, page-aligned by `pad_to_page`.
-            self.image.len()
+            // commit's appends left it — page-aligned by `pad_to_page`, less the
+            // whole pages of free space reaching it, which `post` no longer
+            // records and the truncation below gives back (issue #418).
+            eoa
         } else {
             align_up(ext_addr + blocks_len, page_size)
         };
+        debug_assert!(
+            ext_addr + blocks_len <= final_eof,
+            "the tail must end at or below the end-of-allocation it was placed under"
+        );
 
         let ext_oh = if plan.is_empty() {
             // No free space to track: an empty persist message, page-aligned.
@@ -7258,8 +7516,12 @@ impl WriteEngine {
         }
         // An appended tail ends mid-page; pad it out, so the end-of-allocation stays
         // a whole number of pages. A reused tail is already inside the file, and
-        // matched its reservation exactly, so there is nothing to pad.
-        self.pad_zeros_to(final_eof)?;
+        // matched its reservation exactly, so there is nothing to pad — and where
+        // it released a trailing run its end-of-allocation is *below* the current
+        // end-of-file, which the truncation after the repoint gives back.
+        if !reused {
+            self.pad_zeros_to(final_eof)?;
+        }
         // Exactly the bytes written, contiguous from the extension. A session that
         // reopens this file records the same extents from the message and the
         // manager headers, so nothing depends on remembering this across a close.
@@ -7282,6 +7544,16 @@ impl WriteEngine {
         self.barrier()?;
         self.superblock = new_sb;
 
+        // Physically shrink the file only after the superblock — now carrying the
+        // smaller end-of-file — is durable, for the reason the flat tail gives:
+        // a crash between the two leaves trailing bytes the next open ignores,
+        // where the reverse order would advertise an end-of-file past the file's
+        // actual length.
+        if final_eof < self.image.len() {
+            self.image.truncate(final_eof)?;
+            self.barrier()?;
+        }
+
         // The repoint is durable. Only now are this commit's vacated regions
         // genuinely free, so adopt the lists built above and drop the padding tails
         // they already account for. The blocks just written become the ones the next
@@ -7290,6 +7562,15 @@ impl WriteEngine {
             pg.meta = post.meta;
             pg.raw = post.raw;
             pg.dead = post.dead;
+            // Rebuilt rather than left alone: this list is otherwise constant for
+            // the session, but a released trailing run may have cut into it, and a
+            // section naming bytes the file no longer has would be written back to
+            // the managers by the next commit.
+            let mut unclassified = FreeList::new();
+            for s in &post.unclassified {
+                unclassified.free(s.addr, s.size);
+            }
+            pg.unclassified = unclassified;
             pg.meta_pad.clear();
             pg.raw_pad.clear();
             if !reused {
@@ -7445,10 +7726,12 @@ impl WriteEngine {
         ext_len: u64,
         page_size: u64,
         os: u8,
-    ) -> Option<(PagedPostFree, PagedManagerPlan, u64, u64)> {
+    ) -> Option<(PagedPostFree, PagedManagerPlan, u64, u64, u64)> {
         /// Enough rounds for the section set to settle after a reservation shrinks
         /// it, without letting an oscillating proposal spin.
         const ROUNDS: usize = 4;
+
+        let eof = self.image.len();
 
         // The first proposal: what the blocks would measure with nothing reserved.
         // A manager block's length depends only on the sections it records, never
@@ -7471,7 +7754,13 @@ impl WriteEngine {
                 .as_mut()
                 .expect("commit_persisting_paged is only called on a paged file");
             let at = pg.alloc_typed(proposed, PageType::Meta)?;
-            let post = self.paged_post_free(to_free, old_blocks);
+            let mut post = self.paged_post_free(to_free, old_blocks);
+            // Whole free pages at the end of the file are released rather than
+            // recorded, so the sections these blocks are sized from must already
+            // leave them out (issue #418). The reservation was taken before this
+            // list was built, so the run can only begin at or above the tail's own
+            // end.
+            let eoa = post.release_trailing(eof, page_size, proposed);
             // Class the free space into its managers and place their blocks after
             // the extension. Shared with the bounded backend so both lay out
             // identically.
@@ -7487,7 +7776,12 @@ impl WriteEngine {
             // alone; `end_of_managers` is then its own start.
             let blocks_len = plan.end_of_managers.max(at + ext_len) - at;
             if blocks_len == proposed {
-                return Some((post, plan, at, blocks_len));
+                debug_assert!(
+                    at + blocks_len <= eoa,
+                    "a reused tail at {at} of {blocks_len} bytes runs past the end-of-allocation \
+                     {eoa} it was placed under"
+                );
+                return Some((post, plan, at, blocks_len, eoa));
             }
             let pg = self
                 .paged
@@ -16238,7 +16532,7 @@ mod tests {
             let layout = s.tail_layout(&[], &[], EXT_LEN, PAGE, os);
             let free_after = free_total(&s);
             match layout {
-                Some((_, _, at, blocks_len)) => {
+                Some((_, _, at, blocks_len, _)) => {
                     placed += 1;
                     assert_eq!(
                         free_before - free_after,
@@ -16258,6 +16552,57 @@ mod tests {
             placed > 0,
             "the sweep must reach holes the tail can actually use, or it asserts \
              nothing about placement"
+        );
+    }
+
+    /// The shrink pass never grows the file: asked to rewrite the tail with
+    /// nothing in the free list to put it in, it writes nothing at all
+    /// (issue #418).
+    ///
+    /// That is the whole safety argument for running it. It exists to make the
+    /// file smaller, and a tail it cannot place would otherwise go past
+    /// end-of-file — a rewrite taken for the sake of a shorter file leaving a
+    /// longer one. The second half of the test is what keeps the first half
+    /// honest: under `TailPlacement::Anywhere` the same call on the same session
+    /// does write a tail, so the fixture really did have one to write.
+    #[test]
+    fn a_reuse_only_tail_rewrite_that_cannot_place_itself_writes_nothing() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reuse_only.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..400).collect::<Vec<i32>>())
+            .with_shape(&[400]);
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+        b.write(&path).unwrap();
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        // No hole anywhere: the only place a tail could go is past end-of-file.
+        s.free = FreeList::new();
+        let root = s.superblock.root_group_address;
+        let len_before = s.image.len();
+        let ext_before = s.superblock.superblock_extension_address;
+
+        s.commit_persisting(root, Vec::new(), TailPlacement::ReuseOnly)
+            .unwrap();
+        assert_eq!(
+            s.image.len(),
+            len_before,
+            "a reuse-only rewrite with nothing to reuse must leave the file alone"
+        );
+        assert_eq!(
+            s.superblock.superblock_extension_address, ext_before,
+            "and must not have published a new extension either"
+        );
+
+        s.commit_persisting(root, Vec::new(), TailPlacement::Anywhere)
+            .unwrap();
+        assert!(
+            s.image.len() > len_before,
+            "the same rewrite that may append does grow the file, so the case \
+             above was a tail declined rather than a tail of no size"
         );
     }
 
@@ -16308,7 +16653,7 @@ mod tests {
             s.free = FreeList::new();
             s.free.free(HOLE_AT, hole);
             let free_before = free_total(&s);
-            let (post, at, tail_len) = s.flat_tail_layout(&[], &[], EXT_LEN, os);
+            let (post, at, tail_len, _) = s.flat_tail_layout(&[], &[], EXT_LEN, os);
             let free_after = free_total(&s);
             // The blocks the commit will write into the extent it was handed. A hole
             // consumed outright drops a section from the managers, so this comes out
@@ -19824,6 +20169,12 @@ mod tests {
     /// under churn once the floor on the draw was gone. Measured as the file's
     /// length across the append, which a tail landing anywhere inside leaves
     /// alone.
+    ///
+    /// Measured as the tail's own address rather than as an unchanged length: the
+    /// rewrite supersedes the fixture's tail, which sat at end-of-file, so
+    /// releasing that trailing run leaves the file *shorter* than it started
+    /// (issue #418). An appended tail would land at exactly the pre-append
+    /// end-of-file, which is the case both assertions rule out.
     #[test]
     fn a_draws_rewrite_places_its_tail_inside_the_draw() {
         use tempfile::tempdir;
@@ -19839,11 +20190,17 @@ mod tests {
             !s.reserved.is_empty(),
             "no reserve was drawn, so this measured an ordinary end-of-file append"
         );
-        assert_eq!(
-            s.image.len(),
-            len_before,
-            "the rewrite appended its tail at end-of-file instead of placing it in \
-             the hole it was publishing as taken"
+        let ext = s.superblock.superblock_extension_address.unwrap();
+        assert!(
+            ext < len_before,
+            "the rewrite appended its tail at {ext}, the pre-append end-of-file \
+             {len_before}, instead of placing it in the hole it was publishing as taken"
+        );
+        assert!(
+            s.image.len() <= len_before,
+            "a rewrite that placed its tail inside the file must not have grown it \
+             (was {len_before}, now {})",
+            s.image.len()
         );
     }
 
