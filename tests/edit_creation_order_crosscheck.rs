@@ -958,14 +958,18 @@ fn a_tracked_group_at_its_compact_threshold_is_refused() {
     assert_eq!(links_in_creation_order(&p).1, 8);
     let before = std::fs::read(&p).unwrap();
 
-    let s = File::open_rw(&p).unwrap();
-    s.group("g")
-        .unwrap()
-        .create_dataset("extra", |d| {
-            d.with_i32_data(&[1, 2]);
-        })
-        .unwrap();
-    let err = s.commit().unwrap_err();
+    // Scoped so the session — and the file lock it holds, which Windows
+    // enforces — is gone before the bytes are read back.
+    let err = {
+        let s = File::open_rw(&p).unwrap();
+        s.group("g")
+            .unwrap()
+            .create_dataset("extra", |d| {
+                d.with_i32_data(&[1, 2]);
+            })
+            .unwrap();
+        s.commit().unwrap_err()
+    };
     assert!(
         matches!(&err, Error::EditUnsupported(m)
             if m.contains("link creation order") && m.contains("dense")),
@@ -992,14 +996,18 @@ fn a_dense_tracked_group_is_refused() {
     assert_eq!(links_in_creation_order(&p).1, 9);
     let before = std::fs::read(&p).unwrap();
 
-    let s = File::open_rw(&p).unwrap();
-    s.group("g")
-        .unwrap()
-        .create_dataset("extra", |d| {
-            d.with_i32_data(&[1, 2]);
-        })
-        .unwrap();
-    let err = s.commit().unwrap_err();
+    // Scoped so the session — and the file lock it holds, which Windows
+    // enforces — is gone before the bytes are read back.
+    let err = {
+        let s = File::open_rw(&p).unwrap();
+        s.group("g")
+            .unwrap()
+            .create_dataset("extra", |d| {
+                d.with_i32_data(&[1, 2]);
+            })
+            .unwrap();
+        s.commit().unwrap_err()
+    };
     assert!(
         matches!(&err, Error::EditUnsupported(m) if m.contains("dense")),
         "got: {err}",
