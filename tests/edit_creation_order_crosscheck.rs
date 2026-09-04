@@ -91,6 +91,15 @@ unsafe extern "C" {
         info: *mut AttrInfo,
         lapl: i64,
     ) -> c_int;
+    fn H5Literate2(
+        group: i64,
+        idx_type: c_int,
+        order: c_int,
+        idx: *mut u64,
+        op: extern "C" fn(i64, *const c_char, *const c_void, *mut c_void) -> c_int,
+        op_data: *mut c_void,
+    ) -> c_int;
+    fn H5Gget_info(group: i64, info: *mut GroupInfo) -> c_int;
 }
 
 unsafe extern "C" {
@@ -111,6 +120,18 @@ struct AttrInfo {
     corder: u32,
     cset: c_int,
     data_size: u64,
+}
+
+/// `H5G_info_t`: storage type, link count, the highest link creation index
+/// ever assigned in the group, and whether a file is mounted here. `max_corder`
+/// is the counter a deletion must leave alone.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GroupInfo {
+    storage_type: c_int,
+    nlinks: u64,
+    max_corder: i64,
+    mounted: u8,
 }
 
 const H5P_DEFAULT: i64 = 0;
@@ -230,8 +251,9 @@ fn write_tracked(path: &Path, names: &[String], indexed: Indexed) {
     }
 }
 
-/// A file whose group `/g` tracks *link* creation order, as netCDF-4 writes.
-fn write_link_tracked(path: &Path) {
+/// A file whose group `/g` tracks *link* creation order, as netCDF-4 writes,
+/// holding one dataset per name in `links`, created in that order.
+fn write_link_tracked(path: &Path, links: &[&str]) {
     let _c = c_lib_guard();
     unsafe {
         let fcpl = H5Pcreate(H5P_CLS_FILE_CREATE_ID_g);
@@ -251,18 +273,20 @@ fn write_link_tracked(path: &Path) {
 
         let dims = [4u64];
         let dspace = H5Screate_simple(1, dims.as_ptr(), std::ptr::null());
-        let dname = cstr("d");
-        let dataset = H5Dcreate2(
-            group,
-            dname.as_ptr(),
-            H5T_NATIVE_INT_g,
-            dspace,
-            H5P_DEFAULT,
-            H5P_DEFAULT,
-            H5P_DEFAULT,
-        );
-        assert!(dataset > 0, "create dataset");
-        H5Dclose(dataset);
+        for link in links {
+            let dname = cstr(link);
+            let dataset = H5Dcreate2(
+                group,
+                dname.as_ptr(),
+                H5T_NATIVE_INT_g,
+                dspace,
+                H5P_DEFAULT,
+                H5P_DEFAULT,
+                H5P_DEFAULT,
+            );
+            assert!(dataset > 0, "create dataset {link}");
+            H5Dclose(dataset);
+        }
         H5Sclose(dspace);
         H5Gclose(group);
         H5Pclose(gcpl);
@@ -280,6 +304,26 @@ extern "C" fn collect(
 ) -> c_int {
     // Safety: every caller passes a `&mut Vec<String>` as `op_data`, and the C
     // library hands back a NUL-terminated attribute name.
+    unsafe {
+        let names = &mut *op_data.cast::<Vec<String>>();
+        names.push(
+            std::ffi::CStr::from_ptr(name)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    0
+}
+
+/// Collect link names into the `Vec<String>` `op_data` points at.
+extern "C" fn collect_link(
+    _group: i64,
+    name: *const c_char,
+    _info: *const c_void,
+    op_data: *mut c_void,
+) -> c_int {
+    // Safety: every caller passes a `&mut Vec<String>` as `op_data`, and the C
+    // library hands back a NUL-terminated link name.
     unsafe {
         let names = &mut *op_data.cast::<Vec<String>>();
         names.push(
@@ -406,6 +450,45 @@ impl Drop for Owner {
             }
             H5Fclose(self.file);
         }
+    }
+}
+
+/// The names of `/g`'s links in link creation order, and the highest creation
+/// index the group has ever assigned — the counter a deletion must leave alone.
+fn links_in_creation_order(path: &Path) -> (Vec<String>, i64) {
+    let _c = c_lib_guard();
+    let name = cstr(path.to_str().expect("a temp path is UTF-8"));
+    let gname = cstr("g");
+    // Safety: both ids come from the C library and are closed below; `info` and
+    // `names` are written by the calls that are handed them.
+    unsafe {
+        let file = H5Fopen(name.as_ptr(), H5F_ACC_RDONLY, H5P_DEFAULT);
+        assert!(file > 0, "the C library opens {}", path.display());
+        let group = H5Gopen2(file, gname.as_ptr(), H5P_DEFAULT);
+        assert!(group > 0, "the C library opens /g");
+
+        let mut names: Vec<String> = Vec::new();
+        let mut idx = 0u64;
+        let rc = H5Literate2(
+            group,
+            H5_INDEX_CRT_ORDER,
+            H5_ITER_INC,
+            &raw mut idx,
+            collect_link,
+            (&raw mut names).cast(),
+        );
+        assert_eq!(rc, 0, "the C library iterates links by creation order");
+
+        let mut info = GroupInfo::default();
+        assert_eq!(
+            H5Gget_info(group, &raw mut info),
+            0,
+            "the C library reads group info"
+        );
+
+        H5Gclose(group);
+        H5Fclose(file);
+        (names, info.max_corder)
     }
 }
 
@@ -684,7 +767,7 @@ fn an_object_already_dense_keeps_its_creation_order_across_an_edit() {
 fn a_group_tracking_link_creation_order_refuses_a_new_child() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("t.h5");
-    write_link_tracked(&p);
+    write_link_tracked(&p, &["d"]);
 
     // Its attributes are editable — the object header's creation-order tracking
     // is what this change lifted.
@@ -701,6 +784,64 @@ fn a_group_tracking_link_creation_order_refuses_a_new_child() {
     // Its membership is not: a Link message this crate emits carries no creation
     // index, so adding one would leave an iteration by link creation order
     // walking an unnumbered link.
+    let s = File::open_rw(&p).unwrap();
+    let g = s.group("g").unwrap();
+    g.create_dataset("extra", |d| {
+        d.with_i32_data(&[1, 2]);
+    })
+    .unwrap();
+    let err = s.commit().unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("link creation order")),
+        "got: {err}",
+    );
+}
+
+/// Deleting a link from a group that tracks link creation order is *not*
+/// refused: it leaves a gap in the order and touches no counter, the same shape
+/// this crate already gives an attribute deletion.
+///
+/// The reference C library is the judge, because this crate's own reader ignores
+/// link creation order entirely: `H5Literate2` over `H5_INDEX_CRT_ORDER` reads
+/// the per-link creation indexes, and `H5Gget_info`'s `max_corder` is the
+/// running maximum a deletion must not lower.
+#[test]
+fn a_group_tracking_link_creation_order_takes_a_deletion() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("t.h5");
+    write_link_tracked(&p, &["first", "middle", "last"]);
+    assert_eq!(
+        links_in_creation_order(&p),
+        (
+            vec![
+                "first".to_string(),
+                "middle".to_string(),
+                "last".to_string()
+            ],
+            3
+        ),
+        "the fixture does not track link creation order",
+    );
+
+    {
+        let s = File::open_rw(&p).unwrap();
+        s.group("g").unwrap().delete("middle").unwrap();
+        s.commit().expect("a deletion needs no creation index");
+    }
+
+    let (names, max_corder) = links_in_creation_order(&p);
+    assert_eq!(
+        names,
+        ["first", "last"],
+        "the survivors lost their creation order",
+    );
+    assert_eq!(
+        max_corder, 3,
+        "a deletion must not lower the group's link creation-index counter",
+    );
+
+    // The group is still one this crate refuses to add to, so the deletion did
+    // not quietly turn the tracking off.
     let s = File::open_rw(&p).unwrap();
     let g = s.group("g").unwrap();
     g.create_dataset("extra", |d| {

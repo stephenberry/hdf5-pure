@@ -96,8 +96,8 @@
 //!   message records are walked and re-emitted, a new attribute takes the
 //!   object's next creation index, an overwrite keeps the one it had, and a
 //!   deletion leaves a gap rather than renumbering. A group that tracks **link**
-//!   creation order is read and its attributes edited, but adding or removing
-//!   one of its links is refused.
+//!   creation order is read, its attributes edited, and a link removed from it
+//!   or retargeted; only *adding* a link to one is refused.
 //! - Added datasets may be contiguous *or* chunked, with any filter the
 //!   whole-file writer supports (deflate, shuffle, fletcher32, scale-offset,
 //!   LZF, ZFP), and may declare extensible (maximum, optionally unlimited)
@@ -6056,8 +6056,14 @@ impl WriteEngine {
         // rebuilds the same grouping, by the same rule, once it owns the set.
         let datasets_by_group = group_by_parent(staged.datasets.iter().map(|(p, fd)| (p, fd)));
 
-        // Changing which links a group holds is refused while it tracks *link*
-        // creation order, before anything is written.
+        // Adding a link to a group that tracks *link* creation order is refused,
+        // before anything is written. Removing one is not: dropping a Link
+        // message leaves a gap in the order the same way dropping an Attribute
+        // message does, and the Link Info message's running maximum is copied
+        // through untouched — which is what the reference C library leaves
+        // behind too, since it never lowers that counter. A replacement (a
+        // delete and a creation at one path) adds a link, so it is refused here
+        // like any other addition.
         for key in &keys {
             let node = &nodes[key];
             let gains_a_link = !node.copies.is_empty()
@@ -6066,7 +6072,7 @@ impl WriteEngine {
                 || children
                     .get(key)
                     .is_some_and(|kids| kids.iter().any(|child| nodes[child].is_new));
-            if gains_a_link || !node.deletes.is_empty() {
+            if gains_a_link {
                 reject_link_creation_order(&node.base_region)?;
             }
         }
@@ -12408,21 +12414,28 @@ fn rebuild_compact_layout_region(region: &OhRegion, raw: &[u8]) -> Result<OhRegi
     Ok(region.with_bytes(out))
 }
 
-/// Refuse to add a link to, or remove one from, a group that tracks **link**
-/// creation order.
+/// Refuse to *add* a link to a group that tracks **link** creation order.
 ///
 /// Link creation order is a separate mechanism from the attribute creation order
 /// the object header's own flags describe: a group that tracks it carries a
 /// running maximum in its Link Info message and a creation index on every Link
-/// message, and neither this editor's Link emitter nor its Link Info handling
-/// maintains those. netCDF-4 sets it on every group it writes, so such a group
-/// is read, and its *attributes* are edited, without difficulty — but a link
-/// added without a creation index would leave `H5Literate` by creation order
-/// walking an unnumbered link, so changing the membership is refused instead
-/// (issue #416).
+/// message, and this editor's Link emitter writes neither. netCDF-4 sets it on
+/// every group it writes, so such a group is read, and its *attributes* are
+/// edited, without difficulty — but a link added without a creation index would
+/// leave an iteration by link creation order walking an unnumbered link, so an
+/// addition is refused (issue #416).
 ///
-/// Retargeting an existing link ([`patch_link_target`], how a relocated child is
-/// rewired) changes no creation order and is not refused.
+/// Two things a commit does to such a group's links are *not* refused, because
+/// neither writes a creation order:
+///
+/// - **Removing** a link. Dropping the Link message leaves a gap in the order
+///   exactly as dropping an Attribute message does, and the running maximum is
+///   copied through untouched — the reference C library does not lower it on a
+///   deletion either, so the group is left in a state it could have reached on
+///   its own.
+/// - **Retargeting** one ([`patch_link_target`], how a relocated child is
+///   rewired), which rewrites an address inside a Link message and leaves every
+///   other field of it, creation index included, where it was.
 fn reject_link_creation_order(region: &OhRegion) -> Result<(), Error> {
     let mut p = 0;
     while let Some((msg_type, body, body_end)) = region.next_message(p)? {
@@ -12431,8 +12444,8 @@ fn reject_link_creation_order(region: &OhRegion) -> Result<(), Error> {
             && info.max_creation_order.is_some()
         {
             return Err(Error::EditUnsupported(
-                "a group on the edited path tracks link creation order; its links cannot be \
-                 added to or removed in place yet",
+                "a group on the edited path tracks link creation order; links cannot be \
+                 added to it in place yet",
             ));
         }
         p = body_end;
