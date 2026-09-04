@@ -1705,7 +1705,13 @@ fn paged_free_space_is_reused_after_a_reopen() {
     b.create_dataset("big")
         .with_f64_data(&vec![1.0; ELEMS])
         .with_chunks(&[4096]);
-    b.create_dataset("tail").with_i32_data(&[9; 16]);
+    // Above `big`, and more than a page of it, so deleting `big` leaves an
+    // interior hole rather than a run reaching end-of-file that the commit
+    // releases: sixteen elements landed in a low hole and left the pages
+    // trailing after all.
+    b.create_dataset("tail")
+        .with_f64_data(&vec![9.0f64; CEILING_ELEMS])
+        .with_chunks(&[4096]);
     b.write(&path).unwrap();
     let start = std::fs::metadata(&path).unwrap().len();
 
@@ -1745,7 +1751,214 @@ fn paged_free_space_is_reused_after_a_reopen() {
         f.dataset("keep").unwrap().read_i32().unwrap(),
         vec![1, 2, 3]
     );
-    assert_eq!(f.dataset("tail").unwrap().read_i32().unwrap(), vec![9; 16]);
+    assert_eq!(
+        f.dataset("tail").unwrap().read_f64().unwrap(),
+        vec![9.0f64; CEILING_ELEMS]
+    );
+}
+
+/// Every free section a released file records lies inside it, and a session that
+/// reopens the file agrees with the length the release left (issue #418).
+///
+/// The free-space managers name absolute file offsets, so a run given back to
+/// the filesystem has to leave the record as well as the file — a section past
+/// the end of the file is one the reference C library would hand a writer.
+fn assert_released_file_is_self_consistent(path: &std::path::Path) {
+    assert_eof_matches_file(path);
+    let len = std::fs::metadata(path).unwrap().len();
+    let f = File::open(path).unwrap();
+    for (addr, size) in f.persisted_free_space() {
+        assert!(
+            addr + size <= len,
+            "a persisted free section [{addr}, {}) runs past the end of the \
+             {len}-byte file",
+            addr + size
+        );
+    }
+    drop(f);
+    let s = File::open_rw(path).unwrap();
+    assert_eq!(
+        s.space_accounting().unwrap().logical_size,
+        len,
+        "a reopened session must account for the file at the length the release \
+         left it"
+    );
+}
+
+/// Stage a group of populated chunked datasets under `name` and commit it.
+fn create_populated_group(f: &File, name: &str, rows: usize, cols: usize) {
+    let payload: Vec<i32> = (0..rows as i32).collect();
+    f.root()
+        .create_group_with(name, |g| {
+            for c in 0..cols {
+                g.create_dataset(&format!("c{c}"), |b| {
+                    b.with_i32_data(&payload)
+                        .with_shape(&[rows as u64])
+                        .with_chunks(&[512])
+                        .with_maxshape(&[u64::MAX]);
+                });
+            }
+        })
+        .unwrap();
+    f.commit().unwrap();
+}
+
+/// Deleting a populated group gives the space at the end of the file back to the
+/// filesystem rather than leaving the file at its high-water mark with those
+/// bytes merely recorded as free (issue #418).
+///
+/// What is guaranteed is the release, not that a delete never grows a file:
+/// persisting the free-space managers costs metadata that has to go somewhere,
+/// and the reference C library grows a file to persist them too. So this
+/// measures the file against the data left alive in it — a few kilobytes of
+/// manager blocks and the reserve the next commit's tail needs, not the
+/// megabyte the deleted group occupied.
+#[test]
+fn deleting_a_populated_group_releases_the_end_of_a_flat_file() {
+    const ROWS: usize = 65536; // 256 KiB per dataset
+    let path = temp_path("hdf5_pure_fs_release_flat.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.write(&path).unwrap();
+
+    let f = open_rw_on_close(&path);
+    create_populated_group(&f, "scratch", ROWS, 2);
+    let peak = f.file_size();
+    assert!(
+        peak > 2 * ROWS as u64 * 4,
+        "the fixture must put a megabyte or so in the file, not {peak} bytes"
+    );
+
+    f.root().delete("scratch").unwrap();
+    f.commit().unwrap();
+    let after = f.file_size();
+    assert_eq!(
+        after,
+        f.space_accounting().unwrap().logical_size,
+        "file_size and the session's own accounting must report one length"
+    );
+    // Everything the group occupied reached the end of the file, so all of it
+    // goes back; what is left is the surviving objects and the managers.
+    assert!(
+        after < peak / 16,
+        "deleting the group should have given the end of the file back (peak \
+         {peak}, now {after})"
+    );
+    f.close().unwrap();
+
+    assert_released_file_is_self_consistent(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.dataset("keep").unwrap().read_i32().unwrap(), [1, 2, 3]);
+    assert!(f.group("scratch").is_err(), "the group is gone");
+}
+
+/// The same on a paged file, where the end of allocation stays a whole number of
+/// pages: deleting down to one small group releases the pages above it
+/// (issue #418).
+///
+/// The reporter's first case, keeping the *first* group rather than the last —
+/// with the last, the surviving group's own blocks sit at the top of the file
+/// and no amount of releasing can move them, which is a question for repack
+/// rather than for this.
+#[test]
+fn deleting_down_to_one_group_releases_a_paged_file_s_trailing_pages() {
+    const ROWS: usize = 8192;
+    const GROUPS: usize = 6;
+    let path = temp_path("hdf5_pure_fs_release_paged.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+        .with_file_space_page_size(RECLAIM_PAGE);
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.write(&path).unwrap();
+
+    let f = open_rw_on_close(&path);
+    for i in 0..GROUPS {
+        create_populated_group(&f, &format!("e{i:05}"), ROWS, 2);
+    }
+    let peak = f.file_size();
+    assert!(
+        peak > 16 * RECLAIM_PAGE,
+        "the fixture must reach a good many pages, not {peak} bytes"
+    );
+
+    for i in 1..GROUPS {
+        f.root().delete(&format!("e{i:05}")).unwrap();
+        f.commit().unwrap();
+    }
+    let after = f.file_size();
+    assert_eq!(
+        after % RECLAIM_PAGE,
+        0,
+        "a paged file's end of allocation stays a whole number of pages ({after})"
+    );
+    assert!(
+        after < peak / 2,
+        "deleting down to one group should have released the pages above it \
+         (peak {peak}, now {after})"
+    );
+    f.close().unwrap();
+
+    assert_released_file_is_self_consistent(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.dataset("keep").unwrap().read_i32().unwrap(), [1, 2, 3]);
+    assert_eq!(
+        f.dataset("e00000/c0").unwrap().read_i32().unwrap(),
+        (0..ROWS as i32).collect::<Vec<i32>>()
+    );
+}
+
+/// A release survives the close and the reopen, and the reopened session goes on
+/// editing the shorter file (issue #418).
+///
+/// The length is the one thing a crash-atomic commit publishes *twice* — in the
+/// superblock's end-of-file and in the physical file — so a release that got the
+/// order wrong would leave a file whose superblock names bytes that are not
+/// there. Reading it back with a fresh session is what catches that.
+#[test]
+fn a_released_file_reopens_and_keeps_being_edited() {
+    const ROWS: usize = 65536;
+    let path = temp_path("hdf5_pure_fs_release_reopen.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 0);
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.write(&path).unwrap();
+
+    let peak = {
+        let f = open_rw_on_close(&path);
+        create_populated_group(&f, "scratch", ROWS, 2);
+        let peak = f.file_size();
+        f.root().delete("scratch").unwrap();
+        f.commit().unwrap();
+        f.close().unwrap();
+        peak
+    };
+    let released = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        released < peak / 16,
+        "the close must leave the released length on disk (peak {peak}, now \
+         {released})"
+    );
+    assert_released_file_is_self_consistent(&path);
+
+    // A second round of the same churn on the reopened file settles at the same
+    // length rather than starting again from the high-water mark.
+    {
+        let f = open_rw_on_close(&path);
+        create_populated_group(&f, "scratch2", ROWS, 2);
+        f.root().delete("scratch2").unwrap();
+        f.commit().unwrap();
+        f.close().unwrap();
+    }
+    let again = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        again <= released + RECLAIM_PAGE,
+        "a second round of the same churn must not leave the file larger \
+         (was {released}, now {again})"
+    );
+    assert_released_file_is_self_consistent(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.dataset("keep").unwrap().read_i32().unwrap(), [1, 2, 3]);
 }
 
 /// Build `name` as a rank-1, unlimited, chunked i32 dataset of length zero.
@@ -1906,6 +2119,12 @@ const REUSE_ELEMS: i32 = 512 * 1024;
 /// fixture's 16 KiB page.
 const REUSE_CHUNK: u64 = 16384;
 
+/// A ceiling object big enough to be placed past end-of-file rather than in one
+/// of the file's holes — more than a page on a paged file — so that what a delete
+/// below it leaves really is an interior hole and not a run the commit releases
+/// (issue #418).
+const CEILING_ELEMS: usize = 4096;
+
 /// No region the on-disk free-space managers advertise may overlap a live chunk
 /// of any of `datasets`.
 ///
@@ -1970,11 +2189,13 @@ fn append_churn_on_a_persisting_file(
     // A live object above the churned region, so the delete below leaves an
     // interior hole rather than a run reaching end-of-file that the commit would
     // simply truncate away — which would let this pass on truncation rather than
-    // on reuse.
+    // on reuse. Sized past every hole the file holds at this point and past a
+    // page: a three-element one landed in a low hole and left the payload
+    // trailing after all.
     session
         .root()
         .create_dataset("ceiling", |b| {
-            b.with_i32_data(&[9, 9, 9]);
+            b.with_i32_data(&vec![9i32; CEILING_ELEMS]);
         })
         .unwrap();
     session.commit().unwrap();
@@ -1996,7 +2217,7 @@ fn append_churn_on_a_persisting_file(
     assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), [1, 2, 3]);
     assert_eq!(
         file.dataset("ceiling").unwrap().read_i32().unwrap(),
-        [9, 9, 9]
+        vec![9i32; CEILING_ELEMS]
     );
     drop(file);
     assert_no_persisted_free_space_holds_live_chunks(&path, &["log2"]);
@@ -2103,7 +2324,8 @@ fn a_paged_append_reserve_keeps_pages_homogeneous() {
     b.create_dataset("victim")
         .with_i32_data(&vec![7i32; 1024 * 1024])
         .with_chunks(&[CHUNK]);
-    b.create_dataset("ceiling").with_i32_data(&[9, 9, 9]);
+    b.create_dataset("ceiling")
+        .with_i32_data(&vec![9i32; CEILING_ELEMS]);
     b.write(&path).unwrap();
 
     let session = open_rw_on_close(&path);
@@ -2413,17 +2635,24 @@ fn populated_group_churn(
 
 /// A churn loop's steady state: the last third of the run adds nothing, to the
 /// file or to the space that is neither live nor reusable.
+///
+/// Compared as the *peak* over each of the last two thirds rather than as one
+/// size, because a steady state is a short cycle rather than a fixed point once a
+/// commit releases the free run at the end of the file (issue #418): the cycle
+/// whose delete leaves the tail free gives those bytes back, and the next cycle
+/// takes them again. What may not move is the ceiling of that cycle.
 fn assert_churn_settled(sizes: &[u64], used: &[u64]) {
-    let settled = sizes.len() * 2 / 3;
+    let third = sizes.len() / 3;
+    let peak = |xs: &[u64]| xs.iter().copied().max().expect("a non-empty run");
     assert_eq!(
-        sizes[sizes.len() - 1],
-        sizes[settled],
+        peak(&sizes[2 * third..]),
+        peak(&sizes[third..2 * third]),
         "the file must stop growing once the churn is in its steady state \
          (sizes: {sizes:?})"
     );
     assert_eq!(
-        used[used.len() - 1],
-        used[settled],
+        peak(&used[2 * third..]),
+        peak(&used[third..2 * third]),
         "space that is neither live nor reusable must stop accumulating \
          (used: {used:?})"
     );
