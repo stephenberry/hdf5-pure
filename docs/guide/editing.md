@@ -483,6 +483,8 @@ The last two are silent: every checksum verifies and a reader has no signal. Thi
 
 So a page-buffered session **marks the file for its lifetime**: superblock status-flag bit 0, `H5F_SUPER_WRITE_ACCESS`, the byte the reference C library raises for any writer and this crate otherwise raises only for a SWMR one. It is written and `fsync`ed at open, republished by every commit, and cleared on a clean `close` or drop. A session that dies with pages in memory leaves it standing, and a file carrying it is refused by this crate, by `H5Fopen` and by h5py alike with `Error::FileMarkedInUse`. The silent wrong answer becomes a refusal; `File::clear_swmr_flag` (the `h5clear -s` equivalent) is how to look at such a file anyway, knowing what it may hold.
 
+A reader that wants a snapshot while the session is still running has one too. The mark is bit 0 alone, which no SWMR reader can follow, so `FileAccessProperties::with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)` reads the file as it stands through any `*_with_options` open — on the caller's assertion that the writer has flushed, with `File::sync` or a clean close. It admits nothing else: a SWMR pair still belongs to `File::open_swmr`, and no reader's opt-in lets a second writer in.
+
 ### When it is worth it
 
 The mark costs two `fsync`s per session, at open and at close, whatever the session then does — so a page buffer pays off over a long session and costs on a short one. Measured on an Apple M1 Max (APFS), 256-byte appends into eight datasets, arms alternated and medians of seven:

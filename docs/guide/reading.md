@@ -23,7 +23,19 @@ This page covers opening HDF5 files, navigating their group hierarchy, and readi
 | `File::open_swmr(path)` | A file being appended to | Re-readable with `refresh()` to pick up new data. See [SWMR](swmr.md). |
 | `File::from_source(source)` | Any `Source` — bytes with no path | The streaming reader over an object store, a sandboxed host, anything that answers "how long" and "bytes at this offset". See [Streaming](streaming.md). |
 
-`File::open`, `File::open_streaming` and `File::from_source` refuse a file whose superblock marks it as held by a writer, with `Error::FileMarkedInUse` — the check `H5Fopen` makes of the same byte. `File::open_swmr` follows such a file instead, refusing only a half-set mark, and `File::from_bytes` does not consult the byte at all. Recover a file a writer left flagged when it exited with `File::clear_swmr_flag`; see [SWMR](swmr.md#recovering-a-flagged-file).
+`File::open`, `File::open_streaming` and `File::from_source` refuse a file whose superblock marks it as held by a writer, with `Error::FileMarkedInUse` — the check `H5Fopen` makes of the same byte. Which reader gets at such a file depends on which mark it carries:
+
+- **both bits, a SWMR writer**: follow it with `File::open_swmr`, which also picks up what the writer appends later.
+- **the write bit alone**, which is what a [page-buffered](editing.md#the-page-buffer) writer leaves: no SWMR reader can follow it, so read a snapshot through any `*_with_options` open under `FileAccessProperties::with_write_mark_policy(WriteMarkPolicy::AllowSnapshot)`. That asserts the writer has flushed — it called `File::sync`, or closed the file — which this crate cannot check for you.
+
+```rust
+use hdf5_pure::{File, FileAccessProperties, WriteMarkPolicy};
+
+let props = FileAccessProperties::new().with_write_mark_policy(WriteMarkPolicy::AllowSnapshot);
+let file = File::open_with_options("live.h5", props).unwrap();
+```
+
+The opt-in unlocks nothing else: a SWMR pair still belongs to `File::open_swmr`, and `File::open_rw` is refused whatever it says. `File::from_bytes` does not consult the byte at all, at the cost of a copy of the file. Recover a file a writer left flagged when it exited with `File::clear_swmr_flag`; see [SWMR](swmr.md#recovering-a-flagged-file).
 
 ```rust
 use hdf5_pure::File;

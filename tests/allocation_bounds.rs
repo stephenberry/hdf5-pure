@@ -1060,3 +1060,203 @@ fn open_rw_of_a_persisting_fsm_file_does_not_allocate_the_file() {
          bounds above are not a contrast with anything: {mirrored}"
     );
 }
+
+/// Repeated staged appends do not retain memory per commit (issue #412).
+///
+/// A staged append relocates: the commit writes the new chunks, rebuilds the
+/// dataset's chunk index and moves its object header. The report was that a
+/// process doing this in a loop grew without bound, which would mean each commit
+/// left something behind — a vacated index the engine still held, a batch it did
+/// not release. On the bounded engine a commit holds only what it is building,
+/// so what is live after a run of commits must not scale with their number, and
+/// the peak of that run must be the scratch of *one* commit rather than the sum
+/// of them.
+///
+/// The mirror is the other backing and has its own rule below: it holds the file,
+/// so its retained memory scales with the file and must not scale with anything
+/// else.
+#[test]
+fn repeated_staged_append_commits_retain_nothing_per_commit() {
+    const DATASETS: usize = 4;
+    const CHUNK_ELEMS: u64 = 512;
+    const BATCH_BYTES: usize = CHUNK_ELEMS as usize * 8;
+    const WARMUP_COMMITS: usize = 128;
+    const MEASURED_COMMITS: usize = 64;
+    const APPENDED_BYTES: usize = MEASURED_COMMITS * DATASETS * BATCH_BYTES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("growing.h5");
+    let batch = write_growing_fixture(&path, DATASETS, CHUNK_ELEMS);
+    {
+        let file = File::open_rw_with_options(
+            &path,
+            FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose),
+        )
+        .unwrap();
+        assert_eq!(file.edit_backing(), Some(EditBacking::Bounded));
+        for _ in 0..WARMUP_COMMITS {
+            commit_one_batch_per_dataset(&file, DATASETS, &batch);
+        }
+
+        let (_, measured) = measure("staged_append_commits", || {
+            for _ in 0..MEASURED_COMMITS {
+                commit_one_batch_per_dataset(&file, DATASETS, &batch);
+            }
+        });
+
+        // Every batch is staged inside this region, so their sum is a floor a
+        // measurement of nothing cannot reach.
+        assert!(
+            measured.bytes >= APPENDED_BYTES as u64,
+            "the appended batches are not in the commits' own measurement, so the \
+             bounds below are measuring something other than the commits: {measured}"
+        );
+
+        // Measured at 0 to 8 KiB live after 64 commits. A commit that kept even
+        // one batch per dataset would leave 64 times this ceiling behind; one
+        // that kept its rebuilt index would leave far more.
+        assert!(
+            measured.live_bytes < (2 * DATASETS * BATCH_BYTES) as u64,
+            "{MEASURED_COMMITS} staged-append commits must not retain memory in \
+             proportion to their number: measured {measured}"
+        );
+
+        // Measured at 115 KiB against 1 MiB appended. The peak is one commit's
+        // scratch — four batches, the four rebuilt indexes and headers — and it
+        // grows with the datasets' chunk count (218 KiB and 353 KiB after 512 and
+        // 1024 warm-up commits), never with the number of commits measured. A run
+        // that carried anything from one commit into the next would peak at the
+        // sum of what it appended, above this ceiling four times over.
+        assert!(
+            measured.peak_bytes < (APPENDED_BYTES / 4) as u64,
+            "the peak over {MEASURED_COMMITS} staged-append commits must be one \
+             commit's scratch, not the {APPENDED_BYTES} bytes they appended \
+             together: measured {measured}"
+        );
+    }
+
+    // The session is closed before reading: an open read-write file holds a lock
+    // that a second open refuses on Windows.
+    assert_growing_fixture_contents(
+        &path,
+        DATASETS,
+        CHUNK_ELEMS,
+        WARMUP_COMMITS + MEASURED_COMMITS,
+    );
+}
+
+/// The whole-file mirror holds the file and nothing that grows with the number
+/// of commits made through it (issue #412).
+///
+/// Its memory scales with the file by design — that is the cost
+/// [`MemoryStrategy::Mirrored`] states — so the rule is stated against the file
+/// the run ends with: the image, with the headroom its growth leaves, and the
+/// scratch of the last commit. An image that kept its superseded bytes, or a
+/// commit that held on to a copy of it, would put the run's retained and peak
+/// memory at a multiple of the file these ceilings do not allow.
+#[test]
+fn the_mirror_retains_the_file_not_the_commits_made_through_it() {
+    const DATASETS: usize = 4;
+    const CHUNK_ELEMS: u64 = 512;
+    const COMMITS: usize = 192;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("growing.h5");
+    let batch = write_growing_fixture(&path, DATASETS, CHUNK_ELEMS);
+
+    // The open is inside the region so the image itself is in the measurement,
+    // and the file is handed back out of it so that image is still live when the
+    // region closes.
+    let (file, measured) = measure("mirrored_staged_append_commits", || {
+        let file = File::open_rw_with_options(
+            &path,
+            FileAccessProperties::new()
+                .with_sync_policy(SyncPolicy::OnClose)
+                .with_memory_strategy(MemoryStrategy::Mirrored),
+        )
+        .unwrap();
+        assert_eq!(file.edit_backing(), Some(EditBacking::Mirrored));
+        for _ in 0..COMMITS {
+            commit_one_batch_per_dataset(&file, DATASETS, &batch);
+        }
+        file
+    });
+    let file_size = file.file_size();
+
+    // The image is the floor: a measurement that does not contain the file is
+    // measuring something other than the mirror.
+    assert!(
+        measured.live_bytes >= file_size,
+        "the mirror's image of the {file_size}-byte file is not in its own \
+         measurement, so the ceilings below are bounding something else: {measured}"
+    );
+
+    // Measured at 1.5 file sizes live and at peak for a 3.2 MiB file. The image
+    // grows in steps, so up to two file sizes is the image alone, and a growth
+    // step holds the old and new image together; a mirror that kept one
+    // superseded image per commit would hold hundreds. The peak ceiling is not
+    // tight enough to see one transient copy of the image inside a commit — that
+    // fits under the growth step's headroom — only copies that accumulate.
+    assert!(
+        measured.live_bytes < 3 * file_size,
+        "the mirror must retain its image of the {file_size}-byte file and the \
+         headroom of that image's growth, not what {COMMITS} commits made through \
+         it: measured {measured}"
+    );
+    assert!(
+        measured.peak_bytes < 4 * file_size,
+        "the peak over {COMMITS} mirrored commits must be a small multiple of the \
+         {file_size}-byte image, not the images those commits built together: \
+         measured {measured}"
+    );
+
+    drop(file);
+    assert_growing_fixture_contents(&path, DATASETS, CHUNK_ELEMS, COMMITS);
+}
+
+/// `datasets` rank-1 unlimited f64 datasets of one `chunk_elems` chunk each, and
+/// the batch the tests above append to them.
+fn write_growing_fixture(path: &std::path::Path, datasets: usize, chunk_elems: u64) -> Vec<f64> {
+    let mut builder = FileBuilder::new();
+    let initial = vec![0.0f64; chunk_elems as usize];
+    for i in 0..datasets {
+        builder
+            .create_dataset(&format!("d{i}"))
+            .with_f64_data(&initial)
+            .with_shape(&[chunk_elems])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[chunk_elems]);
+    }
+    builder.write(path).unwrap();
+    (0..chunk_elems).map(|i| i as f64).collect()
+}
+
+/// One staged append of `batch` onto each dataset, then one commit — the loop
+/// issue #412 describes.
+fn commit_one_batch_per_dataset(file: &File, datasets: usize, batch: &[f64]) {
+    for i in 0..datasets {
+        file.dataset(&format!("d{i}"))
+            .unwrap()
+            .append_staged(|b| {
+                b.append_f64(batch);
+            })
+            .unwrap();
+    }
+    file.commit().unwrap();
+}
+
+/// Every dataset holds its initial chunk plus one batch per commit, ending in
+/// the batch's last element.
+fn assert_growing_fixture_contents(
+    path: &std::path::Path,
+    datasets: usize,
+    chunk_elems: u64,
+    commits: usize,
+) {
+    let file = File::open(path).unwrap();
+    for i in 0..datasets {
+        let back = file.dataset(&format!("d{i}")).unwrap().read_f64().unwrap();
+        assert_eq!(back.len(), (commits + 1) * chunk_elems as usize);
+        assert_eq!(back[back.len() - 1], (chunk_elems - 1) as f64);
+    }
+}
