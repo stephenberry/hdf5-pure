@@ -559,6 +559,39 @@ pub fn extract_attributes_full_from_source<S: Source + ?Sized>(
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<AttributeMessage>, FormatError> {
+    Ok(
+        extract_stored_attributes_from_source(source, header, offset_size, length_size)?
+            .into_iter()
+            .map(|a| a.message)
+            .collect(),
+    )
+}
+
+/// An attribute as its object stores it, with the creation index the storage
+/// records for it.
+#[derive(Debug, Clone)]
+pub struct StoredAttribute {
+    /// The attribute itself.
+    pub message: AttributeMessage,
+    /// Its creation index: the object-header message record's field for a
+    /// compact attribute, the name index record's for a dense one. `None`
+    /// where the object does not track attribute creation order — which is
+    /// every object this crate's own whole-file writer produces.
+    pub creation_index: Option<u16>,
+}
+
+/// [`extract_attributes_full_from_source`], keeping each attribute's stored
+/// creation index.
+///
+/// The in-place editor needs it: an object that tracks attribute creation order
+/// has to keep every attribute's index across an edit that rebuilds its storage,
+/// and the index is the one thing an attribute message itself does not carry.
+pub fn extract_stored_attributes_from_source<S: Source + ?Sized>(
+    source: &S,
+    header: &ObjectHeader,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<StoredAttribute>, FormatError> {
     let resolver = SourceResolver::new(source, offset_size, length_size);
     let mut attrs = Vec::new();
 
@@ -571,7 +604,10 @@ pub fn extract_attributes_full_from_source<S: Source + ?Sized>(
             } else {
                 AttributeMessage::parse_resolving(&msg.data, length_size, &resolver)?
             };
-            attrs.push(attr);
+            attrs.push(StoredAttribute {
+                message: attr,
+                creation_index: msg.creation_order,
+            });
         }
     }
 
@@ -658,7 +694,7 @@ fn extract_dense_attributes_from_source<S: Source + ?Sized>(
     fh_addr: u64,
     offset_size: u8,
     length_size: u8,
-) -> Result<Vec<AttributeMessage>, FormatError> {
+) -> Result<Vec<StoredAttribute>, FormatError> {
     let fh = FractalHeapHeader::parse_from_source(source, fh_addr, offset_size, length_size)?;
 
     let btree_addr = attr_info
@@ -682,14 +718,33 @@ fn extract_dense_attributes_from_source<S: Source + ?Sized>(
         }
         let id_bytes = &record.data[id_offset..id_offset + fh.heap_id_length as usize];
         let attr_data = heap.read_from_source(source, id_bytes)?;
-        attrs.push(AttributeMessage::parse_resolving(
-            &attr_data,
-            length_size,
-            &resolver,
-        )?);
+        attrs.push(StoredAttribute {
+            message: AttributeMessage::parse_resolving(&attr_data, length_size, &resolver)?,
+            creation_index: record_creation_index(record, &fh, attr_info),
+        });
     }
 
     Ok(attrs)
+}
+
+/// The creation index a name-index (type 8) record carries, for an object that
+/// tracks attribute creation order.
+///
+/// The field sits right after the heap ID and the message flags byte, and is 4
+/// bytes wide where the Attribute Info message's maximum is 2 — the reference C
+/// library writes the same value into both, so anything past `u16` is a record
+/// this crate did not write and cannot reproduce. An object that does not track
+/// the order stores something else there (this crate's whole-file writer stores
+/// the attribute's position), so the tracked flag gates the read.
+fn record_creation_index(
+    record: &crate::btree_v2::BTreeV2Record,
+    fh: &FractalHeapHeader,
+    attr_info: &AttributeInfoMessage,
+) -> Option<u16> {
+    attr_info.max_creation_index?;
+    let at = fh.heap_id_length as usize + 1;
+    let bytes = record.data.get(at..at + 4)?;
+    u16::try_from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).ok()
 }
 
 #[cfg(test)]

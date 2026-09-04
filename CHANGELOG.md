@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `File::open_rw` edits an object that tracks attribute creation order (h5py's `track_order=True`, and everything netCDF-4 writes), where every such object was refused: a new attribute takes the next creation index, an overwrite keeps the one it had, a deletion leaves a gap, and a set that goes dense gains a creation-order B-tree beside its name index. Adding or removing a *link* in a group that tracks **link** creation order is still refused ([#416](https://github.com/stephenberry/hdf5-pure/issues/416)).
+
 ## [0.43.1] - 2026-09-03
 
 A file that deletes and re-appends objects smaller than a megabyte no longer grows without bound: `Dataset::append` and `BufferedAppender` now reuse a freed hole of any size on a paged file and on a file that persists its free-space managers ([#413](https://github.com/stephenberry/hdf5-pure/issues/413)). Patch release, no API change.

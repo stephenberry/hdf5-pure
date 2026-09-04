@@ -45,14 +45,13 @@
 //! - **Dense (fractal-heap) attributes**, whose values are not in the header,
 //!   and an attribute held as a **shared (SOHM) record**, which is not stored in
 //!   the header either.
-//! - An **attribute's value** in a **version 1 object header**, or in a version
-//!   2 header that tracks message creation order — the two [`read_oh_chunks`]
-//!   declines on a well-formed file (it declines a malformed one too). Such an
-//!   object's *element data* is still reached, through the parsed form that
-//!   reads both versions ([`scan_parsed_header`]); what that form does not hand
-//!   back is the file offset an attribute inside the header would have to be
-//!   written at. Nor does it hide the objects below it: it is descended through
-//!   either way.
+//! - An **attribute's value** in a **version 1 object header** — the one
+//!   [`read_oh_chunks`] declines on a well-formed file (it declines a malformed
+//!   one too). Such an object's *element data* is still reached, through the
+//!   parsed form that reads both versions ([`scan_parsed_header`]); what that
+//!   form does not hand back is the file offset an attribute inside the header
+//!   would have to be written at. Nor does it hide the objects below it: it is
+//!   descended through either way.
 //!
 //! And by datatype, every form `embedded_reference_slots` answers `None` for: an
 //! object reference **wider than 8 bytes**, a **dataset-region** reference, a
@@ -82,7 +81,7 @@ use crate::datatype::{
     Datatype, class_may_hold_object_address, datatype_holds_object_address,
     embedded_reference_slots, stored_object_references,
 };
-use crate::edit::{next_message, read_oh_chunks};
+use crate::edit::read_oh_chunks;
 use crate::error::Error;
 use crate::group_v2::resolve_group_entries_from_source;
 use crate::message_type::MessageType;
@@ -349,8 +348,7 @@ pub(crate) fn plan<S: Source + ?Sized>(
 }
 
 /// Collect the byte edits owed by an object whose header [`read_oh_chunks`]
-/// would not read — a version 1 header, or a version 2 one tracking message
-/// creation order — from the parsed form that reads both.
+/// would not read — a version 1 header — from the parsed form that reads both.
 ///
 /// Version 1 is not a museum piece: it is what the reference C library writes
 /// under its default, earliest-format bounds, so a file that was never told to
@@ -476,8 +474,8 @@ struct Scanned {
     fully_read: bool,
     /// [`read_oh_chunks`] read this header, so its messages were located *in the
     /// file* and an attribute inside it can be edited. False for a version 1
-    /// header and for one tracking message creation order, whose elements are
-    /// reached the other way — see [`scan_parsed_header`].
+    /// header, whose elements are reached the other way — see
+    /// [`scan_parsed_header`].
     header_located: bool,
 }
 
@@ -495,9 +493,8 @@ fn scan_object<S: Source + ?Sized>(
     relocations: &BTreeMap<u64, u64>,
     plan: &mut Plan,
 ) -> Result<Scanned, Error> {
-    // A header this cannot read — version 1, or version 2 tracking message
-    // creation order — contributes no edits, and is reported as a group so the
-    // caller still tries to descend through it:
+    // A header this cannot read — a version 1 one — contributes no edits, and
+    // is reported as a group so the caller still tries to descend through it:
     // `ObjectHeader::parse_from_source` reads both, so such a group does not
     // hide the objects below it from the walk.
     let Ok(chunks) = read_oh_chunks(src, addr, base) else {
@@ -541,8 +538,9 @@ fn scan_object<S: Source + ?Sized>(
     // Reused across messages: one attribute's edits at a time.
     let mut edits: Vec<(u64, u64)> = Vec::new();
     for chunk in &chunks {
+        let layout = chunk.layout();
         let (region, mut p) = chunk.message_region();
-        while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        while let Some((msg_type, body, body_end)) = layout.next_message(region, p)? {
             // Absolute file offset of this message's body.
             let body_at = chunk.span.0 + body as u64;
             // The flags byte is the 4th of the record header (type, size, flags).
@@ -833,6 +831,12 @@ mod tests {
         record
     }
 
+    /// A region of plain (4-byte-record) messages, the layout every writer in
+    /// this crate emits.
+    fn plain_region(bytes: Vec<u8>) -> crate::edit::OhRegion {
+        crate::edit::OhRegion::new(bytes, crate::edit::OhRecordLayout::PLAIN)
+    }
+
     /// An object-reference attribute named `name` pointing at `address`.
     ///
     /// Relabels a `u64` attribute, whose value is already the eight little-endian
@@ -849,7 +853,7 @@ mod tests {
     /// [`HEADER_AT`], with the space before it filled with a byte that is not
     /// part of any address.
     fn image_with_header(region: &[u8]) -> (BytesSource<Vec<u8>>, Vec<u8>) {
-        let header = build_v2_object_header(region).unwrap();
+        let header = build_v2_object_header(&plain_region(region.to_vec())).unwrap();
         let mut bytes = vec![0xAAu8; HEADER_AT as usize];
         bytes.extend_from_slice(&header);
         (BytesSource::new(bytes.clone()), bytes)
@@ -1127,10 +1131,10 @@ mod tests {
     fn a_committed_datatype_is_resolved_through_the_base_address() {
         for base in [BaseAddress::ZERO, BaseAddress::new(1024)] {
             const TYPE_AT: u64 = 2048;
-            let committed = build_v2_object_header(&message_record(
+            let committed = build_v2_object_header(&plain_region(message_record(
                 MessageType::Datatype,
                 &make_object_reference_type().serialize(),
-            ))
+            )))
             .unwrap();
 
             // The dataset's own header: a *shared* datatype message naming the
@@ -1147,7 +1151,7 @@ mod tests {
             layout.extend_from_slice(&8u16.to_le_bytes());
             layout.extend_from_slice(&(300u64).to_le_bytes());
             shared.extend_from_slice(&message_record(MessageType::DataLayout, &layout));
-            let dataset = build_v2_object_header(&shared).unwrap();
+            let dataset = build_v2_object_header(&plain_region(shared)).unwrap();
 
             let mut bytes = vec![0xAAu8; TYPE_AT as usize];
             bytes.extend_from_slice(&committed);

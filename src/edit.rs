@@ -85,12 +85,19 @@
 //!   to the latest format and repointing the superblock's root symbol-table
 //!   entry.
 //! - A version 2/3 group on an edited path stores its links compactly (not in a
-//!   dense fractal heap) and does not track message creation order; headers
-//!   split across continuation chunks (as the reference C library often writes)
-//!   are collapsed into a single chunk when rewritten. A version 1 group is
-//!   converted to a compact-link v2 header, carrying its links and attributes
-//!   over (other group messages — symbol table, modification time — are
-//!   dropped); an attribute it cannot reproduce is refused.
+//!   dense fractal heap); headers split across continuation chunks (as the
+//!   reference C library often writes) are collapsed into a single chunk when
+//!   rewritten. A version 1 group is converted to a compact-link v2 header,
+//!   carrying its links and attributes over (other group messages — symbol
+//!   table, modification time — are dropped); an attribute it cannot reproduce
+//!   is refused.
+//! - An object that tracks **attribute creation order** (`track_order=True`,
+//!   and everything netCDF-4 writes) is edited like any other: its 6-byte
+//!   message records are walked and re-emitted, a new attribute takes the
+//!   object's next creation index, an overwrite keeps the one it had, and a
+//!   deletion leaves a gap rather than renumbering. A group that tracks **link**
+//!   creation order is read and its attributes edited, but adding or removing
+//!   one of its links is refused.
 //! - Added datasets may be contiguous *or* chunked, with any filter the
 //!   whole-file writer supports (deflate, shuffle, fletcher32, scale-offset,
 //!   LZF, ZFP), and may declare extensible (maximum, optionally unlimited)
@@ -230,6 +237,7 @@ use std::path::Path;
 use core::num::NonZeroUsize;
 
 use crate::address::BaseAddress;
+use crate::attribute_info::AttributeInfoMessage;
 use crate::checksum::jenkins_lookup3;
 use crate::chunk_index_inplace::{Located, Store, apply_ea_append, plan_ea_append};
 use crate::chunked_read::{
@@ -254,7 +262,8 @@ use crate::file_create_properties::FileCreateProperties;
 use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS};
 use crate::file_writer::{
-    LENGTH_SIZE, OFFSET_SIZE, build_chunked_dataset_oh, build_dataset_oh, make_link,
+    DenseAttrCreationOrder, LENGTH_SIZE, OFFSET_SIZE, build_chunked_dataset_oh, build_dataset_oh,
+    make_link,
 };
 use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
@@ -269,6 +278,7 @@ use crate::free_space_manager::{
 use crate::group_v2::resolve_group_entries_from_source;
 use crate::image::{FileImage, HandleImage, MirrorImage, WriteBuffering};
 use crate::libver::LibVer;
+use crate::link_info::LinkInfoMessage;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
@@ -425,10 +435,23 @@ struct AppenderClaim {
     path: Option<PathKey>,
 }
 
-/// Variable-length group/root attributes staged by [`apply_compact_attr_ops`],
-/// each an (attribute message still carrying a placeholder heap address, its
-/// global heap collections) pair, resolved in the apply loop.
-type PendingVlAttrs = Vec<(crate::attribute::AttributeMessage, Vec<Vec<u8>>)>;
+/// A variable-length group/root attribute staged by [`apply_compact_attr_ops`]
+/// and resolved in the apply loop.
+#[derive(Clone)]
+struct PendingVlAttr {
+    /// The attribute message, its global-heap references still placeholders.
+    msg: crate::attribute::AttributeMessage,
+    /// The collections whose real addresses those references need.
+    collections: Vec<Vec<u8>>,
+    /// The creation index this attribute keeps, taken from the message it
+    /// replaces on a header that tracks attribute creation order. `None` asks
+    /// for the object's next unused index when the message is appended — which
+    /// is every case on a header that does not track the order.
+    creation_index: Option<u16>,
+}
+
+/// Variable-length group/root attributes staged by [`apply_compact_attr_ops`].
+type PendingVlAttrs = Vec<PendingVlAttr>;
 
 /// Accumulates elements to append to an existing chunked, unlimited dataset via
 /// [`Dataset::append_staged`](crate::Dataset::append_staged), in call order along the dataset's first
@@ -3307,7 +3330,7 @@ impl WriteEngine {
         let mut layout: Option<(usize, usize)> = None;
         let mut filter: Option<(usize, usize)> = None;
         let mut p = 0;
-        while let Ok(Some((msg_type, body, body_end))) = next_message(&region, p) {
+        while let Ok(Some((msg_type, body, body_end))) = region.next_message(p) {
             match msg_type {
                 MessageType::Datatype => datatype = Some((body, body_end)),
                 MessageType::Dataspace => dataspace = Some((body, body_end)),
@@ -6033,6 +6056,21 @@ impl WriteEngine {
         // rebuilds the same grouping, by the same rule, once it owns the set.
         let datasets_by_group = group_by_parent(staged.datasets.iter().map(|(p, fd)| (p, fd)));
 
+        // Changing which links a group holds is refused while it tracks *link*
+        // creation order, before anything is written.
+        for key in &keys {
+            let node = &nodes[key];
+            let gains_a_link = !node.copies.is_empty()
+                || !node.cross_copies.is_empty()
+                || datasets_by_group.get(key).is_some_and(|d| !d.is_empty())
+                || children
+                    .get(key)
+                    .is_some_and(|kids| kids.iter().any(|child| nodes[child].is_new));
+            if gains_a_link || !node.deletes.is_empty() {
+                reject_link_creation_order(&node.base_region)?;
+            }
+        }
+
         // Validate names: no addition may collide with an existing link or with
         // another addition under the same parent. A link this same commit
         // deletes is not one of the existing ones — the apply loop removes it
@@ -6398,7 +6436,7 @@ impl WriteEngine {
             // link stores it relative to the userblock base.
             for (leaf, tree) in copies {
                 let root = self.write_copy_subtree(&tree)?;
-                region.extend_from_slice(&encode_link_message(&leaf, base.relative(root)?));
+                region.push_link(&leaf, base.relative(root)?);
             }
 
             // Datasets directly under this group. Appended addresses are absolute
@@ -6494,7 +6532,7 @@ impl WriteEngine {
                     )?
                 };
                 let oh_addr = self.alloc_or_append_typed(&oh, PageType::Meta)?;
-                region.extend_from_slice(&encode_link_message(&fd.name, base.relative(oh_addr)?));
+                region.push_link(&fd.name, base.relative(oh_addr)?);
                 let mut full = key.clone();
                 full.push(fd.name.clone());
                 path_addr.insert(full, oh_addr);
@@ -6518,7 +6556,7 @@ impl WriteEngine {
                 let child_name = child.last().unwrap();
                 let child_addr = base.relative(path_addr[child])?;
                 if nodes[child].is_new {
-                    region.extend_from_slice(&encode_link_message(child_name, child_addr));
+                    region.push_link(child_name, child_addr);
                 } else {
                     patch_link_target(&mut region, child_name, child_addr)?;
                 }
@@ -7501,7 +7539,7 @@ impl WriteEngine {
         &self,
         ext_addr: usize,
         info: &FileSpaceInfo,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<OhRegion, Error> {
         let region =
             Self::gather_oh_messages(&self.image(), ext_addr as u64, self.superblock.base_address)?;
         rewrite_extension_region_bytes(&region, info)
@@ -7548,13 +7586,17 @@ impl WriteEngine {
         src: &S,
         addr: u64,
         base: BaseAddress,
-    ) -> Result<Vec<u8>, Error> {
-        let mut out = Vec::new();
-        for chunk in read_oh_chunks(src, addr, base)? {
+    ) -> Result<OhRegion, Error> {
+        let chunks = read_oh_chunks(src, addr, base)?;
+        // Every chunk of one header shares the layout chunk 0 declared, which is
+        // what makes concatenating their records into one region well defined.
+        let mut out = OhRegion::empty(chunks[0].layout());
+        for chunk in &chunks {
+            let layout = chunk.layout();
             let (region, mut p) = chunk.message_region();
-            while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+            while let Some((msg_type, _body, body_end)) = layout.next_message(region, p)? {
                 if msg_type != MessageType::ObjectHeaderContinuation {
-                    out.extend_from_slice(&region[p..body_end]);
+                    out.push_bytes(&region[p..body_end]);
                 }
                 p = body_end;
             }
@@ -7591,7 +7633,7 @@ impl WriteEngine {
             // Group-entry addresses are already stored relative to the base address,
             // matching how `encode_link_message` stores link targets — so they are
             // re-emitted verbatim, no base conversion needed.
-            region.extend_from_slice(&encode_link_message(&e.name, e.object_header_address));
+            region.push_link(&e.name, e.object_header_address);
             link_names.push(e.name.clone());
         }
         for m in &oh.messages {
@@ -7607,20 +7649,10 @@ impl WriteEngine {
                     ));
                 }
                 // Re-wrap the attribute message body (it is self-describing) in a
-                // v2 message record.
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "message type ids are a small enum that fits the 1-byte v2 type field"
-                )]
-                region.push(MessageType::Attribute.to_u16() as u8);
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "attribute body length fits the 2-byte message-size field (oversized \
-                              bodies are rejected above)"
-                )]
-                region.extend_from_slice(&(m.data.len() as u16).to_le_bytes());
-                region.push(0); // message flags
-                region.extend_from_slice(&m.data);
+                // v2 message record. The rebuilt header does not track creation
+                // order — a version 1 header cannot have carried any — so the
+                // attribute needs no creation index.
+                region.push(MessageType::Attribute, &m.data);
             }
         }
         Ok(GroupInfo { region, link_names })
@@ -7641,7 +7673,7 @@ impl WriteEngine {
         let mut p = 0;
         let mut has_link_info = false;
         let mut link_names = Vec::new();
-        while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
+        while let Some((msg_type, body, body_end)) = region.next_message(p)? {
             match msg_type {
                 MessageType::LinkInfo => {
                     has_link_info = true;
@@ -7800,7 +7832,7 @@ impl WriteEngine {
         let mut fill_msg: Option<(MessageType, usize, usize)> = None;
         let mut has_link = false;
         let mut p = 0;
-        while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
+        while let Some((msg_type, body, body_end)) = region.next_message(p)? {
             match msg_type {
                 MessageType::Datatype => datatype = Some((body, body_end)),
                 MessageType::Dataspace => dataspace = Some((body, body_end)),
@@ -8136,7 +8168,7 @@ impl WriteEngine {
         let mut fill_msg: Option<(MessageType, usize, usize)> = None;
         let mut has_link = false;
         let mut p = 0;
-        while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
+        while let Some((msg_type, body, body_end)) = region.next_message(p)? {
             match msg_type {
                 MessageType::Datatype => datatype = Some((body, body_end)),
                 MessageType::Dataspace => dataspace = Some((body, body_end)),
@@ -8484,7 +8516,7 @@ impl WriteEngine {
         // region carries neither, and `dense_attrs` carries the parsed set.
         let mut dense = false;
         let mut p = 0;
-        while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
+        while let Some((msg_type, body, body_end)) = region.next_message(p)? {
             if msg_type == MessageType::AttributeInfo {
                 // An Attribute Info message does not by itself mean dense
                 // storage: the reference C library and h5py emit one (with an
@@ -8516,13 +8548,14 @@ impl WriteEngine {
         // userblock before the heap walk, and one home for that framing is what
         // keeps the two from coming to disagree about it.
         let dense_attrs = if dense {
-            let attrs = read_object_attrs(src, addr, base)?;
+            let stored = read_object_attrs(src, addr, base)?;
+            let set = dense_attr_set(&region, stored)?;
             // The typed error names the offending attribute, which the previous
             // blanket `EditUnsupported` message could not.
-            crate::file_writer::dense_attrs_check(&attrs).map_err(Error::Format)?;
-            attrs
+            crate::file_writer::dense_attrs_check(&set.attrs).map_err(Error::Format)?;
+            set
         } else {
-            Vec::new()
+            DenseAttrSet::default()
         };
 
         let mut layout: Option<(usize, usize)> = None; // (body offset in kept, size)
@@ -8531,10 +8564,10 @@ impl WriteEngine {
         // The rebuilt chunk-0 region: every message kept verbatim except hard
         // Link messages (carried as `children`) and, when dense, the Attribute
         // Info message and inline Attribute messages (carried as `dense_attrs`).
-        let mut kept: Vec<u8> = Vec::new();
+        let mut kept = OhRegion::empty(region.layout());
 
         let mut p = 0;
-        while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
+        while let Some((msg_type, body, body_end)) = region.next_message(p)? {
             let mut keep = true;
             match msg_type {
                 MessageType::AttributeInfo => {
@@ -8596,7 +8629,7 @@ impl WriteEngine {
                 _ => {}
             }
             if keep {
-                kept.extend_from_slice(&region[p..body_end]);
+                kept.push_bytes(&region[p..body_end]);
             }
             p = body_end;
         }
@@ -8700,7 +8733,7 @@ impl WriteEngine {
             } => {
                 if cross_file {
                     reject_foreign_addresses(&region)?;
-                    reject_foreign_dense_attrs(&dense_attrs)?;
+                    reject_foreign_dense_attrs(&dense_attrs.attrs)?;
                 }
                 Ok(CopyTree::DatasetVerbatim {
                     region,
@@ -8716,7 +8749,7 @@ impl WriteEngine {
             } => {
                 if cross_file {
                     reject_foreign_addresses(&region)?;
-                    reject_foreign_dense_attrs(&dense_attrs)?;
+                    reject_foreign_dense_attrs(&dense_attrs.attrs)?;
                 }
                 // Storage the source never allocated is copied as storage, not as
                 // the values reading it answers with. The reference library does
@@ -8769,7 +8802,7 @@ impl WriteEngine {
                 // keeps them valid by sharing the source file's heaps.
                 if cross_file {
                     reject_foreign_addresses(&region)?;
-                    reject_foreign_dense_attrs(&dense_attrs)?;
+                    reject_foreign_dense_attrs(&dense_attrs.attrs)?;
                 }
                 let ChunkedHeaderParts {
                     dt,
@@ -8862,7 +8895,7 @@ impl WriteEngine {
             } => {
                 if cross_file {
                     reject_foreign_addresses(&non_link_region)?;
-                    reject_foreign_dense_attrs(&dense_attrs)?;
+                    reject_foreign_dense_attrs(&dense_attrs.attrs)?;
                 }
                 let mut kids = Vec::with_capacity(children.len());
                 for (name, child) in children {
@@ -8902,7 +8935,7 @@ impl WriteEngine {
                 dense_attrs,
             } => {
                 let mut region = region.clone();
-                self.append_dense_attrs(&mut region, dense_attrs)?;
+                self.append_dense_attrs(&mut region, dense_attrs.clone())?;
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
@@ -8921,13 +8954,14 @@ impl WriteEngine {
                     let new_data_addr = self.alloc_or_append_typed(data, PageType::Raw)?;
                     // The placement is an absolute offset; the data-layout
                     // address field stores it relative to the userblock base.
-                    region[*addr_off..*addr_off + 8]
-                        .copy_from_slice(&base.relative(new_data_addr)?.to_le_bytes());
+                    let relative = base.relative(new_data_addr)?;
+                    region.bytes_mut()[*addr_off..*addr_off + 8]
+                        .copy_from_slice(&relative.to_le_bytes());
                 }
                 // The dense heap is placed independently of the data — it is
                 // built for whatever address it gets (see `append_dense_attrs`),
                 // so no ordering between the two is owed.
-                self.append_dense_attrs(&mut region, dense_attrs)?;
+                self.append_dense_attrs(&mut region, dense_attrs.clone())?;
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
@@ -8950,7 +8984,7 @@ impl WriteEngine {
                 pipeline_message.as_deref(),
                 meta,
                 chunk_bytes,
-                dense_attrs,
+                dense_attrs.clone(),
             ),
             CopyTree::Group {
                 non_link_region,
@@ -8961,12 +8995,12 @@ impl WriteEngine {
                 for (name, child) in children {
                     let new_child = self.write_copy_subtree(child)?;
                     // The link target is stored relative to the userblock base.
-                    region.extend_from_slice(&encode_link_message(name, base.relative(new_child)?));
+                    region.push_link(name, base.relative(new_child)?);
                 }
                 // The dense heap is built for whatever address it is placed at
                 // (see `append_dense_attrs`), so it needs no ordering against the
                 // children's headers and data.
-                self.append_dense_attrs(&mut region, dense_attrs)?;
+                self.append_dense_attrs(&mut region, dense_attrs.clone())?;
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
@@ -8996,7 +9030,7 @@ impl WriteEngine {
     )]
     fn write_chunked_relocatable(
         &mut self,
-        region: &[u8],
+        region: &OhRegion,
         shape: &[u64],
         chunk_dims: &[u64],
         element_size: NonZeroUsize,
@@ -9004,7 +9038,7 @@ impl WriteEngine {
         pipeline_message: Option<&[u8]>,
         meta: &[ChunkMeta],
         chunk_bytes: &[Vec<u8>],
-        dense_attrs: &[crate::attribute::AttributeMessage],
+        dense_attrs: DenseAttrSet,
     ) -> Result<u64, Error> {
         // Plan once at a provisional base purely to size the data region: the plan
         // walks chunk *sizes* and sizes the index from its layout, so it touches
@@ -9070,17 +9104,14 @@ impl WriteEngine {
     /// The caller has already validated [`file_writer::dense_attrs_check`].
     fn append_dense_attrs(
         &mut self,
-        region: &mut Vec<u8>,
-        attrs: &[crate::attribute::AttributeMessage],
+        region: &mut OhRegion,
+        set: DenseAttrSet,
     ) -> Result<(), Error> {
-        if attrs.is_empty() {
+        if set.is_empty() {
             return Ok(());
         }
-        let attr_info_message = self.place_dense_attrs(attrs)?;
-        region.extend_from_slice(&region_message(
-            MessageType::AttributeInfo,
-            &attr_info_message,
-        ));
+        let attr_info_message = self.place_dense_attrs(&set.attrs, set.creation)?;
+        region.push(MessageType::AttributeInfo, &attr_info_message);
         Ok(())
     }
 
@@ -9093,7 +9124,8 @@ impl WriteEngine {
         if !fd.attrs_are_dense {
             return Ok(None);
         }
-        self.place_dense_attrs(&fd.attrs).map(Some)
+        self.place_dense_attrs(&fd.attrs, DenseAttrCreationOrder::Untracked)
+            .map(Some)
     }
 
     /// Build a fresh dense attribute blob for `attrs`, place it, and return the
@@ -9103,8 +9135,9 @@ impl WriteEngine {
     fn place_dense_attrs(
         &mut self,
         attrs: &[crate::attribute::AttributeMessage],
+        creation: DenseAttrCreationOrder,
     ) -> Result<Vec<u8>, Error> {
-        let plan = crate::file_writer::dense_attrs_plan(attrs);
+        let plan = crate::file_writer::dense_attrs_plan(attrs, creation);
         let (_addr, attr_info_message) =
             self.place_relocatable(plan.blob_len(), PageType::Meta, |stored_base| {
                 let blob = plan.build(stored_base);
@@ -9130,27 +9163,34 @@ impl WriteEngine {
     /// makes it safe to call on every rebuilt header.
     fn place_edited_attrs(
         &mut self,
-        region: &mut Vec<u8>,
+        region: &mut OhRegion,
         attrs: EditedAttrs,
     ) -> Result<(), Error> {
         match attrs {
             EditedAttrs::Compact(pending) => {
-                for (mut msg, collections) in pending {
+                for pending in pending {
+                    let PendingVlAttr {
+                        mut msg,
+                        collections,
+                        creation_index,
+                    } = pending;
                     let addrs = self.place_vl_collections(&collections)?;
                     patch_vl_refs(&mut msg.raw_data, &addrs);
-                    region.extend_from_slice(&region_message(
-                        MessageType::Attribute,
+                    *region = put_attr_message(
+                        region,
+                        &msg.name,
                         &msg.serialize(LENGTH_SIZE),
-                    ));
+                        creation_index,
+                    )?;
                 }
                 Ok(())
             }
             EditedAttrs::Dense(mut dense) => {
                 for (idx, collections) in std::mem::take(&mut dense.vl) {
                     let addrs = self.place_vl_collections(&collections)?;
-                    patch_vl_refs(&mut dense.attrs[idx].raw_data, &addrs);
+                    patch_vl_refs(&mut dense.set.attrs[idx].raw_data, &addrs);
                 }
-                self.append_dense_attrs(region, &dense.attrs)
+                self.append_dense_attrs(region, dense.set)
             }
         }
     }
@@ -9176,12 +9216,14 @@ impl WriteEngine {
                 // The placement is an absolute file offset; the contiguous
                 // data-layout field stores it relative to the userblock base (`-
                 // base`, a no-op on a base-0 file).
-                region[*addr_off..*addr_off + 8]
-                    .copy_from_slice(&base.relative(new_data_addr)?.to_le_bytes());
+                let relative = base.relative(new_data_addr)?;
+                region.bytes_mut()[*addr_off..*addr_off + 8]
+                    .copy_from_slice(&relative.to_le_bytes());
                 // The data size field follows the 8-byte address in the contiguous
                 // layout body; keep it in sync with the new length.
                 let size_off = *addr_off + 8;
-                region[size_off..size_off + 8].copy_from_slice(&(raw.len() as u64).to_le_bytes());
+                let raw_len = raw.len() as u64;
+                region.bytes_mut()[size_off..size_off + 8].copy_from_slice(&raw_len.to_le_bytes());
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
@@ -9238,7 +9280,7 @@ impl WriteEngine {
                     pipeline_message.as_deref(),
                     &meta,
                     chunk_bytes,
-                    &[],
+                    DenseAttrSet::default(),
                 )
             }
             MovingWrite::AppendedChunks {
@@ -9293,7 +9335,7 @@ impl WriteEngine {
     )]
     fn write_appended_chunks(
         &mut self,
-        region: &[u8],
+        region: &OhRegion,
         new_dataspace_body: &[u8],
         chunk_dims_u32: &[u32],
         element_size: NonZeroUsize,
@@ -10257,7 +10299,7 @@ impl WriteEngine {
         let mut dataspace_msg: Option<(usize, usize)> = None;
         let mut p = 0;
         loop {
-            match next_message(&region, p) {
+            match region.next_message(p) {
                 Ok(Some((msg_type, body, body_end))) => {
                     match msg_type {
                         MessageType::DataLayout => layout_msg = Some((body, body_end)),
@@ -10428,7 +10470,7 @@ impl WriteEngine {
         let mut layout_msg: Option<(usize, usize)> = None;
         let mut p = 0;
         loop {
-            match next_message(&region, p) {
+            match region.next_message(p) {
                 Ok(Some((msg_type, body, body_end))) => {
                     if msg_type == MessageType::DataLayout {
                         layout_msg = Some((body, body_end));
@@ -10491,7 +10533,7 @@ struct Node {
     /// re-resolved: the screen above and the reclaim below both need it, and one
     /// derivation cannot disagree with itself.
     writes: Vec<(String, u64, MovingWrite)>,
-    base_region: Vec<u8>,
+    base_region: OhRegion,
     existing_links: Vec<String>,
     /// What this group's attribute edits left for the apply loop, staged by
     /// [`plan_attr_ops`] and resolved by [`WriteEngine::place_edited_attrs`]
@@ -10518,18 +10560,18 @@ enum ObjModel {
     /// been stripped from `region` and the parsed set is carried here to be
     /// re-emitted into a fresh fractal heap on write.
     DatasetVerbatim {
-        region: Vec<u8>,
-        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+        region: OhRegion,
+        dense_attrs: DenseAttrSet,
     },
     /// A contiguous dataset: copy the region, repointing the data address at
     /// `addr_off` (region-relative) to a fresh copy of `[data_addr, +data_size)`.
     /// See [`DatasetVerbatim`](ObjModel::DatasetVerbatim) for `dense_attrs`.
     DatasetContiguous {
-        region: Vec<u8>,
+        region: OhRegion,
         addr_off: usize,
         data_addr: u64,
         data_size: u64,
-        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+        dense_attrs: DenseAttrSet,
     },
     /// A chunked (and possibly filtered) dataset: the verbatim header `region`
     /// (datatype, dataspace, fill value, data layout, and filter pipeline kept as
@@ -10538,16 +10580,16 @@ enum ObjModel {
     /// rebuilt index on write. See [`DatasetVerbatim`](ObjModel::DatasetVerbatim)
     /// for `dense_attrs`.
     DatasetChunked {
-        region: Vec<u8>,
-        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+        region: OhRegion,
+        dense_attrs: DenseAttrSet,
     },
     /// A group: every non-link message verbatim, plus its hard-link children to
     /// copy and re-link by name. See
     /// [`DatasetVerbatim`](ObjModel::DatasetVerbatim) for `dense_attrs`.
     Group {
-        non_link_region: Vec<u8>,
+        non_link_region: OhRegion,
         children: Vec<(String, u64)>,
-        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+        dense_attrs: DenseAttrSet,
     },
 }
 
@@ -10565,8 +10607,8 @@ enum CopyTree {
     /// heap appended just before the header, whose Attribute Info message is
     /// spliced into the region on write.
     DatasetVerbatim {
-        region: Vec<u8>,
-        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+        region: OhRegion,
+        dense_attrs: DenseAttrSet,
     },
     /// A contiguous dataset: `data` is written first and its new address patched
     /// into the header `region` at `addr_off` before the header is written. See
@@ -10578,10 +10620,10 @@ enum CopyTree {
     /// address. That is a statement about storage, not about length (issue
     /// #336).
     DatasetContiguous {
-        region: Vec<u8>,
+        region: OhRegion,
         addr_off: usize,
         data: Option<Vec<u8>>,
-        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+        dense_attrs: DenseAttrSet,
     },
     /// A chunked (and possibly filtered) dataset. The header `region` is written
     /// verbatim except its data-layout message, which is swapped for one naming the
@@ -10593,7 +10635,7 @@ enum CopyTree {
     /// array), so a B-tree-v1 or implicit source is reproduced with a v4 index. See
     /// [`DatasetVerbatim`](CopyTree::DatasetVerbatim) for `dense_attrs`.
     DatasetChunked {
-        region: Vec<u8>,
+        region: OhRegion,
         /// The dataset's current shape. Held because the index's element
         /// numbering is taken over the *maximum* chunk grid, which needs both
         /// extents (see [`crate::chunk_grid`]).
@@ -10604,15 +10646,15 @@ enum CopyTree {
         pipeline_message: Option<Vec<u8>>,
         meta: Vec<ChunkMeta>,
         chunk_bytes: Vec<Vec<u8>>,
-        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+        dense_attrs: DenseAttrSet,
     },
     /// A group: every non-link message verbatim, plus the (name, child) subtrees
     /// to write first and re-link by name. See
     /// [`DatasetVerbatim`](CopyTree::DatasetVerbatim) for `dense_attrs`.
     Group {
-        non_link_region: Vec<u8>,
+        non_link_region: OhRegion,
         children: Vec<(String, CopyTree)>,
-        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+        dense_attrs: DenseAttrSet,
     },
 }
 
@@ -10697,7 +10739,7 @@ impl InvalidatedAddresses {
 /// The validated, chunk-collapsed message region and existing link names of a
 /// group header.
 struct GroupInfo {
-    region: Vec<u8>,
+    region: OhRegion,
     link_names: Vec<String>,
 }
 
@@ -10782,14 +10824,14 @@ enum MovingWrite {
     /// at `addr_off` in the verbatim header `region`, rewrite the header, and free
     /// `old_extent` (the prior data block, if any) after the commit lands.
     Contiguous {
-        region: Vec<u8>,
+        region: OhRegion,
         addr_off: usize,
         bytes: OverwriteBytes,
         old_extent: Option<(u64, u64)>,
     },
     /// A compact dataset: rebuild the header `region` with the bytes inline.
     Compact {
-        region: Vec<u8>,
+        region: OhRegion,
         bytes: OverwriteBytes,
     },
     /// A chunked dataset whose new (re-encoded) chunks do not all fit their
@@ -10804,7 +10846,7 @@ enum MovingWrite {
     /// untouched Attribute Info message — is preserved verbatim), and the old
     /// chunk storage at `old_addr` is freed after the commit lands.
     Chunked {
-        region: Vec<u8>,
+        region: OhRegion,
         /// See [`CopyTree::DatasetChunked::shape`].
         shape: Vec<u64>,
         chunk_dims: Vec<u64>,
@@ -10829,7 +10871,7 @@ enum MovingWrite {
     /// (`old_tail_extent`) are freed — never the kept chunk data, which both the
     /// old and new index share during the commit.
     AppendedChunks {
-        region: Vec<u8>,
+        region: OhRegion,
         /// The grown dataspace message body (v2-serialized), current axis-0
         /// dimension increased, maximum dimensions (unlimited) preserved.
         new_dataspace_body: Vec<u8>,
@@ -10860,7 +10902,10 @@ enum MovingWrite {
     /// exactly like the other relocating writes — but the data-layout message is
     /// preserved verbatim, so the dataset's chunk data and index stay in place;
     /// only the old header is freed.
-    AttrEdit { region: Vec<u8>, attrs: EditedAttrs },
+    AttrEdit {
+        region: OhRegion,
+        attrs: EditedAttrs,
+    },
 }
 
 /// The chunk data a relocating chunked overwrite ([`MovingWrite::Chunked`])
@@ -11691,13 +11736,17 @@ pub(crate) const LOSSY_TAIL_REFUSAL: &str = "this dataset's filter pipeline is l
 /// the record is rebuilt via [`region_message`] rather than patched in place. The
 /// chunked overwrite and copy paths use this to relocate a dataset's chunk storage
 /// while preserving the rest of its header exactly.
-fn replace_layout_message(region: &[u8], new_layout_body: &[u8]) -> Result<Vec<u8>, Error> {
+fn replace_layout_message(region: &OhRegion, new_layout_body: &[u8]) -> Result<OhRegion, Error> {
     let mut out = Vec::with_capacity(region.len());
     let mut p = 0;
     let mut replaced = false;
-    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, _body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::DataLayout && !replaced {
-            out.extend_from_slice(&region_message(MessageType::DataLayout, new_layout_body));
+            out.extend_from_slice(
+                &region
+                    .layout()
+                    .record(MessageType::DataLayout, new_layout_body),
+            );
             replaced = true;
         } else {
             out.extend_from_slice(&region[p..body_end]);
@@ -11709,7 +11758,7 @@ fn replace_layout_message(region: &[u8], new_layout_body: &[u8]) -> Result<Vec<u
             "chunked dataset header has no data-layout message to relocate",
         ));
     }
-    Ok(out)
+    Ok(region.with_bytes(out))
 }
 
 /// Rebuild a header message `region`, replacing the single Dataspace message's
@@ -11719,13 +11768,20 @@ fn replace_layout_message(region: &[u8], new_layout_body: &[u8]) -> Result<Vec<u
 /// The replacement may differ in length from the original (a v1 on-disk
 /// dataspace is normalized to v2 in the rebuilt header), so the record is rebuilt
 /// via [`region_message`] rather than patched in place.
-fn replace_dataspace_message(region: &[u8], new_dataspace_body: &[u8]) -> Result<Vec<u8>, Error> {
+fn replace_dataspace_message(
+    region: &OhRegion,
+    new_dataspace_body: &[u8],
+) -> Result<OhRegion, Error> {
     let mut out = Vec::with_capacity(region.len());
     let mut p = 0;
     let mut replaced = false;
-    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, _body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::Dataspace && !replaced {
-            out.extend_from_slice(&region_message(MessageType::Dataspace, new_dataspace_body));
+            out.extend_from_slice(
+                &region
+                    .layout()
+                    .record(MessageType::Dataspace, new_dataspace_body),
+            );
             replaced = true;
         } else {
             out.extend_from_slice(&region[p..body_end]);
@@ -11737,7 +11793,7 @@ fn replace_dataspace_message(region: &[u8], new_dataspace_body: &[u8]) -> Result
             "dataset header has no dataspace message to grow",
         ));
     }
-    Ok(out)
+    Ok(region.with_bytes(out))
 }
 
 /// Whether a datatype's raw on-disk bytes can be appended verbatim from a caller
@@ -11786,13 +11842,13 @@ struct ChunkedHeaderParts {
 /// pipeline message bytes (if any) from a chunked dataset header `region`. Used by
 /// the chunked copy path to derive chunk geometry and the on-disk filter pipeline.
 /// Errors if any required message is missing or the layout is not chunked.
-fn parse_chunked_header(region: &[u8]) -> Result<ChunkedHeaderParts, Error> {
+fn parse_chunked_header(region: &OhRegion) -> Result<ChunkedHeaderParts, Error> {
     let mut datatype: Option<(usize, usize)> = None;
     let mut dataspace: Option<(usize, usize)> = None;
     let mut layout: Option<(usize, usize)> = None;
     let mut pipeline: Option<(usize, usize)> = None;
     let mut p = 0;
-    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
         match msg_type {
             MessageType::Datatype => datatype = Some((body, body_end)),
             MessageType::Dataspace => dataspace = Some((body, body_end)),
@@ -12170,34 +12226,18 @@ impl ChunkProvider for SliceChunkProvider<'_> {
     }
 }
 
-fn region_message(msg_type: MessageType, body: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(4 + body.len());
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "message type ids are a small enum that fits the 1-byte v2 type field"
-    )]
-    m.push(msg_type.to_u16() as u8);
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "callers pass bodies that fit the 2-byte message-size field (see doc comment)"
-    )]
-    m.extend_from_slice(&(body.len() as u16).to_le_bytes());
-    m.push(0); // message flags
-    m.extend_from_slice(body);
-    m
-}
-
 /// The chunk-0 message region of a fresh, empty compact-link group: a LinkInfo
 /// message advertising no dense storage, followed by a GroupInfo message.
 /// Mirrors `build_group_oh`.
-fn fresh_group_region() -> Vec<u8> {
+fn fresh_group_region() -> OhRegion {
     let mut li = Vec::with_capacity(18);
     li.push(0); // version
     li.push(0); // flags
     li.extend_from_slice(&u64::MAX.to_le_bytes()); // fractal heap addr = UNDEF
     li.extend_from_slice(&u64::MAX.to_le_bytes()); // btree name index addr = UNDEF
-    let mut region = region_message(MessageType::LinkInfo, &li);
-    region.extend_from_slice(&region_message(MessageType::GroupInfo, &GROUP_INFO_BODY));
+    let mut region = OhRegion::empty(OhRecordLayout::PLAIN);
+    region.push(MessageType::LinkInfo, &li);
+    region.push(MessageType::GroupInfo, &GROUP_INFO_BODY);
     region
 }
 
@@ -12210,15 +12250,15 @@ fn fresh_group_region() -> Vec<u8> {
 /// "message type not found". Such a group round-trips for *reading* but cannot
 /// be *modified* by the C library. Earlier hdf5-pure releases wrote groups that
 /// way, so heal any such header whenever we rewrite one in place.
-fn ensure_group_info(region: &mut Vec<u8>) -> Result<(), Error> {
+fn ensure_group_info(region: &mut OhRegion) -> Result<(), Error> {
     let mut p = 0;
-    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, _body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::GroupInfo {
             return Ok(());
         }
         p = body_end;
     }
-    region.extend_from_slice(&region_message(MessageType::GroupInfo, &GROUP_INFO_BODY));
+    region.push(MessageType::GroupInfo, &GROUP_INFO_BODY);
     Ok(())
 }
 
@@ -12238,10 +12278,10 @@ fn ensure_group_info(region: &mut Vec<u8>) -> Result<(), Error> {
 /// A region already carrying an Attribute Info message is left alone, whichever
 /// storage it names: a defined heap address means dense storage, whose count the
 /// C library takes from the heap's B-tree instead.
-fn ensure_attribute_info(region: &mut Vec<u8>) -> Result<(), Error> {
+fn ensure_attribute_info(region: &mut OhRegion) -> Result<(), Error> {
     let mut has_attrs = false;
     let mut p = 0;
-    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, _body, body_end)) = region.next_message(p)? {
         match msg_type {
             MessageType::AttributeInfo => return Ok(()),
             MessageType::Attribute => has_attrs = true,
@@ -12250,10 +12290,8 @@ fn ensure_attribute_info(region: &mut Vec<u8>) -> Result<(), Error> {
         p = body_end;
     }
     if has_attrs {
-        region.extend_from_slice(&region_message(
-            MessageType::AttributeInfo,
-            &crate::file_writer::compact_attribute_info_message(),
-        ));
+        let body = compact_attribute_info_body(region)?;
+        region.push(MessageType::AttributeInfo, &body);
     }
     Ok(())
 }
@@ -12261,25 +12299,26 @@ fn ensure_attribute_info(region: &mut Vec<u8>) -> Result<(), Error> {
 /// Encode a complete object-header Link message (4-byte record header + body)
 /// for a hard link `name -> addr`. The caller must have validated that the body
 /// fits the u16 size field (see [`flatten_dataset`]); group names are short.
-fn encode_link_message(name: &str, addr: u64) -> Vec<u8> {
+fn encode_link_message(layout: OhRecordLayout, name: &str, addr: u64) -> Vec<u8> {
     let body = make_link(name, addr).serialize(OFFSET_SIZE);
-    region_message(MessageType::Link, &body)
+    layout.record(MessageType::Link, &body)
 }
 
 /// Patch an existing hard Link message in a chunk-0 message `region`, retargeting
 /// the link named `name` to `new_addr` (used to repoint a parent at a relocated
 /// child group). The target address is the trailing `OFFSET_SIZE` bytes of the
 /// link body for a hard link.
-fn patch_link_target(region: &mut [u8], name: &str, new_addr: u64) -> Result<(), Error> {
+fn patch_link_target(region: &mut OhRegion, name: &str, new_addr: u64) -> Result<(), Error> {
     let mut p = 0;
-    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::Link {
             if let Ok(link) = LinkMessage::parse(&region[body..body_end], OFFSET_SIZE) {
                 if link.name == name {
                     return match link.link_target {
                         LinkTarget::Hard { .. } => {
                             let ofs = body_end - OFFSET_SIZE as usize;
-                            region[ofs..body_end].copy_from_slice(&new_addr.to_le_bytes());
+                            region.bytes_mut()[ofs..body_end]
+                                .copy_from_slice(&new_addr.to_le_bytes());
                             Ok(())
                         }
                         _ => Err(Error::EditUnsupported(
@@ -12309,7 +12348,7 @@ const COMPACT_LAYOUT_PREAMBLE: usize = 4;
 /// limit) and, once the 4-byte layout preamble is added, the object header's
 /// 2-byte message-size field — the tighter of the two, which an overwrite of an
 /// existing compact dataset always satisfies.
-fn rebuild_compact_layout_region(region: &[u8], raw: &[u8]) -> Result<Vec<u8>, Error> {
+fn rebuild_compact_layout_region(region: &OhRegion, raw: &[u8]) -> Result<OhRegion, Error> {
     // The bound is on the *message body* the layout becomes — version, class,
     // and the 2-byte inline size ahead of the data — not on `raw` alone, or the
     // last four lengths below the limit would truncate the size field written
@@ -12322,7 +12361,7 @@ fn rebuild_compact_layout_region(region: &[u8], raw: &[u8]) -> Result<Vec<u8>, E
     let mut out = Vec::with_capacity(region.len() + raw.len());
     let mut p = 0;
     let mut replaced = false;
-    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::DataLayout {
             if body_end - body < 2 || region[body + 1] != 0 {
                 return Err(Error::EditUnsupported(
@@ -12340,7 +12379,9 @@ fn rebuild_compact_layout_region(region: &[u8], raw: &[u8]) -> Result<Vec<u8>, E
             )]
             layout.extend_from_slice(&(raw.len() as u16).to_le_bytes());
             layout.extend_from_slice(raw);
-            // Message record: type byte, 2-byte size (LE), flags byte (kept).
+            // Message record: type byte, 2-byte size (LE), then the rest of
+            // the prefix — flags, and a creation index where the header has one
+            // — kept verbatim.
             out.push(region[p]);
             #[expect(
                 clippy::cast_possible_truncation,
@@ -12348,7 +12389,7 @@ fn rebuild_compact_layout_region(region: &[u8], raw: &[u8]) -> Result<Vec<u8>, E
                           body's exact length, to the 2-byte message-size field"
             )]
             out.extend_from_slice(&(layout.len() as u16).to_le_bytes());
-            out.push(region[p + 3]);
+            out.extend_from_slice(&region[p + 3..p + region.layout().prefix_len()]);
             out.extend_from_slice(&layout);
             replaced = true;
         } else {
@@ -12364,17 +12405,49 @@ fn rebuild_compact_layout_region(region: &[u8], raw: &[u8]) -> Result<Vec<u8>, E
             "compact dataset header has no data-layout message",
         ));
     }
-    Ok(out)
+    Ok(region.with_bytes(out))
+}
+
+/// Refuse to add a link to, or remove one from, a group that tracks **link**
+/// creation order.
+///
+/// Link creation order is a separate mechanism from the attribute creation order
+/// the object header's own flags describe: a group that tracks it carries a
+/// running maximum in its Link Info message and a creation index on every Link
+/// message, and neither this editor's Link emitter nor its Link Info handling
+/// maintains those. netCDF-4 sets it on every group it writes, so such a group
+/// is read, and its *attributes* are edited, without difficulty — but a link
+/// added without a creation index would leave `H5Literate` by creation order
+/// walking an unnumbered link, so changing the membership is refused instead
+/// (issue #416).
+///
+/// Retargeting an existing link ([`patch_link_target`], how a relocated child is
+/// rewired) changes no creation order and is not refused.
+fn reject_link_creation_order(region: &OhRegion) -> Result<(), Error> {
+    let mut p = 0;
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
+        if msg_type == MessageType::LinkInfo
+            && let Ok(info) = LinkInfoMessage::parse(&region[body..body_end], OFFSET_SIZE)
+            && info.max_creation_order.is_some()
+        {
+            return Err(Error::EditUnsupported(
+                "a group on the edited path tracks link creation order; its links cannot be \
+                 added to or removed in place yet",
+            ));
+        }
+        p = body_end;
+    }
+    Ok(())
 }
 
 /// Copy a chunk-0 message `region`, dropping the single Link message named
 /// `name` and preserving every other message verbatim (used by `delete`). Errors
 /// if no such link is present.
-fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> {
+fn remove_link_from_region(region: &OhRegion, name: &str) -> Result<OhRegion, Error> {
     let mut out = Vec::with_capacity(region.len());
     let mut p = 0;
     let mut removed = false;
-    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
         let mut skip = false;
         if msg_type == MessageType::Link {
             if let Ok(link) = LinkMessage::parse(&region[body..body_end], OFFSET_SIZE) {
@@ -12397,7 +12470,7 @@ fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
             "link to delete not found in its parent group",
         ));
     }
-    Ok(out)
+    Ok(region.with_bytes(out))
 }
 
 /// Apply attribute edits to an object's header `region` *compactly*, preserving
@@ -12417,16 +12490,21 @@ fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
 /// whose set lives in a fractal heap would leave it carrying two storage forms,
 /// so a dense object is routed to a heap rebuild there instead.
 fn apply_compact_attr_ops(
-    region: &[u8],
+    region: &OhRegion,
     ops: &[&AttrOp],
-) -> Result<(Vec<u8>, PendingVlAttrs), Error> {
-    let mut out = region.to_vec();
+) -> Result<(OhRegion, PendingVlAttrs), Error> {
+    let mut out = region.clone();
     let mut pending_vl: PendingVlAttrs = Vec::new();
     for op in ops {
         match op {
             AttrOp::Set { name, value } => {
-                pending_vl.retain(|(msg, _)| &msg.name != name);
+                pending_vl.retain(|a| &a.msg.name != name);
                 if let Some(strings) = value.var_len_strings() {
+                    // The message this replaces is dropped now and re-appended
+                    // in the apply phase, so the creation index it carried has
+                    // to be read before it goes: an overwrite keeps the index
+                    // the attribute already had.
+                    let creation_index = attr_creation_index(&out, name)?;
                     // Nothing yet to remove from `region` if this name has
                     // never been set as a fixed-size attribute.
                     out = remove_attr_from_region(&out, name, false)?;
@@ -12436,14 +12514,18 @@ fn apply_compact_attr_ops(
                             "attribute is too large to encode in place",
                         ));
                     }
-                    pending_vl.push((msg, build_global_heap_collections(strings)));
+                    pending_vl.push(PendingVlAttr {
+                        msg,
+                        collections: build_global_heap_collections(strings),
+                        creation_index,
+                    });
                 } else {
                     out = set_attr_in_region(&out, name, value)?;
                 }
             }
             AttrOp::Remove { name } => {
                 let before = pending_vl.len();
-                pending_vl.retain(|(msg, _)| &msg.name != name);
+                pending_vl.retain(|a| &a.msg.name != name);
                 if pending_vl.len() == before {
                     out = remove_attr_from_region(&out, name, true)?;
                 }
@@ -12461,7 +12543,7 @@ struct AttrEdits {
     /// already carries every fixed-size attribute. Dense: it carries no attribute
     /// message at all, and the Attribute Info message naming the heap is appended
     /// once that heap is placed.
-    region: Vec<u8>,
+    region: OhRegion,
     /// What the apply phase still has to place, and where the result is stored.
     attrs: EditedAttrs,
 }
@@ -12489,13 +12571,35 @@ impl Default for EditedAttrs {
     }
 }
 
+/// A dense (fractal-heap) attribute set and what its object records about
+/// attribute creation order.
+///
+/// The two travel together because a dense set is never copied as bytes: the
+/// heap is rebuilt from the parsed attributes wherever it lands, so the creation
+/// indexes the old heap's indexes carried have to be carried alongside or they
+/// are lost. An object that does not track the order leaves this
+/// [`DenseAttrCreationOrder::Untracked`], which is every set this crate's
+/// whole-file writer produces.
+#[derive(Clone, Default)]
+struct DenseAttrSet {
+    attrs: Vec<crate::attribute::AttributeMessage>,
+    creation: DenseAttrCreationOrder,
+}
+
+impl DenseAttrSet {
+    fn is_empty(&self) -> bool {
+        self.attrs.is_empty()
+    }
+}
+
 /// A dense (fractal-heap) attribute set an edit rebuilds, staged by
 /// [`plan_attr_ops`] and placed by the apply phase.
 #[derive(Clone)]
 struct DenseAttrEdit {
     /// Every attribute the object will carry: the ones it already had, in the
-    /// order it had them, with this edit's applied over them by name.
-    attrs: Vec<crate::attribute::AttributeMessage>,
+    /// order it had them, with this edit's applied over them by name — and what
+    /// the object records about their creation order.
+    set: DenseAttrSet,
     /// `(index into `attrs`, its global heap collections)` for each
     /// variable-length attribute this edit *sets*. The heap is built over the
     /// attribute message bytes, so each of these has to be patched with its
@@ -12548,7 +12652,7 @@ fn plan_attr_ops<S: Source + ?Sized>(
     src: &S,
     base: BaseAddress,
     addr: Option<u64>,
-    region: &[u8],
+    region: &OhRegion,
     ops: &[&AttrOp],
 ) -> Result<AttrEdits, Error> {
     let dense_now = region_uses_dense_attrs(region)?;
@@ -12596,26 +12700,61 @@ fn plan_attr_ops<S: Source + ?Sized>(
         None => Vec::new(),
     };
     // Each attribute travels with the global heap collections it still needs
-    // placed (`Some` only for a variable-length attribute this edit sets), so no
-    // removal can shift one away from the bytes it belongs to.
-    let mut set: Vec<(crate::attribute::AttributeMessage, Option<Vec<Vec<u8>>>)> =
-        existing.into_iter().map(|a| (a, None)).collect();
+    // placed (`Some` only for a variable-length attribute this edit sets) and
+    // with the creation index its object records for it, so no removal can shift
+    // one away from the bytes — or the index — it belongs to.
+    let existing = dense_attr_set(region, existing)?;
+    let tracked = region.layout().tracks_creation_order();
+    // The next index the object would hand out: what a *new* attribute takes.
+    // `dense_attr_set` has already raised it past every index in use.
+    let mut next_index = match &existing.creation {
+        DenseAttrCreationOrder::Tracked { max, .. } => *max,
+        DenseAttrCreationOrder::Untracked => 0,
+    };
+    let mut set: Vec<DenseAttrSlot> = existing
+        .attrs
+        .into_iter()
+        .zip(existing.creation.indices())
+        .map(|(msg, creation_index)| DenseAttrSlot {
+            msg,
+            collections: None,
+            creation_index,
+        })
+        .collect();
     for op in ops {
         match op {
             AttrOp::Set { name, value } => {
                 let msg = build_attr_message(name, value);
                 let collections = value.var_len_strings().map(build_global_heap_collections);
-                match set.iter_mut().find(|(a, _)| &a.name == name) {
+                match set.iter_mut().find(|slot| &slot.msg.name == name) {
                     // Setting an attribute the object already has replaces it
                     // where it stands, so a repeated `set_attr` does not reorder
-                    // the set.
-                    Some(slot) => *slot = (msg, collections),
-                    None => set.push((msg, collections)),
+                    // the set — and it keeps the creation index it had, so an
+                    // iteration by creation order does not reorder it either.
+                    Some(slot) => {
+                        slot.msg = msg;
+                        slot.collections = collections;
+                    }
+                    None => {
+                        let creation_index = tracked.then_some(next_index);
+                        if tracked {
+                            next_index = bump_creation_index(next_index)?;
+                        }
+                        set.push(DenseAttrSlot {
+                            msg,
+                            collections,
+                            creation_index,
+                        });
+                    }
                 }
             }
             AttrOp::Remove { name } => {
                 let before = set.len();
-                set.retain(|(a, _)| &a.name != name);
+                // A deletion leaves a gap in the creation order rather than
+                // renumbering what is left, and does not lower the maximum:
+                // the reference C library hands out indexes from a counter that
+                // only ever rises.
+                set.retain(|slot| &slot.msg.name != name);
                 if set.len() == before {
                     return Err(Error::EditUnsupported("attribute to remove was not found"));
                 }
@@ -12638,13 +12777,24 @@ fn plan_attr_ops<S: Source + ?Sized>(
         });
     }
     let mut attrs = Vec::with_capacity(set.len());
+    let mut indices = Vec::with_capacity(set.len());
     let mut vl = Vec::new();
-    for (i, (msg, collections)) in set.into_iter().enumerate() {
-        if let Some(collections) = collections {
+    for (i, slot) in set.into_iter().enumerate() {
+        if let Some(collections) = slot.collections {
             vl.push((i, collections));
         }
-        attrs.push(msg);
+        indices.push(slot.creation_index.unwrap_or_default());
+        attrs.push(slot.msg);
     }
+    let creation = if tracked {
+        DenseAttrCreationOrder::Tracked {
+            indices,
+            max: next_index,
+            indexed: region.layout().indexes_creation_order(),
+        }
+    } else {
+        DenseAttrCreationOrder::Untracked
+    };
     // Moving a set into a heap takes it out of reach of the reference repointing
     // a commit does as its last act: `reference_patch::scan_object` reads an
     // object whose attributes are dense as unproven and collects no edit from it.
@@ -12666,16 +12816,29 @@ fn plan_attr_ops<S: Source + ?Sized>(
     crate::file_writer::dense_attrs_check(&attrs).map_err(Error::Format)?;
     Ok(AttrEdits {
         region,
-        attrs: EditedAttrs::Dense(DenseAttrEdit { attrs, vl }),
+        attrs: EditedAttrs::Dense(DenseAttrEdit {
+            set: DenseAttrSet { attrs, creation },
+            vl,
+        }),
     })
+}
+
+/// One attribute of the set a dense rebuild is assembled from.
+struct DenseAttrSlot {
+    msg: crate::attribute::AttributeMessage,
+    /// Global heap collections still to be placed, for a variable-length
+    /// attribute *this edit* sets.
+    collections: Option<Vec<Vec<u8>>>,
+    /// The creation index the object records for it, where it tracks the order.
+    creation_index: Option<u16>,
 }
 
 /// Whether an object's chunk-0 message `region` stores its attributes densely —
 /// an Attribute Info message naming a fractal heap. See
 /// [`attribute_info_is_dense`] for why the message's mere presence is not that.
-fn region_uses_dense_attrs(region: &[u8]) -> Result<bool, Error> {
+fn region_uses_dense_attrs(region: &OhRegion) -> Result<bool, Error> {
     let mut p = 0;
-    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::AttributeInfo
             && attribute_info_is_dense(&region[body..body_end])
         {
@@ -12690,9 +12853,9 @@ fn region_uses_dense_attrs(region: &[u8]) -> Result<bool, Error> {
 /// an attribute means the body is a shared (SOHM) record rather than the
 /// attribute itself. Reads the same byte [`parse_compact_attr_name`] does, so the
 /// two attribute paths refuse exactly the same messages.
-fn region_has_shared_attr(region: &[u8]) -> Result<bool, Error> {
+fn region_has_shared_attr(region: &OhRegion) -> Result<bool, Error> {
     let mut p = 0;
-    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, _body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::Attribute && region[p + 3] != 0 {
             return Ok(true);
         }
@@ -12704,10 +12867,10 @@ fn region_has_shared_attr(region: &[u8]) -> Result<bool, Error> {
 /// Copy a chunk-0 message `region`, dropping every Attribute message and the
 /// Attribute Info message that names their storage. What the object carries in
 /// their place is [`plan_attr_ops`]'s decision, appended by the apply phase.
-fn strip_attr_messages(region: &[u8]) -> Result<Vec<u8>, Error> {
+fn strip_attr_messages(region: &OhRegion) -> Result<OhRegion, Error> {
     let mut out = Vec::with_capacity(region.len());
     let mut p = 0;
-    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, _body, body_end)) = region.next_message(p)? {
         if !matches!(
             msg_type,
             MessageType::Attribute | MessageType::AttributeInfo
@@ -12719,7 +12882,7 @@ fn strip_attr_messages(region: &[u8]) -> Result<Vec<u8>, Error> {
     if p < region.len() {
         out.extend_from_slice(&region[p..]);
     }
-    Ok(out)
+    Ok(region.with_bytes(out))
 }
 
 /// Every attribute an object carries, compact or dense, parsed into messages.
@@ -12738,7 +12901,7 @@ fn read_object_attrs<S: Source + ?Sized>(
     src: &S,
     addr: u64,
     base: BaseAddress,
-) -> Result<Vec<crate::attribute::AttributeMessage>, Error> {
+) -> Result<Vec<crate::attribute::StoredAttribute>, Error> {
     let header = ObjectHeader::parse_from_source(src, addr, OFFSET_SIZE, LENGTH_SIZE, base)
         .map_err(|_| Error::EditUnsupported("an object header could not be parsed"))?;
     if base.get() > src.len() {
@@ -12751,7 +12914,7 @@ fn read_object_attrs<S: Source + ?Sized>(
     // same view the reader uses. `base` is 0 for a plain file, where this is
     // `src` itself.
     let framed = BaseOffsetSource { inner: src, base };
-    crate::attribute::extract_attributes_full_from_source(
+    crate::attribute::extract_stored_attributes_from_source(
         &framed,
         &header,
         OFFSET_SIZE,
@@ -12760,6 +12923,62 @@ fn read_object_attrs<S: Source + ?Sized>(
     .map_err(|_| {
         Error::EditUnsupported("an object's dense (fractal-heap) attributes could not be read")
     })
+}
+
+/// Assemble a [`DenseAttrSet`] from an object's stored attributes and what its
+/// header `region` says about attribute creation order.
+///
+/// An object that does not track the order gets
+/// [`DenseAttrCreationOrder::Untracked`], which is the whole story for every
+/// file this crate writes itself. One that does keeps each attribute's stored
+/// index, and the maximum its Attribute Info message records — the next index it
+/// would hand out, which a deletion does not lower, so it cannot be recomputed
+/// from the attributes that remain. An attribute whose storage recorded no index
+/// (a header that claims to track the order and then does not) is given the next
+/// unused one rather than silently colliding with a real index.
+fn dense_attr_set(
+    region: &OhRegion,
+    stored: Vec<crate::attribute::StoredAttribute>,
+) -> Result<DenseAttrSet, Error> {
+    let layout = region.layout();
+    if !layout.tracks_creation_order() {
+        return Ok(DenseAttrSet {
+            attrs: stored.into_iter().map(|a| a.message).collect(),
+            creation: DenseAttrCreationOrder::Untracked,
+        });
+    }
+    let mut next = next_attr_creation_index(region)?;
+    let mut attrs = Vec::with_capacity(stored.len());
+    let mut indices = Vec::with_capacity(stored.len());
+    for attr in stored {
+        let index = match attr.creation_index {
+            Some(index) => index,
+            None => {
+                let index = next;
+                next = bump_creation_index(next)?;
+                index
+            }
+        };
+        next = next.max(bump_creation_index(index)?);
+        attrs.push(attr.message);
+        indices.push(index);
+    }
+    Ok(DenseAttrSet {
+        attrs,
+        creation: DenseAttrCreationOrder::Tracked {
+            indices,
+            max: next,
+            indexed: layout.indexes_creation_order(),
+        },
+    })
+}
+
+/// One past `index`, refusing the object that has exhausted the 2-byte creation
+/// index its Attribute Info message records.
+fn bump_creation_index(index: u16) -> Result<u16, Error> {
+    index.checked_add(1).ok_or(Error::EditUnsupported(
+        "an object has assigned every attribute creation index its header can record",
+    ))
 }
 
 /// Whether an Attribute Info (0x0015) message body denotes *dense* (fractal-heap)
@@ -12779,24 +12998,189 @@ pub(crate) fn attribute_info_is_dense(body: &[u8]) -> bool {
 
 /// Copy a message region, dropping all Attribute messages named `name` and then
 /// appending a fresh compact Attribute message for `value`.
-fn set_attr_in_region(region: &[u8], name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> {
-    let new_msg = encode_attr_message(name, value)?;
+fn set_attr_in_region(region: &OhRegion, name: &str, value: &AttrValue) -> Result<OhRegion, Error> {
+    let body = encode_attr_body(name, value)?;
+    let keep = attr_creation_index(region, name)?;
+    put_attr_message(region, name, &body, keep)
+}
+
+/// The creation index the Attribute message named `name` carries, or `None`
+/// where the object has no such attribute — or does not track the order at all.
+fn attr_creation_index(region: &OhRegion, name: &str) -> Result<Option<u16>, Error> {
+    if !region.layout().tracks_creation_order() {
+        return Ok(None);
+    }
+    let mut p = 0;
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
+        if msg_type == MessageType::Attribute
+            && parse_compact_attr_name(region, p, body, body_end)? == name
+        {
+            return Ok(region.creation_index(p));
+        }
+        p = body_end;
+    }
+    Ok(None)
+}
+
+/// The highest creation index any Attribute record in `region` carries.
+fn highest_attr_creation_index(region: &OhRegion) -> Result<Option<u16>, Error> {
+    let mut highest = None;
+    let mut p = 0;
+    while let Some((msg_type, _body, body_end)) = region.next_message(p)? {
+        if msg_type == MessageType::Attribute {
+            highest = highest.max(region.creation_index(p));
+        }
+        p = body_end;
+    }
+    Ok(highest)
+}
+
+/// The next unused attribute creation index for an object whose messages are
+/// `region`.
+///
+/// The reference C library hands out `ainfo.max_crt_idx` and increments it
+/// (`H5O__attr_create`), so the recorded maximum is the *next* index rather
+/// than the highest in use, and deleting an attribute never lowers it. Read it
+/// from the Attribute Info message where there is one, and otherwise derive one
+/// past the highest index the records carry — the best evidence a header with no
+/// such message leaves.
+fn next_attr_creation_index(region: &OhRegion) -> Result<u16, Error> {
+    let recorded = find_attribute_info(region)?
+        .and_then(|(_, _, info)| info.max_creation_index)
+        .unwrap_or(0);
+    let derived = highest_attr_creation_index(region)?.map_or(0, |i| u32::from(i) + 1);
+    let next = u32::from(recorded).max(derived);
+    u16::try_from(next).map_err(|_| {
+        Error::EditUnsupported(
+            "an object has assigned every attribute creation index its header can record",
+        )
+    })
+}
+
+/// The Attribute Info message in `region`, as `(record start, body range, parsed
+/// message)`. An unparseable message is reported as absent, which leaves it
+/// untouched: `attribute_info_is_dense` reads the same message and refuses the
+/// object rather than letting an edit rewrite one it did not understand.
+fn find_attribute_info(
+    region: &OhRegion,
+) -> Result<Option<(usize, core::ops::Range<usize>, AttributeInfoMessage)>, Error> {
+    let mut p = 0;
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
+        if msg_type == MessageType::AttributeInfo
+            && let Ok(info) = AttributeInfoMessage::parse(&region[body..body_end], OFFSET_SIZE)
+        {
+            return Ok(Some((p, body..body_end, info)));
+        }
+        p = body_end;
+    }
+    Ok(None)
+}
+
+/// The Attribute Info message body an object storing its attributes compactly
+/// needs, in `region`'s layout.
+///
+/// A header that tracks attribute creation order records the maximum index ever
+/// assigned here, and nowhere else, so a header carrying no such message leaves
+/// only the records to derive it from: one past the highest index in use. That
+/// under-counts an object whose most recently created attributes have since been
+/// deleted, which is why an edit *patches* an existing message
+/// ([`put_attr_message`]) rather than rebuilding one.
+fn compact_attribute_info_body(region: &OhRegion) -> Result<Vec<u8>, Error> {
+    let layout = region.layout();
+    let info = AttributeInfoMessage {
+        max_creation_index: layout
+            .tracks_creation_order()
+            .then(|| next_attr_creation_index(region))
+            .transpose()?,
+        indexes_creation_order: layout.indexes_creation_order(),
+        fractal_heap_address: None,
+        btree_name_index_address: None,
+        btree_creation_order_address: None,
+    };
+    Ok(info.serialize(OFFSET_SIZE))
+}
+
+/// Copy a message region, dropping every Attribute message named `name` and
+/// appending one carrying `body`, then keep the object's Attribute Info message
+/// in step with the creation index the new record takes.
+///
+/// `keep` is the index an *overwrite* preserves: the reference C library modifies
+/// an attribute in place, so writing over one does not move it in an iteration
+/// by creation order. `None` asks for the object's next unused index, which then
+/// becomes the maximum the Attribute Info message records. Both are inert on a
+/// header that does not track the order, where no record has the field.
+fn put_attr_message(
+    region: &OhRegion,
+    name: &str,
+    body: &[u8],
+    keep: Option<u16>,
+) -> Result<OhRegion, Error> {
+    let layout = region.layout();
+    let (creation_index, new_max) = if layout.tracks_creation_order() {
+        match keep {
+            Some(index) => (index, None),
+            None => {
+                let index = next_attr_creation_index(region)?;
+                let next = index.checked_add(1).ok_or(Error::EditUnsupported(
+                    "an object has assigned every attribute creation index its header can record",
+                ))?;
+                (index, Some(next))
+            }
+        }
+    } else {
+        (0, None)
+    };
+    let new_msg = layout.record_with_creation_index(MessageType::Attribute, body, creation_index);
+
     let mut out = Vec::with_capacity(region.len() + new_msg.len());
     let mut p = 0;
-    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
-        if msg_type == MessageType::Attribute {
-            let attr_name = parse_compact_attr_name(region, p, body, body_end)?;
-            if attr_name == name {
+    while let Some((msg_type, msg_body, body_end)) = region.next_message(p)? {
+        match msg_type {
+            MessageType::Attribute
+                if parse_compact_attr_name(region, p, msg_body, body_end)? == name =>
+            {
                 p = body_end;
                 continue;
             }
+            // Bumping the recorded maximum re-encodes the message, since a
+            // header that was not recording one at all needs the field added.
+            MessageType::AttributeInfo if new_max.is_some() => {
+                if let Ok(mut info) =
+                    AttributeInfoMessage::parse(&region[msg_body..body_end], OFFSET_SIZE)
+                {
+                    info.max_creation_index = new_max;
+                    info.indexes_creation_order |= layout.indexes_creation_order();
+                    let encoded = info.serialize(OFFSET_SIZE);
+                    let len = u16::try_from(encoded.len()).map_err(|_| {
+                        Error::EditUnsupported("an Attribute Info message is too large to record")
+                    })?;
+                    // Only the body and its length change: the record keeps its
+                    // own flags — the reference C library marks this message
+                    // "don't share" — and its creation index.
+                    out.push(region[p]);
+                    out.extend_from_slice(&len.to_le_bytes());
+                    out.extend_from_slice(&region[p + 3..msg_body]);
+                    out.extend_from_slice(&encoded);
+                    p = body_end;
+                    continue;
+                }
+                out.extend_from_slice(&region[p..body_end]);
+            }
+            _ => out.extend_from_slice(&region[p..body_end]),
         }
-        out.extend_from_slice(&region[p..body_end]);
         p = body_end;
     }
     out.extend_from_slice(&new_msg);
     if p < region.len() {
         out.extend_from_slice(&region[p..]);
+    }
+    let mut out = region.with_bytes(out);
+    // An object that had no Attribute Info message to bump gets the one
+    // `build_v2_object_header` would add anyway, now, so the maximum this edit
+    // just assigned is recorded rather than re-derived from the records.
+    if new_max.is_some() && find_attribute_info(&out)?.is_none() {
+        let body = compact_attribute_info_body(&out)?;
+        out.push(MessageType::AttributeInfo, &body);
     }
     Ok(out)
 }
@@ -12806,11 +13190,15 @@ fn set_attr_in_region(region: &[u8], name: &str, value: &AttrValue) -> Result<Ve
 /// `Remove` of a nonexistent attribute); when false, it is not an error (a
 /// `Set` of a fresh variable-length attribute may have no fixed-size message
 /// to remove from the region yet).
-fn remove_attr_from_region(region: &[u8], name: &str, required: bool) -> Result<Vec<u8>, Error> {
+fn remove_attr_from_region(
+    region: &OhRegion,
+    name: &str,
+    required: bool,
+) -> Result<OhRegion, Error> {
     let mut out = Vec::with_capacity(region.len());
     let mut p = 0;
     let mut removed = false;
-    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
         let mut skip = false;
         if msg_type == MessageType::Attribute {
             let attr_name = parse_compact_attr_name(region, p, body, body_end)?;
@@ -12830,17 +13218,17 @@ fn remove_attr_from_region(region: &[u8], name: &str, required: bool) -> Result<
     if !removed && required {
         return Err(Error::EditUnsupported("attribute to remove was not found"));
     }
-    Ok(out)
+    Ok(region.with_bytes(out))
 }
 
 /// How many attributes an object's message `region` carries inline. Only a
 /// compact region is ever counted this way: a dense object carries no inline
 /// Attribute message at all, and would count zero — which is why
 /// [`plan_attr_ops`] decides an object's storage before it reaches here.
-fn compact_attr_count(region: &[u8]) -> Result<usize, Error> {
+fn compact_attr_count(region: &OhRegion) -> Result<usize, Error> {
     let mut count = 0usize;
     let mut p = 0;
-    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, _body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::Attribute {
             count += 1;
         }
@@ -12867,7 +13255,7 @@ fn parse_compact_attr_name(
         .map_err(|_| Error::EditUnsupported("a target object has an unreadable attribute message"))
 }
 
-fn encode_attr_message(name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> {
+fn encode_attr_body(name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> {
     // `apply_compact_attr_ops`'s `Set` branch — this function's only caller —
     // handles a value that needs the global heap itself (staging it into
     // `pending_vl` instead of calling `set_attr_in_region`/here), so this value
@@ -12882,7 +13270,7 @@ fn encode_attr_message(name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> 
             "group attribute is too large to encode in place",
         ));
     }
-    Ok(region_message(MessageType::Attribute, &body))
+    Ok(body)
 }
 
 /// Whether `a` is a path prefix of (or equal to) `b`.
@@ -12902,9 +13290,9 @@ fn is_prefix(a: &[String], b: &[String]) -> bool {
 /// Shared by the whole-file mirror commit and the bounded finalize so both write
 /// the same extension bytes.
 pub(crate) fn rewrite_extension_region_bytes(
-    region: &[u8],
+    region: &OhRegion,
     info: &FileSpaceInfo,
-) -> Result<Vec<u8>, Error> {
+) -> Result<OhRegion, Error> {
     let new_body = info.serialize();
     // The message body is the fixed-size File Space Info record (≤ 125 bytes),
     // so it always fits the u16 size field; `try_from` keeps this off the
@@ -12914,11 +13302,13 @@ pub(crate) fn rewrite_extension_region_bytes(
     let mut out = Vec::with_capacity(region.len());
     let mut p = 0;
     let mut replaced = false;
-    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, _body, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::FileSpaceInfo {
             out.push(region[p]); // message type byte
             out.extend_from_slice(&new_len.to_le_bytes());
-            out.push(region[p + 3]); // preserve the message flags (0x14)
+            // Preserve the message flags (0x14) and, where the header carries
+            // one, the record's creation index.
+            out.extend_from_slice(&region[p + 3..p + region.layout().prefix_len()]);
             out.extend_from_slice(&new_body);
             replaced = true;
         } else {
@@ -12934,7 +13324,7 @@ pub(crate) fn rewrite_extension_region_bytes(
             "a persisting file's superblock extension has no File Space Info message",
         ));
     }
-    Ok(out)
+    Ok(region.with_bytes(out))
 }
 
 /// Parse and validate a version 2 object header's prefix, returning the absolute
@@ -12943,20 +13333,22 @@ pub(crate) fn rewrite_extension_region_bytes(
 /// `prefix` holds the bytes at `[addr, addr + prefix.len())` — up to
 /// [`OH_PREFIX_MAX`], fewer when the header sits near the end of the image — and
 /// `file_len` is the length of the image the header lives in, which bounds the
-/// region. Rejects headers that are not OHDR v2 and headers that track message
-/// creation order, whose 6-byte message records this engine does not emit.
-fn oh_region_at(prefix: &[u8], addr: u64, file_len: u64) -> Result<(u64, u64), Error> {
+/// region. Rejects headers that are not OHDR v2. The record layout the flags
+/// byte declares is returned with the region, since a header that tracks
+/// attribute creation order carries 6-byte message records and every walk of
+/// this region has to step by that width.
+fn oh_region_at(
+    prefix: &[u8],
+    addr: u64,
+    file_len: u64,
+) -> Result<(u64, u64, OhRecordLayout), Error> {
     if prefix.len() < 6 || &prefix[..4] != b"OHDR" || prefix[4] != 2 {
         return Err(Error::EditUnsupported(
             "an object does not use a version 2 object header",
         ));
     }
     let flags = prefix[5];
-    if flags & 0x04 != 0 {
-        return Err(Error::EditUnsupported(
-            "an object tracks message creation order (not supported in place yet)",
-        ));
-    }
+    let layout = OhRecordLayout::from_header_flags(flags);
     let mut pos = 6usize;
     if flags & 0x20 != 0 {
         pos += 16; // optional timestamps
@@ -12983,7 +13375,7 @@ fn oh_region_at(prefix: &[u8], addr: u64, file_len: u64) -> Result<(u64, u64), E
         .checked_add(chunk0_size)
         .filter(|e| e.checked_add(4).is_some_and(|end| end <= file_len))
         .ok_or(Error::EditUnsupported("truncated object header"))?;
-    Ok((region_start, region_end))
+    Ok((region_start, region_end, layout))
 }
 
 /// One chunk of a version 2 object header, read out of a file image.
@@ -12999,14 +13391,22 @@ pub(crate) struct OhChunk {
     buf: Vec<u8>,
     /// Offset of the first message within [`buf`](Self::buf).
     messages_start: usize,
+    /// The record layout chunk 0 of this header declared, which every chunk of
+    /// the header shares.
+    layout: OhRecordLayout,
 }
 
 impl OhChunk {
     /// The slice to walk messages in, and the offset to start at. The two are
-    /// returned together because [`next_message`] must not read past the end of
-    /// the message region into the checksum.
+    /// returned together because [`OhRecordLayout::next_message`] must not read
+    /// past the end of the message region into the checksum.
     pub(crate) fn message_region(&self) -> (&[u8], usize) {
         (&self.buf, self.messages_start)
+    }
+
+    /// The record layout to walk [`message_region`](Self::message_region) in.
+    pub(crate) fn layout(&self) -> OhRecordLayout {
+        self.layout
     }
 }
 
@@ -13018,7 +13418,7 @@ fn read_oh_chunk0<S: Source + ?Sized>(src: &S, addr: u64) -> Result<OhChunk, Err
         .min(OH_PREFIX_MAX as u64)
         .to_usize()?;
     let prefix = src.read_metadata_at(addr, window)?;
-    let (rs, re) = oh_region_at(&prefix, addr, file_len)?;
+    let (rs, re, layout) = oh_region_at(&prefix, addr, file_len)?;
     // `re >= rs > addr`, so both differences are non-negative, and `oh_region_at`
     // has checked that the 4-byte checksum past `re` is present.
     let len = (re - addr).to_usize()?;
@@ -13026,6 +13426,7 @@ fn read_oh_chunk0<S: Source + ?Sized>(src: &S, addr: u64) -> Result<OhChunk, Err
         span: (addr, len as u64 + 4),
         buf: src.read_metadata_at(addr, len)?,
         messages_start: (rs - addr).to_usize()?,
+        layout,
     })
 }
 
@@ -13052,10 +13453,13 @@ pub(crate) fn read_oh_chunks<S: Source + ?Sized>(
         // Collect this chunk's continuations before extending the worklist, so the
         // borrow of `chunks[i]` ends first.
         let mut found = Vec::new();
+        let layout = chunks[i].layout();
         let (region, mut p) = chunks[i].message_region();
-        while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        while let Some((msg_type, body, body_end)) = layout.next_message(region, p)? {
             if msg_type == MessageType::ObjectHeaderContinuation {
-                found.push(read_oh_continuation(src, region, body, body_end, base)?);
+                found.push(read_oh_continuation(
+                    src, region, body, body_end, base, layout,
+                )?);
             }
             p = body_end;
         }
@@ -13075,6 +13479,7 @@ fn read_oh_continuation<S: Source + ?Sized>(
     body: usize,
     body_end: usize,
     base: BaseAddress,
+    layout: OhRecordLayout,
 ) -> Result<OhChunk, Error> {
     if body_end - body < (OFFSET_SIZE + LENGTH_SIZE) as usize {
         return Err(Error::EditUnsupported("malformed continuation message"));
@@ -13106,24 +13511,245 @@ fn read_oh_continuation<S: Source + ?Sized>(
         span: (off, len),
         buf,
         messages_start: 4,
+        layout,
     })
 }
 
-pub(crate) fn next_message(
-    region: &[u8],
-    p: usize,
-) -> Result<Option<(MessageType, usize, usize)>, Error> {
-    if p + 4 > region.len() {
-        return Ok(None);
+/// How a version 2 object header's message records are laid out, and what its
+/// flags say about attribute creation order.
+///
+/// Every record opens with a type byte, a 2-byte body size and a flags byte. A
+/// header that *tracks* attribute creation order — bit 2 of the object header's
+/// own flags, what `H5Pset_attr_creation_order` and h5py's `track_order=True`
+/// turn on, and what netCDF-4 sets on every object it writes — follows those
+/// with a 2-byte creation index, so its records are 6 bytes wide rather than 4.
+/// A header that also *indexes* that order (bit 3) carries a creation-order
+/// B-tree beside the name index once its attributes go dense; the reference C
+/// library reads that bit back out of the header when it builds an Attribute
+/// Info message, so a rewrite that dropped it would quietly stop indexing.
+///
+/// Both bits are properties of the whole header, so chunk 0 and every
+/// continuation block of one header share a layout. Carrying it beside the bytes
+/// ([`OhRegion`]) is what keeps the two dozen walkers and the emitters in this
+/// module from having to agree about it one by one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OhRecordLayout {
+    /// Records carry a 2-byte creation index (object header flags bit 2).
+    tracked: bool,
+    /// Dense attribute storage indexes that order (object header flags bit 3).
+    indexed: bool,
+}
+
+/// Object header flags bit 2: message creation order is tracked, so every
+/// message record carries a creation index.
+const OH_FLAG_CREATION_ORDER_TRACKED: u8 = 0x04;
+
+/// Object header flags bit 3: attribute creation order is *indexed* as well as
+/// tracked, so dense attribute storage carries a creation-order B-tree beside
+/// its name index.
+const OH_FLAG_CREATION_ORDER_INDEXED: u8 = 0x08;
+
+impl OhRecordLayout {
+    /// 4-byte record prefixes and no creation order at all: what this crate's
+    /// whole-file writer emits, and what a header this editor creates from
+    /// nothing uses.
+    pub(crate) const PLAIN: Self = Self {
+        tracked: false,
+        indexed: false,
+    };
+
+    /// The layout a version 2 object header's flags byte declares.
+    pub(crate) const fn from_header_flags(flags: u8) -> Self {
+        Self {
+            tracked: flags & OH_FLAG_CREATION_ORDER_TRACKED != 0,
+            indexed: flags & OH_FLAG_CREATION_ORDER_INDEXED != 0,
+        }
     }
-    let msg_type = MessageType::from_u16(region[p] as u16);
-    let msg_size = u16::from_le_bytes([region[p + 1], region[p + 2]]) as usize;
-    let body = p + 4;
-    let body_end = body + msg_size;
-    if body_end > region.len() {
-        return Err(Error::EditUnsupported("malformed object header message"));
+
+    /// Bytes a message record spends before its body.
+    pub(crate) const fn prefix_len(self) -> usize {
+        if self.tracked { 6 } else { 4 }
     }
-    Ok(Some((msg_type, body, body_end)))
+
+    /// The object-header flag bits this layout implies.
+    const fn header_flags(self) -> u8 {
+        let tracked = if self.tracked {
+            OH_FLAG_CREATION_ORDER_TRACKED
+        } else {
+            0
+        };
+        let indexed = if self.indexed {
+            OH_FLAG_CREATION_ORDER_INDEXED
+        } else {
+            0
+        };
+        tracked | indexed
+    }
+
+    /// Whether records carry a creation index at all.
+    pub(crate) const fn tracks_creation_order(self) -> bool {
+        self.tracked
+    }
+
+    /// Whether dense attribute storage on this object indexes that order, with
+    /// a creation-order B-tree beside the name index.
+    pub(crate) const fn indexes_creation_order(self) -> bool {
+        self.indexed
+    }
+
+    /// Parse the message record at `p` within a chunk's message region,
+    /// returning `(message type, body start, body end)`; the next record begins
+    /// at `body end`. Returns `Ok(None)` once fewer bytes remain than a record
+    /// prefix takes (a clean end of the region, or the gap the reference C
+    /// library leaves when a chunk's free space is too small to hold a message),
+    /// and `Err` if a record's declared body runs past the region. Centralizes
+    /// the bounds check shared by every walker.
+    pub(crate) fn next_message(
+        self,
+        region: &[u8],
+        p: usize,
+    ) -> Result<Option<(MessageType, usize, usize)>, Error> {
+        if p + self.prefix_len() > region.len() {
+            return Ok(None);
+        }
+        let msg_type = MessageType::from_u16(region[p] as u16);
+        let msg_size = u16::from_le_bytes([region[p + 1], region[p + 2]]) as usize;
+        let body = p + self.prefix_len();
+        let body_end = body + msg_size;
+        if body_end > region.len() {
+            return Err(Error::EditUnsupported("malformed object header message"));
+        }
+        Ok(Some((msg_type, body, body_end)))
+    }
+
+    /// The creation index the record at `msg_start` carries, or `None` where the
+    /// layout has no such field. The caller must have located `msg_start` with
+    /// [`next_message`](Self::next_message), which bounds the read.
+    fn creation_index(self, region: &[u8], msg_start: usize) -> Option<u16> {
+        self.tracked
+            .then(|| u16::from_le_bytes([region[msg_start + 4], region[msg_start + 5]]))
+    }
+
+    /// Encode one message record: this layout's prefix, then `body`.
+    ///
+    /// `creation_index` is written only where the layout carries one. It is
+    /// meaningful for an Attribute message, whose creation index *is* the
+    /// attribute's creation order; the reference C library writes zero on every
+    /// other message type, which is what [`Self::record`] passes.
+    fn record_with_creation_index(
+        self,
+        msg_type: MessageType,
+        body: &[u8],
+        creation_index: u16,
+    ) -> Vec<u8> {
+        let mut m = Vec::with_capacity(self.prefix_len() + body.len());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "message type ids are a small enum that fits the 1-byte v2 type field"
+        )]
+        m.push(msg_type.to_u16() as u8);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "callers pass bodies that fit the 2-byte message-size field (see doc comment)"
+        )]
+        m.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        m.push(0); // message flags
+        if self.tracks_creation_order() {
+            m.extend_from_slice(&creation_index.to_le_bytes());
+        }
+        m.extend_from_slice(body);
+        m
+    }
+
+    /// Encode one message record whose creation index, if the layout has one, is
+    /// the zero the reference C library writes for every non-attribute message.
+    fn record(self, msg_type: MessageType, body: &[u8]) -> Vec<u8> {
+        self.record_with_creation_index(msg_type, body, 0)
+    }
+}
+
+/// A version 2 object header's message records, in the layout the header
+/// declares them in.
+///
+/// The editor's model of a header is one contiguous run of message records:
+/// [`WriteEngine::gather_oh_messages`] collapses a multi-chunk header into it,
+/// the rewriters copy it message by message, and
+/// [`build_v2_object_header`] wraps it back up. Every one of those has to agree
+/// with the header's own flags about how wide a record prefix is, so the layout
+/// travels with the bytes rather than being re-derived — or assumed — at each
+/// step.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OhRegion {
+    bytes: Vec<u8>,
+    layout: OhRecordLayout,
+}
+
+impl core::ops::Deref for OhRegion {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl OhRegion {
+    /// A region of `bytes` whose records are written in `layout`.
+    pub(crate) fn new(bytes: Vec<u8>, layout: OhRecordLayout) -> Self {
+        Self { bytes, layout }
+    }
+
+    /// An empty region in `layout`, to be filled record by record.
+    fn empty(layout: OhRecordLayout) -> Self {
+        Self::new(Vec::new(), layout)
+    }
+
+    /// The same header's layout over different bytes: what every rewriter that
+    /// copies a region message by message returns.
+    fn with_bytes(&self, bytes: Vec<u8>) -> Self {
+        Self::new(bytes, self.layout)
+    }
+
+    pub(crate) fn layout(&self) -> OhRecordLayout {
+        self.layout
+    }
+
+    /// [`OhRecordLayout::next_message`] over this region's own bytes.
+    pub(crate) fn next_message(
+        &self,
+        p: usize,
+    ) -> Result<Option<(MessageType, usize, usize)>, Error> {
+        self.layout.next_message(&self.bytes, p)
+    }
+
+    /// The creation index of the record at `msg_start`, or `None` for a header
+    /// that does not track it.
+    fn creation_index(&self, msg_start: usize) -> Option<u16> {
+        self.layout.creation_index(&self.bytes, msg_start)
+    }
+
+    /// Append one already-encoded record (or run of records) written in this
+    /// region's layout.
+    fn push_bytes(&mut self, record: &[u8]) {
+        self.bytes.extend_from_slice(record);
+    }
+
+    /// The bytes, for a patch that changes a field inside a record without
+    /// changing any record's length.
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    /// Append a hard Link message record for `name -> addr`.
+    fn push_link(&mut self, name: &str, addr: u64) {
+        let record = encode_link_message(self.layout, name, addr);
+        self.push_bytes(&record);
+    }
+
+    /// Append a message record for `body`, with the zero creation index the
+    /// reference C library writes for every non-attribute message.
+    fn push(&mut self, msg_type: MessageType, body: &[u8]) {
+        let record = self.layout.record(msg_type, body);
+        self.push_bytes(&record);
+    }
 }
 
 /// Version-2 object-header message flag bit marking a message as *shared* (stored
@@ -13149,9 +13775,9 @@ pub(crate) const MSG_FLAG_SHARED: u8 = 0x02;
 /// the only screen that reads this message at all — [`reject_foreign_addresses`]
 /// inspects shared messages, datatypes, and attributes, not this body, which
 /// carries a local-heap address that would dangle in another file.
-fn reject_external_storage(region: &[u8]) -> Result<(), Error> {
+fn reject_external_storage(region: &OhRegion) -> Result<(), Error> {
     let mut p = 0;
-    while let Some((msg_type, _, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, _, body_end)) = region.next_message(p)? {
         if msg_type == MessageType::ExternalDataFiles {
             return Err(Error::EditUnsupported(
                 "a dataset stores its elements in external files (H5Pset_external), \
@@ -13184,9 +13810,9 @@ fn reject_external_storage(region: &[u8]) -> Result<(), Error> {
 /// nested variable-length or reference occurrence is caught too. It is applied
 /// only on the cross-file path; the same-file [`copy`](crate::File::copy)
 /// deliberately keeps these forms (their addresses stay valid in one file).
-fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
+fn reject_foreign_addresses(region: &OhRegion) -> Result<(), Error> {
     let mut p = 0;
-    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
         // A *shared* message stores, in place of its real body, a reference into
         // the source file's shared-message storage — an object-header address or a
         // fractal-heap (SOHM) id — which means nothing in another file. This
@@ -13387,7 +14013,7 @@ fn screen_copied_references(
             ..
         } => (region, dense_attrs),
     };
-    for attr in dense_attrs {
+    for attr in &dense_attrs.attrs {
         screen_resolved_references(&attr.datatype, &attr.raw_data, invalidated)?;
     }
 
@@ -13396,7 +14022,7 @@ fn screen_copied_references(
     let mut element_dt: Option<Datatype> = None;
     let mut compact: Option<Vec<u8>> = None;
     let mut p = 0;
-    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+    while let Some((msg_type, body, body_end)) = region.next_message(p)? {
         // The flags byte is the 4th of the record header (type, size, flags);
         // `next_message` returning `Some` guarantees it is in bounds.
         let shared = region[p + 3] & MSG_FLAG_SHARED != 0;
@@ -13539,23 +14165,26 @@ fn screen_copied_references(
 /// profiles disagree about whether such a file was writable at all — a panic in
 /// a test build, and in a release build a header silently missing its Attribute
 /// Info message, which is the zero-count defect this function exists to prevent.
-pub(crate) fn build_v2_object_header(region: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut owned = region.to_vec();
+pub(crate) fn build_v2_object_header(region: &OhRegion) -> Result<Vec<u8>, Error> {
+    let mut owned = region.clone();
     ensure_attribute_info(&mut owned)?;
     Ok(build_v2_object_header_verbatim(&owned))
 }
 
 /// [`build_v2_object_header`] without the attribute-storage normalization, for
 /// the region that function has already normalized.
-fn build_v2_object_header_verbatim(region: &[u8]) -> Vec<u8> {
+fn build_v2_object_header_verbatim(region: &OhRegion) -> Vec<u8> {
     let total = region.len();
-    let (flags, width) = if total <= 255 {
+    let (size_flags, width) = if total <= 255 {
         (0u8, 1usize)
     } else if total <= 65535 {
         (1u8, 2)
     } else {
         (2u8, 4)
     };
+    // The creation-order bits are the header's own claim about the records
+    // below, so they come from the layout those records were written in.
+    let flags = size_flags | region.layout().header_flags();
     let mut buf = Vec::with_capacity(8 + total + 4);
     buf.extend_from_slice(b"OHDR");
     buf.push(2); // version
@@ -13734,18 +14363,18 @@ mod tests {
     fn a_shared_attribute_message_is_told_from_a_private_one_by_its_flags() {
         let body = crate::type_builders::build_attr_message("a", &AttrValue::I64(1))
             .serialize(LENGTH_SIZE);
-        let private = region_message(MessageType::Attribute, &body);
-        assert!(!region_has_shared_attr(&private).unwrap());
+        let private = message_record(MessageType::Attribute, &body);
+        assert!(!region_has_shared_attr(&plain_region(private.clone())).unwrap());
 
         let mut shared = private.clone();
         shared[3] = 0x02; // H5O_MSG_FLAG_SHARED
-        assert!(region_has_shared_attr(&shared).unwrap());
+        assert!(region_has_shared_attr(&plain_region(shared)).unwrap());
 
         // The flag is only read on an Attribute message: the same byte set on a
         // neighbouring message says nothing about attribute storage.
-        let mut other = region_message(MessageType::Dataspace, &body);
+        let mut other = message_record(MessageType::Dataspace, &body);
         other[3] = 0x02;
-        assert!(!region_has_shared_attr(&other).unwrap());
+        assert!(!region_has_shared_attr(&plain_region(other)).unwrap());
     }
 
     /// An object-reference attribute named `name` pointing at `address`.
@@ -13773,21 +14402,27 @@ mod tests {
     /// Wrap a message body in the object-header record a header region holds it
     /// in: type, body size, flags, body.
     fn message_record(msg_type: MessageType, body: &[u8]) -> Vec<u8> {
-        let mut record = vec![msg_type.to_u16() as u8, 0, 0, 0];
-        record[1..3].copy_from_slice(&(body.len() as u16).to_le_bytes());
-        record.extend_from_slice(body);
-        record
+        OhRecordLayout::PLAIN.record(msg_type, body)
+    }
+
+    /// A region of plain (4-byte-record) messages, the layout every writer in
+    /// this crate emits.
+    fn plain_region(bytes: Vec<u8>) -> OhRegion {
+        OhRegion::new(bytes, OhRecordLayout::PLAIN)
     }
 
     /// A header region holding one attribute inline.
-    fn inline_attr_region(attr: &crate::attribute::AttributeMessage) -> Vec<u8> {
-        message_record(MessageType::Attribute, &attr.serialize_v3(LENGTH_SIZE))
+    fn inline_attr_region(attr: &crate::attribute::AttributeMessage) -> OhRegion {
+        plain_region(message_record(
+            MessageType::Attribute,
+            &attr.serialize_v3(LENGTH_SIZE),
+        ))
     }
 
     /// The header region of a one-element *compact* object-reference dataset:
     /// its datatype, and a version 3 compact data-layout message carrying the
     /// element inline (version, class 0, a 2-byte inline size, then the data).
-    fn compact_reference_region(address: u64) -> Vec<u8> {
+    fn compact_reference_region(address: u64) -> OhRegion {
         let mut region = message_record(
             MessageType::Datatype,
             &crate::type_builders::make_object_reference_type().serialize(),
@@ -13796,7 +14431,7 @@ mod tests {
         layout.extend_from_slice(&8u16.to_le_bytes());
         layout.extend_from_slice(&address.to_le_bytes());
         region.extend_from_slice(&message_record(MessageType::DataLayout, &layout));
-        region
+        plain_region(region)
     }
 
     /// A *compact* dataset keeps its elements inside the data-layout message
@@ -13818,7 +14453,7 @@ mod tests {
         for (address, refused) in [(248u64, true), (318, true), (319, false)] {
             let tree = CopyTree::DatasetVerbatim {
                 region: compact_reference_region(address),
-                dense_attrs: Vec::new(),
+                dense_attrs: DenseAttrSet::default(),
             };
             let got = screen_copied_references(&tree, &invalidated, &empty);
             assert_eq!(got.is_err(), refused, "compact element {address}: {got:?}");
@@ -13830,11 +14465,11 @@ mod tests {
         // is a header that did not parse as one — malformed input, not a shape
         // the copy path produces.
         let no_layout = CopyTree::DatasetVerbatim {
-            region: message_record(
+            region: plain_region(message_record(
                 MessageType::Datatype,
                 &crate::type_builders::make_object_reference_type().serialize(),
-            ),
-            dense_attrs: Vec::new(),
+            )),
+            dense_attrs: DenseAttrSet::default(),
         };
         let err = screen_copied_references(&no_layout, &invalidated, &empty).unwrap_err();
         assert!(
@@ -14119,12 +14754,15 @@ mod tests {
         for (address, refused) in [(248u64, true), (318, true), (319, false), (247, false)] {
             let attr = reference_attr("target", address);
             let dense = CopyTree::DatasetVerbatim {
-                region: Vec::new(),
-                dense_attrs: vec![attr.clone()],
+                region: OhRegion::default(),
+                dense_attrs: DenseAttrSet {
+                    attrs: vec![attr.clone()],
+                    creation: DenseAttrCreationOrder::Untracked,
+                },
             };
             let inline = CopyTree::DatasetVerbatim {
                 region: inline_attr_region(&attr),
-                dense_attrs: Vec::new(),
+                dense_attrs: DenseAttrSet::default(),
             };
             for (storage, tree) in [("dense", &dense), ("inline", &inline)] {
                 let got = screen_copied_references(tree, &invalidated, &empty);
@@ -14138,10 +14776,10 @@ mod tests {
     }
 
     /// Collect the message types present in a chunk-0 region, in order.
-    fn region_types(region: &[u8]) -> Vec<MessageType> {
+    fn region_types(region: &OhRegion) -> Vec<MessageType> {
         let mut out = Vec::new();
         let mut p = 0;
-        while let Some((mt, _, end)) = next_message(region, p).unwrap() {
+        while let Some((mt, _, end)) = region.next_message(p).unwrap() {
             out.push(mt);
             p = end;
         }
@@ -16175,7 +16813,7 @@ mod tests {
             b.extend_from_slice(&u64::MAX.to_le_bytes());
             b
         };
-        let mut region = region_message(MessageType::LinkInfo, &li_body);
+        let mut region = plain_region(message_record(MessageType::LinkInfo, &li_body));
         ensure_group_info(&mut region).unwrap();
         assert_eq!(
             region_types(&region),
@@ -16184,7 +16822,7 @@ mod tests {
 
         // The appended message decodes as a minimal Group Info body.
         let mut p = 0;
-        while let Some((mt, body, end)) = next_message(&region, p).unwrap() {
+        while let Some((mt, body, end)) = region.next_message(p).unwrap() {
             if mt == MessageType::GroupInfo {
                 assert_eq!(&region[body..end], &GROUP_INFO_BODY);
             }
@@ -16199,7 +16837,7 @@ mod tests {
         let mut region = fresh_group_region();
         let before = region.clone();
         ensure_group_info(&mut region).unwrap();
-        assert_eq!(region, before);
+        assert_eq!(*region, *before);
     }
 
     #[test]
@@ -16208,13 +16846,254 @@ mod tests {
         // source-file reference in place of its body, so a verbatim cross-file
         // copy must refuse it, not only shared datatypes/attributes. (A plain,
         // non-shared dataspace embeds no foreign address and is accepted.)
-        let mut shared = region_message(MessageType::Dataspace, &[0u8; 8]);
+        let mut shared = message_record(MessageType::Dataspace, &[0u8; 8]);
         shared[3] = MSG_FLAG_SHARED; // set the message's shared flag
-        let err = reject_foreign_addresses(&shared).unwrap_err();
+        let err = reject_foreign_addresses(&plain_region(shared)).unwrap_err();
         assert!(err.to_string().contains("shared"), "got: {err}");
 
-        let plain = region_message(MessageType::Dataspace, &[0u8; 8]);
-        reject_foreign_addresses(&plain).unwrap();
+        let plain = message_record(MessageType::Dataspace, &[0u8; 8]);
+        reject_foreign_addresses(&plain_region(plain)).unwrap();
+    }
+
+    // ---- version 2 object-header record layout (issue #416) ----
+
+    /// Version-2 object-header message flag bit marking a message as one that
+    /// must not be shared. The reference C library sets it on the Attribute
+    /// Info message it writes, so a rewrite of that message has to keep it.
+    const MSG_FLAG_DONT_SHARE: u8 = 0x04;
+
+    /// The layout of a header that tracks *and* indexes attribute creation
+    /// order: object-header flag bits 2 and 3, and 6-byte message records.
+    const TRACKED: OhRecordLayout = OhRecordLayout::from_header_flags(0x0C);
+
+    /// One compact Attribute message body for `name`.
+    fn attr_body(name: &str, value: i64) -> Vec<u8> {
+        crate::type_builders::build_attr_message(name, &AttrValue::I64(value))
+            .serialize(LENGTH_SIZE)
+    }
+
+    /// A region in `layout` holding one Attribute message per `(name, creation
+    /// index)`, preceded by the Attribute Info message a tracked object carries.
+    fn attr_region(layout: OhRecordLayout, attrs: &[(&str, u16)], max: u16) -> OhRegion {
+        let mut region = OhRegion::empty(layout);
+        let info = AttributeInfoMessage {
+            max_creation_index: layout.tracks_creation_order().then_some(max),
+            indexes_creation_order: layout.indexes_creation_order(),
+            fractal_heap_address: None,
+            btree_name_index_address: None,
+            btree_creation_order_address: None,
+        };
+        let mut record = layout.record(MessageType::AttributeInfo, &info.serialize(OFFSET_SIZE));
+        record[3] = MSG_FLAG_DONT_SHARE;
+        region.push_bytes(&record);
+        for (name, index) in attrs {
+            let record = layout.record_with_creation_index(
+                MessageType::Attribute,
+                &attr_body(name, 1),
+                *index,
+            );
+            region.push_bytes(&record);
+        }
+        region
+    }
+
+    /// The attribute names a region carries, in the order its records hold them,
+    /// each with the creation index its record declares.
+    fn walk_attrs(region: &OhRegion) -> Vec<(String, Option<u16>)> {
+        let mut out = Vec::new();
+        let mut p = 0;
+        while let Some((msg_type, body, body_end)) = region.next_message(p).unwrap() {
+            if msg_type == MessageType::Attribute {
+                let name = parse_compact_attr_name(region, p, body, body_end).unwrap();
+                out.push((name, region.creation_index(p)));
+            }
+            p = body_end;
+        }
+        out
+    }
+
+    /// The message walk steps by the width the header's flags declare: four
+    /// bytes of record prefix without creation-order tracking, six with it.
+    #[test]
+    fn a_record_walk_steps_by_the_width_the_header_declares() {
+        for layout in [OhRecordLayout::PLAIN, TRACKED] {
+            let region = attr_region(layout, &[("alpha", 0), ("beta", 7)], 8);
+            assert_eq!(
+                walk_attrs(&region),
+                vec![
+                    (
+                        "alpha".to_string(),
+                        layout.tracks_creation_order().then_some(0)
+                    ),
+                    (
+                        "beta".to_string(),
+                        layout.tracks_creation_order().then_some(7)
+                    ),
+                ],
+                "layout {layout:?}",
+            );
+        }
+
+        // Non-vacuity: the two widths are not interchangeable. Reading a tracked
+        // region four bytes at a time misparses it from the first record on,
+        // which is the defect this width exists to prevent.
+        let tracked = attr_region(TRACKED, &[("alpha", 0), ("beta", 7)], 8);
+        let misread = OhRegion::new(tracked.to_vec(), OhRecordLayout::PLAIN);
+        let mut p = 0;
+        let mut agreed = true;
+        while let Ok(Some((_, _, body_end))) = misread.next_message(p) {
+            p = body_end;
+        }
+        agreed &= p == tracked.len();
+        assert!(
+            !agreed,
+            "a four-byte walk of a six-byte-record region must not come out even"
+        );
+    }
+
+    /// An emitted record carries the creation index only where the layout has
+    /// the field, and the flags byte stays where every reader looks for it.
+    #[test]
+    fn an_emitted_record_carries_a_creation_index_only_where_the_header_tracks_one() {
+        let body = [0xABu8; 5];
+        let plain =
+            OhRecordLayout::PLAIN.record_with_creation_index(MessageType::Attribute, &body, 9);
+        assert_eq!(plain.len(), 4 + body.len());
+        assert_eq!(&plain[4..], &body);
+
+        let tracked = TRACKED.record_with_creation_index(MessageType::Attribute, &body, 0x1234);
+        assert_eq!(tracked.len(), 6 + body.len());
+        assert_eq!(
+            &tracked[..4],
+            &plain[..4],
+            "type, size and flags are shared"
+        );
+        assert_eq!(&tracked[4..6], &0x1234u16.to_le_bytes());
+        assert_eq!(&tracked[6..], &body);
+
+        // Every non-attribute message the reference C library writes carries a
+        // zero creation index, which is what the plain emitter passes.
+        let group_info = TRACKED.record(MessageType::GroupInfo, &body);
+        assert_eq!(&group_info[4..6], &0u16.to_le_bytes());
+    }
+
+    /// A rebuilt header declares the record layout its bytes are written in, so
+    /// re-reading it walks them the same way.
+    #[test]
+    fn a_rebuilt_header_declares_the_record_layout_it_used() {
+        for layout in [OhRecordLayout::PLAIN, TRACKED] {
+            let region = attr_region(layout, &[("alpha", 3)], 4);
+            let header = build_v2_object_header(&region).unwrap();
+            let (start, end, read_back) =
+                oh_region_at(&header, 0, header.len() as u64).expect("the header parses");
+            assert_eq!(read_back, layout, "the flags lost the layout");
+            let round_tripped =
+                OhRegion::new(header[start as usize..end as usize].to_vec(), read_back);
+            assert_eq!(
+                walk_attrs(&round_tripped),
+                walk_attrs(&region),
+                "layout {layout:?}",
+            );
+        }
+    }
+
+    /// A fresh attribute takes the object's next unused creation index, and the
+    /// Attribute Info message records the one after it — the counter the
+    /// reference C library hands out from.
+    #[test]
+    fn a_new_compact_attribute_takes_the_next_creation_index() {
+        let region = attr_region(TRACKED, &[("alpha", 0), ("beta", 1)], 2);
+        let out = set_attr_in_region(&region, "gamma", &AttrValue::I64(5)).unwrap();
+        assert_eq!(
+            walk_attrs(&out),
+            vec![
+                ("alpha".to_string(), Some(0)),
+                ("beta".to_string(), Some(1)),
+                ("gamma".to_string(), Some(2)),
+            ],
+        );
+        let (record, _, info) = find_attribute_info(&out).unwrap().expect("an info message");
+        assert_eq!(info.max_creation_index, Some(3));
+        assert!(
+            info.indexes_creation_order,
+            "the index flag survives a rewrite"
+        );
+        assert_eq!(
+            out[record + 3],
+            MSG_FLAG_DONT_SHARE,
+            "the rewritten record lost the message flags it carried"
+        );
+    }
+
+    /// Overwriting an attribute keeps the creation index it had, so an
+    /// iteration by creation order does not reorder it.
+    #[test]
+    fn an_overwritten_compact_attribute_keeps_its_creation_index() {
+        let region = attr_region(TRACKED, &[("alpha", 0), ("beta", 1)], 2);
+        assert_eq!(attr_creation_index(&region, "alpha").unwrap(), Some(0));
+        let out = set_attr_in_region(&region, "alpha", &AttrValue::I64(9)).unwrap();
+        // The rewritten message moves to the end of the region — the editor
+        // rebuilds rather than patches — but its creation index does not move.
+        assert_eq!(
+            walk_attrs(&out),
+            vec![
+                ("beta".to_string(), Some(1)),
+                ("alpha".to_string(), Some(0))
+            ],
+        );
+        let (_, _, info) = find_attribute_info(&out).unwrap().expect("an info message");
+        assert_eq!(
+            info.max_creation_index,
+            Some(2),
+            "an overwrite must not advance the counter"
+        );
+    }
+
+    /// A deletion leaves a gap and does not lower the recorded maximum, so the
+    /// next attribute created cannot land in the middle of the order.
+    #[test]
+    fn a_deletion_leaves_the_creation_index_counter_where_it_was() {
+        let region = attr_region(TRACKED, &[("alpha", 0), ("beta", 1), ("gamma", 2)], 3);
+        let after = remove_attr_from_region(&region, "gamma", true).unwrap();
+        assert_eq!(
+            walk_attrs(&after),
+            vec![
+                ("alpha".to_string(), Some(0)),
+                ("beta".to_string(), Some(1))
+            ],
+        );
+        assert_eq!(
+            next_attr_creation_index(&after).unwrap(),
+            3,
+            "the highest index still in use is 1, but the counter is 3"
+        );
+
+        let out = put_attr_message(&after, "delta", &attr_body("delta", 1), None).unwrap();
+        assert_eq!(attr_creation_index(&out, "delta").unwrap(), Some(3));
+    }
+
+    /// A header that tracks the order but carries no Attribute Info message —
+    /// which nothing this crate writes, and nothing the C library writes, but
+    /// which the format permits — gets one recording a counter derived from the
+    /// records themselves.
+    #[test]
+    fn a_tracked_header_without_an_info_message_gains_one() {
+        let mut region = OhRegion::empty(TRACKED);
+        for (name, index) in [("alpha", 0u16), ("beta", 4)] {
+            let record = TRACKED.record_with_creation_index(
+                MessageType::Attribute,
+                &attr_body(name, 1),
+                index,
+            );
+            region.push_bytes(&record);
+        }
+        assert!(find_attribute_info(&region).unwrap().is_none());
+        ensure_attribute_info(&mut region).unwrap();
+        let (_, _, info) = find_attribute_info(&region)
+            .unwrap()
+            .expect("an info message");
+        assert_eq!(info.max_creation_index, Some(5));
+        assert!(info.indexes_creation_order);
     }
 
     /// Build a compact data-layout message body: version, class=0, 2-byte inline
@@ -16231,14 +17110,14 @@ mod tests {
         // A region with a Dataspace message, a compact Data Layout, and a trailing
         // Attribute message: rewriting the inline data must replace exactly the
         // layout's bytes and leave every other message verbatim.
-        let mut region = region_message(MessageType::Dataspace, &[0xAB; 8]);
-        region.extend_from_slice(&region_message(
+        let mut region = message_record(MessageType::Dataspace, &[0xAB; 8]);
+        region.extend_from_slice(&message_record(
             MessageType::DataLayout,
             &compact_layout_body(3, &[1, 2, 3, 4]),
         ));
-        region.extend_from_slice(&region_message(MessageType::Attribute, &[0xCD; 5]));
+        region.extend_from_slice(&message_record(MessageType::Attribute, &[0xCD; 5]));
 
-        let out = rebuild_compact_layout_region(&region, &[9, 8, 7, 6]).unwrap();
+        let out = rebuild_compact_layout_region(&plain_region(region), &[9, 8, 7, 6]).unwrap();
 
         // Same messages in the same order; only the layout's inline data changed.
         assert_eq!(
@@ -16250,7 +17129,7 @@ mod tests {
             ]
         );
         let mut p = 0;
-        while let Some((mt, body, end)) = next_message(&out, p).unwrap() {
+        while let Some((mt, body, end)) = out.next_message(p).unwrap() {
             match mt {
                 MessageType::Dataspace => assert_eq!(&out[body..end], &[0xAB; 8]),
                 MessageType::DataLayout => {
@@ -16271,14 +17150,14 @@ mod tests {
     fn rebuild_compact_layout_refuses_non_compact() {
         // A contiguous (class 1) data layout is not compact, so the rebuild refuses
         // rather than corrupt it.
-        let mut region = region_message(MessageType::DataLayout, &{
+        let mut region = message_record(MessageType::DataLayout, &{
             let mut b = vec![3u8, 1]; // version 3, class 1 (contiguous)
             b.extend_from_slice(&0u64.to_le_bytes());
             b.extend_from_slice(&0u64.to_le_bytes());
             b
         });
-        region.extend_from_slice(&region_message(MessageType::Dataspace, &[0; 8]));
-        let err = rebuild_compact_layout_region(&region, &[1, 2]).unwrap_err();
+        region.extend_from_slice(&message_record(MessageType::Dataspace, &[0; 8]));
+        let err = rebuild_compact_layout_region(&plain_region(region), &[1, 2]).unwrap_err();
         assert!(err.to_string().contains("non-compact"), "got: {err}");
     }
 
@@ -19413,7 +20292,8 @@ mod object_header_wrap_tests {
         region.push(0); // flags
         region.extend_from_slice(&[0u8; 4]); // a body far shorter than declared
 
-        let err = build_v2_object_header(&region).unwrap_err();
+        let err =
+            build_v2_object_header(&OhRegion::new(region, OhRecordLayout::PLAIN)).unwrap_err();
         assert!(
             matches!(err, Error::EditUnsupported(_)),
             "an unwalkable region gave {err:?}"
@@ -19430,7 +20310,8 @@ mod object_header_wrap_tests {
         region.push(0); // flags
         region.extend_from_slice(&body);
 
-        let oh = build_v2_object_header(&region).unwrap();
+        let oh =
+            build_v2_object_header(&OhRegion::new(region.clone(), OhRecordLayout::PLAIN)).unwrap();
         assert_eq!(&oh[..4], b"OHDR");
         assert!(
             oh.len() > 8 + region.len() + 4,
