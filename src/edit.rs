@@ -373,14 +373,15 @@ const REFERENCE_TO_A_MOVED_OBJECT: &str = "a reference this commit writes holds 
 const SHARED_ATTRIBUTE_MESSAGE: &str =
     "a target object has a shared attribute message (not editable in place yet)";
 
-/// A file that shares messages records the *sole* user of a shareable message as
-/// an object-header address in its shared-message (SOHM) index, rather than
-/// copying the message into a heap; the heap holds only messages two or more
-/// objects use. Such a record is a stored address like any other, and nothing
-/// repoints it: the index lives outside every object a commit rebuilds, and this
-/// engine does not write shared-message indexes. A commit that removed or moved
-/// the named header would leave the file's own index pointing at bytes that are
-/// no longer there, which the next library to share a message would follow.
+/// A shared-message (SOHM) index record does not always name a heap entry: where
+/// the reference C library shares a message written into an object header it
+/// already holds open, the record names *that header* and the message stays
+/// where it is. Such a record is a stored address like any other, and it is the
+/// one no rewrite reaches — the index lives outside every object a commit
+/// rebuilds, and this engine writes no shared-message indexes. A commit that
+/// removed or moved the named header would leave the file's own index pointing
+/// at bytes that are no longer there, which the next library to share a message
+/// would follow.
 const SHARED_MESSAGE_INDEX_NAMES_A_MOVED_OBJECT: &str = "this file's shared-message (SOHM) index names an object header this commit \
      removes or rewrites elsewhere, and the index cannot be updated in place; \
      rewrite the file with `repack` instead";
