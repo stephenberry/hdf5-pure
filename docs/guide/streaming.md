@@ -103,6 +103,8 @@ for start in (0..rows).step_by(1_000_000) {
 
 The window is clamped to the dataset, so the final short window needs no special-casing. See [Reading a row window](reading.md#reading-a-row-window) for the full method list.
 
+A window need not be rows. `read_raw_region(start, count)` and the typed `read_*_region` forms read a box along every dimension — a tile, a frame, a band along an axis that is not the first — touching only the chunks the box meets, under the same bound. A dataset whose leading axis has length one, as netCDF writers record a single time step, streams along its next axis this way where a row window would be the whole plane. See [Reading a region](reading.md#reading-a-region).
+
 ## Tuning retained memory
 
 `File::open_streaming_with_options(path, FileAccessProperties)` bounds the memory the streaming backend retains. `FileAccessProperties::new()` returns the crate's default access behavior; you layer on two independent caches with its builder methods.

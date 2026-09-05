@@ -91,6 +91,66 @@ fn windowed_row_read_allocates_on_the_order_of_the_window() {
 }
 
 #[test]
+fn regional_read_allocates_on_the_order_of_the_region() {
+    // The fixture of the row-window bound above, cut along its inner axes as
+    // well: a [64, 16, 4] box at (992, 8, 2) meets two leading bands and, on
+    // each inner axis, both chunk columns — eight 32 KiB chunks for a 32 KiB
+    // region. The ceiling rules out a reader that falls back to the whole
+    // dataset and cuts the box out of it; the output is the floor.
+    const N0: usize = 2048;
+    const ROW_ELEMS: usize = 32 * 8;
+    const DATASET_BYTES: usize = N0 * ROW_ELEMS * 8;
+
+    let data: Vec<f64> = (0..N0 * ROW_ELEMS).map(|i| i as f64).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.h5");
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("t")
+        .with_f64_data(&data)
+        .with_shape(&[N0 as u64, 32, 8])
+        .with_chunks(&[64, 16, 4])
+        .with_deflate(3);
+    builder.write(&path).unwrap();
+    drop(data);
+
+    let file = File::open_streaming(&path).unwrap();
+    let ds = file.dataset("t").unwrap();
+
+    let (start, count) = ([992u64, 8, 2], [64u64, 16, 4]);
+    let (region, measured) = measure("regional_read", || {
+        ds.read_f64_region(&start, &count).unwrap()
+    });
+
+    assert!(
+        measured.peak_bytes < (DATASET_BYTES / 4) as u64,
+        "peak allocation during the regional read must be bounded by the region, \
+         not the {DATASET_BYTES}-byte dataset; measured {measured}"
+    );
+
+    // The read's own output is in this measurement, so its size is a floor a
+    // measurement of nothing cannot reach.
+    const REGION_BYTES: usize = 64 * 16 * 4 * 8;
+    assert!(
+        measured.live_bytes >= REGION_BYTES as u64,
+        "the region this read returned is not in its own measurement, so the \
+         ceiling above is bounding something other than the read: {measured}"
+    );
+
+    // The region must still be the right elements, in row-major order.
+    let mut expected = Vec::with_capacity(REGION_BYTES / 8);
+    for i in 0..count[0] {
+        for j in 0..count[1] {
+            for k in 0..count[2] {
+                let flat = ((start[0] + i) * 32 + start[1] + j) * 8 + start[2] + k;
+                expected.push(flat as f64);
+            }
+        }
+    }
+    assert_eq!(region, expected);
+}
+
+#[test]
 fn windowed_vlen_string_read_allocates_on_the_order_of_the_window() {
     // ~4 MiB of variable-length string payload: 32k rows of 128-byte strings,
     // plus ~512 KiB of heap references in the dataset itself. The writer packs

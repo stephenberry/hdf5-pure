@@ -1171,6 +1171,13 @@ pub enum Error {
     /// static rank (e.g. `read_array::<_, Ix2>`) did not match the dataset's
     /// runtime rank. Only constructed when the `ndarray` feature is enabled.
     Shape(String),
+    /// A region handed to [`Dataset::read_raw_region`](crate::Dataset::read_raw_region)
+    /// or a typed `read_*_region` does not fit the dataset: `start` and `count`
+    /// name a different number of axes than the dataset has, or an axis runs
+    /// past the dataset's extent. The message names the axis that runs past, or
+    /// the two ranks. A region is not clamped the way a row window is, because a
+    /// clamped region would come back in a shape the caller did not ask for.
+    InvalidRegion(String),
     /// A SWMR operation (e.g. [`crate::File::refresh`]) was requested on a file
     /// that was not opened for SWMR reading via `File::open_swmr`.
     SwmrUnsupported,
@@ -1355,6 +1362,7 @@ impl fmt::Display for Error {
             Error::NotANamedDatatype(path) => write!(f, "not a named datatype: {path}"),
             Error::MissingMessage(mt) => write!(f, "missing required message: {mt}"),
             Error::Shape(msg) => write!(f, "array shape error: {msg}"),
+            Error::InvalidRegion(msg) => write!(f, "region does not fit the dataset: {msg}"),
             Error::SwmrUnsupported => write!(
                 f,
                 "refresh requires a file opened with File::open_swmr (live handle)"

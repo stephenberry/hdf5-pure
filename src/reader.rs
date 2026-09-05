@@ -38,6 +38,7 @@ use crate::libver::LibVer;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::read_spec::RawReadSpec;
+use crate::region;
 use crate::shared_message::{self, BufferedResolver, SharedResolver, SourceResolver};
 use crate::signature;
 use crate::source::{
@@ -2132,11 +2133,141 @@ impl FileInner {
         }
     }
 
-    /// Windowed counterpart of [`read_dataset_raw`](Self::read_dataset_raw): read
-    /// the raw element bytes of the row window `[start_row, start_row + num_rows)`,
-    /// touching only the storage it overlaps. Reads through the same base-framed
-    /// `Source`, so on-disk addresses resolve the same way. The caller clamps
-    /// the window to the dataset.
+    /// Regional counterpart of [`read_dataset_raw`](Self::read_dataset_raw): read
+    /// the raw element bytes of `start[i] .. start[i] + count[i]` along every
+    /// dimension, touching only the storage the region overlaps. Reads through
+    /// the same base-framed `Source`, so on-disk addresses resolve the same way.
+    /// The caller holds the region inside the dataset.
+    fn read_dataset_raw_region(
+        &self,
+        spec: RawReadSpec<'_>,
+        cache: &ChunkCache,
+        pass: CachePass,
+        start: &[u64],
+        count: &[u64],
+    ) -> Result<Vec<u8>, FormatError> {
+        let (os, ls) = (self.offset_size(), self.length_size());
+        let (dl, ds, dt) = (spec.layout, spec.dataspace, spec.datatype);
+        let elem_size = dt.element_size_usize()?;
+        // Bytes of the region, checked: through a row window the count is the
+        // dataset's own inner extent, and a crafted dataspace can overflow
+        // `usize` where a real one cannot — it errors instead of panicking
+        // (debug) or wrapping (release).
+        let total_bytes = count.iter().try_fold(elem_size.get(), |acc, &d| {
+            acc.checked_mul(d.to_usize()?)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: acc as u64,
+                    length: d,
+                })
+        })?;
+
+        // Compact data is inline in the layout message — no I/O, no framing.
+        if let DataLayout::Compact { data } = dl {
+            let mut out = vec![0u8; total_bytes];
+            for run in region::runs(&ds.dimensions, start, count)? {
+                let from = run.src.to_usize()?.checked_mul(elem_size.get()).ok_or(
+                    FormatError::OffsetOverflow {
+                        offset: run.src,
+                        length: elem_size.get() as u64,
+                    },
+                )?;
+                let len = run.len * elem_size.get();
+                let end = from.checked_add(len).ok_or(FormatError::OffsetOverflow {
+                    offset: from as u64,
+                    length: len as u64,
+                })?;
+                let bytes = data.get(from..end).ok_or(FormatError::DataSizeMismatch {
+                    expected: end,
+                    actual: data.len(),
+                })?;
+                let dst = run.dst * elem_size.get();
+                out[dst..dst + len].copy_from_slice(bytes);
+            }
+            return Ok(out);
+        }
+
+        let base = self.addr_offset;
+        match &self.backend {
+            Backend::InMemory(v) => {
+                let framed = frame(v, base)?;
+                read_region_framed(
+                    &BytesSource::new(framed),
+                    spec,
+                    os,
+                    ls,
+                    cache,
+                    pass,
+                    start,
+                    count,
+                    total_bytes,
+                )
+            }
+            Backend::Streaming(s) if base.is_zero() => read_region_framed(
+                s.as_ref(),
+                spec,
+                os,
+                ls,
+                cache,
+                pass,
+                start,
+                count,
+                total_bytes,
+            ),
+            Backend::Streaming(s) => {
+                let framed = BaseOffsetSource {
+                    inner: s.as_ref(),
+                    base,
+                };
+                read_region_framed(
+                    &framed,
+                    spec,
+                    os,
+                    ls,
+                    cache,
+                    pass,
+                    start,
+                    count,
+                    total_bytes,
+                )
+            }
+            Backend::Edit(m) => Self::with_engine(
+                m,
+                |data| {
+                    let framed = frame(data, base)?;
+                    read_region_framed(
+                        &BytesSource::new(framed),
+                        spec,
+                        os,
+                        ls,
+                        cache,
+                        pass,
+                        start,
+                        count,
+                        total_bytes,
+                    )
+                },
+                |s| {
+                    let framed = BaseOffsetSource { inner: s, base };
+                    read_region_framed(
+                        &framed,
+                        spec,
+                        os,
+                        ls,
+                        cache,
+                        pass,
+                        start,
+                        count,
+                        total_bytes,
+                    )
+                },
+            ),
+        }
+    }
+
+    /// The row window `[start_row, start_row + num_rows)` as the region that
+    /// spans every inner dimension; see
+    /// [`read_dataset_raw_region`](Self::read_dataset_raw_region). The caller
+    /// clamps the window to the dataset, and a 0-D scalar is one row.
     fn read_dataset_raw_rows(
         &self,
         spec: RawReadSpec<'_>,
@@ -2145,191 +2276,91 @@ impl FileInner {
         start_row: u64,
         num_rows: u64,
     ) -> Result<Vec<u8>, FormatError> {
-        let (os, ls) = (self.offset_size(), self.length_size());
-        let (dl, ds, dt) = (spec.layout, spec.dataspace, spec.datatype);
-        let elem_size = dt.element_size_usize()?;
-        // Elements per row (product of inner dims; 1 when 0-D or 1-D). Checked so
-        // a crafted dataspace whose inner dims overflow `usize` errors instead of
-        // panicking (debug) or wrapping (release).
-        let row_elems: usize = ds.dimensions.iter().skip(1).try_fold(1usize, |acc, &d| {
-            acc.checked_mul(d.to_usize()?)
-                .ok_or(FormatError::OffsetOverflow {
-                    offset: acc as u64,
-                    length: d,
-                })
-        })?;
-        let row_bytes =
-            row_elems
-                .checked_mul(elem_size.get())
-                .ok_or(FormatError::OffsetOverflow {
-                    offset: row_elems as u64,
-                    length: elem_size.get() as u64,
-                })?;
-
-        // Compact data is inline in the layout message — no I/O, no framing.
-        if let DataLayout::Compact { data } = dl {
-            let start = start_row.to_usize()?.checked_mul(row_bytes);
-            let len = num_rows.to_usize()?.checked_mul(row_bytes);
-            let (Some(start), Some(len)) = (start, len) else {
-                return Err(FormatError::OffsetOverflow {
-                    offset: start_row,
-                    length: row_bytes as u64,
-                });
+        let dims = &spec.dataspace.dimensions;
+        if dims.is_empty() {
+            // A scalar has no axis to window along: its one row is the whole
+            // read, and a window of no rows is empty — except over a `Virtual`
+            // layout, which is unsupported and must still error like `read_raw`
+            // does rather than be swallowed by the shortcut.
+            return if num_rows == 0 && !matches!(spec.layout, DataLayout::Virtual { .. }) {
+                Ok(Vec::new())
+            } else {
+                self.read_dataset_raw(spec, cache)
             };
-            let end = start.checked_add(len).ok_or(FormatError::OffsetOverflow {
-                offset: start as u64,
-                length: len as u64,
-            })?;
-            return data
-                .get(start..end)
-                .map(<[u8]>::to_vec)
-                .ok_or(FormatError::DataSizeMismatch {
-                    expected: end,
-                    actual: data.len(),
-                });
         }
-
-        let base = self.addr_offset;
-        match &self.backend {
-            Backend::InMemory(v) => {
-                let framed = frame(v, base)?;
-                read_rows_framed(
-                    &BytesSource::new(framed),
-                    spec,
-                    os,
-                    ls,
-                    cache,
-                    pass,
-                    start_row,
-                    num_rows,
-                    row_bytes,
-                )
-            }
-            Backend::Streaming(s) if base.is_zero() => read_rows_framed(
-                s.as_ref(),
-                spec,
-                os,
-                ls,
-                cache,
-                pass,
-                start_row,
-                num_rows,
-                row_bytes,
-            ),
-            Backend::Streaming(s) => {
-                let framed = BaseOffsetSource {
-                    inner: s.as_ref(),
-                    base,
-                };
-                read_rows_framed(
-                    &framed, spec, os, ls, cache, pass, start_row, num_rows, row_bytes,
-                )
-            }
-            Backend::Edit(m) => Self::with_engine(
-                m,
-                |data| {
-                    let framed = frame(data, base)?;
-                    read_rows_framed(
-                        &BytesSource::new(framed),
-                        spec,
-                        os,
-                        ls,
-                        cache,
-                        pass,
-                        start_row,
-                        num_rows,
-                        row_bytes,
-                    )
-                },
-                |s| {
-                    let framed = BaseOffsetSource { inner: s, base };
-                    read_rows_framed(
-                        &framed, spec, os, ls, cache, pass, start_row, num_rows, row_bytes,
-                    )
-                },
-            ),
-        }
+        let mut start = vec![0u64; dims.len()];
+        start[0] = start_row;
+        let mut count = dims.clone();
+        count[0] = num_rows;
+        self.read_dataset_raw_region(spec, cache, pass, &start, &count)
     }
 }
 
-/// Read a row window through an already base-framed `Source`. Contiguous
-/// layouts are one bounded sub-read; chunked layouts use the windowed chunk
-/// reader (only the rank-0 crafted-file corner falls back to a whole read
-/// plus slice).
-fn read_rows_framed<S: Source + ?Sized>(
+/// Read a region through an already base-framed `Source`. Contiguous layouts
+/// are one bounded sub-read per run of the region; chunked layouts use the
+/// regional chunk reader (only the rank-0 crafted-file corner falls back to a
+/// whole read).
+fn read_region_framed<S: Source + ?Sized>(
     source: &S,
     spec: RawReadSpec<'_>,
     os: u8,
     ls: u8,
     cache: &ChunkCache,
     pass: CachePass,
-    start_row: u64,
-    num_rows: u64,
-    row_bytes: usize,
+    start: &[u64],
+    count: &[u64],
+    total_bytes: usize,
 ) -> Result<Vec<u8>, FormatError> {
     let (dl, fill) = (spec.layout, spec.fill);
-    // A zero-row window reads nothing, uniformly across the *supported* layouts.
+    // An empty region reads nothing, uniformly across the *supported* layouts.
     // A `Virtual` layout is unsupported and must still error like `read_raw`
     // does, so it is excluded here and falls through to the match.
-    if num_rows == 0 && !matches!(dl, DataLayout::Virtual { .. }) {
+    if total_bytes == 0 && !matches!(dl, DataLayout::Virtual { .. }) {
         return Ok(Vec::new());
     }
     match dl {
         DataLayout::Compact { .. } => unreachable!("compact is handled before framing"),
         DataLayout::Contiguous { address, size } => {
-            // Unallocated storage: the window reads as the fill value, the same
+            // Unallocated storage: the region reads as the fill value, the same
             // answer the whole-dataset readers give for it.
             let Some(addr) = *address else {
-                let len = num_rows.to_usize()?.saturating_mul(row_bytes);
-                return fill.buffer(len);
+                return fill.buffer(total_bytes);
             };
-            let start =
-                start_row
-                    .checked_mul(row_bytes as u64)
-                    .ok_or(FormatError::OffsetOverflow {
-                        offset: start_row,
-                        length: row_bytes as u64,
-                    })?;
-            let len =
-                num_rows
-                    .to_usize()?
-                    .checked_mul(row_bytes)
-                    .ok_or(FormatError::OffsetOverflow {
-                        offset: num_rows,
-                        length: row_bytes as u64,
-                    })?;
-            // Never read past the dataset's own contiguous storage.
-            if start.saturating_add(len as u64) > *size {
-                return Err(FormatError::DataSizeMismatch {
-                    expected: start.to_usize()?.saturating_add(len),
-                    actual: (*size).to_usize()?,
-                });
+            let elem_size = spec.datatype.element_size_usize()?.get();
+            let mut out = vec![0u8; total_bytes];
+            for run in region::runs(&spec.dataspace.dimensions, start, count)? {
+                let from =
+                    run.src
+                        .checked_mul(elem_size as u64)
+                        .ok_or(FormatError::OffsetOverflow {
+                            offset: run.src,
+                            length: elem_size as u64,
+                        })?;
+                let len = run.len * elem_size;
+                // Never read past the dataset's own contiguous storage.
+                if from.saturating_add(len as u64) > *size {
+                    return Err(FormatError::DataSizeMismatch {
+                        expected: from.to_usize()?.saturating_add(len),
+                        actual: (*size).to_usize()?,
+                    });
+                }
+                let off = addr.checked_add(from).ok_or(FormatError::OffsetOverflow {
+                    offset: addr,
+                    length: from,
+                })?;
+                let dst = run.dst * elem_size;
+                source.read_at(off, &mut out[dst..dst + len])?;
             }
-            let off = addr.checked_add(start).ok_or(FormatError::OffsetOverflow {
-                offset: addr,
-                length: start,
-            })?;
-            source.read_exact_at(off, len)
+            Ok(out)
         }
         DataLayout::Chunked { .. } => {
-            match crate::chunked_read::read_chunked_rows_from_source(
-                source, spec, os, ls, cache, pass, start_row, num_rows,
+            match crate::chunked_read::read_chunked_region_from_source(
+                source, spec, os, ls, cache, pass, start, count,
             )? {
                 Some(bytes) => Ok(bytes),
-                // Rank-0 chunked (a crafted-file corner): fall back to a whole
-                // read, then slice.
-                None => {
-                    let full =
-                        data_read::read_raw_data_cached_from_source(source, spec, os, ls, cache)?;
-                    let start = start_row.to_usize()? * row_bytes;
-                    let len = num_rows.to_usize()? * row_bytes;
-                    full.get(start..start + len).map(<[u8]>::to_vec).ok_or(
-                        FormatError::DataSizeMismatch {
-                            expected: start + len,
-                            actual: full.len(),
-                        },
-                    )
-                }
+                // Rank-0 chunked (a crafted-file corner): the only region of a
+                // scalar is the scalar, which the whole read answers.
+                None => data_read::read_raw_data_cached_from_source(source, spec, os, ls, cache),
             }
         }
         DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVirtualLayout),
@@ -6374,6 +6405,168 @@ the same commit to replace it",
         Ok(data_read::read_as_strings(&raw, &dt)?)
     }
 
+    /// Read the raw element bytes of the region `start[i] .. start[i] + count[i]`
+    /// along every dimension — the block `H5Sselect_hyperslab` selects at unit
+    /// stride, `h5dump --start --count`, or the `start`/`count` of `nc_get_vara`.
+    ///
+    /// The regional companion to [`read_raw`](Self::read_raw), and the general
+    /// form of [`read_raw_rows`](Self::read_raw_rows), which is the region that
+    /// spans every inner dimension. Only the storage the region overlaps is read
+    /// — one bounded sub-read per contiguous run for compact and contiguous
+    /// layouts, just the chunks it meets for chunked layouts — so peak memory
+    /// scales with the region plus one chunk, not the dataset. Use it for a tile
+    /// of an image, one frame of a stack, or a window along an axis that is not
+    /// the first.
+    ///
+    /// The result is row-major in the shape `count`, and its bytes match what
+    /// [`read_raw`](Self::read_raw) produces for those elements, so the typed
+    /// `read_*_region` helpers decode a region like their whole-dataset forms.
+    /// `start` and `count` have one entry per axis, and every axis must end
+    /// inside its dimension: a region past the edge is refused with
+    /// [`Error::InvalidRegion`](crate::Error::InvalidRegion) rather than clamped,
+    /// because a clamped region would come back in a shape the caller did not
+    /// ask for — a row window can clamp only because its rows keep their inner
+    /// shape however it is cut. A zero `count` on any axis reads an empty `Vec`,
+    /// and a region covering the dataset delegates to
+    /// [`read_raw`](Self::read_raw), so it never costs more than a whole read.
+    /// Variable-length string bytes are heap references, not text — use
+    /// [`read_string_region`](Self::read_string_region).
+    pub fn read_raw_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<u8>, Error> {
+        let dt = self.datatype()?;
+        let ds = self.dataspace()?;
+        let dl = self.read_layout()?;
+        region::fits(&ds.dimensions, start, count).map_err(Error::InvalidRegion)?;
+
+        // See `read_raw`: an unparseable fill value message is carried into the
+        // read rather than failing it up front.
+        let parsed_fill = self.fill_bytes();
+        let fill = match &parsed_fill {
+            Ok(b) => FillPattern::new(b.as_deref(), dt.element_size_usize()?),
+            Err(_) => FillPattern::UNKNOWN,
+        };
+
+        let pipeline = self.filter_pipeline_parsed();
+        let spec = RawReadSpec {
+            layout: &dl,
+            dataspace: &ds,
+            datatype: &dt,
+            pipeline: pipeline.as_ref(),
+            fill,
+        };
+
+        // A region covering the dataset is exactly a whole read: delegate, so it
+        // never costs a region-shaped copy on top of one.
+        if start.iter().all(|&s| s == 0) && count == ds.dimensions.as_slice() {
+            return Ok(self.file.read_dataset_raw(spec, &self.chunk_cache)?);
+        }
+
+        // A lone region's successor is the adjacent one, and the chunk they share
+        // is the one this read finishes on; `CachePass::LRU` is what retains it.
+        Ok(self.file.read_dataset_raw_region(
+            spec,
+            &self.chunk_cache,
+            CachePass::LRU,
+            start,
+            count,
+        )?)
+    }
+
+    /// Regional [`read_f64`](Self::read_f64) — decodes only the region.
+    pub fn read_f64_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<f64>, Error> {
+        let raw = self.read_raw_region(start, count)?;
+        Ok(data_read::read_as_f64(&raw, &self.datatype()?)?)
+    }
+
+    /// Regional [`read_f32`](Self::read_f32) — decodes only the region.
+    pub fn read_f32_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<f32>, Error> {
+        let raw = self.read_raw_region(start, count)?;
+        Ok(data_read::read_as_f32(&raw, &self.datatype()?)?)
+    }
+
+    /// Regional [`read_i8`](Self::read_i8) — decodes only the region.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "read_i8 reinterprets each stored byte as the signed i8 the caller requested"
+    )]
+    pub fn read_i8_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<i8>, Error> {
+        let raw = self.read_raw_region(start, count)?;
+        Ok(raw.iter().map(|&b| b as i8).collect())
+    }
+
+    /// Regional [`read_i16`](Self::read_i16) — decodes only the region.
+    pub fn read_i16_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<i16>, Error> {
+        let raw = self.read_raw_region(start, count)?;
+        Ok(data_read::read_as_i16(&raw, &self.datatype()?)?)
+    }
+
+    /// Regional [`read_i32`](Self::read_i32) — decodes only the region.
+    pub fn read_i32_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<i32>, Error> {
+        let raw = self.read_raw_region(start, count)?;
+        Ok(data_read::read_as_i32(&raw, &self.datatype()?)?)
+    }
+
+    /// Regional [`read_i64`](Self::read_i64) — decodes only the region.
+    pub fn read_i64_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<i64>, Error> {
+        let raw = self.read_raw_region(start, count)?;
+        Ok(data_read::read_as_i64(&raw, &self.datatype()?)?)
+    }
+
+    /// Regional [`read_u8`](Self::read_u8) — reads only the region.
+    pub fn read_u8_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<u8>, Error> {
+        self.read_raw_region(start, count)
+    }
+
+    /// Regional [`read_u16`](Self::read_u16) — decodes only the region.
+    pub fn read_u16_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<u16>, Error> {
+        let raw = self.read_raw_region(start, count)?;
+        Ok(data_read::read_as_u16(&raw, &self.datatype()?)?)
+    }
+
+    /// Regional [`read_u32`](Self::read_u32) — decodes only the region.
+    pub fn read_u32_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<u32>, Error> {
+        let raw = self.read_raw_region(start, count)?;
+        Ok(data_read::read_as_u32(&raw, &self.datatype()?)?)
+    }
+
+    /// Regional [`read_u64`](Self::read_u64) — decodes only the region.
+    pub fn read_u64_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<u64>, Error> {
+        let raw = self.read_raw_region(start, count)?;
+        Ok(data_read::read_as_u64(&raw, &self.datatype()?)?)
+    }
+
+    /// Regional [`read_string`](Self::read_string).
+    ///
+    /// Fixed-length strings decode straight from the region. Variable-length
+    /// strings resolve only the region's heap references, so the memory bound
+    /// holds for them too, as it does for [`read_string_rows`](Self::read_string_rows).
+    pub fn read_string_region(&self, start: &[u64], count: &[u64]) -> Result<Vec<String>, Error> {
+        let dt = self.datatype()?;
+        let raw = self.read_raw_region(start, count)?;
+        if vl_data::is_vlen_string_datatype(&dt) {
+            // The region's heap references, read memory-bounded like any other
+            // fixed-size element; resolving only those against the global heap
+            // keeps the bound — the same resolution `read_string` runs over the
+            // whole dataset's references.
+            let ref_size = 4 + self.file.offset_size() as usize + 4;
+            let num_elements = (raw.len() / ref_size) as u64;
+            let mut strings = Vec::new();
+            self.file.with_source(|source| -> Result<(), Error> {
+                Ok(vl_data::visit_vl_strings_from_source(
+                    source,
+                    &raw,
+                    num_elements,
+                    self.file.offset_size(),
+                    self.file.length_size(),
+                    self.file.addr_offset,
+                    VlenStringReadOptions::default(),
+                    |string| strings.push(String::from(string)),
+                )?)
+            })?;
+            return Ok(strings);
+        }
+        Ok(data_read::read_as_strings(&raw, &dt)?)
+    }
+
     /// Interpret this dataset as an array of HDF5 object references
     /// (`H5R_OBJECT`) and resolve each, in storage order, to the [`Object`] it
     /// points at.
@@ -7935,7 +8128,7 @@ mod tests {
     /// buffer and not a zero-length fill, which is what a caller iterating past
     /// the end of a dataset sees.
     #[test]
-    fn read_rows_framed_zero_row_window_is_ok_even_when_unallocated() {
+    fn read_region_framed_empty_region_is_ok_even_when_unallocated() {
         let dl = DataLayout::Contiguous {
             address: None,
             size: 0,
@@ -7954,40 +8147,86 @@ mod tests {
             bit_precision: 64,
         };
         let cache = ChunkCache::new();
-        let out = read_rows_framed(
+        let out = read_region_framed(
             &BytesSource::new(b""),
             RawReadSpec::plain(&dl, &ds, &dt),
             8,
             8,
             &cache,
             CachePass::LRU,
+            &[0],
+            &[0],
             0,
-            0,
-            8,
         )
-        .expect("a zero-row window must be Ok(empty)");
+        .expect("an empty region must be Ok(empty)");
         assert!(out.is_empty());
 
         // A Virtual layout is unsupported and must still error for a zero-row
         // window, matching `read_raw`, rather than being swallowed by the early
         // return.
         let virtual_dl = DataLayout::Virtual { version: 4 };
-        let err = read_rows_framed(
+        let err = read_region_framed(
             &BytesSource::new(b""),
             RawReadSpec::plain(&virtual_dl, &ds, &dt),
             8,
             8,
             &cache,
             CachePass::LRU,
+            &[0],
+            &[0],
             0,
-            0,
-            8,
         )
-        .expect_err("a virtual layout must error even for a zero-row window");
+        .expect_err("a virtual layout must error even for an empty region");
         assert!(
             matches!(err, FormatError::UnsupportedVirtualLayout),
             "expected UnsupportedVirtualLayout, got {err:?}"
         );
+    }
+
+    /// A region of contiguous storage that was never allocated reads as the fill
+    /// value, sized to the region — the answer the whole-dataset readers give for
+    /// such storage, cut to the box asked for.
+    #[test]
+    fn read_region_framed_over_unallocated_contiguous_storage_is_fill() {
+        let dl = DataLayout::Contiguous {
+            address: None,
+            size: 0,
+        };
+        let ds = Dataspace {
+            space_type: crate::dataspace::DataspaceType::Simple,
+            rank: 2,
+            dimensions: vec![4, 4],
+            max_dimensions: None,
+        };
+        let dt = Datatype::FixedPoint {
+            size: 2,
+            byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 16,
+        };
+        let seven = 7u16.to_le_bytes();
+        let spec = RawReadSpec {
+            layout: &dl,
+            dataspace: &ds,
+            datatype: &dt,
+            pipeline: None,
+            fill: FillPattern::new(Some(&seven), NonZeroUsize::new(2).unwrap()),
+        };
+        let cache = ChunkCache::new();
+        let out = read_region_framed(
+            &BytesSource::new(b""),
+            spec,
+            8,
+            8,
+            &cache,
+            CachePass::LRU,
+            &[1, 1],
+            &[2, 3],
+            12,
+        )
+        .expect("an unallocated region reads as fill");
+        assert_eq!(out, seven.repeat(6));
     }
 
     /// The window a typed whole-dataset read sweeps in is a budget in *stored
