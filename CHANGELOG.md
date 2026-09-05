@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `Dataset::read_raw_region(start, count)` and the typed `read_f64_region` … `read_u64_region` / `read_string_region` read a box along every dimension — the block `H5Sselect_hyperslab` selects at unit stride — touching only the storage it overlaps, so a tile of an image or a window along an axis that is not the first costs its own size rather than the dataset's. A region past an edge is refused with the new `Error::InvalidRegion` rather than clamped ([#465](https://github.com/stephenberry/hdf5-pure/issues/465)).
+
 ## [0.44.0] - 2026-09-04
 
 Files that h5py and netCDF-4 write are editable in place now. `File::open_rw` edits an object that tracks attribute creation order and adds a dataset or group to one that tracks link creation order (h5py's `track_order=True`, and everything netCDF-4 writes), where every such object was refused, and it keeps the object header's timestamps and `H5Pset_attr_phase_change` thresholds across the rewrite instead of dropping both ([#416](https://github.com/stephenberry/hdf5-pure/issues/416), [#422](https://github.com/stephenberry/hdf5-pure/pull/422)). `File::open` and `File::open_streaming` read a file that shares object header messages (`H5Pset_shared_mesg_index`), resolving a datatype, dataspace, fill value, filter pipeline or attribute out of the shared-message heap, and `repack` rewrites such a file with every message stored inline ([#417](https://github.com/stephenberry/hdf5-pure/issues/417)). Deleting objects gives trailing space back to the filesystem rather than leaving `File::file_size()` at a high-water mark ([#418](https://github.com/stephenberry/hdf5-pure/issues/418)), and `WriteMarkPolicy::AllowSnapshot` lets a read-only open take a path-based snapshot of a file a page-buffered writer holds ([#419](https://github.com/stephenberry/hdf5-pure/issues/419)). Additive minor bump.

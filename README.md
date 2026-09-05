@@ -191,6 +191,8 @@ for start in (0..rows).step_by(1_000_000) {
 }
 ```
 
+A box along every dimension — a tile of an image, one frame of a stack, a window along an axis that is not the first — is `read_raw_region(start, count)` and the typed `read_*_region` forms; like a row window, a region touches only the storage it overlaps.
+
 Use `File::open_streaming_with_options` to bound retained metadata and dataset chunk cache memory. `MetadataCacheConfig` mirrors the memory-budget role of `H5Pset_mdc_config`; `ChunkCacheConfig` mirrors the raw-data chunk-cache settings from `H5Pset_cache`, controlling decompressed chunk data and whether parsed chunk indexes are retained between repeated reads of the same dataset.
 
 ```rust

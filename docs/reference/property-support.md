@@ -105,8 +105,9 @@ The second reason is that on the path where a scan would thrash, there is no pru
 |---|---|---|
 | whole (`read_f64` and friends) | fills the cache, then stops offering | `rejections`; `evictions` stays 0 |
 | row window (`read_raw_rows`, `read_*_rows`) | plain LRU, since the chunk its successor needs is the one it finished on | `evictions`; `rejections` stays 0 |
+| region (`read_raw_region`, `read_*_region`) | plain LRU, as the row window it generalizes | `evictions`; `rejections` stays 0 |
 
-A row window is the one path that does evict, so it is the only place a `w0` analogue could ever pick a different victim. It would not pick a better one: the entry the next window needs is the one this read finished on, which is the most recently used and the last thing an LRU rule gives up, while the partially-consumed entries `w0` would additionally protect are the *leading* boundary chunks that a forward sweep never revisits. That is an argument about the access patterns these readers generate, not a proof for an arbitrary one.
+A row window — or a region, its general form — is the one path that does evict, so it is the only place a `w0` analogue could ever pick a different victim. It would not pick a better one: the entry the next window needs is the one this read finished on, which is the most recently used and the last thing an LRU rule gives up, while the partially-consumed entries `w0` would additionally protect are the *leading* boundary chunks that a forward sweep never revisits. That is an argument about the access patterns these readers generate, not a proof for an arbitrary one.
 
 ## Dataset-access properties (`dapl`)
 

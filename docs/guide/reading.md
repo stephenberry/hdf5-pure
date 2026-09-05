@@ -181,6 +181,20 @@ Only the storage the window touches is read: a single bounded sub-read for compa
 
 Combined with a [streaming open](streaming.md#reading-a-large-dataset-a-window-at-a-time), this reads a dataset too large to hold in memory a fixed number of rows at a time.
 
+### Reading a region
+
+A row window cuts the leading dimension only. To read a box along every dimension — a tile of an image, one frame of a stack, or a window along an axis that is not the first — use `read_raw_region(start, count)` and the typed `read_f64_region` / `read_f32_region` / `read_i8_region` … `read_u64_region` / `read_string_region` counterparts. `start` and `count` have one entry per axis, and the result is row-major in the shape `count`: the whole read cut to that box, element for element. It is the block `H5Sselect_hyperslab` selects at unit stride, or the `start`/`count` pair of `nc_get_vara`.
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open("frames.h5").unwrap();
+let ds = file.dataset("frames").unwrap(); // shape [100, 1080, 1920]
+let right_half = ds.read_u16_region(&[7, 0, 960], &[1, 1080, 960]).unwrap(); // frame 7, columns 960..
+```
+
+Only the storage the region overlaps is read: one bounded sub-read per contiguous run for compact and contiguous layouts, and just the chunks it meets for chunked layouts, so peak memory scales with the region (plus one chunk) rather than the dataset. Unlike a row window, a region is not clamped: every axis must end inside its dimension, and one that does not is refused with `Error::InvalidRegion` naming the axis, because a clamped region would come back in a shape the caller did not ask for. A zero `count` on any axis reads an empty `Vec`, and a region covering the dataset is the whole read. `read_string_region` resolves only the region's heap references, as `read_string_rows` does for a window.
+
 ### Datasets with unwritten storage
 
 HDF5 allocates a dataset's storage lazily, so a dataset can exist with a shape and have nothing behind it — created and never written, or written in part, leaving some chunks of a chunked dataset allocated and others not. Those regions read as the dataset's **fill value**: the value `with_fill_value` set, or the type's zero when none was set. This matches the reference C library, and it means a dataset another tool created but has not filled in yet reads as a full-size array of its fill value rather than failing.

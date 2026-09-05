@@ -738,40 +738,39 @@ fn plan_chunk_spans(
     )
 }
 
-/// Read the raw element bytes of the row window `[row_start, row_start + num_rows)`
-/// — a range along the leading dimension — decoding only the chunks it overlaps.
+/// Read the raw element bytes of the region `start[i] .. start[i] + count[i]`
+/// along every dimension, decoding only the chunks it meets.
 ///
-/// The windowed counterpart of [`read_chunked_data_from_source`]: peak memory is
-/// one window plus one chunk, not the whole dataset. `cache` holds the parsed index
-/// and decompressed chunks, so successive windows on the same handle walk the index
-/// once and reuse boundary chunks.
+/// The regional counterpart of [`read_chunked_data_from_source`]: peak memory is
+/// one region plus one chunk, not the whole dataset. A row window is the region
+/// spanning every inner dimension and is read through here. `cache` holds the
+/// parsed index and decompressed chunks, so successive regions on the same
+/// handle walk the index once and reuse boundary chunks.
 ///
-/// A chunk that spans the dataset's full inner extent (`chunk_dims[i] == ds_dims[i]`
-/// for `i >= 1` — every 1-D and frame-per-chunk layout) holds each row contiguously,
-/// so its contribution is a plain row band copied in one move. A chunk of an
-/// inner-split grid scatters into the window through the same N-D kernel the whole
-/// read uses ([`place_chunk`]), aimed at a window-shaped output. Either way only the
-/// chunks overlapping the window are decoded, and `num_rows * row_elems` elements
-/// are returned. Returns `Ok(None)` only for a rank-0 (scalar) chunked layout — a
-/// crafted-file corner with no leading dimension to window — so the caller falls
-/// back to a whole read. The caller clamps the window to the dataset.
+/// Each chunk contributes the box it shares with the region, moved by
+/// [`copy_box`]: a band of whole rows in one copy, an inner-split chunk one row
+/// at a time. Only the chunks meeting the region are decoded, and
+/// `product(count)` elements are returned. Returns `Ok(None)` only for a rank-0
+/// (scalar) chunked layout — a crafted-file corner with no axis to select
+/// along — so the caller falls back to a whole read. The caller holds the region
+/// inside the dataset.
 ///
 /// `pass` decides which chunks the cache keeps, and the answer differs by caller.
-/// A lone window wants [`CachePass::LRU`], so that what it retains is the chunks
-/// it *finished* on: its successor is the adjacent window, and the chunk they
-/// share is that last one. A window that is one step of a sweep across the whole
+/// A lone region wants [`CachePass::LRU`], so that what it retains is the chunks
+/// it *finished* on: its successor is the adjacent region, and the chunk they
+/// share is that last one. A region that is one step of a sweep across the whole
 /// dataset wants a real pass, shared by every step — the sweep never asks for a
 /// chunk twice, so offering each one to a cache already full is a copy and an
 /// eviction with no reader on the other side. See [`CachePass`].
-pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
+pub(crate) fn read_chunked_region_from_source<S: Source + ?Sized>(
     source: &S,
     spec: RawReadSpec<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
     pass: CachePass,
-    row_start: u64,
-    num_rows: u64,
+    start: &[u64],
+    count: &[u64],
 ) -> Result<Option<Vec<u8>>, FormatError> {
     let RawReadSpec {
         layout,
@@ -795,92 +794,97 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     };
 
     let elem_size = datatype.element_size_usize()?;
-    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
+    // The dataset's own extent is not needed here — the caller holds the region
+    // inside it — but the rank check that comes with it is.
+    let (rank, chunk_dims, _) = chunked_dims(chunk_dimensions, dataspace)?;
     ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
 
-    // A rank-0 (scalar) chunked layout has no leading dimension to window; fall
-    // back to the whole-dataset reader, which handles rank 0. Only a crafted
-    // file reaches this (valid chunked layouts are rank >= 1), but the reader
-    // parses untrusted input.
+    // A rank-0 (scalar) chunked layout has no axis to select along; fall back
+    // to the whole-dataset reader, which handles rank 0. Only a crafted file
+    // reaches this (valid chunked layouts are rank >= 1), but the reader parses
+    // untrusted input.
     if rank == 0 {
         return Ok(None);
     }
+    if start.len() != rank || count.len() != rank {
+        return Err(FormatError::ChunkedReadError(format!(
+            "region start has {} entries and count {} for a dataset of rank {rank}",
+            start.len(),
+            count.len()
+        )));
+    }
 
-    // When every chunk spans the dataset's full inner extent, each row is
-    // contiguous in its chunk and a window is one row band per chunk; an
-    // inner-split chunk grid instead scatters each chunk through the N-D kernel.
-    let full_inner = (1..rank).all(|i| chunk_dims[i] == ds_dims[i]);
+    // The region as `[lo, hi)` per axis, and the output's shape. The caller
+    // holds it inside the dataset, so `hi` never passes the dataset's edge.
+    let lo: Vec<usize> = start
+        .iter()
+        .map(|&s| s.to_usize())
+        .collect::<Result<_, _>>()?;
+    let out_dims: Vec<usize> = count
+        .iter()
+        .map(|&c| c.to_usize())
+        .collect::<Result<_, _>>()?;
+    let hi: Vec<usize> = lo
+        .iter()
+        .zip(&out_dims)
+        .map(|(&l, &n)| l.saturating_add(n))
+        .collect();
 
-    // Elements per row (product of the inner dims; 1 when 1-D). Checked so a
-    // crafted dataspace whose inner dims overflow `usize` errors instead of
-    // panicking (debug) or wrapping (release).
-    let row_elems: usize = ds_dims.iter().skip(1).try_fold(1usize, |acc, &d| {
+    // Elements of the region, checked: through a row window the count is the
+    // dataset's own inner extent, and a crafted dataspace can overflow `usize`
+    // where a real one cannot — it errors instead of panicking (debug) or
+    // wrapping (release).
+    let out_elems: usize = out_dims.iter().try_fold(1usize, |acc, &d| {
         acc.checked_mul(d).ok_or(FormatError::OffsetOverflow {
             offset: acc as u64,
             length: d as u64,
         })
     })?;
-    let row_bytes = row_elems
-        .checked_mul(elem_size.get())
-        .ok_or(FormatError::OffsetOverflow {
-            offset: row_elems as u64,
-            length: elem_size.get() as u64,
-        })?;
-
-    let out_rows = num_rows.to_usize()?;
-    let total_bytes = out_rows
-        .checked_mul(row_bytes)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: out_rows as u64,
-            length: row_bytes as u64,
-        })?;
+    let total_bytes =
+        out_elems
+            .checked_mul(elem_size.get())
+            .ok_or(FormatError::OffsetOverflow {
+                offset: out_elems as u64,
+                length: elem_size.get() as u64,
+            })?;
     // Uncovered bytes are unallocated storage; see `assemble_chunks`.
     let mut output = fill.buffer(total_bytes)?;
     if total_bytes == 0 {
         return Ok(Some(output));
     }
 
-    // Scatter geometry for the inner-split path: the output is a dataset whose
-    // leading dimension is the window (`[out_rows, inner dims…]`), row-major.
-    // Checked before any I/O: crafted chunk dimensions (u32 each) can overflow
-    // the stride product where a real chunk's byte size cannot. For a full-inner
-    // chunk the product equals `row_elems`, already checked above.
-    let mut win_dims = ds_dims.clone();
-    win_dims[0] = out_rows;
-    let win_strides = row_major_strides(&win_dims)?;
+    // Copy geometry, checked before any I/O: crafted chunk dimensions (u32 each)
+    // can overflow the stride product where a real chunk's byte size cannot.
+    let out_strides = row_major_strides(&out_dims)?;
     let chunk_strides = row_major_strides(&chunk_dims)?;
 
-    // Unallocated chunk index: no storage exists, so every element of the window
-    // is fill. `output` already holds exactly that (it was built from the
-    // pattern), so the window is finished before any chunk is looked at — the
+    // Unallocated chunk index: no storage exists, so every element of the
+    // region is fill. `output` already holds exactly that (it was built from the
+    // pattern), so the region is finished before any chunk is looked at — the
     // same answer the whole-dataset readers give through `chunk_index_address`,
-    // which is what keeps `read_raw_rows` and `read_raw` agreeing over a dataset
-    // that was created and never written.
+    // which is what keeps `read_raw_region` and `read_raw` agreeing over a
+    // dataset that was created and never written.
     let Some(addr) = *btree_address else {
         return Ok(Some(output));
     };
 
-    let row_lo = row_start.to_usize()?;
-    let row_hi = row_lo.saturating_add(out_rows); // exclusive; caller clamped to the dataset
-    let cd0 = chunk_dims[0];
-
-    // A chunk contributes to the window when its rows meet `[row_lo, row_hi)`.
-    // Every list this function builds and every walk over one applies this test,
-    // so it is written once.
-    let overlaps = |c0: usize| c0 < row_hi && c0.saturating_add(cd0) > row_lo;
+    // A chunk contributes to the region when it meets `[lo, hi)` along every
+    // axis. Every list this function builds and every walk over one applies this
+    // test, so it is written once. A chunk offset too large for `usize` — a
+    // 32-bit target reading a crafted file — is kept rather than dropped: the
+    // walk below converts it again and reports the failure, and a filter that
+    // swallowed it here would turn that error into silence.
     let chunk_overlaps = |chunk: &ChunkInfo| {
-        match chunk.offsets.first().copied().unwrap_or(0).to_usize() {
-            Ok(c0) => overlaps(c0),
-            // A leading offset too large for `usize` — a 32-bit target reading a
-            // crafted file. Kept rather than dropped: the walk below converts it
-            // again and reports the failure, and a filter that swallowed it here
-            // would turn that error into silence.
-            Err(_) => true,
-        }
+        (0..rank).all(
+            |i| match chunk.offsets.get(i).copied().unwrap_or(0).to_usize() {
+                Ok(c0) => c0 < hi[i] && c0.saturating_add(chunk_dims[i]) > lo[i],
+                Err(_) => true,
+            },
+        )
     };
 
-    // Walk the index once, then reuse it for later windows on this handle —
-    // keeping only this window's chunks, since each `ChunkInfo` taken out of the
+    // Walk the index once, then reuse it for later regions on this handle —
+    // keeping only this region's chunks, since each `ChunkInfo` taken out of the
     // index owns a coordinate `Vec` and the rest would be allocated and dropped
     // unread. Sweeping a dataset window by window makes that a product rather
     // than a sum (issue #289).
@@ -908,76 +912,58 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype)?;
 
-    // Coalesce over the window's own chunks. A plan built over the dataset's
-    // whole chunk list would put the rows on either side of the window inside a
-    // span and read them for nothing — an eight-row window measured 32 KB where
-    // it needed 64 bytes.
+    // Coalesce over the region's own chunks. A plan built over the dataset's
+    // whole chunk list would put the chunks on either side of the region inside
+    // a span and read them for nothing — an eight-row window measured 32 KB
+    // where it needed 64 bytes.
     let mut spans = plan_chunk_spans(&chunks, rank, cache, chunk_overlaps);
 
-    // One decoder for the whole window; see `FilterScratch`.
+    // One decoder for the whole region; see `FilterScratch`.
     let mut scratch = FilterScratch::new();
 
+    // The box a chunk shares with the region: its origin in the chunk, its
+    // origin in the output, and its extent. One set of buffers for every chunk.
+    let mut src_origin = vec![0usize; rank];
+    let mut dst_origin = vec![0usize; rank];
+    let mut shared = vec![0usize; rank];
+
     for chunk in &chunks {
-        let c0 = chunk.offsets.first().copied().unwrap_or(0).to_usize()?;
-        // This chunk's exclusive leading-dim end. The saturating add/mul here and
-        // below keep a crafted huge chunk offset or dimension from overflowing
-        // `usize` on 32-bit (a panic in debug, a silently wrong window in
-        // release): a saturated span still compares and clamps correctly, and
-        // `row_band_copy` bounds the copy to the bytes actually present. `dst` and
-        // `band` need no guard — both are bounded by the already-checked
-        // `total_bytes` allocation.
-        let c_end = c0.saturating_add(cd0);
-        if !overlaps(c0) {
-            continue; // no overlap with the window
+        // The saturating arithmetic keeps a crafted huge chunk offset or
+        // dimension from overflowing `usize` on 32-bit (a panic in debug, a
+        // silently wrong region in release): a saturated end still compares and
+        // clamps correctly, and `copy_box` bounds the copy to the bytes actually
+        // present. The index filter above is approximate on such a target, so a
+        // chunk that turns out not to meet the region is skipped here.
+        let mut meets = true;
+        for i in 0..rank {
+            let c0 = chunk.offsets.get(i).copied().unwrap_or(0).to_usize()?;
+            let from = c0.max(lo[i]);
+            let to = c0.saturating_add(chunk_dims[i]).min(hi[i]);
+            if from >= to {
+                meets = false;
+                break;
+            }
+            src_origin[i] = from - c0;
+            dst_origin[i] = from - lo[i];
+            shared[i] = to - from;
+        }
+        if !meets {
+            continue;
         }
 
-        // Rows of this chunk that fall in the window.
-        let lo = c0.max(row_lo);
-        let hi = c_end.min(row_hi);
-
-        // Inner-split scatter parameters. `place_chunk` takes non-negative
-        // offsets, so a chunk straddling the window start is instead entered
-        // `skip` leading slabs in (dim 0 is outermost, so one slab is
-        // `chunk_strides[0]` elements), and its leading dim becomes exactly
-        // the `hi - lo` slabs the window keeps, which also clips a chunk
-        // straddling the window end. A saturated `advance` (crafted dims) makes
-        // `bytes.get(advance..)` come up empty and the chunk copies nothing —
-        // the kernel's clamping discipline for short chunks.
-        let scatter: Option<(Vec<usize>, Vec<usize>, usize)> = if full_inner {
-            None
-        } else {
-            let mut offsets = Vec::with_capacity(rank);
-            for &o in chunk.offsets.iter().take(rank) {
-                offsets.push(o.to_usize()?);
-            }
-            let skip = lo - c0;
-            offsets[0] = lo - row_lo;
-            let mut dims = chunk_dims.clone();
-            dims[0] = hi - lo;
-            let advance = skip
-                .saturating_mul(chunk_strides[0])
-                .saturating_mul(elem_size.get());
-            Some((offsets, dims, advance))
-        };
-
-        // Byte offsets of the contiguous row band (full-inner path).
-        let src = (lo - c0).saturating_mul(row_bytes);
-        let dst = (lo - row_lo) * row_bytes;
-        let band = (hi - lo) * row_bytes;
-
-        let copy = |output: &mut [u8], bytes: &[u8]| match &scatter {
-            None => row_band_copy(output, dst, bytes, src, band, elem_size),
-            Some((offsets, dims, advance)) => place_chunk(
-                bytes.get(*advance..).unwrap_or(&[]),
-                output,
-                offsets,
-                dims,
-                &win_dims,
-                &win_strides,
+        let copy = |output: &mut [u8], bytes: &[u8]| {
+            copy_box(
+                bytes,
+                &chunk_dims,
                 &chunk_strides,
+                &src_origin,
+                output,
+                &out_dims,
+                &out_strides,
+                &dst_origin,
+                &shared,
                 elem_size,
-                rank,
-            ),
+            )
         };
 
         let coord = spatial_coord(chunk, rank);
@@ -1007,24 +993,79 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     Ok(Some(output))
 }
 
-/// Copy one chunk's overlapping row band into the window buffer at `dst`, clamped
-/// to the bytes present on each side (element-aligned). An edge or short chunk
-/// copies only its valid prefix and never reads or writes out of bounds — the same
-/// discipline as [`copy_chunk_to_output`].
-fn row_band_copy(
-    output: &mut [u8],
-    dst: usize,
-    chunk: &[u8],
-    src: usize,
-    band: usize,
+/// The first axis of the tail a box can move as one contiguous run: every axis
+/// after it the box spans fully in both the source and the destination array, so
+/// stepping along it lands on the next element in both.
+///
+/// A band of whole rows folds to axis 0 and moves in a single copy; a box that
+/// cuts the innermost axis folds to nothing and moves one row at a time. A
+/// scalar (empty `dims`) folds to axis 0 as well: its one element is one run.
+fn contiguous_tail(dims: &[usize], src_dims: &[usize], dst_dims: &[usize]) -> usize {
+    let mut run = dims.len().saturating_sub(1);
+    while run > 0 && dims[run] == src_dims[run] && dims[run] == dst_dims[run] {
+        run -= 1;
+    }
+    run
+}
+
+/// Copy the box `dims` at `src_origin` of the row-major array `src` (`src_dims`,
+/// `src_strides`) to `dst_origin` of the row-major array `dst` (`dst_dims`,
+/// `dst_strides`), in elements of `elem_size`. The box lies inside both arrays.
+///
+/// The contiguous tail ([`contiguous_tail`]) moves as one run, and the axes
+/// before it are walked with an odometer, one run per step. Each run is clamped
+/// to the bytes present on each side, on an element boundary, so a short
+/// (malformed) chunk copies only its valid prefix and never indexes out of
+/// bounds — the discipline of [`copy_chunk_to_output`].
+fn copy_box(
+    src: &[u8],
+    src_dims: &[usize],
+    src_strides: &[usize],
+    src_origin: &[usize],
+    dst: &mut [u8],
+    dst_dims: &[usize],
+    dst_strides: &[usize],
+    dst_origin: &[usize],
+    dims: &[usize],
     elem_size: NonZeroUsize,
 ) {
-    let mut len = band
-        .min(chunk.len().saturating_sub(src))
-        .min(output.len().saturating_sub(dst));
-    len -= len % elem_size;
-    if len > 0 {
-        output[dst..dst + len].copy_from_slice(&chunk[src..src + len]);
+    if dims.contains(&0) {
+        return;
+    }
+    let run = contiguous_tail(dims, src_dims, dst_dims);
+    let run_bytes = dims[run..]
+        .iter()
+        .fold(elem_size.get(), |acc, &d| acc.saturating_mul(d));
+    let steps: usize = dims[..run].iter().product();
+    let mut coord = vec![0usize; run];
+
+    for _ in 0..steps {
+        // Element offsets of this run on each side: the origin along every axis,
+        // plus the odometer along the axes before the tail.
+        let (mut s, mut d) = (0usize, 0usize);
+        for i in 0..dims.len() {
+            let k = coord.get(i).copied().unwrap_or(0);
+            s = s.saturating_add((src_origin[i] + k).saturating_mul(src_strides[i]));
+            d = d.saturating_add((dst_origin[i] + k).saturating_mul(dst_strides[i]));
+        }
+        let s = s.saturating_mul(elem_size.get());
+        let d = d.saturating_mul(elem_size.get());
+        let mut avail = run_bytes
+            .min(src.len().saturating_sub(s))
+            .min(dst.len().saturating_sub(d));
+        avail -= avail % elem_size;
+        if avail > 0 {
+            dst[d..d + avail].copy_from_slice(&src[s..s + avail]);
+        }
+
+        // Advance the odometer; the last axis before the tail varies fastest.
+        for i in (0..run).rev() {
+            coord[i] += 1;
+            if coord[i] < dims[i] {
+                break;
+            }
+            coord[i] = 0;
+        }
     }
 }
 
@@ -3081,14 +3122,14 @@ mod tests {
         }
     }
 
-    // --- Windowed row-read guards (read_chunked_rows_from_source) ---
+    // --- Regional read guards (read_chunked_region_from_source) ---
 
-    /// A rank-0 (scalar) chunked layout leaves `chunk_dims` empty; the windowed
+    /// A rank-0 (scalar) chunked layout leaves `chunk_dims` empty; the regional
     /// reader must fall back (`Ok(None)`) rather than index `chunk_dims[0]` and
     /// panic. Only a crafted file reaches this (valid chunked layouts are rank
     /// >= 1), but the reader parses untrusted input.
     #[test]
-    fn windowed_rows_rank0_chunked_falls_back() {
+    fn region_of_rank0_chunked_falls_back() {
         let layout = DataLayout::Chunked {
             chunk_dimensions: vec![8], // dimensionality 1 => rank 0
             btree_address: Some(0),
@@ -3104,15 +3145,15 @@ mod tests {
             max_dimensions: None,
         };
         let cache = ChunkCache::new();
-        let out = read_chunked_rows_from_source(
+        let out = read_chunked_region_from_source(
             &BytesSource::new(b""),
             RawReadSpec::plain(&layout, &dataspace, &make_f64_type()),
             8,
             8,
             &cache,
             CachePass::LRU,
-            0,
-            1,
+            &[],
+            &[],
         )
         .expect("rank-0 chunked must not panic");
         assert!(
@@ -3121,13 +3162,14 @@ mod tests {
         );
     }
 
-    /// Inner *dataspace* dimensions whose product overflows `usize` must error
-    /// rather than panic (debug) or wrap (release). The chunk edges stay small so
-    /// the per-chunk geometry guard passes and the `row_elems` check is what
+    /// A region whose element count overflows `usize` — here a row window over a
+    /// dataspace whose inner dimensions multiply past it — must error rather
+    /// than panic (debug) or wrap (release). The chunk edges stay small so the
+    /// per-chunk geometry guard passes and the region's own count is what
     /// catches the overflow. `(2^22)^3` overflows 64-bit `usize`; `(2^22)^2`
     /// already overflows 32-bit, so this holds on both.
     #[test]
-    fn windowed_rows_inner_dim_product_overflow_errors() {
+    fn region_element_count_overflow_errors() {
         let big: u32 = 1 << 22;
         let layout = DataLayout::Chunked {
             chunk_dimensions: vec![1, 2, 2, 2, 8],
@@ -3144,17 +3186,17 @@ mod tests {
             max_dimensions: None,
         };
         let cache = ChunkCache::new();
-        let err = read_chunked_rows_from_source(
+        let err = read_chunked_region_from_source(
             &BytesSource::new(b""),
             RawReadSpec::plain(&layout, &dataspace, &make_f64_type()),
             8,
             8,
             &cache,
             CachePass::LRU,
-            0,
-            1,
+            &[0, 0, 0, 0],
+            &[1, big.into(), big.into(), big.into()],
         )
-        .expect_err("overflowing inner-dim product must error");
+        .expect_err("an overflowing element count must error");
         assert!(
             matches!(err, FormatError::OffsetOverflow { .. }),
             "expected OffsetOverflow, got {err:?}"
@@ -3164,11 +3206,11 @@ mod tests {
     /// A chunk whose edges declare an impossible logical byte size — here a
     /// `(2^22)^3` element chunk of `f64`, far past the 4 GiB format limit — must
     /// be refused up front, even when the dataset itself is small. The per-chunk
-    /// geometry guard catches it before the windowed reader sizes any allocation
+    /// geometry guard catches it before the regional reader sizes any allocation
     /// or builds strides, so a crafted chunk extent cannot drive an out-of-memory
     /// abort. Checked before any I/O: the empty source would otherwise EOF first.
     #[test]
-    fn windowed_rows_huge_chunk_geometry_refused() {
+    fn region_huge_chunk_geometry_refused() {
         let big: u32 = 1 << 22;
         let layout = DataLayout::Chunked {
             chunk_dimensions: vec![2, big, big, big, 8],
@@ -3185,15 +3227,15 @@ mod tests {
             max_dimensions: None,
         };
         let cache = ChunkCache::new();
-        let err = read_chunked_rows_from_source(
+        let err = read_chunked_region_from_source(
             &BytesSource::new(b""),
             RawReadSpec::plain(&layout, &dataspace, &make_f64_type()),
             8,
             8,
             &cache,
             CachePass::LRU,
-            0,
-            1,
+            &[0, 0, 0, 0],
+            &[1, 2, 2, 2],
         )
         .expect_err("an impossible chunk geometry must error");
         assert!(
@@ -3203,16 +3245,16 @@ mod tests {
     }
 
     /// An unallocated chunk index (`btree_address == None`, e.g. a late-allocated
-    /// never-written dataset) reads as fill for a non-empty window, matching the
-    /// whole-dataset reader element for element, and as the empty buffer for a
-    /// zero-row one.
+    /// never-written dataset) reads as fill for a non-empty region, matching the
+    /// whole-dataset reader element for element, and as the empty buffer for an
+    /// empty one.
     ///
-    /// The window and the whole read reach the fill by different routes — the
-    /// window returns the buffer it built up front, the whole read builds one in
+    /// The region and the whole read reach the fill by different routes — the
+    /// region returns the buffer it built up front, the whole read builds one in
     /// `chunk_index_address` — so this compares them rather than asserting a
     /// literal on either.
     #[test]
-    fn windowed_rows_unallocated_index_matches_whole_read() {
+    fn region_over_unallocated_index_matches_whole_read() {
         let layout = DataLayout::Chunked {
             chunk_dimensions: vec![4, 8],
             btree_address: None,
@@ -3243,32 +3285,143 @@ mod tests {
                     .expect("an unallocated dataset reads as fill");
             assert_eq!(whole.len(), 80);
 
-            let window = read_chunked_rows_from_source(
+            let region = read_chunked_region_from_source(
                 &BytesSource::new(b""),
                 spec,
                 8,
                 8,
                 &cache,
                 CachePass::LRU,
-                2,
-                4,
+                &[2],
+                &[4],
             )
-            .expect("a window over an unallocated index reads as fill")
-            .expect("rank-1 windows are supported");
-            assert_eq!(window, whole[16..48], "the window must match those rows");
+            .expect("a region over an unallocated index reads as fill")
+            .expect("rank-1 regions are supported");
+            assert_eq!(
+                region,
+                whole[16..48],
+                "the region must match those elements"
+            );
 
-            let empty = read_chunked_rows_from_source(
+            let empty = read_chunked_region_from_source(
                 &BytesSource::new(b""),
                 spec,
                 8,
                 8,
                 &cache,
                 CachePass::LRU,
-                0,
-                0,
+                &[0],
+                &[0],
             )
-            .expect("empty window must still be Ok");
+            .expect("an empty region must still be Ok");
             assert_eq!(empty, Some(Vec::new()));
         }
+    }
+
+    // --- The box kernel (copy_box) ---
+
+    /// A band of whole rows is one run; a box that cuts the innermost axis moves
+    /// a row at a time; a scalar is one run of one element.
+    #[test]
+    fn contiguous_tail_folds_the_axes_a_box_spans_in_both_arrays() {
+        // Rows 1..3 of a [4, 6] chunk into a [2, 6] window: axis 1 spans both.
+        assert_eq!(contiguous_tail(&[2, 6], &[4, 6], &[2, 6]), 0);
+        // A [16, 4] chunk into a [64, 32, 8] window: the chunk's inner axis is
+        // 4 of the window's 8, so the tail is the innermost axis alone.
+        assert_eq!(contiguous_tail(&[16, 16, 4], &[64, 16, 4], &[64, 32, 8]), 2);
+        // Inner axes spanned in both: the leading one folds too, and a band of
+        // three whole slabs is one run however many slabs each array holds.
+        assert_eq!(contiguous_tail(&[3, 16, 4], &[64, 16, 4], &[8, 16, 4]), 0);
+        // The innermost axis spanned in both, the middle one cut: fold to axis 1.
+        assert_eq!(contiguous_tail(&[3, 5, 4], &[64, 16, 4], &[8, 5, 4]), 1);
+        assert_eq!(contiguous_tail(&[], &[], &[]), 0);
+    }
+
+    /// The box lands where it should, element for element, whether the tail
+    /// folds or not.
+    #[test]
+    fn copy_box_places_a_box_of_a_chunk_into_the_region() {
+        let one = nz(1);
+        // A [4, 6] source numbered 0..24; take the 2×3 box at (1, 2) into a
+        // [3, 5] destination at (1, 1).
+        let src: Vec<u8> = (0..24).collect();
+        let mut dst = vec![0xFFu8; 15];
+        copy_box(
+            &src,
+            &[4, 6],
+            &[6, 1],
+            &[1, 2],
+            &mut dst,
+            &[3, 5],
+            &[5, 1],
+            &[1, 1],
+            &[2, 3],
+            one,
+        );
+        assert_eq!(
+            dst,
+            [
+                0xFF, 0xFF, 0xFF, 0xFF, 0xFF, //
+                0xFF, 8, 9, 10, 0xFF, //
+                0xFF, 14, 15, 16, 0xFF,
+            ]
+        );
+        // Whole rows 1..3 of the same source into a [2, 6] destination: the
+        // folded run is the same bytes as the source's rows.
+        let mut band = vec![0u8; 12];
+        copy_box(
+            &src,
+            &[4, 6],
+            &[6, 1],
+            &[1, 0],
+            &mut band,
+            &[2, 6],
+            &[6, 1],
+            &[0, 0],
+            &[2, 6],
+            one,
+        );
+        assert_eq!(band, src[6..18]);
+    }
+
+    /// A short (malformed) chunk copies only the bytes it has, on an element
+    /// boundary, and never indexes past either buffer.
+    #[test]
+    fn copy_box_clamps_a_short_chunk_to_its_valid_prefix() {
+        let two = nz(2);
+        // Declared as [2, 4] elements of 2 bytes (16 bytes); only 7 present.
+        let src: Vec<u8> = (1..=7).collect();
+        let mut dst = vec![0u8; 16];
+        copy_box(
+            &src,
+            &[2, 4],
+            &[4, 1],
+            &[0, 0],
+            &mut dst,
+            &[2, 4],
+            &[4, 1],
+            &[0, 0],
+            &[2, 4],
+            two,
+        );
+        // Three whole elements of the first row; the seventh byte is half an
+        // element and stays out.
+        assert_eq!(&dst[..8], [1, 2, 3, 4, 5, 6, 0, 0]);
+        assert!(dst[8..].iter().all(|&b| b == 0));
+        // An empty box copies nothing.
+        let mut untouched = vec![9u8; 4];
+        copy_box(
+            &src,
+            &[2, 4],
+            &[4, 1],
+            &[0, 0],
+            &mut untouched,
+            &[1, 2],
+            &[2, 1],
+            &[0, 0],
+            &[0, 2],
+            two,
+        );
+        assert_eq!(untouched, [9, 9, 9, 9]);
     }
 }
